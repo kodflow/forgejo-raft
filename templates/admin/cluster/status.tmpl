@@ -1,0 +1,184 @@
+{{template "admin/layout_head" (dict "ctxData" . "pageClass" "admin cluster")}}
+<div class="admin-setting-content">
+	{{if .ClusterDisabled}}
+	<h4 class="ui top attached header">{{ctx.Locale.Tr "admin.cluster"}}</h4>
+	<div class="ui attached segment">{{ctx.Locale.Tr "admin.cluster.disabled"}}</div>
+	{{else}}
+	{{$op := .IsClusterOperator}}
+	<h4 class="ui top attached header">
+		{{ctx.Locale.Tr "admin.cluster.node"}} <code>{{.View.Slot}}</code>
+		{{if .View.Ready}}<span class="ui green label">{{ctx.Locale.Tr "admin.cluster.ready"}}</span>{{else}}<span class="ui red label">{{ctx.Locale.Tr "admin.cluster.not_ready"}}</span>{{end}}
+		{{if .View.Fenced}}<span class="ui orange label">{{ctx.Locale.Tr "admin.cluster.fenced"}}</span>{{end}}
+		{{if .View.Stopped}}<span class="ui red label">{{ctx.Locale.Tr "admin.cluster.stopped"}}: {{.View.StopReason}}</span>{{end}}
+	</h4>
+	<div class="ui attached segment">
+		<dl class="admin-dl-horizontal">
+			<dt>{{ctx.Locale.Tr "admin.cluster.role"}}</dt><dd>{{if .View.Role}}{{ctx.Locale.Tr (printf "admin.cluster.role.%s" .View.Role)}}{{else}}-{{end}}</dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.term"}}</dt><dd>{{.View.Term}}</dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.leader"}}</dt><dd><code>{{if .View.Leader}}{{.View.Leader}}{{else}}-{{end}}</code></dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.commit_applied"}}</dt><dd>{{.View.Commit}} / {{.View.Applied}}{{if .View.ApplyLagEntries}} ({{ctx.Locale.Tr "admin.cluster.apply_lag" .View.ApplyLagEntries}}){{end}}</dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.lineage"}}</dt><dd><code>{{.View.Identity}}</code></dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.cluster_version"}}</dt><dd>{{.View.ClusterVersion}}</dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.failure_tolerance"}}</dt><dd>{{if lt .View.FailureTolerance 0}}{{ctx.Locale.Tr "admin.cluster.unknown"}}{{else}}{{.View.FailureTolerance}}{{end}}{{if and (eq .View.Role "leader") (not .View.QuorumReachable)}} <span class="ui red label">{{ctx.Locale.Tr "admin.cluster.no_quorum"}}</span>{{end}}</dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.cert_expiry"}}</dt><dd>{{DateUtils.AbsoluteLong .View.CertExpiry}}</dd>
+			<dt>SPKI</dt><dd><code>{{.View.SPKI}}</code></dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.table_root"}}</dt><dd><code>{{.View.Root}}</code></dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.repositories"}}</dt><dd>{{.View.Repos}}</dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.events"}}</dt><dd>{{.View.Events}} ({{ctx.Locale.TrSize .View.EventBytes}}), {{ctx.Locale.Tr "admin.cluster.consumer_lag"}} {{.View.ConsumerLag}}</dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.txns_in_flight"}}</dt><dd>{{.View.TxnsInFlight}}</dd>
+		</dl>
+	</div>
+
+	<h4 class="ui top attached header">{{ctx.Locale.Tr "admin.cluster.alarms"}}</h4>
+	<div class="ui attached table segment">
+		{{if .View.Alarms}}
+		<table class="ui very basic striped table unstackable">
+			<thead><tr><th>{{ctx.Locale.Tr "admin.cluster.alarm_id"}}</th><th>{{ctx.Locale.Tr "admin.cluster.alarm_kind"}}</th><th>{{ctx.Locale.Tr "admin.cluster.alarm_nodes"}}</th><th></th></tr></thead>
+			<tbody>
+			{{range .View.Alarms}}
+				<tr>
+					<td>{{.ID}}</td><td>{{.Kind}}</td><td>{{range .Nodes}}<code>{{.}}</code> {{end}}</td>
+					<td>{{if and $op (eq .Kind "NO_SPACE")}}
+						<form method="post" action="{{AppSubUrl}}/admin/cluster/operate">
+							<input type="hidden" name="action" value="clear-no-space"><input type="hidden" name="target" value="{{.ID}}">
+							<button class="ui small red button">{{ctx.Locale.Tr "admin.cluster.op.clear-no-space"}}</button>
+						</form>
+					{{end}}</td>
+				</tr>
+			{{end}}
+			</tbody>
+		</table>
+		{{else}}<div class="tw-p-2">{{ctx.Locale.Tr "admin.cluster.no_alarms"}}</div>{{end}}
+	</div>
+
+	<h4 class="ui top attached header">{{ctx.Locale.Tr "admin.cluster.membership"}}</h4>
+	<div class="ui attached table segment tw-overflow-x-auto">
+		<table class="ui very basic striped table unstackable">
+			<thead>
+				<tr>
+					<th>{{ctx.Locale.Tr "admin.cluster.node_id"}}</th>
+					<th>{{ctx.Locale.Tr "admin.cluster.slot"}}</th>
+					<th>{{ctx.Locale.Tr "admin.cluster.address"}}</th>
+					<th>{{ctx.Locale.Tr "admin.cluster.kind"}}</th>
+					<th>{{ctx.Locale.Tr "admin.cluster.match_lag"}}</th>
+					<th>{{ctx.Locale.Tr "admin.cluster.health"}}</th>
+					<th>SPKI</th>
+					{{if $op}}<th>{{ctx.Locale.Tr "admin.cluster.operations"}}</th>{{end}}
+				</tr>
+			</thead>
+			<tbody>
+			{{range .View.Members}}
+				<tr>
+					<td><code>{{.ID}}</code>{{if .Self}} <span class="ui label">{{ctx.Locale.Tr "admin.cluster.self"}}</span>{{end}}{{if .Leader}} <span class="ui blue label">{{ctx.Locale.Tr "admin.cluster.leader"}}</span>{{end}}</td>
+					<td>{{.Slot}}</td>
+					<td><code>{{.Address}}</code></td>
+					<td>{{if .Voter}}{{ctx.Locale.Tr "admin.cluster.voter"}}{{else if .Joining}}{{ctx.Locale.Tr "admin.cluster.joining"}}{{else}}{{ctx.Locale.Tr "admin.cluster.learner"}}{{end}}</td>
+					<td>{{if .Known}}{{.Match}} / {{.Lag}}{{if .Snapshot}} <span class="ui label">{{ctx.Locale.Tr "admin.cluster.snapshot"}}</span>{{end}}{{else if .Self}}-{{else}}<span title="{{ctx.Locale.Tr "admin.cluster.leader_only"}}">?</span>{{end}}</td>
+					<td>{{if .Known}}{{if .Unreachable}}<span class="ui red label">{{ctx.Locale.Tr "admin.cluster.unreachable"}}</span>{{else}}<span class="ui green label">{{ctx.Locale.Tr "admin.cluster.reachable"}}</span> {{.LastContactText}}{{end}}{{else}}-{{end}}</td>
+					<td>{{if .Pinned}}<code title="{{.SPKI}}">{{ShortSha .SPKI}}</code>{{else}}<span class="ui red label">{{ctx.Locale.Tr "admin.cluster.pin_denied"}}</span>{{end}}</td>
+					{{if $op}}
+					<td>
+						<form method="post" action="{{AppSubUrl}}/admin/cluster/operate" class="tw-flex tw-flex-wrap tw-gap-1">
+							<input type="hidden" name="target" value="{{.ID}}">
+							{{if not .Voter}}<button class="ui mini button" name="action" value="promote">{{ctx.Locale.Tr "admin.cluster.op.promote"}}</button>{{end}}
+							{{if and .Voter (not .Leader)}}<button class="ui mini button" name="action" value="transfer-leadership">{{ctx.Locale.Tr "admin.cluster.op.transfer-leadership"}}</button>{{end}}
+							{{if .Pinned}}<button class="ui mini orange button" name="action" value="deny-pin">{{ctx.Locale.Tr "admin.cluster.op.deny-pin"}}</button>{{end}}
+							<button class="ui mini red button" name="action" value="remove">{{ctx.Locale.Tr "admin.cluster.op.remove"}}</button>
+						</form>
+					</td>
+					{{end}}
+				</tr>
+			{{end}}
+			</tbody>
+		</table>
+		{{if .View.Retired}}<div class="tw-p-2">{{ctx.Locale.Tr "admin.cluster.retired"}}: {{range .View.Retired}}<code>{{.}}</code> {{end}}</div>{{end}}
+	</div>
+
+	{{if $op}}
+	<h4 class="ui top attached header">{{ctx.Locale.Tr "admin.cluster.membership_change"}}</h4>
+	<div class="ui attached segment">
+		<form class="ui form" method="post" action="{{AppSubUrl}}/admin/cluster/operate">
+			<input type="hidden" name="action" value="add-learner">
+			<div class="field">
+				<label for="cluster-member">{{ctx.Locale.Tr "admin.cluster.op.add-learner"}}</label>
+				<input id="cluster-member" name="target" required placeholder="id:incarnation:slot:spki:host:port">
+				<p class="help">{{ctx.Locale.Tr "admin.cluster.add_learner_help"}}</p>
+			</div>
+			<button class="ui primary button">{{ctx.Locale.Tr "admin.cluster.op.add-learner"}}</button>
+		</form>
+		<div class="divider"></div>
+		<form class="ui form" method="post" action="{{AppSubUrl}}/admin/cluster/operate">
+			<input type="hidden" name="action" value="authorize-join">
+			<div class="field">
+				<label for="cluster-grant">{{ctx.Locale.Tr "admin.cluster.op.authorize-join"}}</label>
+				<input id="cluster-grant" name="target" required placeholder="{{ctx.Locale.Tr "admin.cluster.authorize_join_placeholder"}}">
+				<p class="help">{{ctx.Locale.Tr "admin.cluster.authorize_join_help"}}</p>
+			</div>
+			<button class="ui button">{{ctx.Locale.Tr "admin.cluster.op.authorize-join"}}</button>
+		</form>
+		<div class="divider"></div>
+		<form class="ui form" method="post" action="{{AppSubUrl}}/admin/cluster/operate">
+			<input type="hidden" name="action" value="update-address">
+			<div class="two fields">
+				<div class="field"><label for="cluster-addr-node">{{ctx.Locale.Tr "admin.cluster.node_id"}}</label><input id="cluster-addr-node" name="target" required></div>
+				<div class="field"><label for="cluster-addr">{{ctx.Locale.Tr "admin.cluster.address"}}</label><input id="cluster-addr" name="address" required placeholder="10.2.0.1:7480"></div>
+			</div>
+			<button class="ui button">{{ctx.Locale.Tr "admin.cluster.op.update-address"}}</button>
+		</form>
+	</div>
+	{{else}}
+	<div class="ui info message">{{ctx.Locale.Tr "admin.cluster.not_operator"}}</div>
+	{{end}}
+
+	<h4 class="ui top attached header">{{ctx.Locale.Tr "admin.cluster.operators"}}</h4>
+	<div class="ui attached segment">
+		<p>{{range .ClusterOperators}}<code>{{.}}</code> {{else}}{{ctx.Locale.Tr "admin.cluster.no_operators"}}{{end}}</p>
+		{{if $op}}
+		<form class="ui form" method="post" action="{{AppSubUrl}}/admin/cluster/operate">
+			<div class="inline field">
+				<label for="cluster-operator">{{ctx.Locale.Tr "admin.cluster.operator_login"}}</label>
+				<input id="cluster-operator" name="target" required>
+				<button class="ui button" name="action" value="grant-operator">{{ctx.Locale.Tr "admin.cluster.op.grant-operator"}}</button>
+				<button class="ui red button" name="action" value="revoke-operator">{{ctx.Locale.Tr "admin.cluster.op.revoke-operator"}}</button>
+			</div>
+		</form>
+		{{end}}
+	</div>
+
+	<h4 class="ui top attached header">{{ctx.Locale.Tr "admin.cluster.refs_lag"}}</h4>
+	<div class="ui attached table segment">
+		{{if .View.Lag}}
+		<table class="ui very basic striped table unstackable">
+			<thead><tr><th>{{ctx.Locale.Tr "admin.cluster.repository"}}</th><th>{{ctx.Locale.Tr "admin.cluster.watermark"}}</th><th>{{ctx.Locale.Tr "admin.cluster.target"}}</th><th>{{ctx.Locale.Tr "admin.cluster.error"}}</th></tr></thead>
+			<tbody>
+			{{range .View.Lag}}
+				<tr><td><code>{{.Repo}}</code></td><td>{{.Watermark}}</td><td>{{.Target}}</td><td>{{.Error}}</td></tr>
+			{{end}}
+			</tbody>
+		</table>
+		{{else}}<div class="tw-p-2">{{ctx.Locale.Tr "admin.cluster.refs_in_sync"}}</div>{{end}}
+	</div>
+
+	<h4 class="ui top attached header">{{ctx.Locale.Tr "admin.cluster.audit"}}</h4>
+	<div class="ui attached table segment">
+		{{if .View.Audit}}
+		<table class="ui very basic striped table unstackable">
+			<thead><tr><th>{{ctx.Locale.Tr "admin.cluster.position"}}</th><th>{{ctx.Locale.Tr "admin.cluster.time"}}</th><th>{{ctx.Locale.Tr "admin.cluster.operator"}}</th><th>{{ctx.Locale.Tr "admin.cluster.action"}}</th><th>{{ctx.Locale.Tr "admin.cluster.target"}}</th><th>{{ctx.Locale.Tr "admin.cluster.outcome"}}</th></tr></thead>
+			<tbody>
+			{{range .View.Audit}}
+				<tr>
+					<td>{{.Token.Index}}</td>
+					<td>{{DateUtils.FullTime .Time}}</td>
+					<td><code>{{.Operator}}</code></td>
+					<td>{{ctx.Locale.Tr (printf "admin.cluster.op.%s" .Action)}}</td>
+					<td><code>{{.Target}}</code></td>
+					<td>{{if eq .Outcome "ok"}}<span class="ui green label">{{ctx.Locale.Tr "admin.cluster.outcome.ok"}}</span>{{else if eq .Outcome "requested"}}<span class="ui label">{{ctx.Locale.Tr "admin.cluster.outcome.requested"}}</span>{{else}}<span class="ui red label" title="{{.Detail}}">{{ctx.Locale.Tr "admin.cluster.outcome.failed"}}</span>{{end}}</td>
+				</tr>
+			{{end}}
+			</tbody>
+		</table>
+		{{else}}<div class="tw-p-2">{{ctx.Locale.Tr "admin.cluster.no_audit"}}</div>{{end}}
+	</div>
+	{{end}}
+</div>
+{{template "admin/layout_footer" .}}
