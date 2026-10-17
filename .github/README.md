@@ -637,9 +637,10 @@ Every merge that brings cluster code to the `forgejo` branch is released by
   Forgejo's own Dockerfile. The binaries are the ones inside the image.
 - **Notes** list the cluster commits since the previous release, upstream
   commits left out.
-- **Upstream syncs release nothing.** A push releases only when it brings a
-  commit outside `.github/` that is in neither the previous release nor
-  upstream Forgejo.
+- **Upstream syncs and tooling changes release nothing.** A push releases
+  only when it brings a commit that is in neither the previous release nor
+  upstream Forgejo and changes something outside `.github/`,
+  `.coderabbit.yaml` and `contrib/cluster-lab/`.
 
 `.github/scripts/release-plan.sh --dry-run` shows, from a local clone, the
 version and notes a push of the current commit would produce.

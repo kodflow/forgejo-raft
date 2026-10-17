@@ -19,7 +19,6 @@ import (
 	"time"
 
 	auth_model "forgejo.org/models/auth"
-
 	cluster_model "forgejo.org/models/cluster"
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/clusterhook"

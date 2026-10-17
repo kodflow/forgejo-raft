@@ -16,9 +16,12 @@
 # created, locally, for git describe. Nothing is pushed.
 #
 # Release or skip: a release is cut when HEAD brings at least one non-merge
-# commit, outside .github/, that is neither in the previous release nor in
-# upstream's branch. An upstream sync (Codeberg's commits plus the sync
-# workflow's merge commit) therefore cuts nothing.
+# commit that changes a released path and is neither in the previous release
+# nor in upstream's branch. An upstream sync (Codeberg's commits plus the sync
+# workflow's merge commit) therefore cuts nothing. Released paths are all but
+# NOT_RELEASED: this repository's tooling, which neither the binary nor the
+# image carries (CI and its scripts, the review bot's configuration, the
+# Docker lab).
 #
 # Environment:
 #   UPSTREAM_URL     default https://codeberg.org/forgejo/forgejo.git
@@ -71,7 +74,10 @@ previous=$(git describe --tags --abbrev=0 --match 'v*-raft.*' "$HEAD_REV" 2>/dev
 range=("$HEAD_REV")
 if [ -n "$previous" ]; then range+=("^$previous"); fi
 
-changes=$(git rev-list --count --no-merges "${range[@]}" --not "$upstream_ref" -- . ':(exclude).github')
+NOT_RELEASED=(.github .coderabbit.yaml contrib/cluster-lab)
+pathspec=(.)
+for p in "${NOT_RELEASED[@]}"; do pathspec+=(":(exclude)$p"); done
+changes=$(git rev-list --count --no-merges "${range[@]}" --not "$upstream_ref" -- "${pathspec[@]}")
 release=false
 if [ "$changes" -gt 0 ]; then release=true; fi
 

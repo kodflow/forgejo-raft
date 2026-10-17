@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"forgejo.org/modules/log"
-
 	"forgejo.org/services/cluster/consensus"
 
 	sdk "github.com/kitsunium/sdk/pkg/v1/app/consensus"
