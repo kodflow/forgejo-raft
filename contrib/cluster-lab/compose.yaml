@@ -43,7 +43,7 @@ x-patroni: &patroni
     start_period: 20s
 
 x-forgejo: &forgejo
-  # The upstream image, built from the root of the feat/raft-cluster tree.
+  # The upstream image, built from the root of the forgejo-raft tree.
   build:
     context: ${FORGEJO_SRC:-../../../forgejo-raft-cluster}
     # make build writes it from the tree's own (forgejo/dockerfile.sh), with

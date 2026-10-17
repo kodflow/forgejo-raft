@@ -81,12 +81,13 @@ jobs:
         # forgejo-raft: pull requests only. A push or a manual run makes the
         # action scan every branch and tag, which here is upstream's history.
         # forgejo-raft: and never on the upstream sync PR, whose head is this
-        # repository's `forgejo` branch (BRANCH in sync-upstream.yml): its
-        # commits are Codeberg's, by other authors, and could never pass
-        # `authors:`. The cluster's checks below still run on it.
+        # repository's `sync/upstream` branch (SYNC_BRANCH in
+        # sync-upstream.yml): its commits are Codeberg's, by other authors,
+        # and could never pass `authors:`. The cluster's checks below still
+        # run on it.
         if: >-
           ${{ github.event_name == 'pull_request'
-              && !(github.head_ref == 'forgejo'
+              && !(github.head_ref == 'sync/upstream'
                    && github.event.pull_request.head.repo.full_name == github.repository) }}
         with:
           # One human commits across the whole fleet, as this account.
