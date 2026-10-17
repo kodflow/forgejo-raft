@@ -30,6 +30,7 @@ upstream `README.md` stays untouched and upstream syncs never conflict.
 - [Quick start: the Docker lab](#quick-start-the-docker-lab)
 - [Production deployment](#production-deployment)
 - [Configuration reference](#configuration-reference)
+- [Releases](#releases)
 - [Limits and status](#limits-and-status)
 - [Credits and license](#credits-and-license)
 
@@ -620,6 +621,29 @@ The `[cluster]` section of `app.ini` (also settable as
 | `RENEW_VAULT_*`, `RENEW_TTL` | off | The in-process certificate renewer. |
 | `NOMAD_ADDR`, `NOMAD_TOKEN_FILE`, `NOMAD_SLOT_META` | off | The JOIN drain check. |
 | `MAX_LOG_BYTES`, `MAX_SNAPSHOT_BYTES`, `ACK_MARGIN`, `TXN_TTL`, `MAX_TXN_PER_REPO`, `MAX_TXN_TOTAL`, `JOIN_GRANT_TTL` | | Bounds. |
+
+## Releases
+
+Every merge that brings cluster code to the `forgejo` branch is released by
+`.github/workflows/release.yml`, with no manual step.
+
+- **Version** `v<upstream>-raft.<N>`, for example `v18.0.0-dev-raft.1`.
+  `<upstream>` is the upstream Forgejo version the code is built on, found
+  as Forgejo's Makefile finds it (`git describe` on the nearest upstream
+  tag). `<N>` counts the releases on that upstream version and starts again
+  at 1 when it changes. `forgejo --version` reports the same version.
+- **Assets**: static `forgejo` binaries for linux/amd64 and linux/arm64
+  (SQLite, embedded assets) and their `SHA256SUMS`, plus the image
+  `ghcr.io/kodflow/forgejo-raft:<version>` (and `:latest`), built with
+  Forgejo's own Dockerfile. The binaries are the ones inside the image.
+- **Notes** list the cluster commits since the previous release, upstream
+  commits left out.
+- **Upstream syncs release nothing.** A push releases only when it brings a
+  commit outside `.github/` that is in neither the previous release nor
+  upstream Forgejo.
+
+`.github/scripts/release-plan.sh --dry-run` shows, from a local clone, the
+version and notes a push of the current commit would produce.
 
 ## Limits and status
 
