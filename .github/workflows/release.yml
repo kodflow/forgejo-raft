@@ -14,7 +14,8 @@
 # an untracked VERSION file, which the Makefile reads as the whole version.
 #
 # When: every push to `forgejo`, and on demand. A run releases only when the
-# commit brings at least one non-merge commit, outside .github/, that is in
+# commit brings at least one non-merge commit that changes a released path
+# (all but .github/, .coderabbit.yaml and contrib/cluster-lab/) and is in
 # neither the previous release nor upstream's branch. Not a `paths:` filter:
 # an upstream sync touches the same directories as the cluster (cmd/,
 # modules/setting/, services/webhook/), and a filter would cut a release on
