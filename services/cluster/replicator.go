@@ -70,6 +70,14 @@ type Replicator struct {
 	dead   deadClock
 	seenMu sync.Mutex
 	seen   map[consensus.NodeID]memberRecord
+	// fence queues this node's own writers while a checkpoint reads
+	// PostgreSQL's position; checkpoints is the coordinator, nil while
+	// [cluster] CHECKPOINT_INTERVAL is 0 (checkpoint.go).
+	fence       sync.RWMutex
+	checkpoints *coordinator
+	// export is the PostgreSQL and archive side of the observers' export
+	// (export.go).
+	export exportSide
 }
 
 type rawWrite struct {
@@ -131,6 +139,10 @@ func (r *Replicator) Table() *reftable.Table { return r.table }
 // database is initialised and does not depend on it (ADR 0152 D19, R7-32):
 // only the consumer waits for the database.
 func Init(ctx context.Context) error {
+	if setting.Cluster.Role == setting.ClusterRoleObserver {
+		// An observer never serves: no listener, no member, no web.
+		return errors.New("[cluster] ROLE = observer: this node is an observer and never serves; run `forgejo cluster observe`")
+	}
 	if !setting.Cluster.Enabled {
 		return nil
 	}
@@ -185,6 +197,17 @@ func Init(ctx context.Context) error {
 	r.projector.fetch = r.objects.fetchMissing
 	// Before the socket opens: a request on it may read the consumer.
 	r.consumer = newConsumer(r)
+	wal := pgWAL{role: setting.Cluster.CheckpointRole}
+	r.export = newExportSide(wal)
+	if setting.Cluster.CheckpointInterval > 0 {
+		if !setting.Database.Type.IsPostgreSQL() {
+			return errors.New("[cluster] CHECKPOINT_INTERVAL needs PostgreSQL: a checkpoint pairs the refs with a WAL position")
+		}
+		if _, err := storageRoots(); err != nil {
+			return fmt.Errorf("[cluster] CHECKPOINT_INTERVAL: %w", err)
+		}
+		r.checkpoints = newCoordinator(r, setting.Cluster.CheckpointInterval, setting.Cluster.CheckpointDir, wal)
+	}
 
 	// The private socket first: a hook that cannot reach it fails closed.
 	if err := r.serveHookSocket(setting.Cluster.HookSocket); err != nil {
@@ -241,6 +264,9 @@ func Init(ctx context.Context) error {
 	go r.startupBarrier(r.ctx)
 	go r.consumer.run(r.ctx)
 	go r.sweepRaw(r.ctx)
+	if r.checkpoints != nil {
+		go r.checkpoints.run(r.ctx)
+	}
 	if r.auto != nil {
 		go r.autopilot(r.ctx)
 	}

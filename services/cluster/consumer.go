@@ -45,6 +45,12 @@ type consumer struct {
 	// tx runs f in one SQL transaction; tests replace it.
 	tx func(ctx context.Context, f func(ctx context.Context) error) error
 
+	// gate holds the dispatch at an index while a checkpoint reads
+	// PostgreSQL's position (checkpoint.go).
+	gate sync.RWMutex
+	hold uint64
+	held bool
+
 	mu       sync.Mutex
 	lastAck  map[string]uint64
 	failures map[uint64]int
@@ -162,7 +168,13 @@ func (c *consumer) step(ctx context.Context) error {
 	events := c.r.table.Events()
 	cursors := map[string]*cluster_model.Cursor{}
 	var pending []reftable.Event
+	limit, held := c.limit()
 	for _, ev := range events {
+		if held && ev.Token.Index > limit {
+			// A checkpoint is reading PostgreSQL's position: what derives
+			// from later entries waits, so it lands after that position.
+			break
+		}
 		lin := ev.Token.Identity().String()
 		cur, ok := cursors[lin]
 		if !ok {

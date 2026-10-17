@@ -34,6 +34,14 @@ var (
 		Name: metricsNamespace + "consumer_failures_total",
 		Help: "Batches the consumer rolled back because their work failed.",
 	})
+	checkpointsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricsNamespace + "checkpoints_total",
+		Help: "Checkpoints the coordinator took on this node while it led, by outcome: closed, failed.",
+	}, []string{"outcome"})
+	exportsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricsNamespace + "exports_total",
+		Help: "Export calls served to observers, by op and outcome: ok, refused.",
+	}, []string{"op", "outcome"})
 )
 
 type collector struct {
@@ -92,6 +100,8 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	objectShipsTotal.Describe(ch)
 	dispatchedTotal.Describe(ch)
 	dispatchFailuresTotal.Describe(ch)
+	checkpointsTotal.Describe(ch)
+	exportsTotal.Describe(ch)
 }
 
 func b2f(b bool) float64 {
@@ -106,6 +116,8 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	objectShipsTotal.Collect(ch)
 	dispatchedTotal.Collect(ch)
 	dispatchFailuresTotal.Collect(ch)
+	checkpointsTotal.Collect(ch)
+	exportsTotal.Collect(ch)
 	r := Current()
 	if r == nil {
 		return

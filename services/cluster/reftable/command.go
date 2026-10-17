@@ -24,6 +24,11 @@ const (
 	KindRepoDelete Kind = 4
 	KindRepoRename Kind = 5
 	KindJoinGrant  Kind = 6
+	// The checkpoint kinds are proposed only once [cluster]
+	// CHECKPOINT_INTERVAL is set, which every member's binary must know
+	// first: an older one stops on them (D18).
+	KindCheckpointBarrier  Kind = 7
+	KindCheckpointPosition Kind = 8
 )
 
 // Limits pinned to the payload version: they are part of Apply's verdict, so
@@ -159,6 +164,10 @@ func decode(data []byte) (Kind, any, error) {
 		v = &RepoRename{}
 	case KindJoinGrant:
 		v = &JoinGrant{}
+	case KindCheckpointBarrier:
+		v = &CheckpointBarrier{}
+	case KindCheckpointPosition:
+		v = &CheckpointPosition{}
 	default:
 		return 0, nil, fmt.Errorf("%w: command kind %d", ErrVersion, kind)
 	}

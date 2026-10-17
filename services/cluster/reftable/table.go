@@ -107,9 +107,14 @@ type Table struct {
 	grants   map[string]JoinGrant
 	applied  consensus.Position
 	identity consensus.LogIdentity
+	// pending is the open checkpoint barrier; checkpoints the closed ones.
+	pending     *pendingCheckpoint
+	checkpoints []CheckpointRecord
 
 	// onChange is called after each Apply, outside the lock. It is not state.
 	onChange func(Change)
+	// onCheckpoint is the coordinator's capture of a barrier. It is not state.
+	onCheckpoint func(nonce string, index uint64, encode func() ([]byte, error))
 }
 
 type renameMark struct {
@@ -162,11 +167,18 @@ func (t *Table) Apply(e consensus.Entry) any {
 			res, ch = t.applyRepoRename(e, body.(*RepoRename))
 		case KindJoinGrant:
 			res = t.applyJoinGrant(body.(*JoinGrant))
+		case KindCheckpointBarrier:
+			res = t.applyCheckpointBarrier(e, body.(*CheckpointBarrier))
+		case KindCheckpointPosition:
+			res = t.applyCheckpointPosition(e, body.(*CheckpointPosition))
 		}
 	}
 	t.applied = e.Position
 	if !e.Token.IsZero() {
 		t.identity = e.Token.Identity()
+	}
+	if kind == KindCheckpointBarrier && res.OK && t.onCheckpoint != nil {
+		t.onCheckpoint(body.(*CheckpointBarrier).Nonce, e.Index, func() ([]byte, error) { return json.Marshal(t.persistedLocked()) })
 	}
 	// The projector learns of the change before the new applied position
 	// is visible to any reader, so a repository is never reported projected
@@ -694,6 +706,10 @@ type persisted struct {
 	Deleted  map[string]uint64               `json:"deleted"`
 	Renamed  map[string]renameMark           `json:"renamed"`
 	Grants   map[string]JoinGrant            `json:"grants,omitempty"`
+	// Pending and Checkpoints are absent from snapshots older than the
+	// checkpoints, which then restore with none.
+	Pending     *pendingCheckpoint `json:"pending,omitempty"`
+	Checkpoints []CheckpointRecord `json:"checkpoints,omitempty"`
 }
 
 type bytesSnapshot struct{ b []byte }
@@ -709,21 +725,27 @@ func (s *bytesSnapshot) Release() { s.b = nil }
 // R2-34) and the cut costs O(state) on the apply goroutine.
 func (t *Table) Snapshot() (consensus.Snapshot, error) {
 	t.mu.RLock()
-	p := persisted{
-		Format: SnapshotFormat, Applied: t.applied, Identity: t.identity,
-		Repos: make(map[string]map[string]*RefValue, len(t.repos)), Last: map[string]uint64{},
-		Events: t.events, Audit: t.audit, Deleted: t.deleted, Renamed: t.renamed, Grants: t.grants,
-	}
-	for k, r := range t.repos {
-		p.Repos[k] = r.refs
-		p.Last[k] = r.last
-	}
-	b, err := json.Marshal(&p)
+	b, err := json.Marshal(t.persistedLocked())
 	t.mu.RUnlock()
 	if err != nil {
 		return nil, err
 	}
 	return &bytesSnapshot{b: b}, nil
+}
+
+// persistedLocked is the table's snapshot form; the caller holds the lock.
+func (t *Table) persistedLocked() *persisted {
+	p := &persisted{
+		Format: SnapshotFormat, Applied: t.applied, Identity: t.identity,
+		Repos: make(map[string]map[string]*RefValue, len(t.repos)), Last: map[string]uint64{},
+		Events: t.events, Audit: t.audit, Deleted: t.deleted, Renamed: t.renamed, Grants: t.grants,
+		Pending: t.pending, Checkpoints: t.checkpoints,
+	}
+	for k, r := range t.repos {
+		p.Repos[k] = r.refs
+		p.Last[k] = r.last
+	}
+	return p
 }
 
 // Restore replaces the table with a snapshot and recomputes both checksums.
@@ -768,6 +790,7 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	t.repos, t.root, t.events, t.eventBytes = nt.repos, nt.root, nt.events, nt.eventBytes
 	t.audit, t.deleted, t.renamed, t.grants = nt.audit, nt.deleted, nt.renamed, nt.grants
 	t.applied, t.identity = p.Applied, p.Identity
+	t.pending, t.checkpoints = p.Pending, p.Checkpoints
 	if t.onChange != nil {
 		repos := make([]string, 0, len(t.repos))
 		for k := range t.repos {

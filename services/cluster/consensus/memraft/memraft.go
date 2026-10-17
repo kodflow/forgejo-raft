@@ -32,6 +32,8 @@ type Cluster struct {
 	members  consensus.Membership
 	alarm    consensus.AlarmID
 	watchers []watcher
+	// compacted is the last index ReadCommitted no longer returns.
+	compacted uint64
 }
 
 type watcher struct {
@@ -412,6 +414,42 @@ func (n *Node) Close(ctx context.Context) error {
 	return nil
 }
 
+// ReadCommitted reads [from, to] of the shared log, as an engine that keeps
+// its log would; Compact stands for a log truncated behind a snapshot.
+func (n *Node) ReadCommitted(ctx context.Context, from, to uint64, maxBytes int) ([]consensus.Entry, error) {
+	c := n.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if n.down || n.closed {
+		return nil, consensus.ErrNodeStopped
+	}
+	if from == 0 || from <= c.compacted {
+		return nil, consensus.ErrCompacted
+	}
+	if last := uint64(len(c.log)); to > last {
+		to = last
+	}
+	var out []consensus.Entry
+	size := 0
+	for i := from; i <= to; i++ {
+		e := c.log[i-1]
+		if len(out) > 0 && size+len(e.Data) > maxBytes {
+			break
+		}
+		size += len(e.Data)
+		e.Data = append([]byte(nil), e.Data...)
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// Compact drops the entries up to index from what ReadCommitted returns.
+func (c *Cluster) Compact(index uint64) {
+	c.mu.Lock()
+	c.compacted = index
+	c.mu.Unlock()
+}
+
 // Leader returns the current leader node.
 func (c *Cluster) Leader() *Node {
 	c.mu.Lock()
@@ -419,4 +457,7 @@ func (c *Cluster) Leader() *Node {
 	return c.nodes[c.leader]
 }
 
-var _ consensus.Engine = (*Node)(nil)
+var (
+	_ consensus.Engine          = (*Node)(nil)
+	_ consensus.CommittedReader = (*Node)(nil)
+)

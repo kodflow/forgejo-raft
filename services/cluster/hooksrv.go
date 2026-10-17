@@ -81,6 +81,13 @@ func (r *Replicator) serveHookConn(conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(budget + 10*time.Second))
 	ctx, cancel := context.WithTimeout(r.ctx, budget)
 	defer cancel()
+	if clusterhook.IsExportOp(req.Op) {
+		if req.Export != nil {
+			req.Export.Op = req.Op
+		}
+		r.serveExport(ctx, conn, req.Export)
+		return
+	}
 	resp := r.Handle(ctx, &req)
 	_ = json.NewEncoder(conn).Encode(resp)
 }

@@ -80,6 +80,8 @@ type Request struct {
 	// Operator is set by the offline command from the local account; the
 	// socket's peer credentials are what authenticates the caller.
 	Operator string `json:"operator,omitempty"`
+	// Export carries the arguments of an export op (export.go).
+	Export *ExportRequest `json:"export,omitempty"`
 }
 
 // Response answers a Request.

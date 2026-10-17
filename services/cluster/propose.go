@@ -35,7 +35,10 @@ func (r *Replicator) prepared(ctx context.Context, req *clusterhook.Request) *cl
 	if err := r.registry.register(req.Nonce, repo, refs, req.PID); err != nil {
 		return fail(err)
 	}
+	// A checkpoint reading PostgreSQL's position holds this briefly.
+	r.fence.RLock()
 	resp := r.propose(ctx, repo, req, tx)
+	r.fence.RUnlock()
 	if !resp.OK {
 		// A refusal deregisters before answering git.
 		r.registry.release(req.Nonce)
@@ -297,7 +300,9 @@ func (r *Replicator) proposeLifecycle(ctx context.Context, kind reftable.Kind, b
 	if err != nil {
 		return err
 	}
+	r.fence.RLock()
 	_, result, err := r.proposeCommand(ctx, data, landed)
+	r.fence.RUnlock()
 	if err != nil {
 		return fmt.Errorf("the cluster did not record it: %w", err)
 	}

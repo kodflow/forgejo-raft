@@ -321,6 +321,15 @@ type Engine interface {
 	Close(ctx context.Context) error
 }
 
+// CommittedReader reads committed entries back, for an observer's export:
+// [from, to], at most maxBytes of data, never past the commit index. A
+// driver whose engine cannot read its log back does not implement it, and
+// the export then serves checkpoints alone. ErrCompacted says from is
+// behind the oldest entry kept: the reader starts again from a snapshot.
+type CommittedReader interface {
+	ReadCommitted(ctx context.Context, from, to uint64, maxBytes int) ([]Entry, error)
+}
+
 // TLSFiles names the PEM files of the node's identity. The certificate and
 // key may be the same file, which a renewer replaces atomically (D17, R7-25).
 type TLSFiles struct {
@@ -455,6 +464,7 @@ var (
 	ErrAdminPrecondition     = errors.New("ADMIN_PRECONDITION_FAILED")
 	ErrNodeIDRetired         = errors.New("NODE_ID_RETIRED")
 	ErrNotImplemented        = errors.New("not implemented by this driver")
+	ErrCompacted             = errors.New("LOG_COMPACTED")
 )
 
 // Certain reports whether err says, with certainty, that nothing was
