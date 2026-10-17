@@ -14,6 +14,7 @@ import (
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/cache"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/graceful"
@@ -35,7 +36,7 @@ var pushQueue *queue.WorkerPoolQueue[[]*repo_module.PushUpdateOptions]
 // handle passed PR IDs and test the PRs
 func handler(items ...[]*repo_module.PushUpdateOptions) [][]*repo_module.PushUpdateOptions {
 	for _, opts := range items {
-		if err := pushUpdates(opts); err != nil {
+		if err := pushUpdates(graceful.GetManager().HammerContext(), opts); err != nil {
 			// Username and repository stays the same between items in opts.
 			pushUpdate := opts[0]
 			log.Error("pushUpdate[%s/%s] failed: %v", pushUpdate.RepoUserName, pushUpdate.RepoName, err)
@@ -73,13 +74,22 @@ func PushUpdates(opts []*repo_module.PushUpdateOptions) error {
 	return pushQueue.Push(opts)
 }
 
+// PushUpdatesNow runs the post-receive work of a push synchronously, outside
+// the node-local queue. The cluster's log consumer calls it on the leader, so
+// SQL is derived from the replicated log and not from a node's hooks.
+// ctx carries the replicated command's identity, which the webhook tasks
+// derive theirs from.
+func PushUpdatesNow(ctx context.Context, opts []*repo_module.PushUpdateOptions) error {
+	return pushUpdates(ctx, opts)
+}
+
 // pushUpdates generates push action history feeds for push updating multiple refs
-func pushUpdates(optsList []*repo_module.PushUpdateOptions) error {
+func pushUpdates(parent context.Context, optsList []*repo_module.PushUpdateOptions) error {
 	if len(optsList) == 0 {
 		return nil
 	}
 
-	ctx, _, finished := process.GetManager().AddContext(graceful.GetManager().HammerContext(), fmt.Sprintf("PushUpdates: %s/%s", optsList[0].RepoUserName, optsList[0].RepoName))
+	ctx, _, finished := process.GetManager().AddContext(parent, fmt.Sprintf("PushUpdates: %s/%s", optsList[0].RepoUserName, optsList[0].RepoName))
 	defer finished()
 
 	repo, err := repo_model.GetRepositoryByOwnerAndName(ctx, optsList[0].RepoUserName, optsList[0].RepoName)
@@ -103,6 +113,8 @@ func pushUpdates(optsList []*repo_module.PushUpdateOptions) error {
 	objectFormat := git.ObjectFormatFromName(repo.ObjectFormatName)
 
 	for _, opts := range optsList {
+		// Each ref of a replicated command is its own part of it.
+		ctx := clusterhook.WithCommandPart(ctx, string(opts.RefFullName))
 		log.Trace("pushUpdates: %-v %s %s %s", repo, opts.OldCommitID, opts.NewCommitID, opts.RefFullName)
 
 		if opts.IsNewRef() && opts.IsDelRef() {
@@ -172,7 +184,12 @@ func pushUpdates(optsList []*repo_module.PushUpdateOptions) error {
 			branch := opts.RefFullName.BranchName()
 			if !opts.IsDelRef() {
 				log.Trace("TriggerTask '%s/%s' by %s", repo.Name, branch, pusher.Name)
-				pull_service.AddTestPullRequestTask(ctx, pusher, repo.ID, branch, true, opts.OldCommitID, opts.NewCommitID, opts.TimeNano)
+				// In a cluster, only once the consumer's batch commits: a
+				// replay must not comment on or notify a pull request again.
+				testDoer, testOpts := pusher, opts
+				clusterhook.Defer(ctx, func() {
+					pull_service.AddTestPullRequestTask(ctx, testDoer, repo.ID, branch, true, testOpts.OldCommitID, testOpts.NewCommitID, testOpts.TimeNano)
+				})
 
 				newCommit, err := gitRepo.GetCommit(opts.NewCommitID)
 				if err != nil {

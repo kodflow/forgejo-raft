@@ -1,0 +1,164 @@
+# forgejo-raft, the smallest cluster: three Forgejo nodes and one PostgreSQL
+# on a single Docker host.
+#
+# What it is for: trying the cluster, a demo, a development loop. It shows
+# the moving parts and nothing more. Every node shares one machine, so it
+# survives the loss of a process, never the loss of the host. For failure
+# drills (partitions, Patroni failover, Recover, Vault, Nomad) use the full
+# lab, contrib/cluster-lab, instead.
+#
+# First start (founds the cluster, see bootstrap.sh):
+#
+#   ./bootstrap.sh
+#
+# Afterwards, an ordinary `docker compose up -d` / `docker compose down`.
+# `docker compose down -v` wipes the cluster, the repositories and the
+# database: run ./bootstrap.sh again after it.
+#
+# Secrets: none lives in this file. bootstrap.sh writes random values into
+# a git-ignored .env beside it, which compose reads. Every ${VAR:?} below
+# is one of those values: if compose says it is missing, run ./bootstrap.sh.
+name: forgejo-raft
+
+x-node: &node
+  # Built from the root of this repository (the Dockerfile's "forgejo"
+  # stage). Set FORGEJO_IMAGE to use an image you built or pulled instead.
+  image: ${FORGEJO_IMAGE:-forgejo-raft:local}
+  build:
+    context: ../../../..
+    target: forgejo
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+  environment: &node-env
+    USER_UID: "1000"
+    USER_GID: "1000"
+    # The image's entrypoint turns every FORGEJO__section__KEY into app.ini.
+    FORGEJO__server__HTTP_PORT: "3000"
+    FORGEJO__server__DISABLE_SSH: "true"
+    FORGEJO__server__OFFLINE_MODE: "true"
+    FORGEJO__database__DB_TYPE: postgres
+    FORGEJO__database__HOST: postgres:5432
+    FORGEJO__database__NAME: forgejo
+    FORGEJO__database__USER: forgejo
+    FORGEJO__database__PASSWD: ${POSTGRES_PASSWORD:?}
+    FORGEJO__database__SSL_MODE: disable
+    FORGEJO__security__INSTALL_LOCK: "true"
+    FORGEJO__security__SECRET_KEY: ${FORGEJO_SECRET_KEY:?}
+    # Required by [cluster]: a user git hook would run inside the
+    # replication path, so the node refuses to start without it.
+    FORGEJO__security__DISABLE_GIT_HOOKS: "true"
+    # Any node may serve the next request. Sessions live in the shared
+    # database. The cache stays in each node's memory, kept short: a value
+    # cached on one node can lag a change made through another for up to
+    # ITEM_TTL (a commit count, a last-commit summary; never git refs or
+    # permissions, which are not served from it). A shared cache (Redis or
+    # Valkey, FORGEJO__cache__ADAPTER: redis) removes that lag, at the price
+    # of one more service to keep highly available.
+    FORGEJO__session__PROVIDER: db
+    FORGEJO__cache__ADAPTER: memory
+    FORGEJO__cache__ITEM_TTL: 1m
+    FORGEJO__metrics__ENABLED: "true"
+    # ---- the cluster ----
+    FORGEJO__cluster__ENABLED: "true"
+    FORGEJO__cluster__CLUSTER_ID: ${CLUSTER_ID:?}
+    # Seeds only: once founded, the committed membership is the authority.
+    FORGEJO__cluster__PEERS: node-a=node-a:7480,node-b=node-b:7480,node-c=node-c:7480
+    # Each node's key and certificate, born in its own volume (pki-init.sh).
+    FORGEJO__cluster__TLS_CERT_FILE: /data/tls/node.pem
+    FORGEJO__cluster__TLS_KEY_FILE: /data/tls/node.key
+    FORGEJO__cluster__TLS_CA_FILE: /data/tls/ca.pem
+    # Seeds the cluster-operator permission while nobody holds it yet.
+    FORGEJO__cluster__OPERATORS: ${CLUSTER_OPERATOR:-site-admin}
+  healthcheck:
+    # 200 once the node is ready: it knows a leader and its projection has
+    # caught up once since it started.
+    test: ["CMD", "curl", "-sf", "http://127.0.0.1:3000/api/healthz"]
+    interval: 5s
+    timeout: 3s
+    retries: 60
+    start_period: 30s
+
+services:
+  # One PostgreSQL, a single point of failure on purpose: this file is about
+  # the Forgejo side. Production puts a highly available PostgreSQL here
+  # (Patroni, a managed service, an operator on Kubernetes).
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:18-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: forgejo
+      POSTGRES_DB: forgejo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+    volumes: [postgres:/var/lib/postgresql]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "forgejo", "-d", "forgejo"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: the cluster's CA, and per node a key (born in that node's
+  # volume) and a certificate carrying the single URI SAN
+  # kitsunium-consensus://<CLUSTER_ID>/slot/<slot>. Rerunning keeps the keys.
+  pki:
+    image: ${PKI_IMAGE:-alpine:3.22}
+    profiles: [setup]
+    environment:
+      CLUSTER_ID: ${CLUSTER_ID:?}
+      SLOTS: node-a node-b node-c
+    entrypoint: ["/bin/sh", "/pki-init.sh"]
+    volumes:
+      - ./pki-init.sh:/pki-init.sh:ro
+      - pki:/pki
+      - node-a:/nodes/node-a
+      - node-b:/nodes/node-b
+      - node-c:/nodes/node-c
+
+  node-a:
+    <<: *node
+    hostname: node-a
+    environment:
+      <<: *node-env
+      FORGEJO__cluster__SLOT: node-a
+      # Never a wildcard: the address the other members reach this one at.
+      FORGEJO__cluster__LISTEN_ADDR: node-a:7480
+      FORGEJO__server__ROOT_URL: http://localhost:${NODE_A_PORT:-3001}/
+    ports: ["127.0.0.1:${NODE_A_PORT:-3001}:3000"]
+    volumes: [node-a:/data]
+
+  node-b:
+    <<: *node
+    hostname: node-b
+    # After node-a, which then runs the database migrations alone.
+    depends_on:
+      postgres: {condition: service_healthy}
+      node-a: {condition: service_started}
+    environment:
+      <<: *node-env
+      FORGEJO__cluster__SLOT: node-b
+      FORGEJO__cluster__LISTEN_ADDR: node-b:7480
+      FORGEJO__server__ROOT_URL: http://localhost:${NODE_B_PORT:-3002}/
+    ports: ["127.0.0.1:${NODE_B_PORT:-3002}:3000"]
+    volumes: [node-b:/data]
+
+  node-c:
+    <<: *node
+    hostname: node-c
+    depends_on:
+      postgres: {condition: service_healthy}
+      node-a: {condition: service_started}
+    environment:
+      <<: *node-env
+      FORGEJO__cluster__SLOT: node-c
+      FORGEJO__cluster__LISTEN_ADDR: node-c:7480
+      FORGEJO__server__ROOT_URL: http://localhost:${NODE_C_PORT:-3003}/
+    ports: ["127.0.0.1:${NODE_C_PORT:-3003}:3000"]
+    volumes: [node-c:/data]
+
+volumes:
+  postgres:
+  pki:
+  node-a:
+  node-b:
+  node-c:

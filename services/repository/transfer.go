@@ -17,6 +17,7 @@ import (
 	access_model "forgejo.org/models/perm/access"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/log"
 	repo_module "forgejo.org/modules/repository"
 	"forgejo.org/modules/sync"
@@ -68,6 +69,7 @@ func TransferOwnership(ctx context.Context, doer, newOwner *user_model.User, rep
 func transferOwnership(ctx context.Context, doer *user_model.User, newOwnerName string, repo *repo_model.Repository) (err error) {
 	repoRenamed := false
 	wikiRenamed := false
+	clusterRenamed := false
 	oldOwnerName := doer.Name
 
 	defer func() {
@@ -78,6 +80,15 @@ func transferOwnership(ctx context.Context, doer *user_model.User, newOwnerName 
 		recoverErr := recover()
 		if err == nil && recoverErr == nil {
 			return
+		}
+
+		// The cluster already moved the keys: move them back first, or
+		// every member would keep the repository under its new owner while
+		// the database names the old one.
+		if clusterRenamed {
+			if err := clusterhook.UndoRepoRenamed(ctx, oldOwnerName, repo.Name, newOwnerName, repo.Name); err != nil {
+				log.Critical("Unable to move repository %s/%s back in the cluster after a failed transfer: %v; run `forgejo cluster reconcile`", oldOwnerName, repo.Name, err)
+			}
 		}
 
 		if repoRenamed {
@@ -264,6 +275,13 @@ func transferOwnership(ctx context.Context, doer *user_model.User, newOwnerName 
 		wikiRenamed = true
 	}
 
+	// In a cluster, the move is replicated before the transaction commits;
+	// an error rolls the directories back through the deferred handler.
+	if err := clusterhook.RepoRenamed(ctx, oldOwner.Name, repo.Name, newOwner.Name, repo.Name); err != nil {
+		return fmt.Errorf("transfer repository in the cluster: %w", err)
+	}
+	clusterRenamed = true
+
 	if err := models.DeleteRepositoryTransfer(ctx, repo.ID); err != nil {
 		return fmt.Errorf("deleteRepositoryTransfer: %w", err)
 	}
@@ -323,6 +341,20 @@ func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newR
 		}
 	}
 
+	// In a cluster, the move is replicated before it is committed, and undone
+	// here when the other members cannot follow.
+	if err := clusterhook.RepoRenamed(ctx, repo.Owner.Name, oldRepoName, repo.Owner.Name, newRepoName); err != nil {
+		if rerr := util.Rename(newRepoPath, repo.RepoPath()); rerr != nil {
+			log.Critical("Unable to move repository %s back after a refused cluster rename: %v", newRepoPath, rerr)
+		}
+		if isExist {
+			if rerr := util.Rename(repo_model.WikiPath(repo.Owner.Name, newRepoName), wikiPath); rerr != nil {
+				log.Critical("Unable to move the wiki of %s back after a refused cluster rename: %v", newRepoPath, rerr)
+			}
+		}
+		return fmt.Errorf("rename repository in the cluster: %w", err)
+	}
+
 	ctx, committer, err := db.TxContext(ctx)
 	if err != nil {
 		return err
@@ -330,10 +362,23 @@ func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newR
 	defer committer.Close()
 
 	if err := repo_model.NewRedirect(ctx, repo.Owner.ID, repo.ID, oldRepoName, newRepoName); err != nil {
+		undoClusterRename(ctx, repo.Owner.Name, oldRepoName, newRepoName)
 		return err
 	}
 
-	return committer.Commit()
+	if err := committer.Commit(); err != nil {
+		undoClusterRename(ctx, repo.Owner.Name, oldRepoName, newRepoName)
+		return err
+	}
+	return nil
+}
+
+// undoClusterRename moves a renamed repository back in the cluster when the
+// database did not record the new name.
+func undoClusterRename(ctx context.Context, owner, oldName, newName string) {
+	if err := clusterhook.UndoRepoRenamed(ctx, owner, oldName, owner, newName); err != nil {
+		log.Critical("Unable to move repository %s/%s back in the cluster after a failed rename: %v; run `forgejo cluster reconcile`", owner, oldName, err)
+	}
 }
 
 // ChangeRepositoryName changes all corresponding setting from old repository name to new one.

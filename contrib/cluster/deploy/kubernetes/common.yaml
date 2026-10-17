@@ -1,0 +1,201 @@
+# forgejo-raft on Kubernetes: three Forgejo pods replicating git refs over
+# Raft, one per machine.
+#
+# Prerequisites
+#   - cert-manager, and the CA Secret described in certificates.yaml;
+#   - PostgreSQL OUTSIDE this file, highly available, reachable from every
+#     pod: CloudNativePG, the Zalando operator, a managed database, or
+#     Patroni on VMs. The cluster replicates git refs, not SQL: the database
+#     must survive a node loss on its own. Fill the Secret forgejo-raft-db;
+#   - three schedulable nodes (the pods refuse to share one), with a
+#     StorageClass for persistent, ideally local and encrypted, volumes;
+#   - optionally, the Recover witnesses, two small services OUTSIDE this
+#     Kubernetes cluster (see WITNESSES below).
+#
+# Layout (kustomize: `kubectl apply -k .`)
+#   - common.yaml: the namespace, the Services, the shared ConfigMaps and the
+#     PodDisruptionBudget;
+#   - certificates.yaml: the Issuer and one Certificate per slot;
+#   - base/statefulset.yaml: ONE StatefulSet of one replica, the template;
+#   - node-a/, node-b/, node-c/: one StatefulSet per slot from that template,
+#     each labelled with its slot and mounting ONLY its own certificate
+#     Secret. A pod never sees another slot's private key.
+#
+# Founding the cluster (once)
+#   1. kubectl apply -k .
+#      Each pod's cluster-init container runs `forgejo cluster init` on its
+#      volume, logs its member line and waits: the pods stay in Init.
+#   2. Collect the three lines and give them to every pod:
+#        for s in a b c; do
+#          kubectl -n forgejo-raft logs forgejo-raft-$s-0 -c cluster-init | sed -n 's/^member line: //p'
+#        done
+#        kubectl -n forgejo-raft create configmap forgejo-raft-members \
+#          --from-literal=members=<line0>,<line1>,<line2>
+#   3. On their next attempt the init containers run `forgejo cluster
+#      bootstrap` with that identical list and the servers start. A leader
+#      is elected within seconds; `kubectl get pods` shows 3/3 ready.
+#   Keep the ConfigMap: a pod whose line is in it never bootstraps twice
+#   (bootstrap is idempotent), and a REPLACEMENT pod (new volume, new id)
+#   is not in it, so it starts as a joining node that an operator admits
+#   from Site Administration > Cluster.
+#
+# Why these choices
+#   - one StatefulSet per slot, so each mounts only its own Secret; with one
+#     replica each, OrderedReady never waits on another member.
+#   - required anti-affinity, a PodDisruptionBudget of one, and a rolling
+#     update that waits for readiness: never two members down on purpose.
+#   - a readiness probe on /api/healthz, and NO liveness probe on it: a node
+#     cut off from the majority is not ready, and must not be killed either.
+#   - LISTEN_ADDR is the pod's stable DNS name in the headless Service, which
+#     publishes not-ready pods: the members must reach each other before
+#     any of them is ready.
+#
+# Limits of this example
+#   - cert-manager draws each private key and keeps it in that slot's
+#     Secret: the key is not generated on the machine, and whoever can read
+#     Secrets in the namespace can read it. Each pod mounts only its own.
+#   - The in-process Vault renewer and the Nomad JOIN drain check stay off:
+#     cert-manager renews, and Forgejo reloads a renewed certificate file at
+#     the next TLS handshake.
+#   - Written for clarity, not yet exercised on a live Kubernetes cluster;
+#     the Compose example and the Docker lab are.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: forgejo-raft
+---
+# The consensus and object channel addresses: one stable DNS name per pod,
+# forgejo-raft-<slot letter>-0.forgejo-raft-consensus, published before readiness.
+apiVersion: v1
+kind: Service
+metadata:
+  name: forgejo-raft-consensus
+  namespace: forgejo-raft
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: forgejo-raft
+  ports:
+    - name: consensus
+      port: 7480
+    - name: objects
+      port: 7481
+---
+# What users reach (put your Ingress or Gateway in front of it). Any ready
+# node serves reads and writes; a write is forwarded to the leader.
+apiVersion: v1
+kind: Service
+metadata:
+  name: forgejo-raft-http
+  namespace: forgejo-raft
+spec:
+  selector:
+    app.kubernetes.io/name: forgejo-raft
+  ports:
+    - name: http
+      port: 3000
+---
+# The Secret forgejo-raft-db (keys: host, password, secret-key) is NOT in
+# this file: no credential belongs in a manifest. Create it from your
+# PostgreSQL operator or secret manager, or by hand:
+#
+#   kubectl -n forgejo-raft create secret generic forgejo-raft-db \
+#     --from-literal=host=<postgres-host>:5432 \
+#     --from-file=password=<file holding the database password> \
+#     --from-literal=secret-key="$(openssl rand -hex 32)"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: forgejo-raft-scripts
+  namespace: forgejo-raft
+data:
+  # Runs as root in the image, renders app.ini from FORGEJO__* exactly as
+  # the server will, then runs the cluster commands as the git user.
+  cluster-init.sh: |
+    set -e
+    # The image's setup expects unset variables to be empty: no -u before it.
+    cd /etc/s6/gitea && source ./setup >/dev/null
+    set -u
+    fj() { su-exec git /usr/local/bin/gitea cluster "$@"; }
+    line_file=/data/gitea/cluster-member-line
+    if [ ! -s /data/gitea/cluster/STAMP ]; then
+      # Offline, once per volume: a new node id and incarnation, stamped.
+      fj init | tr -d '\r' | tail -n 1 >"$line_file"
+    fi
+    line="$(cat "$line_file")"
+    echo "member line: $line"
+    # A stamped node that is still "joining" with an empty log has been
+    # neither founded nor admitted yet; anything else is already a member.
+    state="$(fj inspect)"
+    if ! echo "$state" | grep -q '"Joining": true' || ! echo "$state" | grep -q '"LastIndex": 0,'; then
+      exit 0
+    fi
+    members_file=/etc/forgejo-raft/members/members
+    if [ ! -s "$members_file" ]; then
+      echo "waiting for the ConfigMap forgejo-raft-members (key: members)" >&2
+      exit 1
+    fi
+    members="$(tr -d ' \r\n' <"$members_file")"
+    if echo "$members" | tr ',' '\n' | grep -qxF "$line"; then
+      fj bootstrap --members "$members"
+    else
+      echo "not a founding member: starting as a joining node"
+    fi
+  witness-check.sh: |
+    set -e
+    if [ -z "${FORGEJO__cluster__WITNESSES:-}" ]; then
+      echo "no witnesses configured: the Recover fence is not checked"
+      exit 0
+    fi
+    cd /etc/s6/gitea && source ./setup >/dev/null
+    # Exit 77 when a witness says this volume's cluster was superseded by a
+    # Recover, or when none answers: the pod then never starts Forgejo.
+    exec su-exec git /usr/local/bin/gitea cluster witness check
+---
+# Settings shared by every pod. Each pod adds its slot (from its label) and
+# its address (see statefulset.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: forgejo-raft-env
+  namespace: forgejo-raft
+data:
+  USER_UID: "1000"
+  USER_GID: "1000"
+  FORGEJO__server__ROOT_URL: https://git.example.com/
+  FORGEJO__server__HTTP_PORT: "3000"
+  FORGEJO__server__DISABLE_SSH: "true"
+  FORGEJO__database__DB_TYPE: postgres
+  FORGEJO__database__NAME: forgejo
+  FORGEJO__database__USER: forgejo
+  FORGEJO__database__SSL_MODE: require
+  FORGEJO__security__INSTALL_LOCK: "true"
+  # Required by [cluster]: a user git hook would run in the replication path.
+  FORGEJO__security__DISABLE_GIT_HOOKS: "true"
+  FORGEJO__session__PROVIDER: db
+  FORGEJO__metrics__ENABLED: "true"
+  FORGEJO__cluster__ENABLED: "true"
+  FORGEJO__cluster__CLUSTER_ID: 0123456789abcdef0123456789abcdef
+  # Seeds only; the committed membership is the authority afterwards.
+  FORGEJO__cluster__PEERS: >-
+    node-a=forgejo-raft-a-0.forgejo-raft-consensus:7480,node-b=forgejo-raft-b-0.forgejo-raft-consensus:7480,node-c=forgejo-raft-c-0.forgejo-raft-consensus:7480
+  # Seeds the cluster-operator permission while nobody holds it yet.
+  FORGEJO__cluster__OPERATORS: site-admin
+  # The Recover witnesses, outside this Kubernetes cluster, on machines that
+  # fail independently of its nodes, with their Ed25519 public keys in the
+  # same order. Empty: the fence is off, and a Recover cannot keep an old
+  # majority from coming back.
+  FORGEJO__cluster__WITNESSES: ""
+  FORGEJO__cluster__WITNESS_KEYS: ""
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: forgejo-raft
+  namespace: forgejo-raft
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: forgejo-raft

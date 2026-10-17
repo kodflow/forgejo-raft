@@ -1,0 +1,5 @@
+# The StatefulSet template, shared by node-a/, node-b/ and node-c/.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - statefulset.yaml

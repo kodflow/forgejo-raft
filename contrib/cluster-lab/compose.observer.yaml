@@ -1,0 +1,165 @@
+# The observer scenario, laid over compose.yaml (scripts/observer-e2e.sh,
+# contrib/cluster/observer.md). It is written and has NOT been run yet: run
+# it only once the lab's owner agrees, the whole lab plus an observer and a
+# recovered node needs about 4 GB.
+#
+#   - pg-1..3 archive their WAL into one shared volume (a deployment keeps
+#     one archive per member, beside the Forgejo node that exports it);
+#   - forgejo-1..3 run the checkpoint coordinator every 30 s, export
+#     through their own sshd on port 2222, read the archive, and run
+#     pg_basebackup through HAProxy;
+#   - observer is the observer: no port, an SSH key, a secrets key, a
+#     snapshot hook copying its directory into the snapshots volume;
+#   - forgejo-r (profile recover) is the node a recovery rebuilds, with its
+#     own PostgreSQL in the same container, run as git.
+
+x-observer-image: &observer-image
+  build: !reset null
+  image: forgejo-cluster-lab/forgejo:observer
+  pull_policy: never # built by `make observer-build`
+
+x-member-env: &member-env
+  FORGEJO__cluster__CHECKPOINT_INTERVAL: 30s
+  FORGEJO__cluster__CHECKPOINT_ROLE: forgejo_checkpoint
+  FORGEJO__cluster__WAL_ARCHIVE_DIR: /wal-archive
+  FORGEJO__cluster__PG_BASEBACKUP: pg_basebackup
+  FORGEJO__cluster__PG_BASEBACKUP_DSN: "host=10.89.0.30 port=5000 user=replicator passfile=/data/pgpass sslmode=disable"
+  FORGEJO__cluster__OBSERVER_RECIPIENTS: ${OBSERVER_RECIPIENTS:-}
+  FORGEJO__server__LFS_START_SERVER: "true"
+
+x-pg-archive: &pg-archive
+  ARCHIVE_COMMAND: "/usr/local/bin/archive-wal /wal-archive %p %f"
+
+services:
+  wal-archive-init:
+    image: forgejo-cluster-lab/patroni:4.1.5-pg18
+    pull_policy: never
+    user: "0"
+    entrypoint:
+      [
+        "/bin/sh",
+        "-c",
+        "chown postgres:postgres /wal-archive && chmod 0750 /wal-archive",
+      ]
+    volumes: [wal-archive:/wal-archive]
+    network_mode: none
+
+  pg-1:
+    environment: { <<: *pg-archive }
+    depends_on:
+      { wal-archive-init: { condition: service_completed_successfully } }
+    volumes:
+      [
+        "wal-archive:/wal-archive",
+        "../cluster/observer/archive-wal.sh:/usr/local/bin/archive-wal:ro",
+      ]
+  pg-2:
+    environment: { <<: *pg-archive }
+    depends_on:
+      { wal-archive-init: { condition: service_completed_successfully } }
+    volumes:
+      [
+        "wal-archive:/wal-archive",
+        "../cluster/observer/archive-wal.sh:/usr/local/bin/archive-wal:ro",
+      ]
+  pg-3:
+    environment: { <<: *pg-archive }
+    depends_on:
+      { wal-archive-init: { condition: service_completed_successfully } }
+    volumes:
+      [
+        "wal-archive:/wal-archive",
+        "../cluster/observer/archive-wal.sh:/usr/local/bin/archive-wal:ro",
+      ]
+
+  forgejo-1:
+    <<: *observer-image
+    environment: { <<: *member-env }
+    volumes: ["wal-archive:/wal-archive:ro"]
+  forgejo-2:
+    <<: *observer-image
+    environment: { <<: *member-env }
+    volumes: ["wal-archive:/wal-archive:ro"]
+  forgejo-3:
+    <<: *observer-image
+    environment: { <<: *member-env }
+    volumes: ["wal-archive:/wal-archive:ro"]
+
+  observer:
+    <<: *observer-image
+    profiles: [observer]
+    hostname: observer
+    restart: unless-stopped
+    mem_limit: 256m
+    user: "0"
+    # The image's setup renders app.ini from FORGEJO__ variables; the
+    # observer then runs as git. No port is published or listened on.
+    entrypoint:
+      [
+        "/bin/sh",
+        "-c",
+        "chown -R git:git /observer /snapshots && cd /etc/s6/gitea && . ./setup >/dev/null && exec su-exec git /usr/local/bin/gitea cluster observe",
+      ]
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      FORGEJO__security__INSTALL_LOCK: "true"
+      FORGEJO__cluster__ROLE: observer
+      FORGEJO__cluster__OBSERVER_NAME: lab-observer
+      FORGEJO__cluster__OBSERVER_DIR: /observer
+      FORGEJO__cluster__OBSERVER_ENDPOINTS: node-a=git@10.89.0.41:2222,node-b=git@10.89.0.42:2222,node-c=git@10.89.0.43:2222
+      FORGEJO__cluster__OBSERVER_KNOWN_HOSTS: /keys/known_hosts
+      FORGEJO__cluster__OBSERVER_SSH_KEY_FILE: /keys/id_ed25519
+      FORGEJO__cluster__OBSERVER_SECRETS_KEY_FILE: /keys/secrets.key
+      FORGEJO__cluster__OBSERVER_SNAPSHOT_HOOK: /usr/local/bin/observer-snapshot
+      FORGEJO__cluster__OBSERVER_POLL_INTERVAL: 10s
+    volumes: [observer:/observer, observer-keys:/keys, snapshots:/snapshots]
+    networks: { lab: { ipv4_address: 10.89.0.80 } }
+
+  forgejo-r:
+    <<: *observer-image
+    profiles: [recover]
+    hostname: forgejo-r
+    restart: "no"
+    mem_limit: 768m
+    user: "0"
+    # Idle until scripts/observer-e2e.sh drives the recovery inside it.
+    entrypoint:
+      ["/bin/sh", "-c", "chown -R git:git /data && exec sleep infinity"]
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      FORGEJO__server__HTTP_PORT: "3000"
+      FORGEJO__server__ROOT_URL: "http://localhost:3009/"
+      FORGEJO__server__DISABLE_SSH: "true"
+      FORGEJO__server__START_SSH_SERVER: "false"
+      FORGEJO__server__OFFLINE_MODE: "true"
+      FORGEJO__server__LFS_START_SERVER: "true"
+      FORGEJO__database__DB_TYPE: postgres
+      FORGEJO__database__HOST: /data/pgsock
+      FORGEJO__database__NAME: forgejo
+      FORGEJO__database__USER: forgejo
+      FORGEJO__database__SSL_MODE: disable
+      FORGEJO__security__INSTALL_LOCK: "true"
+      FORGEJO__security__DISABLE_GIT_HOOKS: "true"
+      FORGEJO__session__PROVIDER: db
+      FORGEJO__cache__ADAPTER: memory
+      FORGEJO__cluster__ENABLED: "true"
+      FORGEJO__cluster__SLOT: node-r
+      FORGEJO__cluster__LISTEN_ADDR: "10.89.0.49:7480"
+      FORGEJO__cluster__DATA_DIR: /data/gitea/cluster
+      FORGEJO__cluster__TLS_CERT_FILE: /data/tls/node.pem
+      FORGEJO__cluster__TLS_KEY_FILE: /data/tls/node.key
+      FORGEJO__cluster__TLS_CA_FILE: /data/tls/ca.pem
+      FORGEJO__cluster__WAL_ARCHIVE_DIR: /data/wal-archive
+    ports: ["127.0.0.1:3009:3000"]
+    volumes:
+      [forgejo-r:/data, "snapshots:/snapshots:ro", "observer-keys:/keys:ro"]
+    networks: { lab: { ipv4_address: 10.89.0.49 } }
+
+volumes:
+  wal-archive:
+  observer:
+  observer-keys:
+  snapshots:
+  forgejo-r:

@@ -124,6 +124,11 @@
 				</a>
 			</div>
 		</details>
+		{{if .EnableCluster}}
+		<a class="{{if .PageIsAdminCluster}}active {{end}}item" href="{{AppSubUrl}}/admin/cluster">
+			{{ctx.Locale.Tr "admin.cluster"}}
+		</a>
+		{{end}}
 		{{if .EnableModeration}}
 		<a class="{{if .PageIsAdminModerationReports}}active {{end}}item" href="{{AppSubUrl}}/admin/moderation/reports">
 			{{ctx.Locale.Tr "admin.moderation.moderation_reports"}}

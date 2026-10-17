@@ -1,0 +1,186 @@
+# Cuts a release of forgejo-raft when cluster code lands on `forgejo`.
+#
+# Version: v<upstream>-raft.<N>, e.g. v18.0.0-dev-raft.1.
+#   <upstream>  the upstream Forgejo version, taken as Forgejo's Makefile takes
+#               it: git describe on the nearest upstream tag reachable from the
+#               commit, `-test` tags excluded, leading v dropped. Upstream's
+#               `forgejo` branch carries the development tag of its next major,
+#               so this is X.0.0-dev until that changes. This repository holds
+#               no upstream tags: they are read from Codeberg (ls-remote) and
+#               created in the runner only, never pushed.
+#   <N>         1 + the highest N already tagged here for that <upstream>.
+#               A new upstream version starts again at 1.
+# The binary reports <upstream>-raft.<N>+gitea-<compat>: the build writes it to
+# an untracked VERSION file, which the Makefile reads as the whole version.
+#
+# When: every push to `forgejo`, and on demand. A run releases only when the
+# commit brings at least one non-merge commit, outside .github/, that is in
+# neither the previous release nor upstream's branch. Not a `paths:` filter:
+# an upstream sync touches the same directories as the cluster (cmd/,
+# modules/setting/, services/webhook/), and a filter would cut a release on
+# every sync and none after a failed run. Comparing against the last tag and
+# upstream also makes a failed release come back on the next push.
+#
+# Output: a tag and a GitHub Release with notes from the cluster commits since
+# the previous tag; forgejo binaries for linux/amd64 and linux/arm64 with
+# SHA256SUMS; and ghcr.io/<owner>/forgejo-raft:<version> and :latest, built
+# with Forgejo's own Dockerfile (bindata, timetzdata, sqlite,
+# sqlite_unlock_notify, static). The binaries are the image's /app/gitea/gitea,
+# so release and image hold the same build. The tag is created last: a failed
+# build tags nothing.
+#
+# The decision lives in .github/scripts/release-plan.sh; run it locally with
+# --dry-run to see what a push would do.
+name: Release
+
+on:
+  push:
+    branches: [forgejo]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Compute the version and the notes, build and publish nothing
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      file_version: ${{ steps.plan.outputs.file_version }}
+      upstream_version: ${{ steps.plan.outputs.upstream_version }}
+      sha: ${{ steps.plan.outputs.sha }}
+      notes: ${{ steps.notes.outputs.notes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Version and decision
+        id: plan
+        env:
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
+        run: .github/scripts/release-plan.sh
+
+      - name: Notes
+        id: notes
+        env:
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
+        run: |
+          cat "$NOTES_FILE" >> "$GITHUB_STEP_SUMMARY"
+          delim="notes_$(openssl rand -hex 16)"
+          {
+            echo "notes<<$delim"
+            cat "$NOTES_FILE"
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: plan
+    if: ${{ needs.plan.outputs.release == 'true' && !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      FILE_VERSION: ${{ needs.plan.outputs.file_version }}
+      UPSTREAM_VERSION: ${{ needs.plan.outputs.upstream_version }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+
+      # Untracked, read by the Makefile in place of git describe: the image
+      # build has no tags to describe.
+      - name: Version file
+        run: printf '%s\n' "$FILE_VERSION" > VERSION
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Image
+        id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: RELEASE_VERSION=${{ needs.plan.outputs.file_version }}
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.plan.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.plan.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.plan.outputs.sha }}
+            org.opencontainers.image.title=forgejo-raft
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,scope=release,mode=max
+
+      - name: Binaries from the image
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir dist
+          for arch in amd64 arm64; do
+            out="dist/forgejo-${VERSION#v}-linux-$arch"
+            id=$(docker create --platform "linux/$arch" "$IMAGE@$DIGEST")
+            docker cp "$id:/app/gitea/gitea" "$out"
+            docker rm "$id" >/dev/null
+            chmod 755 "$out"
+          done
+          # The runner is amd64: that binary must start and report the version.
+          reported=$("dist/forgejo-${VERSION#v}-linux-amd64" --version)
+          echo "$reported"
+          case "$reported" in
+            *"$FILE_VERSION"*) ;;
+            *) echo "::error::the binary does not report $FILE_VERSION" >&2; exit 1 ;;
+          esac
+          (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ needs.plan.outputs.notes }}
+        run: |
+          set -euo pipefail
+          {
+            printf '%s\n\n' "$NOTES"
+            printf 'Container image: %s%s:%s%s\n' '`' "$IMAGE" "$VERSION" '`'
+          } > "$RUNNER_TEMP/notes.md"
+          # A development upstream version is a prerelease upstream too.
+          pre=()
+          case "$UPSTREAM_VERSION" in *-*) pre=(--prerelease) ;; esac
+          gh release create "$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "$VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "${pre[@]}"

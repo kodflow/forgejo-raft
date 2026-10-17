@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Review the PRs of this repository, whose default branch is `forgejo`, not
+# `main`: the cluster branch, its stacked PRs and the documentation.
+reviews:
+  auto_review:
+    base_branches:
+      - forgejo
+      - feat/raft-cluster
+      - "feat/.*"
+      - "docs/.*"

@@ -1,0 +1,296 @@
+# Active/active Forgejo: operator reference
+
+This is the operator's reference for running Forgejo on three nodes that all
+accept writes. The tutorial, with the architecture, a walk through a push and
+the failure scenarios, is the repository's README (`.github/README.md`).
+Deployment examples live in `contrib/cluster/deploy`, and a disposable Docker
+lab in `contrib/cluster-lab`.
+
+Every ref write goes through a consensus log (the `kitsunium/sdk` engine). A
+write is committed once a majority of the nodes holds it on disk, together
+with its git objects. What the consensus replicates is the ref table of every
+repository; each node's git repositories are a projection of it. The SQL
+database is shared (PostgreSQL, for example under Patroni), and what pushes
+derive in it is written by a single consumer, on the leader.
+
+## Requirements
+
+- Three nodes, each with a management address the other two can reach.
+- A shared PostgreSQL database, declared in the usual `[database]` section.
+- A cluster certificate authority, and for each node a certificate carrying a
+  single URI SAN `kitsunium-consensus://<CLUSTER_ID>/slot/<SLOT>`, with the
+  `serverAuth` and `clientAuth` usages. The key stays on the node.
+- `[security] DISABLE_GIT_HOOKS = true`. Start-up fails without it, since a
+  user hook would run inside the replication path.
+
+## The `[cluster]` keys
+
+| Key | Default | Purpose |
+|---|---|---|
+| `ENABLED` | `false`, `true` when `EXPECTED_NODES` is 3 or more | Turns the replicator on. |
+| `EXPECTED_NODES` | none (manual mode) | How many nodes the cluster has: 1, or 3 to 5. At 1 the section is off and Forgejo is the standard product. From 3 the node forms the cluster by itself: see "The autonomous mode". 2 is refused (no safe failover without a third vote), and so is any other value. |
+| `DRIVER` | `kitsunium` | The consensus engine compiled into the binary. |
+| `SLOT` | none, required | The node's slot, `[a-z0-9-]{1,32}`, the one its certificate names. |
+| `CLUSTER_ID` | none | The cluster id, 32 lowercase hex digits, read by `cluster init`. |
+| `LISTEN_ADDR` | none, required | The consensus listener, on the management address. A wildcard address is refused. |
+| `OBJECT_PORT` | `7481` | The object channel port of every member. |
+| `OBJECT_LISTEN_ADDR` | host of `LISTEN_ADDR` and `OBJECT_PORT` | The object channel listener, mutual TLS. |
+| `OBJECT_PEERS` | empty | Per slot, `slot=host:port`, when members do not share `OBJECT_PORT` (several nodes on one host). |
+| `PEERS` | empty | The seeds, comma-separated `slot=host:port`. The committed membership's addresses take over afterwards. |
+| `PEER_PINS` | empty | For a node joining by itself: `slot=spki` of the members it trusts, as `forgejo cluster status` prints them. Its JOIN counts only an answer from one of them; without any it does not join. |
+| `TLS_CERT_FILE` | none, required | The node's certificate. It may hold the key too. |
+| `TLS_KEY_FILE` | `TLS_CERT_FILE` | The node's key. |
+| `TLS_CA_FILE` | none, required | The cluster's CA. |
+| `DATA_DIR` | `<APP_DATA_PATH>/cluster` | The log and snapshots, never on a tmpfs. |
+| `HOOK_SOCKET` | `<APP_DATA_PATH>/cluster-run/hook.sock` | The private socket of the git hooks and of `forgejo cluster`. 103 bytes at most. |
+| `OPERATORS` | empty | Bootstrap only: these site administrators get the operator permission while nobody holds it. |
+| `STEP_UP_MAX_AGE` | `5m` | How long a re-authentication allows further operations. |
+| `STEP_UP_OIDC_SOURCE`, `STEP_UP_ACR` | empty | The OpenID Connect source every operator re-authenticates with, and the authentication class required. Without a source, password and TOTP apply. |
+| `STEP_UP_PASSWORD_OPERATORS` | empty | Break-glass logins that keep password and TOTP when `STEP_UP_OIDC_SOURCE` is set. |
+| `READ_AFTER_WRITE_TIMEOUT` | `2s` | How long a request waits for the node to catch up with the caller's last write. |
+| `MAX_LOG_BYTES`, `MAX_SNAPSHOT_BYTES` | 1 GiB | Bounds of the log and of a snapshot. |
+| `ACK_MARGIN` | `1024` | How far the trimming of consumed events lags the cursor. |
+| `TXN_TTL`, `MAX_TXN_PER_REPO`, `MAX_TXN_TOTAL` | `30s`, `64`, `4096` | Bounds of the git transactions in flight. |
+| `JOIN_GRANT_TTL` | `1h` | How long an operator's permission to join lasts. |
+| `DEAD_MEMBER_TIMEOUT` | `5m`, one minute at least | Autonomous mode: how long a member stays out of the leader's reach before it is removed. |
+| `WITNESSES`, `WITNESS_KEYS` | empty | The Recover witnesses (one per witness host) and their Ed25519 public keys, in the same order. |
+| `WITNESS_OVERRIDE_SHA256` | empty | The hash of the operator's boot override, read from `FORGEJO_CLUSTER_WITNESS_OVERRIDE`. |
+| `RENEW_VAULT_ADDR` | empty | Vault, for the in-process certificate renewal. Off while empty. |
+| `RENEW_VAULT_MOUNT`, `RENEW_VAULT_ROLE`, `RENEW_TTL` | `pki-consensus`, `SLOT`, `720h` | The PKI mount, the slot's role and the lifetime asked for. |
+| `RENEW_VAULT_JWT_FILE` | empty | The Nomad allocation's workload identity, read again at each login. |
+| `RENEW_VAULT_AUTH_MOUNT`, `RENEW_VAULT_AUTH_ROLE` | `jwt-consensus`, `SLOT` | Vault's JWT auth mount and the slot's role. |
+| `RENEW_VAULT_TOKEN_FILE` | empty | A Vault token in a file, the fallback when the identity login fails. |
+| `NOMAD_ADDR` | empty | Nomad's API, read-only, for the JOIN drain check: `http(s)://` or `unix://` (the task API socket). Off while empty. |
+| `NOMAD_TOKEN_FILE` | empty | A `node:read` token, read again at each call. |
+| `NOMAD_SLOT_META` | `forgejo_slot` | The Nomad node meta naming the slot it hosts. |
+| `RENEW_VAULT_CA_FILE`, `NOMAD_CA_FILE` | empty | The CA of Vault's and Nomad's HTTPS when it is private. A plain `http://` address off the loopback is logged: tokens then rely on an encrypted network. |
+
+## The autonomous mode
+
+Set `EXPECTED_NODES` and `PEERS`, naming every other slot, the same list on
+every node, and start the nodes. Nobody runs `cluster init`, `bootstrap` or
+grants a join.
+
+- **One node** (`EXPECTED_NODES = 1`) is plain Forgejo: no replicator, no
+  data directory, the hooks upstream writes. A node whose data directory
+  already holds a cluster's log refuses to start with 1, since alone it would
+  fork the repositories; move the directory away on purpose, or set
+  `ENABLED = false`, to run it standalone.
+- **Two nodes are refused.** Two nodes cannot fail over safely without a
+  third vote: when the link between them is cut, neither can tell a dead
+  partner from a cut link, and if both kept writing, the repositories would
+  split for good. Choose 1, or 3 and more; a third node may be small.
+- **Forming.** Each node stamps its data directory and asks the others who
+  they are, over the object channel with mutual TLS. If one is already a
+  member, it joins. Otherwise the node with the lowest slot founds the
+  cluster alone, as soon as it reaches a majority of the expected nodes, and
+  the others join it. Every node must be given the same size and the same
+  `PEERS`.
+- **Voters.** `EXPECTED_NODES` sizes the founding and `PEERS`; afterwards
+  every live member votes: three, four or five. The leader promotes a
+  learner (the eldest first) as soon as it caught up. `forgejo cluster
+  status` prints each member as voter, learner or removed, its rank (the
+  order it entered the membership) and since when this node sees it so.
+- **Dead members.** The leader removes a member it has not heard from for
+  `DEAD_MEMBER_TIMEOUT`, as long as three voters remain without it. The
+  removal is a committed membership change, so it happens only while a
+  majority of the voters answers the leader. At five nodes: the first
+  failure is removed (four voters), the second too (three voters); after
+  the third, two of three voters are a majority and the cluster keeps
+  writing, each write on two disks; after the fourth, it is read-only until
+  a member returns. If a majority is lost at once, there is no leader:
+  nothing is removed and nothing is written until a member returns.
+- **A removed node that comes back** has an id the cluster retired. Once a
+  majority of the voters of the newest membership confirm it, the node moves
+  its consensus data directory aside (`<DATA_DIR>.retired-<UTC time>`, kept,
+  never deleted), stamps a new id, joins as a learner through the CA
+  admission, catches up, and is made a voter again. Its repositories are
+  left as they are; the projector and the object channel bring them in line.
+- **Joining** needs no grant: a node presenting a certificate of this
+  cluster's CA, for a slot `PEERS` names and that has no member, is admitted
+  as a learner. A cluster admits one member above its size, for a
+  replacement standing by. A grant bound to another key still refuses,
+  retired ids are still refused, and the Nomad drain check and the
+  witnesses' boot check still apply. `CLUSTER_ID` may stay empty: the
+  certificate names the cluster.
+
+**What the CA is trusted with.** In this mode, possessing a certificate the
+cluster's CA signed for a slot is enough to join an empty slot, and a joining
+node trusts every member presenting such a certificate (set `PEER_PINS` to
+trust given keys only). Keep the CA offline or in Vault, sign one certificate
+per expected slot, and revoke by removing the member.
+
+## Founding the cluster
+
+This is the manual mode, without `EXPECTED_NODES`. The three servers are
+stopped and share one configuration, apart from `SLOT`, `LISTEN_ADDR` and
+the TLS files.
+
+1. On each node, `forgejo cluster init`. It prepares the data directory and
+   prints the member line `id:incarnation:slot:spki:host:port`.
+2. Gather the three lines.
+3. On each node, `forgejo cluster bootstrap --members "line1,line2,line3"`,
+   with the same list everywhere. It is offline and may be run again.
+4. Start the three servers. A leader is elected within a second or two.
+5. If repositories existed before the cluster, run `forgejo cluster import`
+   once on the node that holds them. A push to a ref that is not in the table
+   is refused.
+6. Grant the operator permission, through `OPERATORS` on the first start or
+   with `forgejo cluster operator add <login>`.
+
+## Adding or replacing a node
+
+The engine refuses a slot that still has a member, and a Remove never takes
+the voters below three. A replacement is therefore always an addition first.
+
+- **A new slot.** Add the new node, promote it, then remove the old one. The
+  cluster keeps its fault tolerance throughout.
+- **The machine of a slot is replaced.** The new machine joins under a new
+  slot name (for example `node-a2`, with a certificate naming it), is
+  promoted, and the old member is removed: a slot that still has a member
+  cannot be reused, and removing first would go below three voters. Replace
+  one node at a time.
+
+The steps for the node that joins:
+
+1. On the new node, set `PEER_PINS` from `forgejo cluster status` on a
+   member, run `forgejo cluster init`, then start the server.
+2. Either:
+   - in the administration, "Authorize a node to join" for its slot,
+     optionally bound to its key (`slot:spki`): the node asks to join by
+     itself and enters as a learner;
+   - or "Add a learner" with the line `cluster init` printed.
+3. `forgejo cluster objects verify` on the new node, then `backfill` if
+   objects are missing.
+4. "Promote" the learner once it caught up.
+5. "Transfer leadership" if the old node leads, then "Remove" the old one.
+
+## The administration page
+
+Site Administration, then Cluster. Every site administrator sees it; only
+cluster operators change anything.
+
+- The node: role, term, leader, commit and applied index, lineage, fault
+  tolerance, certificate expiry, table digest.
+- The members: progress, lag and reachability of each. Only the leader knows
+  these values: open the page on the leader.
+- The alarms, including the no-space alarm and its release.
+- The projection lag per repository.
+- The replicated audit log of operations, with their operator.
+
+Every operation asks to type its target again and a re-authentication. Once
+`STEP_UP_OIDC_SOURCE` is set, every operator re-authenticates at that
+provider (with the class `STEP_UP_ACR` when set), and a password is not
+accepted. The identity expected at the provider is pinned on the operator
+permission: the account's link when the permission is granted, or
+`forgejo cluster operator pin <login>` on a node. Deleting or replacing the
+link from the account settings changes nothing. Without an active source or a
+pinned identity, the operation is refused. Only the break-glass accounts in
+`STEP_UP_PASSWORD_OPERATORS` keep password and TOTP. An operation may be
+submitted on any node, which forwards it to the leader. No API route leads to
+it.
+
+## Recovery
+
+These commands run with the server stopped, on the data directory.
+
+- `forgejo cluster inspect` prints the stamp, the log, the snapshots and any
+  quarantine.
+- `forgejo cluster quarantine clear --exit wipe-and-rejoin` or
+  `--exit truncate-and-stay-silent` leaves a quarantine after a corrupt log.
+- `forgejo cluster recover --new-cluster <id> --members ... --fenced id:method:receipt`
+  forces a new configuration after the majority is lost. Every old voter left
+  out must be fenced, and every fence carries a receipt signed by each
+  witness. The command asks to type the new id again.
+- `forgejo cluster snapshot save --out <file>`, server running, writes the
+  table snapshot with its SHA-256 and its metadata beside it.
+- `forgejo cluster restore --file <file> --sha256 <digest> --new-cluster <id> --members ...`
+  restores that snapshot into an empty directory, on every node of the new
+  cluster. Read the digest from the authenticated backup store.
+- After a restore or a PostgreSQL failover, `forgejo cluster reconcile` lists
+  the differences between the table and SQL. `--apply` rebuilds the rows that
+  can be regenerated (branches, tags); the others are reported with what to
+  do, such as a pull request marked merged whose commit is missing from its
+  base branch.
+- `forgejo cluster recover --from-observer <checkpoint> ...` rebuilds a
+  cluster from an observer's protected checkpoint, every member lost
+  ([observer.md](observer.md)).
+
+## Observers
+
+An observer (`[cluster] ROLE = observer`) is never a member and opens no
+port: it pulls, over SSH, checkpoints that pair the refs, the objects, the
+stored files and Forgejo's PostgreSQL at one causal cut, each one protected
+by a snapshot the cluster cannot reach. The members take the checkpoints
+once `CHECKPOINT_INTERVAL` is set. Setup, guarantees, limits and the
+recovery: [observer.md](observer.md).
+
+## Metrics
+
+With `[metrics] ENABLED = true`, `/metrics` exposes two families.
+
+- `consensus_*`, the engine's: role, term, fault tolerance, commit, apply
+  and fsync latencies, and on the leader `consensus_peer_match_lag_entries`,
+  `consensus_peer_unreachable` and `consensus_peer_last_contact_seconds` per
+  peer.
+- `forgejo_cluster_*`, Forgejo's: readiness, pending projection, event queue,
+  consumer lag and stalls, git transactions in flight, certificate expiry,
+  transport refusals before TLS, and the counters of proposals, object
+  shipments and consumed events. In the autonomous mode,
+  `forgejo_cluster_expected_nodes` (the founding size) and
+  `forgejo_cluster_voters`.
+
+`/api/healthz` says whether the node is ready. On the leader it gives the
+fault tolerance, the gate of a node-by-node upgrade. A healthy follower
+reports nothing.
+
+## Under Nomad
+
+`contrib/cluster/deploy/nomad` holds a generic job. Its shape:
+
+- One job, three groups, each pinned on its machine's `${node.unique.id}`, a
+  task named after its slot. Nomad never moves a member by itself:
+  `reschedule { attempts = 0, unlimited = false }` and
+  `disconnect { replace = false }`.
+- **The witness check before Forgejo.** A `prestart` task runs
+  `forgejo cluster witness check` through the image's setup, so it reads the
+  same `[cluster]` settings as Forgejo, on the data volume mounted read-write
+  (opening the data directory takes its lock file). It exits 77 when a witness
+  says the lineage was superseded, or when none answers: Forgejo does not
+  start, the allocation fails and Nomad does not reschedule it.
+- **Vault through the workload identity.** The renewer logs in at
+  `auth/jwt-consensus/login` with its slot's role and the JWT Nomad writes into
+  the task's secrets. It keeps the token to two thirds of its TTL, then logs in
+  again; a token Vault refuses is dropped and the signature retried once.
+  `RENEW_VAULT_TOKEN_FILE` stays the logged fallback. On Vault's side, each
+  role binds `nomad_namespace`, `nomad_job_id` and `nomad_task`, and its
+  policy signs for its slot only.
+- **The JOIN drain check.** Before admitting a node that joins by itself,
+  Forgejo reads Nomad read-only (`GET /v1/nodes`, `GET /v1/node/<id>`,
+  `node:read`). The node hosting the slot is the one whose `forgejo_slot` meta
+  names it. The JOIN is refused while that node is draining, ineligible or not
+  ready, and when Nomad does not answer. When several nodes carry the slot,
+  the joiner's address decides; otherwise the refusal stands. The joiner reads
+  the reason in its log.
+- **Certificate reload.** A renewed certificate is used from the next
+  handshake, on both sides. The object channel rotates its open connections as
+  soon as the files change: idle ones close at once, a request in flight
+  finishes on its connection, which then closes. The consensus transport keeps
+  its connections to their natural end: the key does not change, so neither
+  does the SPKI pin, and the engine already bounds each connection by the
+  expiry of the certificate that opened it.
+
+The lab proves this against a real Nomad: `make nomad-e2e` in
+`contrib/cluster-lab`.
+
+## Known limits
+
+- A push must reach a majority of the nodes, objects included, within the
+  hook's budget (about fifty seconds). A very large push over a slow link may
+  be refused. A first large repository goes through `forgejo cluster import`,
+  which has its own 30-minute budget, like `reconcile`, `objects backfill` and
+  `snapshot save`.
+- The drain check covers the joiner's Nomad node. That the old member was
+  drained or purged remains the responsibility of the operator who grants the
+  join.
+- Forgejo has no tracing: the engine's spans are not exported.
