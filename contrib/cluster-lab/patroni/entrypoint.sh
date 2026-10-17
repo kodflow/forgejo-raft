@@ -57,4 +57,16 @@ postgresql:
     unix_socket_directories: /var/run/postgresql
 EOF
 
+# The observer scenario (compose.observer.yaml) sets ARCHIVE_COMMAND: every
+# node archives (archive_mode on: the primary, and a promoted node its new
+# timeline), every 30 s at least (contrib/cluster/observer.md).
+if [ -n "${ARCHIVE_COMMAND:-}" ]; then
+  cat >>/etc/patroni/patroni.yml <<EOF
+    archive_mode: "on"
+    archive_command: "${ARCHIVE_COMMAND}"
+    archive_timeout: 30s
+    synchronous_commit: "on"
+EOF
+fi
+
 exec patroni /etc/patroni/patroni.yml

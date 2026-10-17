@@ -9,7 +9,7 @@ DC := docker compose --project-directory $(CURDIR) -f $(CURDIR)/compose.yaml
 _ := $(shell $(CURDIR)/scripts/secrets.sh)
 DB := consul-1 consul-2 consul-3 pg-1 pg-2 pg-3 haproxy
 
-.PHONY: help build build-db up up-db down reset bootstrap status failover chaos chaos-e2e heal e2e witnesses recover-e2e vault-renew-e2e nomad-e2e secret
+.PHONY: help build build-db up up-db down reset bootstrap status failover chaos chaos-e2e heal e2e witnesses recover-e2e vault-renew-e2e nomad-e2e secret observer-build observer-e2e
 
 help: ## This list
 	@grep -hE '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -82,6 +82,12 @@ vault-renew-e2e: ## Vault dev, pki-consensus with the lab CA, renew each node's 
 
 nomad-e2e: ## Nomad dev: Vault login by workload identity, witness prestart exit 77, JOIN refused on a draining node
 	scripts/nomad-e2e.sh
+
+observer-build: build ## The observer scenario's image: sshd, pg_basebackup 18, PostgreSQL 18, git-lfs
+	$(DC) -f $(CURDIR)/compose.observer.yaml --profile observer build observer
+
+observer-e2e: ## Observer, poison, failover, total loss, recover --from-observer (about 4 GB; ask the lab owner first)
+	scripts/observer-e2e.sh
 
 secret: ## Print one lab secret from .env: make secret NAME=LAB_ADMIN_PASSWORD
 	@grep "^$(NAME)=" .env | cut -d= -f2-

@@ -202,3 +202,34 @@ The outputs of the latest full runs from scratch are in
   `forgejo cluster import`. The end-to-end run creates its own afterwards.
 - `make e2e` reads the Raft leader from `forgejo cluster status --json`,
   field `Role`, on each node.
+
+## The observer scenario
+
+`compose.observer.yaml` lays the observer over the lab
+(`contrib/cluster/observer.md`): the PostgreSQL nodes archive their WAL into
+one shared volume, the Forgejo nodes take a checkpoint every 30 seconds and
+serve the export through their own sshd on port 2222, an `observer` service
+pulls and protects the checkpoints, its snapshot hook copying its directory
+into a `snapshots` volume, and `forgejo-r` is the node a recovery rebuilds,
+with its own PostgreSQL run as git in the same container.
+
+```sh
+make up bootstrap   # the lab
+make observer-build # the image with sshd, pg_basebackup, PostgreSQL 18, git-lfs
+make observer-e2e   # scripts/observer-e2e.sh
+```
+
+`scripts/observer-e2e.sh` protects a clean checkpoint (a branch, an LFS
+object, an issue, a TOTP 2FA user) and measures the time from the push to its
+protection; poisons the cluster with a valid force-push and a SQL `DELETE`,
+which the observer protects too; fails PostgreSQL over and checks the next
+checkpoint on the new timeline; loses every member and every PostgreSQL;
+then recovers the clean checkpoint from its snapshot on `forgejo-r`, in the
+plan's order, compares the replay with `recovery_target_inclusive` off and
+on, and checks the clean branch, the deleted issue, the LFS object, the 2FA
+login and the revoked tokens.
+
+It is written and has not been run yet: it needs about 4 GB beside the lab,
+and runs only with the lab owner's agreement. The Alpine package names of
+`observer/Dockerfile` are to be confirmed against the image's release.
+

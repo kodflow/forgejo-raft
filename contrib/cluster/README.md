@@ -212,6 +212,18 @@ These commands run with the server stopped, on the data directory.
   can be regenerated (branches, tags); the others are reported with what to
   do, such as a pull request marked merged whose commit is missing from its
   base branch.
+- `forgejo cluster recover --from-observer <checkpoint> ...` rebuilds a
+  cluster from an observer's protected checkpoint, every member lost
+  ([observer.md](observer.md)).
+
+## Observers
+
+An observer (`[cluster] ROLE = observer`) is never a member and opens no
+port: it pulls, over SSH, checkpoints that pair the refs, the objects, the
+stored files and Forgejo's PostgreSQL at one causal cut, each one protected
+by a snapshot the cluster cannot reach. The members take the checkpoints
+once `CHECKPOINT_INTERVAL` is set. Setup, guarantees, limits and the
+recovery: [observer.md](observer.md).
 
 ## Metrics
 
