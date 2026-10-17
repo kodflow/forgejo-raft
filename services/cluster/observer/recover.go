@@ -5,6 +5,7 @@ package observer
 
 import (
 	"archive/tar"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -244,6 +245,9 @@ type PGOptions struct {
 	// RestoreDir receives the checkpoint's WAL; restore_command reads
 	// nothing else.
 	RestoreDir string
+	// HBA is the recovered PostgreSQL's pg_hba.conf, the operator's, never
+	// the source's; local peer connections only by default.
+	HBA string
 	// Listen, ArchiveDir and ArchiveCommand are for the configuration the
 	// recovered primary runs with.
 	Listen         string
@@ -357,7 +361,7 @@ func (a *Archive) RestorePG(name, pgdata string, opt PGOptions) error {
 	for f, body := range map[string]string{
 		"postgresql.conf":      conf,
 		"postgresql.auto.conf": "# Do not edit: forgejo cluster recover --from-observer keeps it empty.\n",
-		"pg_hba.conf":          "local all all peer\n",
+		"pg_hba.conf":          cmp.Or(opt.HBA, "local all all peer\n"),
 		"pg_ident.conf":        "",
 		"recovery.signal":      "",
 	} {

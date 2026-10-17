@@ -42,6 +42,7 @@ func recoverFromObserverFlags() []cli.Flag {
 		&cli.StringFlag{Name: "pg-socket-dir", Usage: "the recovered PostgreSQL's socket directory (default: <pgdata>)"},
 		&cli.IntFlag{Name: "pg-port", Value: 5432},
 		&cli.StringFlag{Name: "pg-listen", Value: "localhost", Usage: "listen_addresses of the recovered primary"},
+		&cli.StringFlag{Name: "pg-hba-file", Usage: "the recovered PostgreSQL's pg_hba.conf, the operator's (default: local peer only)"},
 		&cli.StringFlag{Name: "pg-ctl", Usage: "pg_ctl, run as PostgreSQL's owner; without it, the recovery stops for the operator to start PostgreSQL"},
 		&cli.StringFlag{Name: "wal-archive-dir", Usage: "the recovered primary's fresh WAL archive (default: [cluster] WAL_ARCHIVE_DIR)"},
 	}
@@ -175,6 +176,13 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		restoreDir = filepath.Join(out, "wal-restore")
 	}
 	opt := observer.PGOptions{Port: c.Int("pg-port"), SocketDir: socket, RestoreDir: restoreDir, Listen: c.String("pg-listen")}
+	if f := c.String("pg-hba-file"); f != "" {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return err
+		}
+		opt.HBA = string(b)
+	}
 	if !prog.done(stepPG) {
 		if err := archive.RestorePG(name, c.String("pgdata"), opt); err != nil {
 			return err
