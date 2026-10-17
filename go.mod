@@ -1,8 +1,6 @@
 module forgejo.org
 
-go 1.26.0
-
-toolchain go1.27.2
+go 1.27.2
 
 require (
 	code.forgejo.org/forgejo-contrib/go-libravatar v0.0.0-20260301104140-add494e31dab
@@ -69,6 +67,8 @@ require (
 	github.com/jhillyerd/enmime/v2 v2.2.0
 	github.com/json-iterator/go v1.1.12
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
+	github.com/kitsunium/sdk/pkg/v1/app v0.0.0-20261014002517-aa07aca47e1b
+	github.com/kitsunium/sdk/pkg/v1/observe v0.0.0-20261014002517-aa07aca47e1b
 	github.com/klauspost/compress v1.20.0
 	github.com/markbates/goth v1.82.0
 	github.com/mattn/go-isatty v0.0.24
@@ -85,6 +85,8 @@ require (
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/pquerna/otp v1.5.0
 	github.com/prometheus/client_golang v1.21.1
+	github.com/prometheus/client_model v0.6.1
+	github.com/prometheus/common v0.62.0
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/sergi/go-diff v1.4.0
@@ -196,9 +198,13 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/jonboulle/clockwork v0.5.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
+	github.com/kitsunium/sdk/internal v0.0.0-20261014002517-aa07aca47e1b // indirect
+	github.com/kitsunium/sdk/pkg/v1/clock v0.0.0-20261014002517-aa07aca47e1b // indirect
+	github.com/kitsunium/sdk/pkg/v1/errs v0.0.0-20261014002517-aa07aca47e1b // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
+	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/libdns/libdns v1.1.1 // indirect
 	github.com/mailru/easyjson v0.9.0 // indirect
 	github.com/markbates/going v1.0.3 // indirect
@@ -226,8 +232,6 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.22 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/prometheus/client_model v0.6.1 // indirect
-	github.com/prometheus/common v0.62.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/rhysd/actionlint v1.7.12 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
