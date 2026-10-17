@@ -93,6 +93,26 @@ func TestSyncConfig(t *testing.T) {
 	assert.True(t, gitConfigContains("cfg-key-a = CfgValA"))
 }
 
+// The cluster turns git's own garbage collection off in the global config,
+// and turning the cluster off turns it back on.
+func TestSyncConfigClusterGarbageCollection(t *testing.T) {
+	defer test.MockProtect(&setting.GitConfig)()
+	defer test.MockVariableValue(&setting.Cluster.Enabled, true)()
+	require.NoError(t, syncGitConfig())
+	assert.True(t, gitConfigContains("autogc = false"))
+	assert.True(t, gitConfigContains("auto = 0"))
+
+	setting.Cluster.Enabled = false
+	require.NoError(t, syncGitConfig())
+	assert.False(t, gitConfigContains("autogc = false"))
+	assert.False(t, gitConfigContains("auto = 0"))
+
+	// A value [git.config] sets is left alone.
+	setting.GitConfig.Options["gc.auto"] = "0"
+	require.NoError(t, syncGitConfig())
+	assert.True(t, gitConfigContains("auto = 0"))
+}
+
 func TestSyncConfigGPGFormat(t *testing.T) {
 	defer test.MockProtect(&setting.GitConfig)()
 

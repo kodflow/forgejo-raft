@@ -1,0 +1,429 @@
+// Copyright 2026 The Forgejo Authors. All rights reserved.
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Package clusterhook is the small shared part of Forgejo's ref replicator
+// that the git launch wrapper, the hook command, `forgejo serv` and the
+// replicator all need: the transaction nonce, and the protocol of the
+// replicator's private socket (kitsunium ADR 0152 D19, ADR 0148). It holds
+// no state of the replicator and imports nothing of it.
+package clusterhook
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+	"sync"
+	"time"
+
+	"forgejo.org/modules/json"
+)
+
+// EnvTxn carries the transaction nonce in git's environment. It is set LAST
+// by Forgejo's git launch wrapper on every git invocation, so nothing a user
+// controls overrides it; it is a correlation id, not an authenticator (R7-37).
+const EnvTxn = "FORGEJO_CLUSTER_TXN"
+
+// NewNonce draws a 128-bit nonce from crypto/rand.
+func NewNonce() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// Line is one line of the reference-transaction hook's input.
+type Line struct {
+	Old string `json:"old"`
+	New string `json:"new"`
+	Ref string `json:"ref"`
+}
+
+// Ops of the socket protocol.
+const (
+	OpPrepared      = "prepared"
+	OpCommitted     = "committed"
+	OpAborted       = "aborted"
+	OpRegister      = "register"
+	OpStatus        = "status"
+	OpSnapshot      = "snapshot-save"
+	OpReproject     = "reproject"
+	OpObjectsVerify = "objects-verify"
+	OpReconcile     = "reconcile"
+	OpImport        = "import"
+	OpObjectsFill   = "objects-backfill"
+)
+
+// Request is one call on the socket: one JSON object per connection.
+type Request struct {
+	Op          string            `json:"op"`
+	Nonce       string            `json:"nonce,omitempty"`
+	GitDir      string            `json:"git_dir,omitempty"`
+	Lines       []Line            `json:"lines,omitempty"`
+	PusherID    int64             `json:"pusher_id,omitempty"`
+	RepoID      int64             `json:"repo_id,omitempty"`
+	IsWiki      bool              `json:"is_wiki,omitempty"`
+	PRID        int64             `json:"pr_id,omitempty"`
+	Trigger     string            `json:"trigger,omitempty"`
+	PushOptions map[string]string `json:"push_options,omitempty"`
+	// PID is the hook's parent, the git process owning the transaction.
+	PID int `json:"pid,omitempty"`
+	// Path and Repo are arguments of the operational calls.
+	Path   string `json:"path,omitempty"`
+	Repo   string `json:"repo,omitempty"`
+	DryRun bool   `json:"dry_run,omitempty"`
+	// Operator is set by the offline command from the local account; the
+	// socket's peer credentials are what authenticates the caller.
+	Operator string `json:"operator,omitempty"`
+}
+
+// Response answers a Request.
+type Response struct {
+	OK      bool    `json:"ok"`
+	Message string  `json:"message,omitempty"`
+	Data    RawJSON `json:"data,omitempty"`
+}
+
+// RawJSON is a JSON value carried as is.
+type RawJSON []byte
+
+// MarshalJSON returns the value itself.
+func (r RawJSON) MarshalJSON() ([]byte, error) {
+	if len(r) == 0 {
+		return []byte("null"), nil
+	}
+	return r, nil
+}
+
+// UnmarshalJSON keeps a copy of the value.
+func (r *RawJSON) UnmarshalJSON(b []byte) error {
+	*r = append((*r)[:0], b...)
+	return nil
+}
+
+// Call sends one request to the replicator's socket and reads its answer.
+func Call(ctx context.Context, socket string, req *Request) (*Response, error) {
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "unix", socket)
+	if err != nil {
+		return nil, fmt.Errorf("cluster replicator unreachable on %s: %w", socket, err)
+	}
+	defer conn.Close()
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	}
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return nil, err
+	}
+	var resp Response
+	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
+		return nil, fmt.Errorf("cluster replicator answer: %w", err)
+	}
+	return &resp, nil
+}
+
+// ---- the git launch wrapper ----
+
+var (
+	enabledMu sync.RWMutex
+	enabled   bool
+)
+
+// SetEnabled turns the nonce on for every git invocation of this process.
+func SetEnabled(on bool) {
+	enabledMu.Lock()
+	enabled = on
+	enabledMu.Unlock()
+}
+
+// Enabled reports whether the nonce is set on git invocations.
+func Enabled() bool {
+	enabledMu.RLock()
+	defer enabledMu.RUnlock()
+	return enabled
+}
+
+type collectorKey struct{}
+
+// Collector gathers the nonces of the git invocations a request made, so the
+// response can carry a read-after-write cookie for the writes among them.
+type Collector struct {
+	mu     sync.Mutex
+	nonces []string
+}
+
+// WithCollector returns a context whose git invocations are collected.
+func WithCollector(ctx context.Context) (context.Context, *Collector) {
+	c := &Collector{}
+	return context.WithValue(ctx, collectorKey{}, c), c
+}
+
+// Nonces returns what was collected so far.
+func (c *Collector) Nonces() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.nonces...)
+}
+
+// TxnEnv returns the variables the git launch wrapper appends last to every
+// git invocation: a fresh nonce per invocation.
+func TxnEnv(ctx context.Context) []string {
+	if !Enabled() {
+		return nil
+	}
+	n := NewNonce()
+	if ctx != nil {
+		if c, ok := ctx.Value(collectorKey{}).(*Collector); ok {
+			c.mu.Lock()
+			if len(c.nonces) < 256 {
+				c.nonces = append(c.nonces, n)
+			}
+			c.mu.Unlock()
+		}
+	}
+	return []string{EnvTxn + "=" + n}
+}
+
+// ErrRefused is a transaction the replicator refused.
+var ErrRefused = errors.New("refused by the cluster")
+
+// DefaultTimeout bounds one hook call: a proposal, its objects and its commit.
+const DefaultTimeout = 60 * time.Second
+
+// ServerBudget is what the replicator allows itself for one call: less than
+// the hook waits, so the answer reaches the hook before it gives up. A hook
+// that gives up anyway cannot tell whether the write committed.
+const ServerBudget = DefaultTimeout - 10*time.Second
+
+// AdminTimeout bounds an operator's command on the socket (import,
+// reconcile, objects backfill, snapshot, reproject): it moves whole
+// repositories, which a hook's budget cannot.
+const AdminTimeout = 30 * time.Minute
+
+// Budget is what the replicator allows itself for one request: the hook's
+// budget for the push path, the operator's for the rest.
+func Budget(op string) time.Duration {
+	switch op {
+	case OpPrepared, OpCommitted, OpAborted, OpRegister, OpStatus:
+		return ServerBudget
+	default:
+		return AdminTimeout - 10*time.Second
+	}
+}
+
+// ---- repository lifecycle ----
+
+// A repository deleted or renamed by Forgejo changes the table too, so every
+// member's projector follows (kitsunium ADR 0152 D19). The replicator
+// registers these at start; without a cluster they do nothing.
+var (
+	lifecycleMu sync.RWMutex
+	onDeleted   func(ctx context.Context, key string, repoID int64) error
+	onRenamed   func(ctx context.Context, moves [][2]string) error
+)
+
+// SetRepoLifecycle registers the replicator's handlers.
+func SetRepoLifecycle(deleted func(ctx context.Context, key string, repoID int64) error, renamed func(ctx context.Context, moves [][2]string) error) {
+	lifecycleMu.Lock()
+	onDeleted, onRenamed = deleted, renamed
+	lifecycleMu.Unlock()
+}
+
+// RepoKey is the table's key of a repository: its path under the
+// repository root, lowercase, as Forgejo writes it.
+func RepoKey(owner, name string, wiki bool) string {
+	n := strings.ToLower(name)
+	if wiki {
+		n += ".wiki"
+	}
+	return strings.ToLower(owner) + "/" + n + ".git"
+}
+
+// RepoDeleted records the deletion of a repository and its wiki, after
+// Forgejo removed them locally.
+func RepoDeleted(ctx context.Context, owner, name string, repoID int64) error {
+	lifecycleMu.RLock()
+	f := onDeleted
+	lifecycleMu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	return errors.Join(f(ctx, RepoKey(owner, name, false), repoID), f(ctx, RepoKey(owner, name, true), repoID))
+}
+
+// RepoRenamed records a repository and its wiki moving, after Forgejo moved
+// them locally. Both moves are one replicated command, applied together or
+// not at all. An error means the other members did not follow: the caller
+// moves them back.
+func RepoRenamed(ctx context.Context, oldOwner, oldName, newOwner, newName string) error {
+	lifecycleMu.RLock()
+	f := onRenamed
+	lifecycleMu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	return f(ctx, [][2]string{
+		{RepoKey(oldOwner, oldName, false), RepoKey(newOwner, newName, false)},
+		{RepoKey(oldOwner, oldName, true), RepoKey(newOwner, newName, true)},
+	})
+}
+
+// UndoRepoRenamed moves a repository and its wiki back in the replicated
+// table after RepoRenamed succeeded and Forgejo's SQL then failed: every
+// projector, the origin's included, follows the table, so without it the
+// directories would stay under names the database does not know. It runs on
+// a context detached from the failed request.
+func UndoRepoRenamed(ctx context.Context, oldOwner, oldName, newOwner, newName string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultTimeout)
+	defer cancel()
+	return RepoRenamed(ctx, newOwner, newName, oldOwner, oldName)
+}
+
+// UndoOwnerRenamed is UndoRepoRenamed for every repository of an owner.
+func UndoOwnerRenamed(ctx context.Context, oldOwner, newOwner string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultTimeout)
+	defer cancel()
+	return OwnerRenamed(ctx, newOwner, oldOwner)
+}
+
+var onOwnerRenamed func(ctx context.Context, oldOwner, newOwner string) error
+
+// SetOwnerLifecycle registers the replicator's handler of a renamed owner.
+func SetOwnerLifecycle(renamed func(ctx context.Context, oldOwner, newOwner string) error) {
+	lifecycleMu.Lock()
+	onOwnerRenamed = renamed
+	lifecycleMu.Unlock()
+}
+
+// OwnerRenamed moves every repository of an owner, after Forgejo moved the
+// owner's directory locally. An error means the other members did not
+// follow: the caller moves it back.
+func OwnerRenamed(ctx context.Context, oldOwner, newOwner string) error {
+	lifecycleMu.RLock()
+	f := onOwnerRenamed
+	lifecycleMu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	return f(ctx, strings.ToLower(oldOwner), strings.ToLower(newOwner))
+}
+
+var mayGC func(key string) bool
+
+// SetGarbageCollectionGate registers the projector's answer to "may git gc
+// run on this repository now".
+func SetGarbageCollectionGate(f func(key string) bool) {
+	lifecycleMu.Lock()
+	mayGC = f
+	lifecycleMu.Unlock()
+}
+
+// MayCollectGarbage reports whether git gc may run on a repository; it is
+// always true without a cluster.
+func MayCollectGarbage(key string) bool {
+	lifecycleMu.RLock()
+	f := mayGC
+	lifecycleMu.RUnlock()
+	return f == nil || f(key)
+}
+
+var waitWrites func(ctx context.Context, nonces []string) bool
+
+// SetWriteWaiter registers the replicator's wait for a request's writes.
+func SetWriteWaiter(f func(ctx context.Context, nonces []string) bool) {
+	lifecycleMu.Lock()
+	waitWrites = f
+	lifecycleMu.Unlock()
+}
+
+// WaitWrites waits, within the read-after-write bound, until this node is
+// projected and the consumer has derived SQL for the writes a collector saw.
+// It reports false on a timeout; without a cluster it returns at once.
+func WaitWrites(ctx context.Context, c *Collector) bool {
+	lifecycleMu.RLock()
+	f := waitWrites
+	lifecycleMu.RUnlock()
+	if f == nil || c == nil {
+		return true
+	}
+	return f(ctx, c.Nonces())
+}
+
+type afterCommitKey struct{}
+
+// AfterCommit collects side effects that must happen once the work of a
+// replicated command committed, and never on a rolled-back attempt: the log
+// consumer replays a batch until its SQL transaction commits, and a
+// goroutine or a queue started during a failed attempt would act again on
+// the replay (kitsunium ADR 0152 D10, R8-25).
+type AfterCommit struct {
+	mu  sync.Mutex
+	fns []func()
+}
+
+// WithAfterCommit returns a context whose Defer calls collect into the
+// returned AfterCommit instead of running at once.
+func WithAfterCommit(ctx context.Context) (context.Context, *AfterCommit) {
+	a := &AfterCommit{}
+	return context.WithValue(ctx, afterCommitKey{}, a), a
+}
+
+// Defer runs fn after the replicated command's work commits when ctx is
+// collecting, and at once otherwise (no cluster: unchanged behaviour).
+func Defer(ctx context.Context, fn func()) {
+	if a, ok := ctx.Value(afterCommitKey{}).(*AfterCommit); ok {
+		a.mu.Lock()
+		a.fns = append(a.fns, fn)
+		a.mu.Unlock()
+		return
+	}
+	fn()
+}
+
+// Collecting reports whether ctx defers side effects to a commit.
+func Collecting(ctx context.Context) bool {
+	_, ok := ctx.Value(afterCommitKey{}).(*AfterCommit)
+	return ok
+}
+
+// Run runs what was collected, once, in order.
+func (a *AfterCommit) Run() {
+	a.mu.Lock()
+	fns := a.fns
+	a.fns = nil
+	a.mu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+type commandKey struct{}
+
+// WithCommand marks a context as doing the work of one replicated command,
+// named by its lineage-scoped identity. Side effects created under it — a
+// webhook task — derive their identity from it, so a replay after a
+// failover creates no second one (kitsunium ADR 0152 D10, R8-25).
+func WithCommand(ctx context.Context, identity string) context.Context {
+	return context.WithValue(ctx, commandKey{}, identity)
+}
+
+// WithCommandPart narrows a command's identity to one part of it, such as
+// one ref of a multi-ref transaction.
+func WithCommandPart(ctx context.Context, part string) context.Context {
+	id, ok := CommandIdentity(ctx)
+	if !ok {
+		return ctx
+	}
+	return WithCommand(ctx, id+"|"+part)
+}
+
+// CommandIdentity returns the identity WithCommand set.
+func CommandIdentity(ctx context.Context) (string, bool) {
+	id, ok := ctx.Value(commandKey{}).(string)
+	return id, ok && id != ""
+}

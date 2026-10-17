@@ -28,6 +28,7 @@ import (
 	user_model "forgejo.org/models/user"
 	"forgejo.org/models/webhook"
 	actions_module "forgejo.org/modules/actions"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/lfs"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/optional"
@@ -365,6 +366,12 @@ func DeleteRepositoryDirectly(ctx context.Context, repoID int64, opts DeleteRepo
 	// Remove wiki files
 	if repo.HasWiki() {
 		system_model.RemoveAllWithNotice(ctx, "Delete repository wiki", repo.WikiPath())
+	}
+
+	// In a cluster, the other members remove their copies once the deletion
+	// is in the replicated table.
+	if err := clusterhook.RepoDeleted(ctx, repo.OwnerName, repo.Name, repo.ID); err != nil {
+		log.Error("cluster: the deletion of %s/%s was not replicated, other nodes keep their copy until reconciled: %v", repo.OwnerName, repo.Name, err)
 	}
 
 	// Remove archives

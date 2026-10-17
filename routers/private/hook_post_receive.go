@@ -28,6 +28,7 @@ import (
 	timeutil "forgejo.org/modules/timeutil"
 	"forgejo.org/modules/util"
 	"forgejo.org/modules/web"
+	cluster_service "forgejo.org/services/cluster"
 	app_context "forgejo.org/services/context"
 	repo_service "forgejo.org/services/repository"
 )
@@ -96,7 +97,11 @@ func HookPostReceive(ctx *app_context.PrivateContext) {
 		}
 	}
 
-	if repo != nil && len(updates) > 0 {
+	// In a cluster, branch rows, push actions, webhooks and pull request
+	// updates are derived from the replicated log by the leader's consumer,
+	// never by the node that happened to receive the push (kitsunium ADR
+	// 0152 D19, R7-29).
+	if repo != nil && len(updates) > 0 && !cluster_service.Enabled() {
 		branchesToSync := make([]*repo_module.PushUpdateOptions, 0, len(updates))
 		for _, update := range updates {
 			if !update.RefFullName.IsBranch() {
