@@ -5,7 +5,15 @@ LAB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-forgejo-cluster-lab}"
 export FORGEJO_DOCKERFILE="${FORGEJO_DOCKERFILE:-$LAB_DIR/.build/Dockerfile.forgejo}"
 
-dc() { docker compose --project-directory "$LAB_DIR" -f "$LAB_DIR/compose.yaml" "$@"; }
+# COMPOSE_FILE, when set, names the files instead (the CI lays
+# compose.ci.yaml over compose.yaml).
+dc() {
+  if [ -n "${COMPOSE_FILE:-}" ]; then
+    docker compose --project-directory "$LAB_DIR" "$@"
+  else
+    docker compose --project-directory "$LAB_DIR" -f "$LAB_DIR/compose.yaml" "$@"
+  fi
+}
 
 # The lab's secrets (scripts/secrets.sh), for the scripts' own calls.
 "$LAB_DIR/scripts/secrets.sh"

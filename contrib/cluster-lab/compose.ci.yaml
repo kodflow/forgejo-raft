@@ -1,0 +1,122 @@
+# The lab as the CI end-to-end suite runs it, laid over compose.yaml
+# (.github/workflows/e2e.yml, scripts/ci/). What it changes:
+#
+#   - the autonomous mode: EXPECTED_NODES = 3 and PEERS, no `make bootstrap`;
+#     the three nodes found the cluster by themselves;
+#   - the consensus and the object channel on their own network, `raft`
+#     (10.89.1.0/24, internal), the HTTP API and PostgreSQL on `lab`: a
+#     partition cuts a node off its peers with `docker network disconnect`
+#     on `raft` alone, while its HTTP port and its database stay reachable,
+#     so what refuses a write is the consensus, not a lost database;
+#   - LFS, attachments, avatars and archives on one volume every node
+#     mounts, as the cluster requires for non-git files (shared storage);
+#   - Forgejo's own SSH server on each node (127.0.0.1:2221 to 2223);
+#   - a webhook receiver (10.89.0.80:8080) that records every delivery.
+#
+# Use: COMPOSE_FILE=compose.yaml:compose.ci.yaml (absolute paths), which
+# scripts/lib.sh honours.
+
+x-ci-forgejo-env: &ci-forgejo-env
+  FORGEJO__cluster__EXPECTED_NODES: "3"
+  FORGEJO__cluster__PEERS: node-a=10.89.1.41:7480,node-b=10.89.1.42:7480,node-c=10.89.1.43:7480
+  FORGEJO__server__LFS_START_SERVER: "true"
+  FORGEJO__server__LFS_JWT_SECRET: ${LFS_JWT_SECRET:?}
+  FORGEJO__server__DISABLE_SSH: "false"
+  FORGEJO__server__START_SSH_SERVER: "true"
+  FORGEJO__server__SSH_LISTEN_PORT: "2222"
+  FORGEJO__server__SSH_DOMAIN: 127.0.0.1
+  # Every local storage (repo-archive, packages...) under /shared/<name>,
+  # and the two the image's app.ini names explicitly.
+  FORGEJO__storage__PATH: /shared
+  FORGEJO__lfs__PATH: /shared/lfs
+  FORGEJO__attachment__PATH: /shared/attachments
+  FORGEJO__picture__AVATAR_UPLOAD_PATH: /shared/avatars
+  FORGEJO__picture__REPOSITORY_AVATAR_UPLOAD_PATH: /shared/repo-avatars
+  # The receiver lives on the lab's private network.
+  FORGEJO__webhook__ALLOWED_HOST_LIST: private
+  FORGEJO__webhook__DELIVER_TIMEOUT: "10"
+
+services:
+  # The shared storage belongs to the git user (uid 1000) of every node.
+  shared-init:
+    image: forgejo-cluster-lab/patroni:4.1.5-pg18
+    pull_policy: never
+    user: "0"
+    entrypoint:
+      ["/bin/sh", "-c", "chown 1000:1000 /shared && chmod 0750 /shared"]
+    volumes: [shared:/shared]
+    network_mode: none
+
+  forgejo-1:
+    depends_on:
+      shared-init: { condition: service_completed_successfully }
+    environment:
+      <<: *ci-forgejo-env
+      FORGEJO__cluster__LISTEN_ADDR: "10.89.1.41:7480"
+      FORGEJO__server__SSH_PORT: "2221"
+    ports: ["127.0.0.1:2221:2222"]
+    volumes: [shared:/shared]
+    networks: { raft: { ipv4_address: 10.89.1.41 } }
+  forgejo-2:
+    depends_on:
+      shared-init: { condition: service_completed_successfully }
+    environment:
+      <<: *ci-forgejo-env
+      FORGEJO__cluster__LISTEN_ADDR: "10.89.1.42:7480"
+      FORGEJO__server__SSH_PORT: "2222"
+    ports: ["127.0.0.1:2222:2222"]
+    volumes: [shared:/shared]
+    networks: { raft: { ipv4_address: 10.89.1.42 } }
+  forgejo-3:
+    depends_on:
+      shared-init: { condition: service_completed_successfully }
+    environment:
+      <<: *ci-forgejo-env
+      FORGEJO__cluster__LISTEN_ADDR: "10.89.1.43:7480"
+      FORGEJO__server__SSH_PORT: "2223"
+    ports: ["127.0.0.1:2223:2222"]
+    volumes: [shared:/shared]
+    networks: { raft: { ipv4_address: 10.89.1.43 } }
+
+  # Records each webhook delivery as one JSON line (ci/receiver.py).
+  receiver:
+    image: forgejo-cluster-lab/patroni:4.1.5-pg18
+    pull_policy: never
+    restart: unless-stopped
+    mem_limit: 64m
+    user: "0"
+    entrypoint:
+      [
+        "python3",
+        "-u",
+        "/lab/receiver.py",
+        "0.0.0.0",
+        "8080",
+        "/deliveries/deliveries.jsonl",
+      ]
+    volumes: ["./ci/receiver.py:/lab/receiver.py:ro", "deliveries:/deliveries"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: { lab: { ipv4_address: 10.89.0.80 } }
+
+networks:
+  # Internal: no gateway, so Docker never routes the published ports
+  # through it, and cutting it leaves the HTTP side alone.
+  raft:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.89.1.0/24
+
+volumes:
+  shared:
+  deliveries:
