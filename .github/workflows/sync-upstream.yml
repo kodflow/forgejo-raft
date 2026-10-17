@@ -137,7 +137,10 @@ jobs:
             "Mise à jour amont : \`$SYNC_BRANCH\` apporte $AHEAD commits à \`$BASE_BRANCH\`, jusqu'à forgejo/forgejo@$UPSTREAM." \
             "Ouverte et tenue à jour par le workflow Sync upstream. Elle se fusionne seule (auto-merge, commit de fusion) une fois post-commit au vert." \
             "**Fusionner par un commit de fusion**, jamais par squash ou rebase, pour que les commits amont deviennent des ancêtres de \`$BASE_BRANCH\`.")"
-          pr="$(gh pr list -R "$REPO" --base "$BASE_BRANCH" --head "$SYNC_BRANCH" --state open --json number -q '.[0].number // empty')"
+          # --head matches a branch name only: a fork's sync/upstream would
+          # match too, so only this repository's own head is kept.
+          pr="$(gh pr list -R "$REPO" --base "$BASE_BRANCH" --head "$SYNC_BRANCH" --state open \
+            --json number,isCrossRepository -q '[.[] | select(.isCrossRepository | not)][0].number // empty')"
           created=false
           if [ -n "$pr" ]; then
             gh pr edit "$pr" -R "$REPO" --body "$body"
@@ -153,5 +156,5 @@ jobs:
             echo "::warning::auto-merge could not be enabled on PR #$pr (repository setting allow_auto_merge?): it waits for a manual merge."
           fi
           if [ "$HAS_SYNC_TOKEN" != true ] && [ "$created" = true ]; then
-            gh pr comment "$pr" -R "$REPO" --body "Ouverte avec le GITHUB_TOKEN : aucun contrôle ne démarre, donc post-commit ne rend pas de statut et l'auto-merge attend. Pour lancer les contrôles, pousser un commit sur \`$SYNC_BRANCH\` ou fermer puis rouvrir la PR. Pour que les prochaines synchros les lancent seules, fixer le secret SYNC_TOKEN (voir l'en-tête de .github/workflows/sync-upstream.yml)."
+            gh pr comment "$pr" -R "$REPO" --body "Ouverte avec le GITHUB_TOKEN : les contrôles ne démarrent pas seuls (ou attendent une approbation, bouton « Approve workflows to run » de la PR), donc post-commit ne rend pas de statut et l'auto-merge attend. Pour les lancer, approuver les runs en attente s'il y en a, sinon pousser un commit sur \`$SYNC_BRANCH\` ou fermer puis rouvrir la PR. Pour que les prochaines synchros les lancent seules, fixer le secret SYNC_TOKEN (voir l'en-tête de .github/workflows/sync-upstream.yml)."
           fi
