@@ -40,6 +40,7 @@ func cmdHook() *cli.Command {
 			subcmdHookUpdate(),
 			subcmdHookPostReceive(),
 			subcmdHookProcReceive(),
+			subcmdHookReferenceTransaction(),
 		},
 	}
 }

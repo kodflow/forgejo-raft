@@ -179,6 +179,7 @@ func innerNewMainApp(version, versionExtra string, subCmdsStandaloneArgs, subCmd
 		cmdMigrateStorage(),
 		cmdDumpRepository(),
 		cmdRestoreRepository(),
+		cmdCluster(),
 	}
 
 	subCmdWithConfig = append(subCmdWithConfig, subCmdWithConfigArgs...)
