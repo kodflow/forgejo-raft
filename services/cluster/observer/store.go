@@ -18,9 +18,8 @@ import (
 	"strings"
 	"time"
 
-	"forgejo.org/modules/json"
-
 	"forgejo.org/modules/clusterhook"
+	"forgejo.org/modules/json"
 )
 
 // The observer's directory, which the snapshot hook covers whole:

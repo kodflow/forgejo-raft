@@ -70,6 +70,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Offline, a few seconds: a wrong decision must stop the run, not cut
+      # or miss a release.
+      - name: Test the decision
+        run: .github/scripts/release-plan.test.sh
+
       - name: Version and decision
         id: plan
         env:

@@ -24,13 +24,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"forgejo.org/services/cluster/nomadgate"
-
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/graceful"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/setting"
 	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/nomadgate"
 	"forgejo.org/services/cluster/reftable"
 )
 
