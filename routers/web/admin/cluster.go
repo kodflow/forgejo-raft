@@ -113,10 +113,10 @@ func ClusterOperate(ctx *context.Context) {
 	renderConfirm(ctx, o, "", "")
 }
 
-// The fields an error can point at.
+// The fields an error can point at: keys of the switch below, never shown.
 const (
-	errFieldConfirm  = "confirm"
-	errFieldPassword = "password"
+	errFieldConfirm = "confirm"
+	errFieldStepUp  = "step-up"
 )
 
 func renderConfirm(ctx *context.Context, o cluster_service.Operation, errField, errMsg string) {
@@ -136,7 +136,7 @@ func renderConfirm(ctx *context.Context, o cluster_service.Operation, errField, 
 		switch errField {
 		case errFieldConfirm:
 			ctx.Data["Err_Confirm"] = true
-		case errFieldPassword:
+		case errFieldStepUp:
 			ctx.Data["Err_Password"] = true
 		}
 		ctx.Flash.Error(errMsg, true)
@@ -179,7 +179,7 @@ func ClusterOperateConfirm(ctx *context.Context) {
 			return
 		}
 		if !ctx.Doer.ValidatePassword(ctx, ctx.FormString("password")) {
-			renderConfirm(ctx, o, errFieldPassword, ctx.Locale.TrString("admin.cluster.op.step_up_failed"))
+			renderConfirm(ctx, o, errFieldStepUp, ctx.Locale.TrString("admin.cluster.op.step_up_failed"))
 			return
 		}
 		if has, _ := auth_model.HasTwoFactorByUID(ctx, ctx.Doer.ID); has {
@@ -193,7 +193,7 @@ func ClusterOperateConfirm(ctx *context.Context) {
 			// A passcode counts once, as at login: a replay inside its
 			// window does not step up again.
 			if err != nil || !ok || twofa.LastUsedPasscode == passcode {
-				renderConfirm(ctx, o, errFieldPassword, ctx.Locale.TrString("admin.cluster.op.step_up_failed"))
+				renderConfirm(ctx, o, errFieldStepUp, ctx.Locale.TrString("admin.cluster.op.step_up_failed"))
 				return
 			}
 			twofa.LastUsedPasscode = passcode

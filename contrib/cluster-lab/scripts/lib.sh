@@ -60,9 +60,12 @@ haproxy_primary() {
 
 # Runs SQL through HAProxy :5000 from any running PostgreSQL container.
 via_haproxy() {
-  local n
+  local n PGPASSWORD
+  # Passed by name: the value never sits on the command line.
+  PGPASSWORD=$PG_SUPERUSER_PASSWORD
+  export PGPASSWORD
   for n in pg-1 pg-2 pg-3; do
-    if dc exec -T -e PGPASSWORD="$PG_SUPERUSER_PASSWORD" "$n" \
+    if dc exec -T -e PGPASSWORD "$n" \
       psql -h 10.89.0.30 -p 5000 -U postgres -d postgres -v ON_ERROR_STOP=1 -Atc "$1" 2>/dev/null; then
       return 0
     fi
