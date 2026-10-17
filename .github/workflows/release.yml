@@ -26,7 +26,8 @@
 # SHA256SUMS; and ghcr.io/<owner>/forgejo-raft:<version> and :latest, built
 # with Forgejo's own Dockerfile (bindata, timetzdata, sqlite,
 # sqlite_unlock_notify, static). The binaries are the image's /app/gitea/gitea,
-# so release and image hold the same build. The tag is created last: a failed
+# exported from the same cached build, so release and image hold the same
+# build. The tag is created last: a failed
 # build tags nothing.
 #
 # The decision lives in .github/scripts/release-plan.sh; run it locally with
@@ -143,18 +144,30 @@ jobs:
           cache-from: type=gha,scope=release
           cache-to: type=gha,scope=release,mode=max
 
+      # The same build again, every layer from the cache the step above just
+      # filled, exported as files instead of pulled back from the registry:
+      # pulling one digest for two platforms into the runner's image store
+      # fails ("cannot overwrite digest"). A multi-platform local export puts
+      # each platform's root filesystem under its own directory.
+      - name: Image filesystems, per platform
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: RELEASE_VERSION=${{ needs.plan.outputs.file_version }}
+          outputs: type=local,dest=${{ runner.temp }}/rootfs
+          cache-from: type=gha,scope=release
+
       - name: Binaries from the image
         env:
-          DIGEST: ${{ steps.image.outputs.digest }}
+          ROOTFS: ${{ runner.temp }}/rootfs
         run: |
           set -euo pipefail
           mkdir dist
           for arch in amd64 arm64; do
             out="dist/forgejo-${VERSION#v}-linux-$arch"
-            id=$(docker create --platform "linux/$arch" "$IMAGE@$DIGEST")
-            docker cp "$id:/app/gitea/gitea" "$out"
-            docker rm "$id" >/dev/null
-            chmod 755 "$out"
+            install -m 755 "$ROOTFS/linux_$arch/app/gitea/gitea" "$out"
           done
           # The runner is amd64: that binary must start and report the version.
           reported=$("dist/forgejo-${VERSION#v}-linux-amd64" --version)
@@ -163,6 +176,8 @@ jobs:
             *"$FILE_VERSION"*) ;;
             *) echo "::error::the binary does not report $FILE_VERSION" >&2; exit 1 ;;
           esac
+          # And the arm64 one must be an arm64 executable.
+          file "dist/forgejo-${VERSION#v}-linux-arm64" | tee /dev/stderr | grep -q 'ARM aarch64'
           (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
 
       - name: Tag and release
