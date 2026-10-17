@@ -387,3 +387,34 @@ func TestObserverPrunesOnlyProtectedOldCheckpoints(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, refs)
 }
+
+// A gap in the archive is not waited out: after gapPasses passes the base
+// held does not cover, a new base backup is taken, and the next
+// checkpoint is covered from it.
+func TestObserverTakesANewBaseAfterAGap(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+
+	// A segment is lost from the archive before the observer copied it.
+	c.push("alice/demo.git", "refs/heads/main", c.commit("lost"))
+	c.pg.switchWAL()
+	for name := range c.pg.archive {
+		if !o.store.haveWAL(name) && !strings.HasSuffix(name, ".history") {
+			delete(c.pg.archive, name)
+		}
+	}
+	c.checkpoint()
+	for range gapPasses - 1 {
+		require.ErrorIs(t, o.Step(ctx), ErrNoCoverage)
+	}
+	require.Len(t, o.State().Bases, 1)
+	require.ErrorIs(t, o.Step(ctx), ErrNoCoverage)
+	require.Len(t, o.State().Bases, 2, "a new base after the gap")
+	c.push("alice/demo.git", "refs/heads/main", c.commit("after the gap"))
+	c.checkpoint()
+	require.NoError(t, o.Step(ctx))
+	assert.Len(t, o.State().Checkpoints, 2)
+}

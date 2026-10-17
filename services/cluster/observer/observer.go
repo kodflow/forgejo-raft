@@ -80,7 +80,14 @@ type Observer struct {
 	// slots is the round-robin order of the endpoints.
 	slots []string
 	next  int
+	// uncovered counts the passes whose checkpoint the newest base did not
+	// reach: past gapPasses, the WAL has a gap, not a lag.
+	uncovered int
 }
+
+// gapPasses is how many passes a base backup may fail to cover before the
+// observer takes a new one: any gap in the archive forces a new base.
+const gapPasses = 20
 
 // The refusals that stop ingestion until a human acts.
 var (
@@ -823,12 +830,15 @@ func (o *Observer) coverPG(ctx context.Context, leader string, cp clusterhook.Ex
 	}
 	cov, err := Cover(o.state.Bases, cp.SystemID, target, cp.Timeline, cp.WALSegmentSize, o.store.haveWAL, o.store.history, o.store.abandoned())
 	if err == nil {
+		o.uncovered = 0
 		return cov, nil
 	}
 	if !errors.Is(err, ErrNoCoverage) {
 		return Coverage{}, err
 	}
-	if o.needsBase(cp.SystemID) {
+	o.uncovered++
+	if o.needsBase(cp.SystemID) || o.uncovered >= gapPasses {
+		o.uncovered = 0
 		o.state.Rebootstrap = "taking a base backup: " + err.Error()
 		if berr := o.fetchBase(ctx, leader); berr != nil {
 			return Coverage{}, fmt.Errorf("%w; the base backup failed: %w", err, berr)
