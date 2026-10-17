@@ -5,10 +5,13 @@ package webhook
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"time"
 
 	"forgejo.org/models/db"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/json"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/setting"
@@ -118,8 +121,28 @@ func HookTasks(ctx context.Context, hookID int64, page int) ([]*HookTask, error)
 
 // CreateHookTask creates a new hook task,
 // it handles conversion from Payload to PayloadContent.
+// clusterTaskNamespace scopes the derived identities of hook tasks.
+var clusterTaskNamespace = gouuid.MustParse("6f1c6c1e-6a0e-5a4f-9b1d-0152c0457a5c")
+
 func CreateHookTask(ctx context.Context, t *HookTask) (*HookTask, error) {
 	t.UUID = gouuid.New().String()
+	// Under a replicated command, the task's identity is derived from the
+	// command's, the hook, the event and the payload, so the log consumer
+	// replaying a command after a failover finds the task instead of
+	// creating a second, while one command that emits several events of a
+	// kind (closing several pull requests or issues) keeps each of them.
+	if id, ok := clusterhook.CommandIdentity(ctx); ok {
+		payload := sha256.Sum256([]byte(t.PayloadContent))
+		t.UUID = gouuid.NewSHA1(clusterTaskNamespace, fmt.Appendf(nil, "%s|%d|%s|%x", id, t.HookID, t.EventType, payload)).String()
+		existing := &HookTask{}
+		has, err := db.GetEngine(ctx).Where("uuid = ?", t.UUID).Get(existing)
+		if err != nil {
+			return nil, err
+		}
+		if has {
+			return existing, nil
+		}
+	}
 	if t.Delivered == 0 {
 		t.Delivered = timeutil.TimeStampNanoNow()
 	}

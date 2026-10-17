@@ -5,6 +5,7 @@ package healthcheck
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"time"
@@ -14,6 +15,8 @@ import (
 	"forgejo.org/modules/json"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/setting"
+	cluster_service "forgejo.org/services/cluster"
+	"forgejo.org/services/cluster/consensus"
 )
 
 type status string
@@ -76,6 +79,9 @@ func Check(w http.ResponseWriter, r *http.Request) {
 		statuses = append(statuses, checkDatabase(r.Context(), rsp.Checks))
 		statuses = append(statuses, checkCache(rsp.Checks))
 	}
+	if r := cluster_service.Current(); r != nil {
+		statuses = append(statuses, checkCluster(r, rsp.Checks))
+	}
 	for _, s := range statuses {
 		if s != Pass {
 			rsp.Status = Fail
@@ -132,6 +138,36 @@ func checkCache(checks checks) status {
 		st.Time = getCheckTime()
 	}
 	checks["cache:ping"] = []componentStatus{st}
+	return st.Status
+}
+
+// checkCluster reports ready only when the replicator is ready: engine
+// ready, table rebuilt, projection caught up once since the start (kitsunium
+// ADR 0152 D19, R4-18). The failure tolerance, the rolling update's gate
+// (R7-45), is known by the leader alone: the leader warns below one, a
+// follower reports its own readiness and whether it knows a leader.
+func checkCluster(r *cluster_service.Replicator, checks checks) status {
+	st := componentStatus{Status: Pass, Time: getCheckTime()}
+	if !r.Ready() {
+		st.Status, st.Output = Fail, "the replicator is not ready"
+	}
+	checks["cluster:ready"] = []componentStatus{st}
+	ft := componentStatus{Status: Pass, Time: getCheckTime()}
+	if eng := r.Engine(); eng != nil {
+		h := eng.Health()
+		if h.Role == consensus.RoleLeader {
+			ft.Output = fmt.Sprintf("role=leader failure_tolerance=%d", h.FailureTolerance)
+			if h.FailureTolerance < 1 {
+				ft.Status = warn
+			}
+		} else {
+			ft.Output = fmt.Sprintf("role=%s leader_known=%t", h.Role, h.LeaderKnown)
+			if !h.LeaderKnown {
+				ft.Status = warn
+			}
+		}
+	}
+	checks["cluster:failure_tolerance"] = []componentStatus{ft}
 	return st.Status
 }
 

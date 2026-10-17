@@ -20,6 +20,7 @@ import (
 	repo_model "forgejo.org/models/repo"
 	system_model "forgejo.org/models/system"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/eventsource"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/setting"
@@ -165,9 +166,25 @@ func renameUser(ctx context.Context, u *user_model.User, newUserName string, doe
 		return fmt.Errorf("rename user directory: %w", err)
 	}
 
+	// In a cluster, every repository of the owner moves in the replicated
+	// table too; the directory is moved back when the members cannot follow.
+	if err = clusterhook.OwnerRenamed(ctx, oldUserName, newUserName); err != nil {
+		u.Name = oldUserName
+		u.LowerName = strings.ToLower(oldUserName)
+		if err2 := util.Rename(user_model.UserPath(newUserName), user_model.UserPath(oldUserName)); err2 != nil && !os.IsNotExist(err2) {
+			log.Critical("Unable to rollback directory change during a refused cluster rename from %s to %s: %v", oldUserName, newUserName, err2)
+		}
+		return fmt.Errorf("rename user in the cluster: %w", err)
+	}
+
 	if err = committer.Commit(); err != nil {
 		u.Name = oldUserName
 		u.LowerName = strings.ToLower(oldUserName)
+		// The cluster already moved the owner's repositories: move them
+		// back before the directory, so every member follows the database.
+		if err2 := clusterhook.UndoOwnerRenamed(ctx, oldUserName, newUserName); err2 != nil {
+			log.Critical("Unable to move the repositories of %s back in the cluster after a failed rename: %v; run `forgejo cluster reconcile`", oldUserName, err2)
+		}
 		if err2 := util.Rename(user_model.UserPath(newUserName), user_model.UserPath(oldUserName)); err2 != nil && !os.IsNotExist(err2) {
 			log.Critical("Unable to rollback directory change during failed username change from: %s to: %s. DB Error: %v. Filesystem Error: %v", oldUserName, newUserName, err, err2)
 			return fmt.Errorf("failed to rollback directory change during failed username change from: %s to: %s. DB Error: %w. Filesystem Error: %v", oldUserName, newUserName, err, err2)

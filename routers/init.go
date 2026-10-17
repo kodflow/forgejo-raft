@@ -36,6 +36,7 @@ import (
 	auth_method "forgejo.org/services/auth/method"
 	"forgejo.org/services/auth/source/oauth2"
 	"forgejo.org/services/automerge"
+	cluster_service "forgejo.org/services/cluster"
 	"forgejo.org/services/cron"
 	federation_service "forgejo.org/services/federation"
 	feed_service "forgejo.org/services/feed"
@@ -114,6 +115,10 @@ func InitWebInstalled(ctx context.Context) {
 	setting.LoadSettings()
 	mustInit(storage.Init)
 
+	// The ref replicator starts before the database and does not depend on
+	// it: a node keeps its place in the consensus while PostgreSQL fails over.
+	mustInitCtx(ctx, cluster_service.Init)
+
 	mailer.NewContext(ctx)
 	mustInit(cache.Init)
 	mustInit(feed_service.Init)
@@ -141,6 +146,7 @@ func InitWebInstalled(ctx context.Context) {
 	mustInitCtx(ctx, models.Init)
 	mustInitCtx(ctx, auth_model.Init)
 	mustInitCtx(ctx, repo_service.Init)
+	mustInitCtx(ctx, cluster_service.SeedOperators)
 
 	// Booting long running goroutines.
 	mustInit(indexer_service.Init)

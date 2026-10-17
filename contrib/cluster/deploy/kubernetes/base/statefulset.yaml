@@ -1,0 +1,143 @@
+# The StatefulSet template: one replica, one slot. The kustomizations in
+# ../node-a/, ../node-b/ and ../node-c/ make one StatefulSet per slot from it, each
+# with its slot label and its own certificate Secret. See common.yaml for
+# the layout and the founding steps.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: forgejo-raft
+  namespace: forgejo-raft
+spec:
+  serviceName: forgejo-raft-consensus
+  replicas: 1
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: forgejo-raft
+      forgejo-raft/slot: SLOT
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: forgejo-raft
+        forgejo-raft/slot: SLOT
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: forgejo-raft
+              topologyKey: kubernetes.io/hostname
+      # Long enough for a leader to hand leadership over on SIGTERM.
+      terminationGracePeriodSeconds: 90
+      initContainers:
+        - name: cluster-init
+          image: registry.example.com/forgejo-raft@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          command: ["/bin/bash", "/etc/forgejo-raft/scripts/cluster-init.sh"]
+          envFrom:
+            - configMapRef:
+                name: forgejo-raft-env
+          env: &node-env
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # The slot is the StatefulSet's label, the one its Certificate names.
+            - name: FORGEJO__cluster__SLOT
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['forgejo-raft/slot']
+            - name: FORGEJO__cluster__LISTEN_ADDR
+              value: $(POD_NAME).forgejo-raft-consensus:7480
+            - name: FORGEJO__cluster__TLS_CERT_FILE
+              value: /etc/forgejo-raft/tls/tls.crt
+            - name: FORGEJO__cluster__TLS_KEY_FILE
+              value: /etc/forgejo-raft/tls/tls.key
+            - name: FORGEJO__cluster__TLS_CA_FILE
+              value: /etc/forgejo-raft/tls/ca.crt
+            - name: FORGEJO__database__HOST
+              valueFrom:
+                secretKeyRef: {name: forgejo-raft-db, key: host}
+            - name: FORGEJO__database__PASSWD
+              valueFrom:
+                secretKeyRef: {name: forgejo-raft-db, key: password}
+            - name: FORGEJO__security__SECRET_KEY
+              valueFrom:
+                secretKeyRef: {name: forgejo-raft-db, key: secret-key}
+          volumeMounts: &node-mounts
+            - name: data
+              mountPath: /data
+            - name: tls
+              mountPath: /etc/forgejo-raft/tls
+              readOnly: true
+            - name: scripts
+              mountPath: /etc/forgejo-raft/scripts
+              readOnly: true
+            - name: members
+              mountPath: /etc/forgejo-raft/members
+              readOnly: true
+        - name: witness-check
+          image: registry.example.com/forgejo-raft@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          command: ["/bin/bash", "/etc/forgejo-raft/scripts/witness-check.sh"]
+          envFrom:
+            - configMapRef:
+                name: forgejo-raft-env
+          env: *node-env
+          volumeMounts: *node-mounts
+      containers:
+        - name: forgejo
+          image: registry.example.com/forgejo-raft@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          # The image's entrypoint renders app.ini, then runs Forgejo as git.
+          envFrom:
+            - configMapRef:
+                name: forgejo-raft-env
+          env: *node-env
+          ports:
+            - name: http
+              containerPort: 3000
+            - name: consensus
+              containerPort: 7480
+            - name: objects
+              containerPort: 7481
+          readinessProbe:
+            httpGet:
+              path: /api/healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests: {cpu: 500m, memory: 1Gi}
+            limits: {memory: 2Gi}
+          volumeMounts: *node-mounts
+      volumes:
+        # This slot's certificate Secret alone: the per-slot kustomization
+        # sets its name.
+        - name: tls
+          secret:
+            secretName: SLOT-TLS
+            defaultMode: 0440
+        - name: scripts
+          configMap:
+            name: forgejo-raft-scripts
+        - name: members
+          configMap:
+            name: forgejo-raft-members
+            optional: true
+      securityContext:
+        # The image starts as root and drops to the git user (uid 1000);
+        # the volumes are handed to that group.
+        fsGroup: 1000
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 50Gi

@@ -1,0 +1,51 @@
+{{template "admin/layout_head" (dict "ctxData" . "pageClass" "admin cluster")}}
+<div class="admin-setting-content">
+	<h4 class="ui top attached header">{{ctx.Locale.Tr "admin.cluster.confirm_title"}}</h4>
+	<div class="ui attached segment">
+		<div class="ui warning message">
+			<p>{{ctx.Locale.Tr (printf "admin.cluster.op.%s.warning" .Operation.Action)}}</p>
+			<p>{{ctx.Locale.Tr "admin.cluster.confirm_any_node"}}</p>
+		</div>
+		<dl class="admin-dl-horizontal">
+			<dt>{{ctx.Locale.Tr "admin.cluster.action"}}</dt><dd>{{ctx.Locale.Tr (printf "admin.cluster.op.%s" .Operation.Action)}}</dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.target"}}</dt><dd><code>{{.Operation.Target}}</code>{{if .Operation.Address}} → <code>{{.Operation.Address}}</code>{{end}}</dd>
+		</dl>
+		<form class="ui form" method="post" action="{{AppSubUrl}}/admin/cluster/operate/confirm" autocomplete="off">
+			<input type="hidden" name="action" value="{{.Operation.Action}}">
+			<input type="hidden" name="target" value="{{.Operation.Target}}">
+			<input type="hidden" name="address" value="{{.Operation.Address}}">
+			<div class="required field {{if .Err_Confirm}}error{{end}}">
+				<label for="cluster-confirm">{{ctx.Locale.Tr "admin.cluster.type_to_confirm" .ConfirmWord}}</label>
+				<input id="cluster-confirm" name="confirm" required autofocus>
+			</div>
+			{{if and .NeedStepUp .StepUpBlocked}}
+				<div class="ui error message">{{ctx.Locale.Tr "admin.cluster.op.step_up_oidc_unavailable"}}</div>
+			{{else if and .NeedStepUp .StepUpOIDC}}
+				<div class="ui info message">{{ctx.Locale.Tr "admin.cluster.step_up_oidc" .StepUpOIDC}}</div>
+			{{else if .NeedStepUp}}
+				{{if .HasPassword}}
+				<div class="required field {{if .Err_Password}}error{{end}}">
+					<label for="cluster-password">{{ctx.Locale.Tr "admin.cluster.step_up_password"}}</label>
+					<input id="cluster-password" name="password" type="password" required autocomplete="current-password">
+				</div>
+				{{if .NeedPasscode}}
+				<div class="required field {{if .Err_Password}}error{{end}}">
+					<label for="cluster-passcode">{{ctx.Locale.Tr "admin.cluster.step_up_passcode"}}</label>
+					<input id="cluster-passcode" name="passcode" required inputmode="numeric" autocomplete="one-time-code">
+				</div>
+				{{end}}
+				{{else}}
+				<div class="ui error message">{{ctx.Locale.Tr "admin.cluster.op.step_up_no_password"}}</div>
+				{{end}}
+			{{end}}
+			{{if and .NeedStepUp .StepUpBlocked}}
+			{{else if and .NeedStepUp .StepUpOIDC}}
+			<button class="ui primary button" formaction="{{AppSubUrl}}/admin/cluster/stepup" formnovalidate>{{ctx.Locale.Tr "admin.cluster.step_up_oidc_button" .StepUpOIDC}}</button>
+			{{else}}
+			<button class="ui red button">{{ctx.Locale.Tr "admin.cluster.confirm_button"}}</button>
+			{{end}}
+			<a class="ui button" href="{{AppSubUrl}}/admin/cluster">{{ctx.Locale.Tr "cancel"}}</a>
+		</form>
+	</div>
+</div>
+{{template "admin/layout_footer" .}}

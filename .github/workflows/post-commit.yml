@@ -1,0 +1,206 @@
+# post-commit — mandatory merge gate.
+#
+# No AI attribution anywhere in the history, conventional commit subjects,
+# no credentials added. Every rule — and what happens to a pull request that
+# fails them — lives in kodflow/post-commit. The gate is pinned to @main on
+# purpose: it holds contents: read only, and a fix there is live here on the
+# next run with no change to this file. Do not pin it, and do not copy the
+# logic into this repo.
+#
+# The job MUST stay named `post-commit`: that is the status the branch
+# ruleset requires, so renaming it or deleting this file leaves the required
+# status unreported and blocks every merge. It is also why this is not a
+# reusable workflow: a called job reports as `<caller> / <job>`, never as
+# `post-commit`, and from any owner but kodflow it could not reach that
+# owner's self-hosted runners at all.
+#
+# `runs-on:` is the only thing allowed to differ between repositories. A private
+# repository runs both jobs on its owner's self-hosted runner, set centrally in
+# RUNNER_OVERRIDES of kodflow/post-commit/scripts/enforce.sh; a public one stays
+# on ubuntu-latest, because a self-hosted runner there would run strangers'
+# pull requests on the fleet.
+#
+# forgejo-raft deviates from the central stub in the places marked
+# "forgejo-raft:" below, and nowhere else. This repository is a fork of
+# Forgejo, so its history is upstream's: tens of thousands of commits by other
+# authors, which no `authors:` list and no ten-minute walk of the full history
+# can pass. The same job also carries the cluster's build, vet, race tests and
+# lint, so the one required status `post-commit` fails when either the gate or
+# the cluster does. A separate job chained with `needs:` would report under its
+# own name, which the ruleset does not require.
+name: post-commit
+
+on:
+  pull_request:
+    # ready_for_review matters: a failed run puts the pull request back into
+    # draft, so marking it ready is how you ask for another verdict.
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    # forgejo-raft: the default branch is `forgejo`.
+    branches: [main, master, forgejo]
+  # The verdict can change without this repository changing — a new rule, or a
+  # rewritten history — so a quiet repository can be asked on demand.
+  workflow_dispatch:
+
+# One verdict at a time, one group per pull request (github.ref is
+# refs/pull/<n>/merge there; head_ref would collide across forks). Without it
+# a stale failure could draft a pull request a newer commit already fixed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# forgejo-raft: the cluster's scope. Upstream's own CI lives in
+# .forgejo/workflows and does not run here; this one stays bounded to the
+# replicated-cluster code, so a merge from Codeberg passes it as long as it
+# leaves that code building and green.
+env:
+  TAGS: sqlite sqlite_unlock_notify
+  SCOPE: >-
+    ./services/cluster/...
+    ./routers/web/admin/
+    ./cmd/
+    ./modules/setting/
+    ./services/webhook/
+    ./modules/clusterhook/
+    ./models/cluster/
+
+jobs:
+  post-commit:
+    runs-on: ubuntu-latest
+    # forgejo-raft: 30, not 10. The race tests of the cluster run in this job.
+    timeout-minutes: 30
+    # Job outputs survive a failed job, which is the only case that needs them.
+    outputs:
+      report: ${{ steps.gate.outputs.report }}
+    steps:
+      - uses: kodflow/post-commit@main
+        id: gate
+        # forgejo-raft: pull requests only. A push or a manual run makes the
+        # action scan every branch and tag, which here is upstream's history.
+        # forgejo-raft: and never on the upstream sync PR, whose head is this
+        # repository's `forgejo` branch (BRANCH in sync-upstream.yml): its
+        # commits are Codeberg's, by other authors, and could never pass
+        # `authors:`. The cluster's checks below still run on it.
+        if: >-
+          ${{ github.event_name == 'pull_request'
+              && !(github.head_ref == 'forgejo'
+                   && github.event.pull_request.head.repo.full_name == github.repository) }}
+        with:
+          # One human commits across the whole fleet, as this account.
+          authors: kodflow
+          # forgejo-raft: the pull request's own commits, not its ancestry,
+          # which is upstream Forgejo's and could never pass `authors:`.
+          history: range
+
+      # forgejo-raft: the cluster's checks, from here to the end of the job.
+      # The gate's checkout above is the pull request's head; this one is the
+      # merge commit GitHub would produce, which is what the cluster must
+      # build against.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The lint's baseline is a merge base or the push's previous commit.
+          fetch-depth: 0
+          # No later step authenticates to git: the token stays out of it.
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build -tags "$TAGS" ./...
+
+      - name: Vet the cluster scope
+        run: |
+          # shellcheck disable=SC2086 # the scope is a list of packages
+          go vet -tags "$TAGS" $SCOPE
+
+      - name: Race tests of the cluster scope
+        run: |
+          # shellcheck disable=SC2086 # the scope is a list of packages
+          go test -race -timeout 20m -count=1 -tags "$TAGS" $SCOPE
+
+      # The baseline is computed here, not by the action's only-new-issues:
+      # that one fetches the pull request's patch from the API, which GitHub
+      # refuses past 20000 lines, and then lints whole packages, upstream
+      # Forgejo's own issues included. --new-from-rev diffs locally instead.
+      - name: Baseline of the lint
+        id: baseline
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          head=$(git rev-parse HEAD)
+          case "$EVENT" in
+            pull_request) rev=$(git merge-base "origin/$BASE_REF" HEAD) ;;
+            push)
+              # A force-push replaces several commits: the baseline is the
+              # common ancestor of the old and new tips, so every replacing
+              # commit is linted. The old tip is no longer referenced once
+              # replaced, so it is fetched by its SHA (the repository is
+              # public). Without it, the run fails rather than lint less.
+              if [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then
+                echo "::error::no previous commit for this push, no baseline" >&2
+                exit 1
+              fi
+              git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+                || git fetch --no-tags origin "$BEFORE" \
+                || { echo "::error::previous commit $BEFORE unavailable" >&2; exit 1; }
+              rev=$(git merge-base "$BEFORE" HEAD) ;;
+            *)
+              rev=$(git merge-base origin/forgejo HEAD)
+              # A manual run on forgejo itself has no older baseline than its
+              # own tip: it checks the last commit.
+              if [ "$rev" = "$head" ]; then rev=$(git rev-parse HEAD~1); fi ;;
+          esac
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - name: Lint the cluster scope (new issues only)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.14.0
+          args: >-
+            --build-tags=sqlite,sqlite_unlock_notify
+            --new-from-rev=${{ steps.baseline.outputs.rev }}
+            ./services/cluster/...
+            ./routers/web/admin/
+            ./cmd/
+            ./modules/setting/
+            ./services/webhook/
+            ./modules/clusterhook/
+            ./models/cluster/
+
+  # A fallback, not a gate: a failed run puts the pull request back into draft
+  # and comments the verdict. Where a ruleset requires the status this is
+  # redundant; where GitHub refuses one (a private repo in a Free-plan org) it
+  # raises the cost of merging a failing history, it does not prevent it.
+  #
+  # A separate job so the gate above never holds a write token. The `if:` must
+  # stay here: a job that does not start is what keeps `pull-requests: write`
+  # away from push, manual and fork runs (a fork gets a read-only token anyway,
+  # so it is skipped rather than failing on a grant that cannot happen).
+  #
+  # And pinned to a commit, unlike the gate: this is the one job holding a
+  # write token, and @main would hand it to whatever @main becomes. The pin
+  # moves only through kodflow/post-commit's scripts/bump-block-merge.sh and a
+  # reviewed change to the central stub, which enforce.sh then rolls out.
+  block-merge:
+    needs: post-commit
+    if: >-
+      ${{ failure()
+          && github.event_name == 'pull_request'
+          && github.event.pull_request.draft == false
+          && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: kodflow/post-commit/block-merge@db14679a9662f4224ba8d99d189f100733f1da9e  # 2026-09-30
+        with:
+          report: ${{ needs['post-commit'].outputs.report }}

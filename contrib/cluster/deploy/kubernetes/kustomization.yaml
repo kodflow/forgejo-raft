@@ -1,0 +1,9 @@
+# kubectl apply -k .  (see common.yaml)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - common.yaml
+  - certificates.yaml
+  - node-a
+  - node-b
+  - node-c

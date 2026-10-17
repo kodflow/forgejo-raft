@@ -10,11 +10,13 @@ import (
 	"html/template"
 	"net/http"
 	"strings"
+	"time"
 
 	"forgejo.org/models/db"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
 	webhook_model "forgejo.org/models/webhook"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/graceful"
 	"forgejo.org/modules/log"
@@ -132,8 +134,35 @@ func handler(items ...int64) []int64 {
 	return nil
 }
 
+// enqueueRetries bounds how long a committed task's enqueue is retried; the
+// startup scan of undelivered tasks remains the last resort.
+var enqueueRetries = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}
+
+// enqueueCommitted queues a task whose row is already committed. A failure
+// is retried in the background: the transaction that created the task, and
+// the cluster consumer's cursor with it, cannot be replayed to queue it again.
+func enqueueCommitted(taskID int64) {
+	err := enqueueHookTask(taskID)
+	if err == nil {
+		return
+	}
+	log.Warn("enqueue webhook task %d: %v; retrying", taskID, err)
+	go func() {
+		for _, wait := range enqueueRetries {
+			time.Sleep(wait)
+			if err = enqueueHookTask(taskID); err == nil {
+				return
+			}
+		}
+		log.Error("enqueue webhook task %d: %v; it is delivered at the next start", taskID, err)
+	}()
+}
+
+// pushHookTask puts a task id in the delivery queue; tests replace it.
+var pushHookTask = func(taskID int64) error { return hookQueue.Push(taskID) }
+
 func enqueueHookTask(taskID int64) error {
-	err := hookQueue.Push(taskID)
+	err := pushHookTask(taskID)
 	if err != nil && err != queue.ErrAlreadyInQueue {
 		return err
 	}
@@ -206,7 +235,7 @@ func PrepareWebhook(ctx context.Context, w *webhook_model.Webhook, event webhook
 		return fmt.Errorf("CreateHookTask for %s: %w", event, err)
 	}
 
-	return enqueueHookTask(task.ID)
+	return enqueueAfterCommit(ctx, task.ID)
 }
 
 // PrepareTestWebhook creates a hook task for test delivery and enqueues it for processing.
@@ -232,7 +261,7 @@ func PrepareTestWebhook(ctx context.Context, w *webhook_model.Webhook, p api.Pay
 		return fmt.Errorf("CreateHookTask for Test: %w", err)
 	}
 
-	return enqueueHookTask(task.ID)
+	return enqueueAfterCommit(ctx, task.ID)
 }
 
 // PrepareWebhooks adds new webhooks to task queue for given payload.
@@ -292,5 +321,26 @@ func ReplayHookTask(ctx context.Context, w *webhook_model.Webhook, uuid string) 
 		return err
 	}
 
-	return enqueueHookTask(task.ID)
+	return enqueueAfterCommit(ctx, task.ID)
+}
+
+// enqueueAfterCommit queues a task for delivery once the transaction that
+// created it commits, so a worker never looks for a task not yet visible:
+// the cluster's log consumer creates tasks inside the transaction that also
+// moves its cursor. Outside a transaction it queues at once.
+func enqueueAfterCommit(ctx context.Context, taskID int64) error {
+	if clusterhook.Collecting(ctx) {
+		// The cluster's consumer runs it once its batch committed.
+		clusterhook.Defer(ctx, func() { enqueueCommitted(taskID) })
+		return nil
+	}
+	if !db.InTransaction(ctx) {
+		return enqueueHookTask(taskID)
+	}
+	db.AfterTx(ctx, func() {
+		if err := enqueueHookTask(taskID); err != nil {
+			log.Error("enqueue webhook task %d: %v", taskID, err)
+		}
+	})
+	return nil
 }
