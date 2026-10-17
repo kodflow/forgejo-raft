@@ -1,0 +1,92 @@
+# forgejo-raft on Kubernetes: the consensus certificates, with cert-manager.
+#
+# Every member authenticates every other one by mutual TLS. A member's
+# certificate carries exactly ONE URI SAN,
+#
+#   kitsunium-consensus://<CLUSTER_ID>/slot/<slot>
+#
+# and both the server and client usages. On top of the CA, each member is
+# pinned on its public key (SPKI) in the replicated membership: renewing
+# the certificate must keep the key. Hence privateKey.rotationPolicy: Never.
+#
+# Before applying:
+#   - draw the cluster id once, `openssl rand -hex 16`, and replace
+#     0123456789abcdef0123456789abcdef below and in forgejo-raft.yaml;
+#   - create the CA Secret (a dedicated CA, used for nothing else):
+#       kubectl -n forgejo-raft create secret tls forgejo-raft-ca \
+#         --cert=ca.pem --key=ca.key
+#     or replace the Issuer with your own (Vault issuer, an intermediate).
+#
+# The slots are node-a, node-b and node-c, one StatefulSet each; each
+# Secret is mounted by its slot's pod only. Adding a member means a new
+# slot: a Certificate and a kustomization like node-a/.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: forgejo-raft-ca
+  namespace: forgejo-raft
+spec:
+  ca:
+    secretName: forgejo-raft-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: forgejo-raft-node-a
+  namespace: forgejo-raft
+spec:
+  secretName: forgejo-raft-node-a-tls
+  issuerRef:
+    kind: Issuer
+    name: forgejo-raft-ca
+  # No common name, no DNS name: the URI SAN is the identity.
+  uris:
+    - kitsunium-consensus://0123456789abcdef0123456789abcdef/slot/node-a
+  usages: [digital signature, server auth, client auth]
+  duration: 720h
+  renewBefore: 240h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    # The member is pinned on this key: never draw a new one on renewal.
+    rotationPolicy: Never
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: forgejo-raft-node-b
+  namespace: forgejo-raft
+spec:
+  secretName: forgejo-raft-node-b-tls
+  issuerRef:
+    kind: Issuer
+    name: forgejo-raft-ca
+  uris:
+    - kitsunium-consensus://0123456789abcdef0123456789abcdef/slot/node-b
+  usages: [digital signature, server auth, client auth]
+  duration: 720h
+  renewBefore: 240h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: forgejo-raft-node-c
+  namespace: forgejo-raft
+spec:
+  secretName: forgejo-raft-node-c-tls
+  issuerRef:
+    kind: Issuer
+    name: forgejo-raft-ca
+  uris:
+    - kitsunium-consensus://0123456789abcdef0123456789abcdef/slot/node-c
+  usages: [digital signature, server auth, client auth]
+  duration: 720h
+  renewBefore: 240h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
