@@ -218,7 +218,7 @@ request into `forgejo`, every push to it, nightly and on demand. It lays
 - LFS, attachments, avatars and archives on one volume every node mounts
   (the cluster does not replicate non-git files);
 - Forgejo's own SSH server (127.0.0.1:2221 to 2223) and a webhook receiver
-  (`ci/receiver.py`, 10.89.0.80:8080).
+  (`ci/receiver.py`, 10.89.0.85:8080).
 
 Each job brings up its own lab and runs one suite of `scripts/ci/`, which
 prints one `CHECK <name>: PASS|FAIL` line per checkpoint:

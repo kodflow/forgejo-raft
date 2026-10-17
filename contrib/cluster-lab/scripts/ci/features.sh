@@ -21,6 +21,13 @@ as_user() { local TOKEN="$USER_TOKEN"; "$@"; }
 json() { api "$1" GET "$2" | jq -r "$3"; }
 deliveries() { dc exec -T receiver cat "$RECEIVER_FILE" 2>/dev/null; }
 git_q() { git -c user.name=e2e -c user.email=e2e@lab.invalid "$@"; }
+# branch_row <node> <branch> <sha>: the node's API shows the branch at sha.
+# Branch rows derive from a push asynchronously, written by the cluster's
+# consumer on the leader.
+branch_row() { [ "$(json "$1" "/repos/$REPO/branches/$2" .commit.id 2>/dev/null)" = "$3" ]; }
+# Git's global configuration for this run only (git lfs install writes it).
+export GIT_CONFIG_GLOBAL="$WORK/gitconfig"
+: >"$GIT_CONFIG_GLOBAL"
 
 say "C0. Every node ready"
 for n in 1 2 3; do poll 180 healthy "$n" || flunk C.node-ready "forgejo-$n"; done
@@ -94,10 +101,16 @@ for n in 2 3; do
   fi
 done
 
+if poll 30 branch_row 2 main "$MAIN"; then
+  pass C.branch-row-after-push "node 2's API shows main ${POLL_TOOK}s after the push to node 1"
+else
+  flunk C.branch-row-after-push "node 2's API: $(json 2 "/repos/$REPO/branches/main" .commit.id 2>&1 | tail -n 1)"
+fi
+
 say "C4. Branch, tag, branch deletion"
 if api 2 POST "/repos/$REPO/branches" '{"new_branch_name":"api-branch","old_branch_name":"main"}' >/dev/null &&
   poll 10 serves 3 "$REPO" refs/heads/api-branch "$MAIN" &&
-  [ "$(json 1 "/repos/$REPO/branches/api-branch" .commit.id)" = "$MAIN" ]; then
+  poll 30 branch_row 1 api-branch "$MAIN"; then
   pass C.branch-created "through the API on node 2, served by node 3 over git and node 1 over the API"
 else
   flunk C.branch-created
@@ -111,7 +124,7 @@ else
 fi
 if [ "$(api_code 1 DELETE "/repos/$REPO/branches/api-branch")" = 204 ] &&
   poll 10 bash -c "[ -z \"\$(git ls-remote '$(remote 2 "$REPO")' refs/heads/api-branch)\" ]" &&
-  [ "$(api_code 3 GET "/repos/$REPO/branches/api-branch")" = 404 ]; then
+  poll 30 bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: token $TOKEN' '$(node_url 3)/api/v1/repos/$REPO/branches/api-branch')\" = 404 ]"; then
   pass C.branch-deleted "on node 1, gone from node 2 over git and node 3 over the API"
 else
   flunk C.branch-deleted
@@ -140,7 +153,7 @@ else
 fi
 
 say "C6. Webhook, exactly once"
-hook="$(jq -nc '{type:"forgejo", active:true, events:["push","issues"], config:{url:"http://10.89.0.80:8080/hook", content_type:"json"}}')"
+hook="$(jq -nc '{type:"forgejo", active:true, events:["push","issues"], config:{url:"http://10.89.0.85:8080/hook", content_type:"json"}}')"
 HOOK_ID="$(api 1 POST "/repos/$REPO/hooks" "$hook" | jq -r .id)"
 if [ -n "$HOOK_ID" ] && [ "$HOOK_ID" != null ] && [ "$(json 2 "/repos/$REPO/hooks/$HOOK_ID" .active)" = true ]; then
   pass C.webhook-created "on node 1, read on node 2"
@@ -178,8 +191,10 @@ git -C "$WORK/src" checkout -q main
 git -C "$WORK/src" checkout -q -b feature
 echo feature >"$WORK/src/feature.txt"
 git -C "$WORK/src" add feature.txt && git_q -C "$WORK/src" commit -qm "a feature"
-if git -C "$WORK/src" push -q "http://$USER_NAME:$USER_TOKEN@127.0.0.1:3001/$REPO.git" feature 2>"$WORK/err"; then
-  pass C.pr-branch-pushed "by $USER_NAME to node 1"
+FEATURE="$(git -C "$WORK/src" rev-parse HEAD)"
+if git -C "$WORK/src" push -q "http://$USER_NAME:$USER_TOKEN@127.0.0.1:3001/$REPO.git" feature 2>"$WORK/err" &&
+  poll 30 branch_row 2 feature "$FEATURE"; then
+  pass C.pr-branch-pushed "by $USER_NAME to node 1, its branch row on node 2 after ${POLL_TOOK}s"
 else
   flunk C.pr-branch-pushed "$(tail -n 2 "$WORK/err" | tr '\n' ' ')"
 fi
@@ -214,6 +229,7 @@ fi
 
 say "C8. LFS"
 if command -v git-lfs >/dev/null 2>&1; then
+  git lfs install --skip-repo >/dev/null
   git -C "$WORK/src" checkout -q main && git -C "$WORK/src" pull -q "$(remote 1 "$REPO")" main 2>/dev/null
   git -C "$WORK/src" lfs install --local >/dev/null
   git -C "$WORK/src" lfs track '*.bin' >/dev/null
@@ -261,7 +277,7 @@ if [ -n "$KEY_ID" ] && [ "$KEY_ID" != null ] && git clone -q "ssh://git@127.0.0.
   [ "$(git -C "$WORK/ssh-2" rev-parse HEAD)" = "$HEAD_NOW" ]; then
   pass C.ssh-clone-node-2 "key added on node 1, clone over SSH from node 2 at ${HEAD_NOW:0:12}"
 else
-  flunk C.ssh-clone-node-2 "$(tail -n 2 "$WORK/err" | tr '\n' ' ')"
+  flunk C.ssh-clone-node-2 "key $KEY_ID, HEAD $(git -C "$WORK/ssh-2" rev-parse --abbrev-ref HEAD 2>/dev/null) at $(git -C "$WORK/ssh-2" rev-parse HEAD 2>/dev/null | cut -c1-12), main on node 1 at ${HEAD_NOW:0:12}: $(tail -n 2 "$WORK/err" | tr '\n' ' ')"
 fi
 if [ -d "$WORK/ssh-2" ]; then
   git -C "$WORK/ssh-2" checkout -q -b ssh-push

@@ -11,7 +11,7 @@
 #   - LFS, attachments, avatars and archives on one volume every node
 #     mounts, as the cluster requires for non-git files (shared storage);
 #   - Forgejo's own SSH server on each node (127.0.0.1:2221 to 2223);
-#   - a webhook receiver (10.89.0.80:8080) that records every delivery.
+#   - a webhook receiver (10.89.0.85:8080) that records every delivery.
 #
 # Use: COMPOSE_FILE=compose.yaml:compose.ci.yaml (absolute paths), which
 # scripts/lib.sh honours.
@@ -106,7 +106,7 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
-    networks: { lab: { ipv4_address: 10.89.0.80 } }
+    networks: { lab: { ipv4_address: 10.89.0.85 } }
 
 networks:
   # Internal: no gateway, so Docker never routes the published ports

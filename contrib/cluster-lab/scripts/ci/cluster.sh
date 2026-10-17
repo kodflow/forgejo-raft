@@ -287,8 +287,10 @@ else
 fi
 if out="$(push "$F" b5-minority)"; then
   flunk B.partition-minority-refuses "the cut-off follower forgejo-$F accepted b5-minority at ${out:0:12}"
-else
+elif clear_refusal; then
   pass B.partition-minority-refuses "forgejo-$F: $(grep -iE 'cluster|quorum|leader|nothing was written' "$WORK/push.err" | head -n 1 | sed 's/^remote: *//' | cut -c1-160)"
+else
+  flunk B.partition-minority-refuses "refused without a clear reason: $(tail -n 2 "$WORK/push.err" | tr '\n' ' ')"
 fi
 reconnect "$F"
 if poll "$CATCH_UP_BOUND" converged 1 2 3 && [ -z "$(ref_sha "$F" "$REPO" refs/heads/b5-minority)" ]; then
@@ -313,8 +315,10 @@ else
 fi
 if out="$(push "$L" b6-minority)"; then
   flunk B.partition-old-leader-refuses "the cut-off old leader forgejo-$L accepted b6-minority at ${out:0:12}"
-else
+elif clear_refusal; then
   pass B.partition-old-leader-refuses "forgejo-$L: $(grep -iE 'cluster|quorum|leader|nothing was written' "$WORK/push.err" | head -n 1 | sed 's/^remote: *//' | cut -c1-160)"
+else
+  flunk B.partition-old-leader-refuses "refused without a clear reason: $(tail -n 2 "$WORK/push.err" | tr '\n' ' ')"
 fi
 reconnect "$L"
 if poll "$CATCH_UP_BOUND" serves "$L" "$REPO" refs/heads/b6-majority "$sha" && poll "$CATCH_UP_BOUND" converged 1 2 3 &&

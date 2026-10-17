@@ -46,7 +46,10 @@ jobs:
 
       # Read by the Makefile in place of git describe: the build has no tags.
       - name: Version file
-        run: printf '0.0.0-e2e-%s+gitea-1.22.0\n' "${GITHUB_SHA::12}" > VERSION
+        run: |
+          v="0.0.0-e2e-${GITHUB_SHA::12}+gitea-1.22.0"
+          printf '%s\n' "$v" > VERSION
+          echo "E2E_VERSION=$v" >> "$GITHUB_ENV"
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -57,6 +60,7 @@ jobs:
           file: Dockerfile
           target: forgejo
           platforms: linux/amd64
+          build-args: RELEASE_VERSION=${{ env.E2E_VERSION }}
           tags: forgejo-cluster-lab/forgejo:raft-cluster
           outputs: type=docker,dest=${{ runner.temp }}/images/forgejo.tar
           cache-from: type=gha,scope=e2e-forgejo
