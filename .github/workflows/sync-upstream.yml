@@ -1,0 +1,127 @@
+# Keeps this repository's `forgejo` branch in step with Codeberg's
+# forgejo/forgejo, and offers upstream changes to the cluster branch through
+# review.
+#
+# - Daily and on demand: fetch codeberg.org/forgejo/forgejo `forgejo` and
+#   merge it into our `forgejo`. Our only extra file is this workflow, and
+#   upstream has no .github directory since 2024-02, so the merge is clean.
+#   On a conflict, or when upstream changes .github/workflows (a push the
+#   GITHUB_TOKEN may not make), the run fails and pushes nothing.
+# - When feat/raft-cluster is behind `forgejo` and a merge would bring it
+#   something, open or update the PR forgejo -> feat/raft-cluster. It is
+#   never merged here, and is merged with a merge commit, never a squash.
+# - A PR opened with the GITHUB_TOKEN starts no workflow: its checks run once
+#   someone pushes to it or closes and reopens it, or with SYNC_TOKEN.
+#
+# Creating that PR with the GITHUB_TOKEN needs the repository setting
+# "Allow GitHub Actions to create and approve pull requests". Without it, set
+# the secret SYNC_TOKEN (a fine-grained token on this repository with
+# Contents and Pull requests read and write), which is then used instead.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Merge and report, push nothing, open no PR
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://codeberg.org/forgejo/forgejo.git
+  UPSTREAM_BRANCH: forgejo
+  BRANCH: forgejo
+  CLUSTER_BRANCH: feat/raft-cluster
+  DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+
+      - name: Merge upstream into forgejo
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          up="$(git rev-parse FETCH_HEAD)"
+          if git merge-base --is-ancestor "$up" HEAD; then
+            echo "forgejo already contains upstream ${up:0:12}"
+            exit 0
+          fi
+          base="$(git merge-base "$up" HEAD)"
+          if ! git diff --quiet "$base" "$up" -- .github/workflows; then
+            echo "::error::upstream changes .github/workflows: the GITHUB_TOKEN may not push it, and our workflow lives there. Merge by hand."
+            git diff --stat "$base" "$up" -- .github/workflows
+            exit 1
+          fi
+          if ! git merge --no-edit --no-ff -m "Merge upstream forgejo/forgejo@${up:0:12}" "$up"; then
+            echo "::error::upstream does not merge cleanly into forgejo; nothing was pushed. Conflicted files:"
+            git diff --name-only --diff-filter=U
+            git merge --abort
+            exit 1
+          fi
+          echo "merged $(git rev-list --count "$base..$up") upstream commits, up to ${up:0:12}"
+          if [ "$DRY_RUN" = true ]; then
+            echo "dry run: not pushed"
+            exit 0
+          fi
+          git push origin "HEAD:refs/heads/$BRANCH"
+
+      - name: Offer forgejo to the cluster branch
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$BRANCH" "$CLUSTER_BRANCH"
+          behind="$(git rev-list --count "origin/$CLUSTER_BRANCH..origin/$BRANCH")"
+          if [ "$behind" = 0 ]; then
+            echo "$CLUSTER_BRANCH already contains $BRANCH"
+            exit 0
+          fi
+          # Ancestry is not enough: after a squash or rebase merge of the
+          # previous sync PR, its commits are never ancestors, yet their
+          # content is in. Nothing to offer when merging forgejo into the
+          # cluster branch would leave its tree unchanged. A conflicting
+          # merge (exit 1) is offered: the PR shows the conflict.
+          if merged="$(git merge-tree --write-tree "origin/$CLUSTER_BRANCH" "origin/$BRANCH")" &&
+            [ "$merged" = "$(git rev-parse "origin/$CLUSTER_BRANCH^{tree}")" ]; then
+            echo "$CLUSTER_BRANCH already holds the content of $BRANCH ($behind commits not ancestors: a squash or rebase merge)"
+            exit 0
+          fi
+          head="$(git rev-parse --short=12 "origin/$BRANCH")"
+          body="$(printf '%s\n\n%s\n\n%s\n\n%s\n' \
+            "Mise à jour amont pour la branche du cluster. \`$CLUSTER_BRANCH\` a $behind commits de retard sur \`$BRANCH\` ($head)." \
+            "Ouverte et tenue à jour par le workflow Sync upstream. Elle n'est jamais fusionnée automatiquement." \
+            "**Fusionner par un commit de fusion** (Create a merge commit), jamais par squash ou rebase, pour que les commits amont deviennent des ancêtres de la branche du cluster." \
+            "Ouverte avec le GITHUB_TOKEN, elle ne déclenche aucun contrôle. Pour les lancer, pousser un commit vide sur la branche ou fermer puis rouvrir la PR (ou fixer le secret SYNC_TOKEN).")"
+          pr="$(gh pr list -R "$REPO" --base "$CLUSTER_BRANCH" --head "$BRANCH" --state open --json number -q '.[0].number // empty')"
+          if [ "$DRY_RUN" = true ]; then
+            echo "dry run: would ${pr:+update PR #$pr}${pr:-open a PR} ($behind commits behind)"
+            exit 0
+          fi
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" -R "$REPO" --body "$body"
+            echo "updated PR #$pr ($behind commits behind)"
+          else
+            gh pr create -R "$REPO" --base "$CLUSTER_BRANCH" --head "$BRANCH" \
+              --title "chore: forgejo amont vers $CLUSTER_BRANCH" --body "$body"
+          fi
