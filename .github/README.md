@@ -9,13 +9,14 @@ push, a merge, a branch deleted from the web UI) goes through a
 majority of the nodes holds it, objects included, on disk. Lose any one
 machine and the forge keeps serving, pushes included, with nothing lost.
 
-> **Status: experimental.** The cluster mode is under review (pull request
-> to the `feat/raft-cluster` branch). It is not part of upstream Forgejo. Read
+> **Status: experimental.** The cluster mode lives on this repository's
+> `forgejo` branch. It is not part of upstream Forgejo. Read
 > [Limits and status](#limits-and-status) before trusting it with data you
 > cannot rebuild.
 
-This repository mirrors upstream Forgejo on its default branch (`forgejo`).
-This page lives in `.github/README.md` so that GitHub shows it while the
+The default branch, `forgejo`, is upstream Forgejo plus the cluster mode.
+Upstream reaches it every day through a pull request from `sync/upstream`,
+which merges itself once the checks are green. This page lives in `.github/README.md` so that GitHub shows it while the
 upstream `README.md` stays untouched and upstream syncs never conflict.
 
 ## Contents
@@ -447,7 +448,7 @@ upgrade.
 
 ## Quick start: the Docker lab
 
-The lab (`contrib/cluster-lab`, branch `feat/raft-cluster-lab`) is a
+The lab (`contrib/cluster-lab`) is a
 disposable, complete setup on one machine: three Consul servers, three
 PostgreSQL 18 under Patroni behind HAProxy, a lab PKI, three Forgejo nodes,
 two witnesses, a development Vault and a development Nomad. About 1.2 GB of
@@ -456,11 +457,9 @@ memory in use, 3.4 GB at most. Docker with Compose v2 is all it needs.
 ```sh
 git clone https://github.com/kodflow/forgejo-raft.git
 cd forgejo-raft
-git worktree add ../forgejo-raft-lab origin/feat/raft-cluster-lab
-git checkout feat/raft-cluster
-cd ../forgejo-raft-lab/contrib/cluster-lab
+cd contrib/cluster-lab
 
-export FORGEJO_SRC="$PWD/../../../forgejo-raft"   # the tree the image is built from
+export FORGEJO_SRC="$PWD/../.."   # the tree the image is built from
 
 make help          # every target
 make up            # build the images, start everything

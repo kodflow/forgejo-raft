@@ -5,6 +5,5 @@ reviews:
   auto_review:
     base_branches:
       - forgejo
-      - feat/raft-cluster
       - "feat/.*"
       - "docs/.*"
