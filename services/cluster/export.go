@@ -89,7 +89,7 @@ func (r *Replicator) serveExport(ctx context.Context, conn net.Conn, req *cluste
 		exportsTotal.WithLabelValues(req.Op, "refused").Inc()
 		a := clusterhook.ExportAnswer{Message: err.Error()}
 		if ee, ok := errors.AsType[*clusterhook.ExportError](err); ok {
-			a.Code, a.Message, a.Leader = ee.Code, ee.Message, ee.Leader
+			a.Code, a.Message, a.Leader, a.Term = ee.Code, ee.Message, ee.Leader, ee.Term
 		}
 		head(a)
 		return
@@ -171,7 +171,7 @@ func (r *Replicator) leaderOnly(eng consensus.Engine) error {
 	if st.Role == consensus.RoleLeader {
 		return nil
 	}
-	e := &clusterhook.ExportError{Code: clusterhook.CodeNotLeader, Message: "this member does not lead; ask the leader"}
+	e := &clusterhook.ExportError{Code: clusterhook.CodeNotLeader, Message: "this member does not lead; ask the leader", Term: st.Term}
 	for _, m := range eng.Membership().Members {
 		if m.ID == st.Leader && st.Leader != 0 {
 			e.Leader = m.Slot

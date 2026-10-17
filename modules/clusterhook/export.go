@@ -77,6 +77,7 @@ type ExportAnswer struct {
 	Code    string  `json:"code,omitempty"`
 	Message string  `json:"message,omitempty"`
 	Leader  string  `json:"leader,omitempty"`
+	Term    uint64  `json:"term,omitempty"`
 	Stream  bool    `json:"stream,omitempty"`
 	Data    RawJSON `json:"data,omitempty"`
 }
@@ -86,8 +87,10 @@ type ExportError struct {
 	Code    string
 	Message string
 	// Leader is the slot of the leader, as the member knows it: a hint
-	// the observer follows only to an endpoint it pins.
+	// the observer follows only to an endpoint it pins. Term is the
+	// member's: a view of an older term comes from a deposed leader.
 	Leader string
+	Term   uint64
 }
 
 func (e *ExportError) Error() string {
