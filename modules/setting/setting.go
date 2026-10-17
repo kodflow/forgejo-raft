@@ -211,6 +211,7 @@ func loadCommonSettingsFrom(cfg ConfigProvider) error {
 	loadQuotaFrom(cfg)
 	loadOtherFrom(cfg)
 	loadCustomFundingProvidersFrom(cfg)
+	loadClusterFrom(cfg)
 	return nil
 }
 
