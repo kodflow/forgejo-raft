@@ -126,6 +126,27 @@ var Cluster = struct {
 	NomadSlotMeta  string
 	// NomadCAFile verifies Nomad's HTTPS certificate (private PKI).
 	NomadCAFile string
+	// Role is "voter" (the default: a member of the cluster) or
+	// "observer": a node that never joins, opens no port and pulls
+	// protected checkpoints from the leader over SSH (observer.go).
+	Role string
+	// Checkpoints, on the members: the coordinator's period (0 is off,
+	// which every member must allow before it is turned on), the PostgreSQL
+	// role that creates restore points, where the leader keeps each
+	// checkpoint's artifacts, and the local WAL archive the export serves.
+	CheckpointInterval time.Duration
+	CheckpointRole     string
+	CheckpointDir      string
+	WALArchiveDir      string
+	// PGBaseBackup is the pg_basebackup binary, PGBaseBackupDSN its
+	// connection string (a replication role, on the members only).
+	PGBaseBackup    string
+	PGBaseBackupDSN string
+	// ObserverRecipients are the observers' X25519 public keys, name=hex:
+	// the secrets bundle is sealed to the one an export names.
+	ObserverRecipients map[string]string
+	// Observer is the observer's side, read when Role is "observer".
+	Observer ObserverSettings
 	// ConfigError is set when the section is enabled and invalid. The
 	// replicator refuses to start on it; the hook refuses every push.
 	ConfigError error
@@ -146,10 +167,56 @@ var Cluster = struct {
 
 var clusterSlotPattern = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
 
+// The roles of [cluster] ROLE.
+const (
+	ClusterRoleVoter    = "voter"
+	ClusterRoleObserver = "observer"
+)
+
+// ObserverSettings configure `forgejo cluster observe`.
+type ObserverSettings struct {
+	// Name is the observer's name at the members (OBSERVER_RECIPIENTS).
+	Name string
+	// Dir holds every checkpoint, on the volume the snapshot hook covers.
+	Dir string
+	// Endpoints map a member's slot to the SSH address its export answers
+	// on, user@host:port; an export's leader hint is followed only to them.
+	Endpoints map[string]string
+	// KnownHostsFile pins each endpoint's host key: an unknown key is
+	// refused, never learnt.
+	KnownHostsFile string
+	// SSHKeyFile is the observer's private key; SecretsKeyFile the X25519
+	// key the secrets bundle is sealed to. Both live in an encrypted volume.
+	SSHKeyFile     string
+	SecretsKeyFile string
+	// SnapshotHook is run after each verified checkpoint and must snapshot
+	// the whole of Dir atomically; its success makes the checkpoint
+	// PROTECTED.
+	SnapshotHook string
+	PollInterval time.Duration
+	// StagingQuota stops ingestion when the staging area reaches it; it
+	// never deletes a protected checkpoint.
+	StagingQuota int64
+}
+
+// observerRefusedKeys are what an observer may not hold: it never listens,
+// never has a slot, is never granted a join and never founds a cluster.
+var observerRefusedKeys = []string{
+	"ENABLED", "LISTEN_ADDR", "OBJECT_LISTEN_ADDR", "OBJECT_PORT", "OBJECT_PEERS",
+	"SLOT", "PEERS", "PEER_PINS", "EXPECTED_NODES", "CLUSTER_ID",
+	"JOIN_GRANT_TTL", "OPERATORS", "CHECKPOINT_INTERVAL",
+}
+
 func loadClusterFrom(rootCfg ConfigProvider) {
 	sec := rootCfg.Section("cluster")
 	// Asked before Key, which creates the key it reads.
 	expectedSet, enabledSet := sec.HasKey("EXPECTED_NODES"), sec.HasKey("ENABLED")
+	var refused []string
+	for _, k := range observerRefusedKeys {
+		if sec.HasKey(k) {
+			refused = append(refused, k)
+		}
+	}
 	Cluster.ExpectedNodes = sec.Key("EXPECTED_NODES").MustInt(0)
 	// A size of three or more turns the replicator on by itself.
 	Cluster.Enabled = sec.Key("ENABLED").MustBool(expectedSet && Cluster.ExpectedNodes >= 3)
@@ -231,7 +298,36 @@ func loadClusterFrom(rootCfg ConfigProvider) {
 	Cluster.NomadCAFile = sec.Key("NOMAD_CA_FILE").String()
 	Cluster.MaxTxnTotal = sec.Key("MAX_TXN_TOTAL").MustInt(Cluster.MaxTxnTotal)
 
+	Cluster.CheckpointInterval = clusterDuration(sec, "CHECKPOINT_INTERVAL", 0)
+	Cluster.CheckpointRole = sec.Key("CHECKPOINT_ROLE").MustString("forgejo_checkpoint")
+	Cluster.CheckpointDir = sec.Key("CHECKPOINT_DIR").MustString(filepath.Join(AppDataPath, "cluster-checkpoints"))
+	Cluster.WALArchiveDir = sec.Key("WAL_ARCHIVE_DIR").String()
+	Cluster.PGBaseBackup = sec.Key("PG_BASEBACKUP").MustString("pg_basebackup")
+	Cluster.PGBaseBackupDSN = sec.Key("PG_BASEBACKUP_DSN").String()
+	Cluster.ObserverRecipients = map[string]string{}
+	for _, p := range sec.Key("OBSERVER_RECIPIENTS").Strings(",") {
+		name, key, _ := strings.Cut(strings.TrimSpace(p), "=")
+		Cluster.ObserverRecipients[strings.TrimSpace(name)] = strings.ToLower(strings.TrimSpace(key))
+	}
+
 	Cluster.ConfigError = nil
+	Cluster.Role = strings.ToLower(sec.Key("ROLE").MustString(ClusterRoleVoter))
+	if Cluster.Role == ClusterRoleObserver {
+		// An observer is never a member: the replicator stays off, and a
+		// section that would make it one is refused.
+		Cluster.Enabled = false
+		Cluster.ConfigError = loadObserver(sec, refused)
+		if Cluster.ConfigError != nil {
+			log.Error("[cluster] ROLE = observer is invalid: %v", Cluster.ConfigError)
+		}
+		return
+	}
+	if Cluster.Role != ClusterRoleVoter {
+		Cluster.Enabled = true
+		Cluster.ConfigError = fmt.Errorf("ROLE %q must be voter or observer", Cluster.Role)
+		log.Error("[cluster] %v", Cluster.ConfigError)
+		return
+	}
 	if expectedSet {
 		explicitOff := enabledSet && !Cluster.Enabled
 		if err := clusterSize(explicitOff); err != nil {
@@ -273,6 +369,70 @@ func clusterSize(explicitOff bool) error {
 	}
 	Cluster.Enabled = false
 	return nil
+}
+
+// loadObserver reads and validates the observer's side of [cluster].
+func loadObserver(sec ConfigSection, refused []string) error {
+	var errs []error
+	for _, k := range refused {
+		errs = append(errs, fmt.Errorf("%s is refused with ROLE = observer: an observer never listens, never holds a slot, is never granted a join and never founds a cluster", k))
+	}
+	o := ObserverSettings{
+		Name:           sec.Key("OBSERVER_NAME").String(),
+		Dir:            sec.Key("OBSERVER_DIR").String(),
+		Endpoints:      map[string]string{},
+		KnownHostsFile: sec.Key("OBSERVER_KNOWN_HOSTS").String(),
+		SSHKeyFile:     sec.Key("OBSERVER_SSH_KEY_FILE").String(),
+		SecretsKeyFile: sec.Key("OBSERVER_SECRETS_KEY_FILE").String(),
+		SnapshotHook:   sec.Key("OBSERVER_SNAPSHOT_HOOK").String(),
+		PollInterval:   clusterDuration(sec, "OBSERVER_POLL_INTERVAL", 15*time.Second),
+		StagingQuota:   sec.Key("OBSERVER_STAGING_QUOTA").MustInt64(10 << 30),
+	}
+	for _, p := range sec.Key("OBSERVER_ENDPOINTS").Strings(",") {
+		slot, addr, ok := strings.Cut(strings.TrimSpace(p), "=")
+		slot, addr = strings.TrimSpace(slot), strings.TrimSpace(addr)
+		if !ok || !clusterSlotPattern.MatchString(slot) || !validSSHTarget(addr) {
+			errs = append(errs, fmt.Errorf("OBSERVER_ENDPOINTS: %q is not slot=user@host:port", p))
+			continue
+		}
+		o.Endpoints[slot] = addr
+	}
+	if !clusterSlotPattern.MatchString(o.Name) {
+		errs = append(errs, fmt.Errorf("OBSERVER_NAME %q must match [a-z0-9-]{1,32}", o.Name))
+	}
+	if len(o.Endpoints) == 0 {
+		errs = append(errs, errors.New("OBSERVER_ENDPOINTS is required: the members' SSH exports"))
+	}
+	if !filepath.IsAbs(o.Dir) {
+		errs = append(errs, errors.New("OBSERVER_DIR must be an absolute path"))
+	}
+	for key, v := range map[string]string{
+		"OBSERVER_KNOWN_HOSTS": o.KnownHostsFile, "OBSERVER_SSH_KEY_FILE": o.SSHKeyFile,
+		"OBSERVER_SECRETS_KEY_FILE": o.SecretsKeyFile, "OBSERVER_SNAPSHOT_HOOK": o.SnapshotHook,
+	} {
+		if v == "" {
+			errs = append(errs, fmt.Errorf("%s is required with ROLE = observer", key))
+		}
+	}
+	if o.PollInterval < time.Second {
+		errs = append(errs, errors.New("OBSERVER_POLL_INTERVAL must be one second at least"))
+	}
+	if o.StagingQuota <= 0 {
+		errs = append(errs, errors.New("OBSERVER_STAGING_QUOTA must be positive"))
+	}
+	Cluster.Observer = o
+	return errors.Join(errs...)
+}
+
+// validSSHTarget accepts user@host:port, nothing that ssh would read as an
+// option.
+func validSSHTarget(s string) bool {
+	user, hostPort, ok := strings.Cut(s, "@")
+	if !ok || user == "" || strings.HasPrefix(user, "-") {
+		return false
+	}
+	host, port, err := net.SplitHostPort(hostPort)
+	return err == nil && host != "" && port != "" && !strings.HasPrefix(host, "-")
 }
 
 func clusterDuration(sec ConfigSection, key string, def time.Duration) time.Duration {
@@ -328,6 +488,14 @@ func validateCluster() error {
 	}
 	if Cluster.ExpectedNodes >= 3 {
 		errs = append(errs, validateAutonomous()...)
+	}
+	if Cluster.CheckpointInterval < 0 || Cluster.CheckpointInterval > 0 && Cluster.CheckpointInterval < 10*time.Second {
+		errs = append(errs, errors.New("CHECKPOINT_INTERVAL must be 0 (off) or 10s at least"))
+	}
+	for name, key := range Cluster.ObserverRecipients {
+		if b, err := hex.DecodeString(key); err != nil || len(b) != 32 || !clusterSlotPattern.MatchString(name) {
+			errs = append(errs, fmt.Errorf("OBSERVER_RECIPIENTS: %q is not name=<64 hex digits>", name))
+		}
 	}
 	return errors.Join(errs...)
 }
