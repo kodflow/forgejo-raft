@@ -68,14 +68,14 @@ func cmdCluster() *cli.Command {
 			},
 			{
 				Name:  "recover",
-				Usage: "Offline, after a lost majority: force a new configuration under a new cluster id",
-				Flags: []cli.Flag{
+				Usage: "Offline, after a lost majority: force a new configuration under a new cluster id; or, with --from-observer, rebuild from an observer's checkpoint",
+				Flags: append([]cli.Flag{
 					&cli.StringFlag{Name: "new-cluster", Required: true},
-					&cli.StringFlag{Name: "members", Required: true},
-					&cli.StringSliceFlag{Name: "fenced", Required: true, Usage: "old voter fence: id:method:receipt-file[+receipt-file], one per old voter"},
+					&cli.StringFlag{Name: "members", Usage: "required unless --from-observer"},
+					&cli.StringSliceFlag{Name: "fenced", Usage: "old voter fence: id:method:receipt-file[+receipt-file], one per old voter; required unless --from-observer"},
 					&cli.StringSliceFlag{Name: "witness-key", Usage: "hex Ed25519 public key of a witness"},
 					&cli.StringSliceFlag{Name: "joining", Usage: "member lines of nodes stamped joining under the new cluster id"},
-				},
+				}, recoverFromObserverFlags()...),
 				Action: runClusterRecover,
 			},
 			{
@@ -125,6 +125,9 @@ func cmdCluster() *cli.Command {
 				},
 			},
 			cmdClusterWitness(),
+			cmdClusterExport(),
+			cmdClusterObserve(),
+			cmdClusterWALArchive(),
 			{
 				Name:  "cert",
 				Usage: "The node certificate",
@@ -288,6 +291,12 @@ func runClusterInspect(ctx context.Context, c *cli.Command) error {
 }
 
 func runClusterRecover(ctx context.Context, c *cli.Command) error {
+	if c.String("from-observer") != "" {
+		return runRecoverFromObserver(ctx, c)
+	}
+	if c.String("members") == "" || len(c.StringSlice("fenced")) == 0 {
+		return errors.New("--members and --fenced are required, unless --from-observer")
+	}
 	d, err := clusterDriver()
 	if err != nil {
 		return err
