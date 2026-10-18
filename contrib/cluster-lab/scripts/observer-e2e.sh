@@ -34,7 +34,9 @@ dco() {
 # compose run of observer would claim the observer's fixed address, which
 # the running observer holds.
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# The client writes into $WORK as root: the files go through a container,
+# and a cleanup that fails never becomes the script's exit status.
+trap 'docker run --rm -u 0 -v "$WORK:/work" --entrypoint /bin/sh forgejo-cluster-lab/forgejo:observer -c "rm -rf /work/* /work/.[!.]*" >/dev/null 2>&1; rm -rf "$WORK" 2>/dev/null || true' EXIT
 client() {
   docker run --rm -i -u 0 --network "${COMPOSE_PROJECT_NAME}_lab" -v "$WORK:/work" \
     --entrypoint /bin/sh forgejo-cluster-lab/forgejo:observer -c "$1"
