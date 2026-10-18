@@ -643,14 +643,19 @@ brings cluster code to the `forgejo` branch.
   `.coderabbit.yaml` and `contrib/cluster-lab/`.
 
 **Official Forgejo releases**, `.github/workflows/upstream-releases.yml`:
-every official release gets its raft release, `vX.Y.Z-raft.N`, the day it is
-announced.
+every official release of the newest Forgejo major gets its raft release,
+`vX.Y.Z-raft.N`, the day it is announced.
 
-- **Which**: the versions Forgejo declares supported in the TXT record of
-  `release.forgejo.org` (what Forgejo's own update checker reads), that is
-  the newest release of each supported major, LTS included. Checked daily
-  after the upstream sync. No backfill: an older release is built on demand
-  (`tag` input). Release candidates are not built.
+- **Which**: of the versions Forgejo declares supported in the TXT record of
+  `release.forgejo.org` (what Forgejo's own update checker reads), only the
+  newest stable release of the highest major: v17 today. Nothing is pinned:
+  the day 18.0.0 is announced and tagged upstream, 18 becomes the only
+  target and 17 is no longer followed. Older majors, LTS included, get no
+  new raft release. Checked daily after the upstream sync. No backfill: an
+  older release is built on demand (`tag` input), and the repository
+  variable `RAFT_MAJORS` (e.g. `16 17`) is an explicit override that covers
+  the supported release of each listed major instead. Release candidates
+  are not built.
 - **How**: the raft delta (what `forgejo` changes relative to the upstream
   commit it last merged, tooling excluded) is applied onto the official tag
   by a three-way merge, committed on the branch `release/vX.Y.Z` with the
