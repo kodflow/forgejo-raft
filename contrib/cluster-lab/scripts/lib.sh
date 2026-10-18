@@ -66,7 +66,8 @@ haproxy_primary() {
   curl -sf 'http://127.0.0.1:7000/;csv' | awk -F, '$1=="primary" && $2 ~ /^pg-/ && $18 ~ /^UP/ {print $2}'
 }
 
-# Runs SQL through HAProxy :5000 from any running PostgreSQL container.
+# via_haproxy <sql> [database]: SQL through HAProxy :5000 from any running
+# PostgreSQL container, on the postgres database unless another is named.
 via_haproxy() {
   local n PGPASSWORD
   # Passed by name: the value never sits on the command line.
@@ -74,7 +75,7 @@ via_haproxy() {
   export PGPASSWORD
   for n in pg-1 pg-2 pg-3; do
     if dc exec -T -e PGPASSWORD "$n" \
-      psql -h 10.89.0.30 -p 5000 -U postgres -d postgres -v ON_ERROR_STOP=1 -Atc "$1" 2>/dev/null; then
+      psql -h 10.89.0.30 -p 5000 -U postgres -d "${2:-postgres}" -v ON_ERROR_STOP=1 -Atc "$1" 2>/dev/null; then
       return 0
     fi
   done

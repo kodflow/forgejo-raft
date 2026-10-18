@@ -80,7 +80,7 @@ via_haproxy "DO \$\$ BEGIN CREATE ROLE forgejo_checkpoint NOLOGIN; EXCEPTION WHE
   GRANT EXECUTE ON FUNCTION pg_create_restore_point(text) TO forgejo_checkpoint;
   GRANT EXECUTE ON FUNCTION pg_switch_wal() TO forgejo_checkpoint;
   GRANT EXECUTE ON FUNCTION pg_control_system() TO forgejo_checkpoint;
-  GRANT forgejo_checkpoint TO forgejo;" >/dev/null
+  GRANT forgejo_checkpoint TO forgejo;" forgejo >/dev/null
 ok "checkpoint role granted to forgejo"
 dco run --rm --no-deps -T -u 0 --entrypoint /bin/sh observer -c \
   'chown -R git:git /keys && [ -s /keys/id_ed25519 ] || su-exec git /usr/local/bin/gitea cluster observe keygen --name lab-observer --out /keys' >"$WORK/keygen.txt"
@@ -160,7 +160,7 @@ else:
 print("ok")
 PY
 client "python3 /work/web.py $BASE $TFA_USER $TFA_PASS enroll" >/dev/null
-via_haproxy "SELECT count(*) FROM two_factor" | grep -qx 1 || fail "2FA enrolment"
+via_haproxy "SELECT count(*) FROM two_factor" forgejo | grep -qx 1 || fail "2FA enrolment"
 ok "$TFA_USER enrolled in TOTP 2FA"
 head -c 2048 /dev/urandom >"$WORK/blob.bin"
 client "cd /work && git init -q -b main repo && cd repo && git lfs install --local >/dev/null && git lfs track '*.bin' >/dev/null &&
@@ -175,7 +175,7 @@ ok "checkpoint $CLEAN protected ${RPO}s after the push (measured RPO; budget 60 
 say "3. The attacker: a force-push and a SQL DELETE, through the normal paths"
 client "cd /work/repo && git checkout -q --orphan ransom && git rm -qrf . && echo pay >note.txt && git add note.txt &&
   git -c user.name=x -c user.email=x@x commit -qm ransom && git push -qf http://$USER_NAME:$TOKEN@10.89.0.41:3000/$USER_NAME/$REPO.git ransom:main"
-via_haproxy "DELETE FROM issue WHERE repo_id = (SELECT id FROM repository WHERE lower_name = lower('$REPO'))" >/dev/null
+via_haproxy "DELETE FROM issue WHERE repo_id = (SELECT id FROM repository WHERE lower_name = lower('$REPO'))" forgejo >/dev/null
 POISON_AT="$(date +%s)"
 POISONED="$(wait_protected_after "$POISON_AT")"
 ok "the poisoned history is checkpoint $POISONED: protected like any other, the observer cannot tell"
