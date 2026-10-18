@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -99,6 +100,7 @@ func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook
 	tx := &reftable.RefTxn{
 		Repo: repo, RepoID: req.RepoID, PusherID: req.PusherID, Time: time.Now().UnixNano(),
 		Nonce: req.Nonce, Trigger: req.Trigger, PRID: req.PRID, IsWiki: req.IsWiki, PushOptions: req.PushOptions,
+		Push: req.PusherID != 0,
 	}
 	var refs []string
 	for _, l := range req.Lines {
@@ -250,7 +252,10 @@ func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.
 		objectShipsTotal.WithLabelValues("ok").Inc()
 	}
 
-	data, err := reftable.Encode(reftable.KindRefTxn, tx)
+	// From payload version 2, Apply itself refuses a push into a key
+	// deleted or renamed away by an entry this node had not applied yet
+	// when pushTargetGone looked.
+	data, err := reftable.EncodeVersion(r.table.WriteVersion(), reftable.KindRefTxn, tx)
 	if err != nil {
 		return fail(err)
 	}
@@ -357,9 +362,15 @@ func (r *Replicator) confirm(ctx context.Context) (consensus.Token, error) {
 	}
 }
 
-// committed reports whether every ref of tx holds its new value at the
-// revision it expected plus one.
+// committed reports whether tx committed: its nonce among the accepted
+// transactions, or else every ref of tx holding its new value at the
+// revision it expected plus one. The nonce answers even when a later write
+// already moved a ref, where the values alone would call a committed push
+// refused.
 func (r *Replicator) committed(repo string, tx *reftable.RefTxn) bool {
+	if _, ok := r.table.CommittedNonce(tx.Nonce); ok {
+		return true
+	}
 	for _, u := range tx.Updates {
 		v, ok := r.table.Get(repo, u.Ref)
 		if !ok || v.Rev != u.ExpectRev+1 {
@@ -461,6 +472,34 @@ func (r *Replicator) proposeOwnerRename(ctx context.Context, oldOwner, newOwner 
 		moves = append(moves, [2]string{key, newOwner + "/" + strings.TrimPrefix(key, prefix)})
 	}
 	return r.proposeRepoMoves(ctx, moves)
+}
+
+// RaisePayloadVersion makes the cluster write reftable.PayloadVersion from
+// now on. The raise is a version 1 Audit entry, which a member running an
+// older binary applies as a plain record: it must be proposed only once
+// every member runs a binary that applies the new version, or the first
+// entry written at it stops the members that cannot read it (D18: stopped,
+// never forked). The autonomous mode raises it by itself once every member
+// says it can (autopilot); an operator raises it otherwise.
+func (r *Replicator) RaisePayloadVersion(ctx context.Context, op consensus.Operator) error {
+	if r.table.WriteVersion() >= reftable.PayloadVersion {
+		return nil
+	}
+	data, err := reftable.Encode(reftable.KindAudit, &reftable.Audit{
+		ID: clusterhook.NewNonce(), Operator: string(op), Action: reftable.AuditPayloadVersion,
+		Target: strconv.Itoa(reftable.PayloadVersion), Outcome: reftable.AuditRaised, Time: time.Now().Unix(),
+	})
+	if err != nil {
+		return err
+	}
+	_, result, err := r.proposeCommand(ctx, data, func() bool { return r.table.WriteVersion() >= reftable.PayloadVersion })
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return fmt.Errorf("the cluster refused it: %s", result.Reason)
+	}
+	return nil
 }
 
 // commandBudget bounds a command's retries when its caller set no deadline.

@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"forgejo.org/modules/clusterhook"
+	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/reftable"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -137,4 +139,52 @@ func TestPushToADeletedOrRenamedKeyIsRefused(t *testing.T) {
 		Lines: []clusterhook.Line{{Old: zero, New: "ref:refs/heads/main", Ref: "HEAD"}},
 	})
 	require.True(t, resp.OK, resp.Message)
+}
+
+// A proposal whose outcome was unknown is settled from the table: when a
+// later push already moved the ref, the values no longer say it committed,
+// and the push was reported refused although its entry was in the log.
+// The nonce the table keeps answers instead.
+func TestUnknownOutcomeSettledByTheNonceAfterALaterWrite(t *testing.T) {
+	r := newReplicator(t.TempDir(), newRegistry(time.Second, 8, 64))
+	a, b := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	apply := func(i uint64, tx *reftable.RefTxn) {
+		data, err := reftable.Encode(reftable.KindRefTxn, tx)
+		require.NoError(t, err)
+		res := r.table.Apply(consensus.Entry{Term: 1, Index: i, Data: data}).(reftable.Result)
+		require.True(t, res.OK, res.Reason)
+	}
+	mine := &reftable.RefTxn{Repo: "o/r.git", Format: "sha1", Nonce: "mine", Updates: []reftable.RefUpdate{{Ref: "refs/heads/main", New: a}}}
+	apply(1, mine)
+	apply(2, &reftable.RefTxn{Repo: "o/r.git", Format: "sha1", Nonce: "theirs", Updates: []reftable.RefUpdate{{Ref: "refs/heads/main", Old: a, ExpectRev: 1, New: b}}})
+	assert.True(t, r.committed("o/r.git", mine))
+	other := &reftable.RefTxn{Repo: "o/r.git", Format: "sha1", Nonce: "never", Updates: []reftable.RefUpdate{{Ref: "refs/heads/main", New: a}}}
+	assert.False(t, r.committed("o/r.git", other))
+}
+
+// The written command version is raised once every member applies it, and
+// a push then travels at the new version; a member that did not say so
+// keeps the cluster at the old one.
+func TestPayloadVersionRaisedOnlyWhenEveryMemberAppliesIt(t *testing.T) {
+	m := consensus.Membership{Members: []consensus.Member{{ID: 1}, {ID: 2}, {ID: 3}}}
+	v := reftable.PayloadVersion
+	all := []hello{{Node: consensus.NodeID(2).String(), Payload: v}, {Node: consensus.NodeID(3).String(), Payload: v}}
+	assert.True(t, everyMemberApplies(m, 1, all, v))
+	assert.False(t, everyMemberApplies(m, 1, all[:1], v), "a member that did not answer")
+	old := []hello{all[0], {Node: consensus.NodeID(3).String()}}
+	assert.False(t, everyMemberApplies(m, 1, old, v), "a member running an older binary")
+
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	require.NoError(t, tc.nodes[1].r.RaisePayloadVersion(context.Background(), "op"))
+	for _, n := range tc.nodes {
+		require.Eventually(t, func() bool { return n.r.table.WriteVersion() == reftable.PayloadVersion }, 10*time.Second, 10*time.Millisecond, n.slot)
+	}
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	c1 := commit(t, work, "one")
+	require.True(t, tc.pushVia(tc.nodes[2], work, "v/r.git", "refs/heads/main", strings.Repeat("0", 40), c1).OK)
+	for _, n := range tc.nodes {
+		v, _ := n.r.table.Get("v/r.git", "refs/heads/main")
+		assert.Equal(t, c1, v.SHA, n.slot)
+	}
 }

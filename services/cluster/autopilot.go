@@ -11,6 +11,7 @@ import (
 
 	"forgejo.org/modules/log"
 	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/reftable"
 )
 
 // autopilotOperator is the identity the autonomous mode records in the log
@@ -92,7 +93,49 @@ func (r *Replicator) autopilotStep(ctx context.Context) {
 	}
 	if id, ok := NextPromotion(m); ok {
 		r.autoChange(pctx, ActionPromote, id, "every live member votes", eng.Promote)
+		return
 	}
+	r.maybeRaisePayload(pctx, m)
+}
+
+// payloadProbeEvery paces the leader's question "does every member apply
+// the new command version" while the cluster still writes the old one.
+const payloadProbeEvery = 30 * time.Second
+
+// maybeRaisePayload raises the written command version once EVERY member
+// of the membership answers that its binary applies it: a rolling upgrade
+// raises it after the last member restarted on the new binary, and never
+// while one still runs the old one (it would stop on the first new entry).
+func (r *Replicator) maybeRaisePayload(ctx context.Context, m consensus.Membership) {
+	if r.table.WriteVersion() >= reftable.PayloadVersion || r.auto.now().Before(r.payloadProbe) {
+		return
+	}
+	r.payloadProbe = r.auto.now().Add(payloadProbeEvery)
+	if !everyMemberApplies(m, r.selfID(), r.auto.round(ctx), reftable.PayloadVersion) {
+		return
+	}
+	if err := r.RaisePayloadVersion(ctx, autopilotOperator); err != nil {
+		log.Debug("cluster: autopilot: raising the payload version: %v; retried", err)
+		return
+	}
+	log.Warn("cluster: autopilot: every member applies payload version %d: the cluster writes it from now on", reftable.PayloadVersion)
+}
+
+// everyMemberApplies reports whether every member other than self answered
+// as itself (its node id) with a binary that applies version v.
+func everyMemberApplies(m consensus.Membership, self consensus.NodeID, seen []hello, v int) bool {
+	ok := map[string]bool{}
+	for _, h := range seen {
+		if h.Payload >= v {
+			ok[h.Node] = true
+		}
+	}
+	for _, x := range m.Members {
+		if x.ID != self && !ok[x.ID.String()] {
+			return false
+		}
+	}
+	return true
 }
 
 // autoChange runs one membership change of the autopilot, logged and
