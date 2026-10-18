@@ -67,8 +67,8 @@ require (
 	github.com/jhillyerd/enmime/v2 v2.2.0
 	github.com/json-iterator/go v1.1.12
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
-	github.com/kitsunium/sdk/pkg/v1/app v0.0.0-20261018001355-c964a63143bf
-	github.com/kitsunium/sdk/pkg/v1/observe v0.0.0-20261018001355-c964a63143bf
+	github.com/kitsunium/sdk/pkg/v1/app v0.0.0-20261018141316-f16dcc0b2cf7
+	github.com/kitsunium/sdk/pkg/v1/observe v0.0.0-20261018141316-f16dcc0b2cf7
 	github.com/klauspost/compress v1.20.3
 	github.com/markbates/goth v1.82.0
 	github.com/mattn/go-isatty v0.0.24
@@ -199,9 +199,9 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/jonboulle/clockwork v0.5.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
-	github.com/kitsunium/sdk/internal v0.0.0-20261018001355-c964a63143bf // indirect
-	github.com/kitsunium/sdk/pkg/v1/clock v0.0.0-20261018001355-c964a63143bf // indirect
-	github.com/kitsunium/sdk/pkg/v1/errs v0.0.0-20261018001355-c964a63143bf // indirect
+	github.com/kitsunium/sdk/internal v0.0.0-20261018141316-f16dcc0b2cf7 // indirect
+	github.com/kitsunium/sdk/pkg/v1/clock v0.0.0-20261018141316-f16dcc0b2cf7 // indirect
+	github.com/kitsunium/sdk/pkg/v1/errs v0.0.0-20261018141316-f16dcc0b2cf7 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
