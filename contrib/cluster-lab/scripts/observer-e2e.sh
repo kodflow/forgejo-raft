@@ -216,7 +216,8 @@ rexec() {
 RECOVER=(cluster recover --from-observer "$CLEAN" --new-cluster "$NEW" --observer-dir "/snapshots/$CLEAN"
   --secrets-key /keys/secrets.key --new-observer-recipient "$NEW_RECIPIENT" --out /data/recover
   --pgdata /data/pg --pg-socket-dir /data/pgsock --pg-hba-file /data/lab-hba.conf --wal-archive-dir /data/wal-archive)
-rexec cluster observe list --dir "/snapshots/$CLEAN" | grep -q "^$CLEAN .*PROTECTED.*yes" || fail "$CLEAN does not restore from its snapshot"
+rexec cluster observe list --dir "/snapshots/$CLEAN" >"$WORK/list.txt" 2>&1 || true
+grep -q "^$CLEAN .*PROTECTED.*yes" "$WORK/list.txt" || fail "$CLEAN does not restore from its snapshot: $(cat "$WORK/list.txt")"
 ok "$CLEAN listed PROTECTED and restorable from its snapshot"
 
 # Run 1 stops for the rotation: nothing restored yet.
