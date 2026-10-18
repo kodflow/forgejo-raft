@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/json"
@@ -417,4 +418,33 @@ func TestObserverTakesANewBaseAfterAGap(t *testing.T) {
 	c.checkpoint()
 	require.NoError(t, o.Step(ctx))
 	assert.Len(t, o.State().Checkpoints, 2)
+}
+
+// Two bases taken within one second get two names: the base after a gap
+// used to take the name of the base before it, its rename failed, and the
+// observer never held a base past the gap (seen on a fast runner).
+func TestTwoBasesInOneSecondKeepTheirOwnNames(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	at := time.Date(2026, 10, 18, 2, 32, 19, 0, time.UTC)
+	o.cfg.Now = func() time.Time { return at }
+	seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+
+	c.push("alice/demo.git", "refs/heads/main", c.commit("lost"))
+	c.pg.switchWAL()
+	for name := range c.pg.archive {
+		if !o.store.haveWAL(name) && !strings.HasSuffix(name, ".history") {
+			delete(c.pg.archive, name)
+		}
+	}
+	c.checkpoint()
+	for range gapPasses {
+		require.ErrorIs(t, o.Step(ctx), ErrNoCoverage)
+	}
+	bases := o.State().Bases
+	require.Len(t, bases, 2, "a new base after the gap, in the same second")
+	assert.Equal(t, "20261018T023219Z", bases[0].Label)
+	assert.Equal(t, "20261018T023219Z-2", bases[1].Label)
 }
