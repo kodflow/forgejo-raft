@@ -31,6 +31,28 @@
 		</dl>
 	</div>
 
+	{{if or .View.BackupLag .View.EventQueueAlarm}}
+	<div class="ui warning message">
+		{{if .View.BackupLag}}<p>{{ctx.Locale.Tr "admin.cluster.backup_lag_held" .View.BackupLag}}</p>{{end}}
+		{{if .View.EventQueueAlarm}}<p>{{ctx.Locale.Tr "admin.cluster.event_queue_alarm" (ctx.Locale.TrSize .View.EventBytes) (ctx.Locale.TrSize .View.EventQueueMax)}}</p>{{end}}
+	</div>
+	{{end}}
+
+	{{if .View.Parked}}
+	<h4 class="ui top attached header">{{ctx.Locale.Tr "admin.cluster.parked_events"}}</h4>
+	<div class="ui attached table segment">
+		<table class="ui very basic striped table unstackable">
+			<thead><tr><th>{{ctx.Locale.Tr "admin.cluster.parked_index"}}</th><th>{{ctx.Locale.Tr "admin.cluster.repositories"}}</th><th>{{ctx.Locale.Tr "admin.cluster.parked_attempts"}}</th><th>{{ctx.Locale.Tr "admin.cluster.parked_error"}}</th><th>{{ctx.Locale.Tr "admin.cluster.parked_since"}}</th></tr></thead>
+			<tbody>
+			{{range .View.Parked}}
+				<tr><td><code>{{.Index}}</code></td><td><code>{{.Repo}}</code></td><td>{{.Attempts}}</td><td>{{.Error}}</td><td>{{DateUtils.AbsoluteLong .Since}}</td></tr>
+			{{end}}
+			</tbody>
+		</table>
+		<p>{{ctx.Locale.Tr "admin.cluster.parked_resolve_hint"}}</p>
+	</div>
+	{{end}}
+
 	<h4 class="ui top attached header">{{ctx.Locale.Tr "admin.cluster.alarms"}}</h4>
 	<div class="ui attached table segment">
 		{{if .View.Alarms}}

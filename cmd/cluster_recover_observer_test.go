@@ -9,8 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"forgejo.org/modules/clusterhook"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/urfave/cli/v3"
 )
 
 // The recovery's PostgreSQL may still replay when pg_ctl -w returns, and
@@ -48,4 +51,38 @@ func TestRecoveryMarker(t *testing.T) {
 	assert.Equal(t, m, recoveryMarker("0123-5-00000000000000000042", "c1"))
 	assert.NotEqual(t, m, recoveryMarker("0123-5-00000000000000000042", "c2"))
 	assert.NotEqual(t, m, recoveryMarker("0123-5-00000000000000000043", "c1"))
+}
+
+// `forgejo cluster parked resolve` gives nothing up without a reason.
+func TestParkedResolveNeedsAReason(t *testing.T) {
+	run := func(args ...string) (*clusterhook.Request, error) {
+		var req *clusterhook.Request
+		var rerr error
+		cmd := &cli.Command{
+			Name: "resolve",
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "reason"},
+				&cli.StringFlag{Name: "lineage"},
+			},
+			Action: func(_ context.Context, c *cli.Command) error {
+				req, rerr = parkedResolveRequest(c)
+				return nil
+			},
+		}
+		require.NoError(t, cmd.Run(context.Background(), append([]string{"resolve"}, args...)))
+		return req, rerr
+	}
+	_, err := run("5")
+	require.ErrorContains(t, err, "--reason is required")
+	_, err = run("--reason", "   ", "5")
+	require.ErrorContains(t, err, "--reason is required")
+	_, err = run("--reason", "x", "abc")
+	require.Error(t, err)
+	req, err := run("--reason", "account recreated", "--lineage", "l", "5")
+	require.NoError(t, err)
+	assert.Equal(t, clusterhook.OpParkedResolve, req.Op)
+	assert.EqualValues(t, 5, req.Index)
+	assert.Equal(t, "l", req.Lineage)
+	assert.Equal(t, "account recreated", req.Reason)
+	assert.NotEmpty(t, req.Operator)
 }

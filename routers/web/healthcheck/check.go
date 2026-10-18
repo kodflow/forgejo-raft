@@ -197,6 +197,16 @@ func checkClusterSQL(r *cluster_service.Replicator, checks checks) {
 		pk.Output = "none"
 	}
 	checks["cluster:parked_events"] = []componentStatus{pk}
+	bk := componentStatus{Status: Pass, Time: getCheckTime()}
+	if v.BackupLag > 0 {
+		bk.Status, bk.Output = warn, fmt.Sprintf("the PostgreSQL backup lags %d entries, trim held: take a checkpoint", v.BackupLag)
+	}
+	checks["cluster:backup_lag"] = []componentStatus{bk}
+	q := componentStatus{Status: Pass, Time: getCheckTime(), Output: fmt.Sprintf("%d of %d bytes", v.EventBytes, v.EventQueueMax)}
+	if v.EventQueueAlarm {
+		q.Status, q.Output = warn, fmt.Sprintf("the event queue holds %d of %d bytes: pushes are refused when it is full; resolve what holds the trim (parked events, backup lag, durability)", v.EventBytes, v.EventQueueMax)
+	}
+	checks["cluster:event_queue"] = []componentStatus{q}
 }
 
 func getCheckTime() string {

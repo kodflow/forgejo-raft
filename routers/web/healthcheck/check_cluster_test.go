@@ -52,3 +52,18 @@ func TestCheckClusterSQLDurability(t *testing.T) {
 	checkCluster(reps[0], c)
 	assert.Equal(t, Pass, c["cluster:sql_durability"][0].Status)
 }
+
+// A backup that lags beyond its bound holds the trim, and says so.
+func TestCheckClusterBackupLag(t *testing.T) {
+	_, reps := cluster.NewForTesting(t.TempDir(), "node-a")
+	c := checks{}
+	checkCluster(reps[0], c)
+	assert.Equal(t, Pass, c["cluster:backup_lag"][0].Status)
+	assert.Equal(t, Pass, c["cluster:event_queue"][0].Status)
+
+	cluster.SetBackupLagForTesting(reps[0], 2_000_000)
+	c = checks{}
+	checkCluster(reps[0], c)
+	assert.Equal(t, warn, c["cluster:backup_lag"][0].Status)
+	assert.Contains(t, c["cluster:backup_lag"][0].Output, "lags 2000000 entries, trim held")
+}

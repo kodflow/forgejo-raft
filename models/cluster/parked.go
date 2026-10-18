@@ -6,6 +6,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"forgejo.org/models/db"
 	"forgejo.org/modules/timeutil"
@@ -100,4 +101,94 @@ func NoteParkedFailure(ctx context.Context, lineage string, index int64, reason 
 	_, err := db.GetEngine(ctx).Exec("UPDATE cluster_parked_event SET attempts = attempts + 1, reason = ?, updated_unix = ? WHERE lineage = ? AND log_index = ?",
 		reason, timeutil.TimeStampNow(), lineage, index)
 	return err
+}
+
+// ParkedResolution is the durable record of a parked event an operator
+// resolved without its work: who, when, why, and the event itself, so
+// nothing leaves the forge silently.
+type ParkedResolution struct {
+	ID        int64  `xorm:"pk autoincr"`
+	Lineage   string `xorm:"VARCHAR(64) NOT NULL INDEX(lineage_index)"`
+	LogIndex  int64  `xorm:"NOT NULL INDEX(lineage_index)"`
+	Seq       int    `xorm:"NOT NULL DEFAULT 0"`
+	Repo      string `xorm:"VARCHAR(255) NOT NULL"`
+	Event     string `xorm:"LONGTEXT NOT NULL"`
+	LastError string `xorm:"TEXT"`
+	Attempts  int    `xorm:"NOT NULL DEFAULT 0"`
+	// Operator is the opaque identity of who resolved it, Reason why.
+	Operator     string             `xorm:"VARCHAR(255) NOT NULL"`
+	Reason       string             `xorm:"TEXT NOT NULL"`
+	ParkedUnix   timeutil.TimeStamp `xorm:"NOT NULL DEFAULT 0"`
+	ResolvedUnix timeutil.TimeStamp `xorm:"created"`
+}
+
+// TableName keeps the table's name when the type is read from another package.
+func (ParkedResolution) TableName() string { return "cluster_parked_resolution" }
+
+func init() {
+	db.RegisterModel(new(ParkedResolution))
+}
+
+// ErrResolveNeedsReason refuses a resolution without its why.
+var ErrResolveNeedsReason = errors.New("a parked event is resolved with a reason")
+
+// ErrParkedNotFound is a resolution of an index that holds no parked event.
+var ErrParkedNotFound = errors.New("no parked event at that index")
+
+// ErrParkedAmbiguous is an index parked in several lineages: the lineage
+// must be named.
+var ErrParkedAmbiguous = errors.New("that index is parked in several lineages; name the lineage")
+
+// ResolveParked removes the parked rows of one entry without running its
+// work, and records each one, payload included, with who resolved it and
+// why, in the same transaction. lineage may be empty when the index is
+// parked in one lineage only.
+func ResolveParked(ctx context.Context, lineage string, index int64, operator, reason string) ([]*ParkedResolution, error) {
+	if strings.TrimSpace(reason) == "" {
+		return nil, ErrResolveNeedsReason
+	}
+	if strings.TrimSpace(operator) == "" {
+		return nil, errors.New("a parked event is resolved by a named operator")
+	}
+	var out []*ParkedResolution
+	err := db.WithTx(ctx, func(ctx context.Context) error {
+		e := db.GetEngine(ctx)
+		var rows []*ParkedEvent
+		q := e.Where("log_index = ?", index)
+		if lineage != "" {
+			q = q.And("lineage = ?", lineage)
+		}
+		if err := q.OrderBy("lineage, seq").Find(&rows); err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return ErrParkedNotFound
+		}
+		for _, r := range rows {
+			if r.Lineage != rows[0].Lineage {
+				return ErrParkedAmbiguous
+			}
+		}
+		for _, r := range rows {
+			out = append(out, &ParkedResolution{
+				Lineage: r.Lineage, LogIndex: r.LogIndex, Seq: r.Seq, Repo: r.Repo, Event: r.Event,
+				LastError: r.Reason, Attempts: r.Attempts, Operator: operator, Reason: reason, ParkedUnix: r.CreatedUnix,
+			})
+		}
+		if _, err := e.Insert(out); err != nil {
+			return err
+		}
+		return UnparkEntry(ctx, rows[0].Lineage, index, len(rows))
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListParkedResolutions returns the resolutions, newest first.
+func ListParkedResolutions(ctx context.Context, limit int) ([]*ParkedResolution, error) {
+	var out []*ParkedResolution
+	err := db.GetEngine(ctx).OrderBy("id DESC").Limit(limit).Find(&out)
+	return out, err
 }

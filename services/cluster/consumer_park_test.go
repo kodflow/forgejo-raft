@@ -362,3 +362,23 @@ func TestTrimStopsAtTheBackupCursor(t *testing.T) {
 	require.Len(t, lg.list(), 30)
 	assert.EqualValues(t, 21, lg.list()[0].Token.Index)
 }
+
+// The trim never passes the backup cursor, however far the backup lags:
+// it is held there, and the lag is reported.
+func TestTrimHeldAtALaggingBackup(t *testing.T) {
+	defer test.MockVariableValue(&setting.Cluster.AckMargin, 0)()
+	defer test.MockVariableValue(&ackEvery, 1)()
+	store, lg, parked := newSQLStore(), &memLog{}, &memParked{}
+	const base = backupMaxLag + 100
+	for i := uint64(base); i < base+20; i++ {
+		lg.events = append(lg.events, reftable.Event{Token: testToken(i), Kind: reftable.EventRef, Repo: "o/r.git", PusherID: 1})
+	}
+	c := unitConsumer(store, lg, parked, func(context.Context, []reftable.Event) error { return nil })
+	lin := testToken(1).Identity().String()
+	store.primary[cluster_model.CursorBackup] = cluster_model.Cursor{Lineage: lin, Position: 10}
+	require.NoError(t, c.pass(context.Background()))
+	store.replicate()
+	c.maybeAck(context.Background(), lin)
+	assert.Len(t, lg.list(), 20, "nothing past the backup is trimmed")
+	assert.EqualValues(t, base+19-10, c.BackupLag(), "the held trim is reported")
+}

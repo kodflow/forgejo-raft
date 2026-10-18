@@ -155,6 +155,23 @@ func cmdCluster() *cli.Command {
 				Action: runClusterReconcile,
 			},
 			{
+				Name:  "parked",
+				Usage: "Online: the events whose post-receive work waits parked",
+				Commands: []*cli.Command{
+					{Name: "list", Usage: "List the parked events with their error", Action: runClusterParkedList},
+					{
+						Name:      "resolve",
+						Usage:     "Give up the work of a parked event that can never succeed; the event and the reason are kept in cluster_parked_resolution and the audit",
+						ArgsUsage: "<index>",
+						Flags: []cli.Flag{
+							&cli.StringFlag{Name: "reason", Usage: "why the event is given up (required, kept with it)"},
+							&cli.StringFlag{Name: "lineage", Usage: "the lineage, when the index is parked in several"},
+						},
+						Action: runClusterParkedResolve,
+					},
+				},
+			},
+			{
 				Name:      "import",
 				Usage:     "Online: put the refs of repositories that predate the cluster into the table, objects first",
 				ArgsUsage: "[owner/name.git]",
@@ -554,6 +571,45 @@ func runClusterReconcile(ctx context.Context, c *cli.Command) error {
 		return errors.New("--apply and --dry-run exclude each other")
 	}
 	resp, err := callReplicator(ctx, &clusterhook.Request{Op: clusterhook.OpReconcile, DryRun: !c.Bool("apply")})
+	if err != nil {
+		return err
+	}
+	_, err = c.Root().Writer.Write(append(resp.Data, '\n'))
+	return err
+}
+
+func runClusterParkedList(ctx context.Context, c *cli.Command) error {
+	resp, err := callReplicator(ctx, &clusterhook.Request{Op: clusterhook.OpParkedList})
+	if err != nil {
+		return err
+	}
+	_, err = c.Root().Writer.Write(append(resp.Data, '\n'))
+	return err
+}
+
+// parkedResolveRequest checks the arguments of `parked resolve`: an index,
+// and a reason, without which nothing is given up.
+func parkedResolveRequest(c *cli.Command) (*clusterhook.Request, error) {
+	if c.Args().Len() != 1 {
+		return nil, errors.New("usage: forgejo cluster parked resolve <index> --reason \"...\"")
+	}
+	index, err := strconv.ParseInt(c.Args().First(), 10, 64)
+	if err != nil || index <= 0 {
+		return nil, fmt.Errorf("%q is not a log index", c.Args().First())
+	}
+	reason := strings.TrimSpace(c.String("reason"))
+	if reason == "" {
+		return nil, errors.New("--reason is required: it is kept with the event given up")
+	}
+	return &clusterhook.Request{Op: clusterhook.OpParkedResolve, Index: index, Lineage: c.String("lineage"), Reason: reason, Operator: string(localOperator())}, nil
+}
+
+func runClusterParkedResolve(ctx context.Context, c *cli.Command) error {
+	req, err := parkedResolveRequest(c)
+	if err != nil {
+		return err
+	}
+	resp, err := callReplicator(ctx, req)
 	if err != nil {
 		return err
 	}

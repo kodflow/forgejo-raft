@@ -19,9 +19,8 @@ const (
 	// CursorDispatch is the consumer's position: every event at or below it
 	// has had its post-receive work committed.
 	CursorDispatch = "dispatch"
-	// CursorBackup is written by the PostgreSQL backup with the dispatch
-	// cursor it captured; trimming never passes it unless it lags beyond its
-	// bound (R9-14).
+	// CursorBackup is written by each checkpoint with the index of its
+	// barrier; trimming never passes it, whatever its lag (R9-14).
 	CursorBackup = "backup"
 )
 

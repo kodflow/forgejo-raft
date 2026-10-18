@@ -227,3 +227,41 @@ func TestParkedEventCommitsWithItsCursorAndReconcileAppliesIt(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, ms)
 }
+
+// The operator's path for an event that can never succeed: listed with its
+// error, resolved only with a reason, recorded in the replicated audit and
+// in cluster_parked_resolution with its payload; the trim is then free.
+func TestResolveParkedIsAuditedAndFreesTheTrim(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ctx := db.DefaultContext
+	_, reps := NewForTesting(t.TempDir(), "node-a")
+	r := reps[0]
+	require.Eventually(t, func() bool { return r.Engine().Status().Role == consensus.RoleLeader }, 5*time.Second, 10*time.Millisecond)
+	require.NoError(t, cluster_model.ParkEvents(ctx, []*cluster_model.ParkedEvent{
+		{Lineage: "lin", LogIndex: 12, Repo: "o/a.git", Event: `{"repo":"o/a.git"}`, Reason: "repository ID 3 is o/b: the ID was reused", Attempts: 5},
+	}))
+	ps, err := r.ListParked(ctx)
+	require.NoError(t, err)
+	require.Len(t, ps, 1)
+	assert.Equal(t, "repository ID 3 is o/b: the ID was reused", ps[0].Error)
+	v := r.View(ctx)
+	assert.EqualValues(t, 1, v.ParkedEvents)
+	require.Len(t, v.Parked, 1, "the administration lists it")
+
+	op := consensus.Operator("local-uid:1000")
+	_, err = r.ResolveParked(ctx, op, "", 12, "")
+	require.ErrorIs(t, err, cluster_model.ErrResolveNeedsReason)
+	_, err = r.ResolveParked(ctx, op, "", 12, "repository recreated, push replayed")
+	require.NoError(t, err)
+
+	_, ok, err := cluster_model.MinParkedIndex(ctx, "lin")
+	require.NoError(t, err)
+	assert.False(t, ok, "nothing holds the trim any more")
+	found := false
+	for _, a := range r.table.Audit() {
+		if a.Action == string(ActionResolveParked) && a.Detail == "repository recreated, push replayed" && a.Operator == string(op) {
+			found = true
+		}
+	}
+	assert.True(t, found, "the resolution is in the replicated audit")
+}

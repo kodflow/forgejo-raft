@@ -90,6 +90,9 @@ type consumer struct {
 	seen      map[string]int64
 	lastRetry time.Time
 	lag       uint64
+	// backupLag is how far the backup cursor lags the dispatch cursor when
+	// that lag is beyond backupMaxLag and holds the trim; 0 otherwise.
+	backupLag uint64
 	// stall is the head event waiting for its repository's projection.
 	stall struct {
 		index uint64
@@ -112,8 +115,10 @@ var parkedRetryEvery = 30 * time.Second
 var ackEvery uint64 = 256
 
 const (
-	batchMax     = 64
-	maxAttempts  = 5
+	batchMax    = 64
+	maxAttempts = 5
+	// backupMaxLag is the backup lag past which the held trim is alarmed:
+	// the trim never passes the backup, whatever its lag.
 	backupMaxLag = 1 << 20
 )
 
@@ -198,6 +203,14 @@ func (c *consumer) Stalled() (string, time.Duration) {
 
 // Durability is the last verdict on SQL's durability.
 func (c *consumer) Durability() Durability { return c.durability.get() }
+
+// BackupLag is how far the last PostgreSQL backup lags the cursor when it
+// holds the trim beyond its bound; 0 otherwise.
+func (c *consumer) BackupLag() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.backupLag
+}
 
 func (c *consumer) run(ctx context.Context) {
 	tick := time.NewTicker(time.Second)
@@ -562,7 +575,7 @@ func (r *Replicator) RetryParked(ctx context.Context) (applied int, remaining in
 // maybeAck trims the table's events behind what SQL holds durably: the
 // cursor READ BACK from SQL, never at or past a parked event, lagging by
 // the configured margin, never past the cursor of the last PostgreSQL
-// backup unless that backup lags beyond its bound (R8-23, R9-14), and only
+// backup whatever its lag (R8-23, R9-14), and only
 // once the durability check, run AFTER those reads, confirms that a
 // failover of the database cannot bring them back.
 func (c *consumer) maybeAck(ctx context.Context, lineage string) {
@@ -583,14 +596,29 @@ func (c *consumer) maybeAck(ctx context.Context, lineage string) {
 		return
 	}
 	target := bound - setting.Cluster.AckMargin
+	var backupLag uint64
 	if b, err := c.cursor(ctx, cluster_model.CursorBackup); err != nil {
 		return
 	} else if b.Lineage == lineage {
+		// Never past the backup, whatever its lag: a PostgreSQL restored to
+		// it replays what follows from the log. A backup that lags too far
+		// holds the trim, loudly, until the next checkpoint closes.
 		pos := uint64(readBack.Position)
-		if bp := uint64(b.Position); bp < target && pos-bp < backupMaxLag {
+		if bp := uint64(b.Position); bp < target {
 			target = bp
-		} else if bp < target {
-			log.Warn("cluster consumer: the PostgreSQL backup lags %d entries behind; trimming past it, that backup is not replayable", pos-bp)
+			if pos-bp >= backupMaxLag {
+				backupLag = pos - bp
+			}
+		}
+	}
+	c.mu.Lock()
+	prevLag := c.backupLag
+	c.backupLag = backupLag
+	c.mu.Unlock()
+	if backupLag > 0 {
+		backupTrimHeldTotal.Inc()
+		if prevLag == 0 {
+			log.Error("cluster consumer: the PostgreSQL backup lags %d entries behind the cursor; the event queue is not trimmed past it until a checkpoint closes", backupLag)
 		}
 	}
 	c.mu.Lock()

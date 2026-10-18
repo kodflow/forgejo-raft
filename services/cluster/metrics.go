@@ -46,6 +46,10 @@ var (
 		Name: metricsNamespace + "consumer_trim_held_total",
 		Help: "Trims of the event queue held back because SQL's durability was not confirmed.",
 	})
+	backupTrimHeldTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: metricsNamespace + "consumer_backup_trim_held_total",
+		Help: "Trims of the event queue held at the backup cursor while the PostgreSQL backup lags beyond its bound.",
+	})
 	cursorRegressionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: metricsNamespace + "consumer_cursor_regressions_total",
 		Help: "Times the consumer read a cursor behind one it had seen (a database failover or restore): the events past it are replayed from the log.",
@@ -119,6 +123,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	parkedTotal.Describe(ch)
 	unparkedTotal.Describe(ch)
 	trimHeldTotal.Describe(ch)
+	backupTrimHeldTotal.Describe(ch)
 	cursorRegressionsTotal.Describe(ch)
 	checkpointsTotal.Describe(ch)
 	exportsTotal.Describe(ch)
@@ -139,6 +144,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	parkedTotal.Collect(ch)
 	unparkedTotal.Collect(ch)
 	trimHeldTotal.Collect(ch)
+	backupTrimHeldTotal.Collect(ch)
 	cursorRegressionsTotal.Collect(ch)
 	checkpointsTotal.Collect(ch)
 	exportsTotal.Collect(ch)

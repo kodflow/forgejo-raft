@@ -44,3 +44,13 @@ func SetSQLDurabilityForTesting(r *Replicator, ok bool, reason string) {
 	}
 	r.consumer.durability.set(ok, reason)
 }
+
+// SetBackupLagForTesting sets the consumer's held backup lag.
+func SetBackupLagForTesting(r *Replicator, lag uint64) {
+	if r.consumer == nil {
+		r.consumer = &consumer{r: r}
+	}
+	r.consumer.mu.Lock()
+	r.consumer.backupLag = lag
+	r.consumer.mu.Unlock()
+}

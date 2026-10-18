@@ -109,10 +109,19 @@ type View struct {
 	SQLDurable           bool
 	SQLDurability        string
 	SQLDurabilityChecked time.Time
-	ApplyLagEntries      uint64
-	Lag                  []RepoLag
-	Audit                []reftable.AuditRecord
-	Started              time.Time
+	// Parked lists the first parked entries with their error.
+	Parked []ParkedView
+	// BackupLag is how far the PostgreSQL backup lags the cursor while it
+	// holds the trim beyond its bound; 0 otherwise.
+	BackupLag uint64
+	// EventQueueMax is the bound past which pushes are refused;
+	// EventQueueAlarm is set past EventQueueAlarmShare of it.
+	EventQueueMax   int64
+	EventQueueAlarm bool
+	ApplyLagEntries uint64
+	Lag             []RepoLag
+	Audit           []reftable.AuditRecord
+	Started         time.Time
 	// ExpectedNodes is [cluster] EXPECTED_NODES, 0 in the manual mode, and
 	// VoterTarget the voters the rule wants with the members present.
 	ExpectedNodes int
@@ -143,6 +152,15 @@ func (r *Replicator) View(ctx context.Context) View {
 	}
 	ch := r.ConsumerHealth(ctx)
 	v.SQLDurable, v.SQLDurability, v.SQLDurabilityChecked, v.ParkedEvents = ch.SQLDurable, ch.SQLDurability, ch.SQLDurabilityChecked, ch.ParkedEvents
+	v.BackupLag, v.EventQueueMax, v.EventQueueAlarm = ch.BackupLag, ch.EventQueueMax, ch.EventQueueAlarm
+	if v.ParkedEvents > 0 {
+		if ps, err := r.ListParked(ctx); err == nil {
+			if len(ps) > 100 {
+				ps = ps[:100]
+			}
+			v.Parked = ps
+		}
+	}
 	if r.consumer != nil {
 		v.ConsumerLag = r.consumer.Lag()
 	}
@@ -216,8 +234,19 @@ func (r *Replicator) ConsumerHealth(ctx context.Context) View {
 			v.ParkedEvents = n
 		}
 	}
+	if r.consumer != nil {
+		v.BackupLag = r.consumer.BackupLag()
+	}
+	if r.table != nil {
+		v.EventBytes, v.EventQueueMax = r.table.EventBytes(), reftable.MaxEventBytes
+		v.EventQueueAlarm = v.EventBytes >= int64(float64(reftable.MaxEventBytes)*EventQueueAlarmShare)
+	}
 	return v
 }
+
+// EventQueueAlarmShare is the share of the event queue's bound at which the
+// health check and the administration warn, before pushes are refused.
+const EventQueueAlarmShare = 0.5
 
 // Action names an online operation of ADR 0152 D17.
 type Action string

@@ -129,6 +129,18 @@ func (r *Replicator) Handle(ctx context.Context, req *clusterhook.Request) *clus
 			return fail(err)
 		}
 		return withData(ms)
+	case clusterhook.OpParkedList:
+		ps, err := r.ListParked(ctx)
+		if err != nil {
+			return fail(err)
+		}
+		return withData(ps)
+	case clusterhook.OpParkedResolve:
+		res, err := r.ResolveParked(ctx, operatorOrLocal(req.Operator), req.Lineage, req.Index, req.Reason)
+		if err != nil {
+			return fail(err)
+		}
+		return withData(res)
 	case clusterhook.OpImport:
 		rep, err := r.Import(ctx, req.Repo)
 		if err != nil {

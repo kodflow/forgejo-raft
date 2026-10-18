@@ -63,10 +63,35 @@ so its work keeps its order. The event queue is not trimmed at or past a
 parked event. The leader retries the parked events every 30 seconds, and
 `forgejo cluster reconcile --apply` retries them at once; a retry's work and
 the removal of the row commit in one transaction, so each event is applied
-exactly once. The count is on the administration page and under
-`cluster:parked_events` in `/api/healthz`. A parked event that can never
-succeed (its repository or pusher ID was reissued) holds the queue's trim:
-fix its cause, or remove its row by hand, knowingly.
+exactly once. As soon as one is parked, it is logged as an error, listed
+with its error on the administration page and warned under
+`cluster:parked_events` in `/api/healthz`. When the event queue reaches half
+of its bound (64 MiB), `cluster:event_queue` warns and the administration
+says so, before pushes are refused.
+
+A parked event that can never succeed (its repository or pusher ID was
+reissued) is given up by an operator, never silently:
+
+```sh
+forgejo cluster parked list
+forgejo cluster parked resolve <index> --reason "why" [--lineage <lineage>]
+```
+
+`resolve` refuses without a reason. It keeps every event of the entry, its
+payload and last error, with who resolved it, when and why, in
+`cluster_parked_resolution`, in the transaction that removes it from the
+parked events; the resolution is also written to the replicated audit and
+logged. Only then may the trim pass it.
+
+## Backups hold the trim
+
+Each checkpoint records the backup cursor; the event queue is never trimmed
+past it, whatever its lag, since a PostgreSQL restored to that checkpoint
+replays what follows from the log. When it lags more than 1,048,576 entries
+(checkpoints stopped or failing), the held trim is counted
+(`forgejo_cluster_consumer_backup_trim_held_total`), `/api/healthz` warns
+under `cluster:backup_lag` and the administration page says "backup lags N
+entries": take a checkpoint.
 
 ## The `[cluster]` keys
 

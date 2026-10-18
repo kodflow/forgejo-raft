@@ -56,3 +56,46 @@ func TestParkedEntryUnparksOnce(t *testing.T) {
 	idx, _, _ = MinParkedIndex(ctx, "l")
 	assert.EqualValues(t, 9, idx)
 }
+
+// An operator gives up a parked entry only with a reason; the event, its
+// last error, who and why are kept, and the trim is no longer held by it.
+func TestResolveParkedKeepsTheEventAndItsReason(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ctx := db.DefaultContext
+	require.NoError(t, ParkEvents(ctx, []*ParkedEvent{
+		{Lineage: "l", LogIndex: 4, Seq: 0, Repo: "o/a.git", Event: `{"repo":"o/a.git"}`, Reason: "pusher ID reused", Attempts: 5},
+		{Lineage: "l", LogIndex: 4, Seq: 1, Repo: "o/a.git", Event: `{"repo":"o/a.git","ref":"b"}`, Reason: "pusher ID reused", Attempts: 5},
+		{Lineage: "m", LogIndex: 6, Repo: "o/b.git", Event: "{}"},
+		{Lineage: "n", LogIndex: 6, Repo: "o/c.git", Event: "{}"},
+	}))
+
+	_, err := ResolveParked(ctx, "", 4, "local-uid:0", "  ")
+	require.ErrorIs(t, err, ErrResolveNeedsReason)
+	n, _ := CountParked(ctx)
+	assert.EqualValues(t, 4, n, "nothing given up without a reason")
+
+	_, err = ResolveParked(ctx, "", 6, "local-uid:0", "gone")
+	require.ErrorIs(t, err, ErrParkedAmbiguous)
+	_, err = ResolveParked(ctx, "", 99, "local-uid:0", "gone")
+	require.ErrorIs(t, err, ErrParkedNotFound)
+
+	res, err := ResolveParked(ctx, "", 4, "forgejo-user:1", "the pusher's account was recreated; work replayed by hand")
+	require.NoError(t, err)
+	require.Len(t, res, 2)
+	_, ok, _ := MinParkedIndex(ctx, "l")
+	assert.False(t, ok, "the trim is no longer held")
+
+	kept, err := ListParkedResolutions(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, kept, 2)
+	for _, k := range kept {
+		assert.EqualValues(t, 4, k.LogIndex)
+		assert.Equal(t, "forgejo-user:1", k.Operator)
+		assert.Equal(t, "the pusher's account was recreated; work replayed by hand", k.Reason)
+		assert.Equal(t, "pusher ID reused", k.LastError)
+		assert.Contains(t, k.Event, `"repo":"o/a.git"`, "the payload is kept")
+		assert.NotZero(t, k.ResolvedUnix)
+	}
+	_, err = ResolveParked(ctx, "m", 6, "local-uid:0", "gone")
+	require.NoError(t, err, "named by its lineage")
+}
