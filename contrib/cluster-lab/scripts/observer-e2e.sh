@@ -181,8 +181,10 @@ for ((i = 0; i < 60; i++)); do
   sleep 1
 done
 [ -n "$(haproxy_primary || true)" ] || fail "no primary behind HAProxy after the switchover"
+# Forgejo's pooled connections die with the old primary: the first requests
+# after the switch may fail, as in e2e.sh, so the push is retried.
 client "cd /work/repo && echo after-failover >g.txt && git add g.txt && git -c user.name=x -c user.email=x@x commit -qm failover &&
-  git push -qf http://$USER_NAME:$TOKEN@10.89.0.41:3000/$USER_NAME/$REPO.git HEAD:refs/heads/after-failover"
+  for i in \$(seq 60); do git push -qf http://$USER_NAME:$TOKEN@10.89.0.41:3000/$USER_NAME/$REPO.git HEAD:refs/heads/after-failover && exit 0; sleep 1; done; exit 1"
 FAILOVER="$(wait_protected_after "$(date +%s)")"
 NEW_TLI="$(observer_list | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["timeline"])')"
 [ "$NEW_TLI" -gt "$OLD_TLI" ] || fail "the checkpoint after the failover is on timeline $NEW_TLI, not past $OLD_TLI"
