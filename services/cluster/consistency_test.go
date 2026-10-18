@@ -169,10 +169,10 @@ func TestPayloadVersionRaisedOnlyWhenEveryMemberAppliesIt(t *testing.T) {
 	m := consensus.Membership{Members: []consensus.Member{{ID: 1}, {ID: 2}, {ID: 3}}}
 	v := reftable.PayloadVersion
 	all := []hello{{Node: consensus.NodeID(2).String(), Payload: v}, {Node: consensus.NodeID(3).String(), Payload: v}}
-	assert.True(t, everyMemberApplies(m, 1, all, v))
-	assert.False(t, everyMemberApplies(m, 1, all[:1], v), "a member that did not answer")
+	assert.True(t, everyMemberApplies(m, 1, all))
+	assert.False(t, everyMemberApplies(m, 1, all[:1]), "a member that did not answer")
 	old := []hello{all[0], {Node: consensus.NodeID(3).String()}}
-	assert.False(t, everyMemberApplies(m, 1, old, v), "a member running an older binary")
+	assert.False(t, everyMemberApplies(m, 1, old), "a member running an older binary")
 
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	require.NoError(t, tc.nodes[1].r.RaisePayloadVersion(context.Background(), "op"))

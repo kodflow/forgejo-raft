@@ -111,7 +111,7 @@ func (r *Replicator) maybeRaisePayload(ctx context.Context, m consensus.Membersh
 		return
 	}
 	r.payloadProbe = r.auto.now().Add(payloadProbeEvery)
-	if !everyMemberApplies(m, r.selfID(), r.auto.round(ctx), reftable.PayloadVersion) {
+	if !everyMemberApplies(m, r.selfID(), r.auto.round(ctx)) {
 		return
 	}
 	if err := r.RaisePayloadVersion(ctx, autopilotOperator); err != nil {
@@ -122,11 +122,11 @@ func (r *Replicator) maybeRaisePayload(ctx context.Context, m consensus.Membersh
 }
 
 // everyMemberApplies reports whether every member other than self answered
-// as itself (its node id) with a binary that applies version v.
-func everyMemberApplies(m consensus.Membership, self consensus.NodeID, seen []hello, v int) bool {
+// as itself (its node id) with a binary that applies reftable.PayloadVersion.
+func everyMemberApplies(m consensus.Membership, self consensus.NodeID, seen []hello) bool {
 	ok := map[string]bool{}
 	for _, h := range seen {
-		if h.Payload >= v {
+		if h.Payload >= reftable.PayloadVersion {
 			ok[h.Node] = true
 		}
 	}
