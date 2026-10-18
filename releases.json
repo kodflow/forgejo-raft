@@ -2,6 +2,12 @@
   "schema": 1,
   "releases": [
     {
+      "version": "17.0.0-raft.1",
+      "upstream": "17.0.0",
+      "url": "https://github.com/kodflow/forgejo-raft/releases/tag/v17.0.0-raft.1",
+      "prerelease": false
+    },
+    {
       "version": "18.0.0-dev-raft.1",
       "upstream": "18.0.0-dev",
       "url": "https://github.com/kodflow/forgejo-raft/releases/tag/v18.0.0-dev-raft.1",
