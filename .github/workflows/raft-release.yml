@@ -1,0 +1,296 @@
+# One official Forgejo release, vX.Y.Z, turned into the raft release
+# vX.Y.Z-raft.N. Called by upstream-releases.yml, once per tag.
+#
+# 1. prepare  .github/scripts/raft-release-branch.sh builds or picks up the
+#             branch release/vX.Y.Z: the tag plus the raft delta (the script's
+#             header says how, and how it proves nothing else comes along).
+#             .github/scripts/release-plan.sh then decides whether there is
+#             anything to release (nothing when the branch is already
+#             released) and the version: N counts the releases on vX.Y.Z.
+# 2. checks   cluster-checks.yml on the branch (build, vet, race tests),
+#             and E2E (e2e.yml, the three suites on a real lab).
+# 3. publish  release-publish.yml, as for the development line, as a
+#             release (not a prerelease); marked Latest and image :latest
+#             when it is the highest stable raft version.
+# 4. report   a conflict or a red check releases nothing and opens, or
+#             updates, the issue "raft release vX.Y.Z blocked" with the
+#             conflicted files or the failed jobs. Fix it on release/vX.Y.Z
+#             (the issue says how): the next run tests the branch as it
+#             stands. A run that finds the same attempt already blocked
+#             (same branch commit, or same tag and same delta) skips it,
+#             so a blocked release costs no E2E run a day. A release closes
+#             the issue.
+#
+# The release branch carries no .github: its checks run from the workflows
+# of the commit that calls this one (`forgejo`), with `ref`. The branch is
+# pushed with the GITHUB_TOKEN, which needs no workflows permission for that,
+# and starts nothing by itself: every check here is called, not triggered.
+name: Raft release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Official release, vX.Y.Z
+        type: string
+        required: true
+      dry_run:
+        type: boolean
+        default: false
+      refresh:
+        description: Rebuild an existing release branch from the current delta
+        type: boolean
+        default: false
+      force:
+        description: Retry even when this attempt is already blocked
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: raft-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      issues: read
+    outputs:
+      action: ${{ steps.decide.outputs.action }}
+      reason: ${{ steps.decide.outputs.reason }}
+      mode: ${{ steps.branch.outputs.mode }}
+      branch: ${{ steps.branch.outputs.branch }}
+      sha: ${{ steps.branch.outputs.sha }}
+      base: ${{ steps.branch.outputs.base }}
+      source: ${{ steps.branch.outputs.source }}
+      conflicts: ${{ steps.branch.outputs.conflicts }}
+      attempt: ${{ steps.branch.outputs.attempt }}
+      version: ${{ steps.plan.outputs.version }}
+      file_version: ${{ steps.plan.outputs.file_version }}
+      upstream_version: ${{ steps.plan.outputs.upstream_version }}
+      notes: ${{ steps.notes.outputs.notes }}
+    env:
+      TAG: ${{ inputs.tag }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # The branch is pushed with it.
+          persist-credentials: true
+
+      # Offline, a few seconds: a wrong branch must stop the run.
+      - name: Test the scripts
+        run: |
+          .github/scripts/raft-release-branch.test.sh
+          .github/scripts/release-plan.test.sh
+
+      - name: Release branch
+        id: branch
+        env:
+          REFRESH: ${{ inputs.refresh }}
+          NOTES_FILE: ${{ runner.temp }}/raft-notes.md
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          args=()
+          if [ "$DRY_RUN" = true ]; then args=(--dry-run); fi
+          .github/scripts/raft-release-branch.sh "${args[@]}" | tee "$RUNNER_TEMP/branch.txt"
+          if [ "$DRY_RUN" = true ]; then
+            sed '/^--- /,$d' "$RUNNER_TEMP/branch.txt" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Version and decision
+        id: plan
+        if: ${{ steps.branch.outputs.sha != '' }}
+        env:
+          UPSTREAM_BRANCH: ${{ steps.branch.outputs.stable_branch }}
+          HEAD_REV: ${{ steps.branch.outputs.sha }}
+          NOTES_FILE: ${{ runner.temp }}/plan-notes.md
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = true ]; then
+            .github/scripts/release-plan.sh --dry-run | tee "$RUNNER_TEMP/plan.txt"
+            sed '/^--- /,$d' "$RUNNER_TEMP/plan.txt" >> "$GITHUB_OUTPUT"
+          else
+            .github/scripts/release-plan.sh
+          fi
+
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ steps.branch.outputs.mode }}
+          ATTEMPT: ${{ steps.branch.outputs.attempt }}
+          RELEASE: ${{ steps.plan.outputs.release }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          action=test reason=
+          if [ "$MODE" != conflict ] && [ "$RELEASE" != true ]; then
+            action=skip reason="release/$TAG is already released"
+          else
+            body=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --limit 100 \
+              --search "\"raft release $TAG blocked\" in:title" --json title,body \
+              -q "[.[] | select(.title == \"raft release $TAG blocked\")][0].body // \"\"")
+            if [ "$FORCE" != true ] && grep -qF "<!-- raft-release attempt: $ATTEMPT -->" <<<"$body"; then
+              action=skip reason="this attempt is already blocked (the open issue), nothing changed since"
+            elif [ "$MODE" = conflict ]; then
+              action=blocked reason="the raft delta does not merge onto $TAG"
+            fi
+          fi
+          if [ "$DRY_RUN" = true ] && [ "$action" = test ]; then
+            action=dry reason="dry run: would test and release"
+          fi
+          echo "$TAG: $action${reason:+ ($reason)}"
+          { echo "action=$action"; echo "reason=$reason"; } >> "$GITHUB_OUTPUT"
+
+      - name: Notes
+        id: notes
+        env:
+          RAFT_NOTES: ${{ runner.temp }}/raft-notes.md
+          PLAN_NOTES: ${{ runner.temp }}/plan-notes.md
+          ACTION: ${{ steps.decide.outputs.action }}
+          REASON: ${{ steps.decide.outputs.reason }}
+          CONFLICTS: ${{ steps.branch.outputs.conflicts }}
+        run: |
+          set -euo pipefail
+          {
+            cat "$RAFT_NOTES"
+            if [ -s "$PLAN_NOTES" ]; then echo; cat "$PLAN_NOTES"; fi
+          } > "$RUNNER_TEMP/notes.md"
+          {
+            echo "### $TAG: $ACTION"
+            [ -n "$REASON" ] && echo "$REASON"
+            [ -n "$CONFLICTS" ] && echo && echo "Conflicts: \`${CONFLICTS//,/\`, \`}\`"
+            echo
+            cat "$RUNNER_TEMP/notes.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+          delim="notes_$(openssl rand -hex 16)"
+          {
+            echo "notes<<$delim"
+            cat "$RUNNER_TEMP/notes.md"
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.action == 'test' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/cluster-checks.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+      skip_lint: true
+
+  e2e:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.action == 'test' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/e2e.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+
+  publish:
+    needs: [prepare, checks, e2e]
+    if: ${{ needs.prepare.outputs.action == 'test' }}
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/release-publish.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      file_version: ${{ needs.prepare.outputs.file_version }}
+      upstream_version: ${{ needs.prepare.outputs.upstream_version }}
+      sha: ${{ needs.prepare.outputs.sha }}
+      notes: ${{ needs.prepare.outputs.notes }}
+      cache_scope: release-${{ inputs.tag }}
+
+  report:
+    needs: [prepare, checks, e2e, publish]
+    if: >-
+      ${{ always() && !inputs.dry_run
+          && (needs.prepare.result != 'success'
+              || needs.prepare.outputs.action == 'blocked'
+              || needs.prepare.outputs.action == 'test') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      ACTION: ${{ needs.prepare.outputs.action }}
+      ATTEMPT: ${{ needs.prepare.outputs.attempt }}
+      BRANCH: ${{ needs.prepare.outputs.branch }}
+      SHA: ${{ needs.prepare.outputs.sha }}
+      BASE: ${{ needs.prepare.outputs.base }}
+      SOURCE: ${{ needs.prepare.outputs.source }}
+      MODE: ${{ needs.prepare.outputs.mode }}
+      CONFLICTS: ${{ needs.prepare.outputs.conflicts }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      RESULTS: >-
+        prepare=${{ needs.prepare.result }}
+        cluster-checks=${{ needs.checks.result }}
+        e2e=${{ needs.e2e.result }}
+        publish=${{ needs.publish.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open, update or close the issue
+        run: |
+          set -euo pipefail
+          title="raft release $TAG blocked"
+          issue=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --search "\"$title\" in:title" --json number,title \
+            -q "[.[] | select(.title == \"$title\")][0].number // empty")
+
+          failed=
+          for r in $RESULTS; do
+            case "$r" in *=success|*=skipped) ;; *) failed="$failed ${r%%=*}" ;; esac
+          done
+          if [ "$ACTION" = test ] && [ -z "$failed" ]; then
+            if [ -n "$issue" ]; then
+              gh issue close "$issue" -R "$GITHUB_REPOSITORY" \
+                --comment "Publiée : $VERSION ($RUN_URL)."
+            fi
+            exit 0
+          fi
+
+          if [ "$ACTION" = blocked ]; then
+            # shellcheck disable=SC2016 # the backticks are Markdown
+            why="Le delta raft ne se fusionne pas sur \`$TAG\` (mode \`$MODE\`). Fichiers en conflit :"$'\n\n'"$(tr ',' '\n' <<<"$CONFLICTS" | sed 's/^/- `/; s/$/`/')"
+            # shellcheck disable=SC2016 # the backticks are Markdown
+            fix="$(printf '%s\n' \
+              'Résoudre à la main, sur une branche partant du tag :' '' '```sh' \
+              "git fetch https://codeberg.org/forgejo/forgejo.git tag $TAG --no-tags" \
+              "git fetch origin $SOURCE" \
+              "git switch -c $BRANCH 'refs/tags/$TAG^{commit}'" \
+              "git diff --binary $BASE $SOURCE -- . ':(exclude).github' ':(exclude).coderabbit.yaml' | git apply -3" \
+              '# résoudre les conflits, puis' \
+              "git commit -am 'feat(release): raft delta onto $TAG'" \
+              "git push origin $BRANCH" '```' '' \
+              "Le prochain passage (quotidien, ou Upstream releases lancé avec \`tag: $TAG\`) teste \`$BRANCH\` telle quelle et publie si tout est vert.")"
+          else
+            why="La branche \`$BRANCH\` (\`${SHA:0:12}\`, mode \`$MODE\`) ne passe pas :${failed}."
+            fix="Corriger sur \`$BRANCH\` (un commit de plus, jamais une fusion de \`forgejo\` ni de la branche de développement amont, que le contrôle refuse). Le prochain passage la reteste telle quelle."
+          fi
+          body="$(printf '%s\n\n%s\n\n%s\n\n%s\n' \
+            "Aucune version raft n'est publiée pour Forgejo \`$TAG\` tant que ceci n'est pas réglé." \
+            "$why" "$fix" \
+            "Dernier passage : $RUN_URL")"$'\n\n'"<!-- raft-release attempt: $ATTEMPT -->"
+
+          if [ -n "$issue" ]; then
+            gh issue edit "$issue" -R "$GITHUB_REPOSITORY" --body "$body"
+            gh issue comment "$issue" -R "$GITHUB_REPOSITORY" --body "Toujours bloquée : $RUN_URL"
+            echo "updated issue #$issue"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+          echo "::error::raft release $TAG blocked: ${failed:-conflict}"
+          exit 1

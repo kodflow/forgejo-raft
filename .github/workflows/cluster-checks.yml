@@ -14,6 +14,10 @@
 # replicated-cluster code, so a merge from Codeberg passes it as long as it
 # leaves that code building and green. It runs on the upstream sync pull
 # request too.
+#
+# raft-release.yml calls it on a release branch (release/vX.Y.Z, which carries
+# no .github of its own) with `ref`, and without the lint: that code was
+# linted on `forgejo`, and a release branch has no meaningful baseline.
 name: cluster-checks
 
 on:
@@ -22,9 +26,20 @@ on:
   push:
     branches: [forgejo]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit or branch to check, default the event's
+        type: string
+        default: ""
+      skip_lint:
+        type: boolean
+        default: false
 
+# Named, not github.workflow: called, that is the caller's name, and the
+# releases of several tags would cancel each other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: cluster-checks-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -51,6 +66,7 @@ jobs:
       # what the cluster must build against.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           # The lint's baseline is a merge base or the push's previous commit.
           fetch-depth: 0
           # No later step authenticates to git: the token stays out of it.
@@ -80,6 +96,7 @@ jobs:
       # Forgejo's own issues included. --new-from-rev diffs locally instead.
       - name: Baseline of the lint
         id: baseline
+        if: ${{ !inputs.skip_lint }}
         env:
           EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
@@ -111,6 +128,7 @@ jobs:
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
 
       - name: Lint the cluster scope (new issues only)
+        if: ${{ !inputs.skip_lint }}
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.14.0
