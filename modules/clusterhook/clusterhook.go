@@ -57,6 +57,8 @@ const (
 	OpReconcile     = "reconcile"
 	OpImport        = "import"
 	OpObjectsFill   = "objects-backfill"
+	OpParkedList    = "parked-list"
+	OpParkedResolve = "parked-resolve"
 )
 
 // Request is one call on the socket: one JSON object per connection.
@@ -77,6 +79,11 @@ type Request struct {
 	Path   string `json:"path,omitempty"`
 	Repo   string `json:"repo,omitempty"`
 	DryRun bool   `json:"dry_run,omitempty"`
+	// Lineage, Index and Reason name a parked event and why an operator
+	// resolves it.
+	Lineage string `json:"lineage,omitempty"`
+	Index   int64  `json:"index,omitempty"`
+	Reason  string `json:"reason,omitempty"`
 	// Operator is set by the offline command from the local account; the
 	// socket's peer credentials are what authenticates the caller.
 	Operator string `json:"operator,omitempty"`

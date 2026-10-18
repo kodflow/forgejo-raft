@@ -88,6 +88,10 @@ var Cluster = struct {
 	MaxSnapshotBytes      int64
 	// AckMargin is how far event trimming lags the consumer's cursor.
 	AckMargin uint64
+	// SQLStandalone declares that no replica of the database can ever be
+	// promoted: the consumer's durability check then requires local
+	// durability only, not a synchronous standby that holds every commit.
+	SQLStandalone bool
 	// TxnTTL bounds a native git transaction's registration (R6-06).
 	TxnTTL time.Duration
 	// JoinGrantTTL is how long an operator's grant lets a node join a slot.
@@ -270,6 +274,7 @@ func loadClusterFrom(rootCfg ConfigProvider) {
 	Cluster.MaxLogBytes = sec.Key("MAX_LOG_BYTES").MustInt64(Cluster.MaxLogBytes)
 	Cluster.MaxSnapshotBytes = sec.Key("MAX_SNAPSHOT_BYTES").MustInt64(Cluster.MaxSnapshotBytes)
 	Cluster.AckMargin = uint64(sec.Key("ACK_MARGIN").MustInt64(int64(Cluster.AckMargin)))
+	Cluster.SQLStandalone = sec.Key("SQL_STANDALONE").MustBool(false)
 	Cluster.TxnTTL = clusterDuration(sec, "TXN_TTL", Cluster.TxnTTL)
 	Cluster.MaxTxnPerRepo = sec.Key("MAX_TXN_PER_REPO").MustInt(Cluster.MaxTxnPerRepo)
 	Cluster.JoinGrantTTL = clusterDuration(sec, "JOIN_GRANT_TTL", Cluster.JoinGrantTTL)

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	cluster_model "forgejo.org/models/cluster"
 	"forgejo.org/models/db"
 	git_model "forgejo.org/models/git"
 	issues_model "forgejo.org/models/issues"
@@ -94,6 +95,9 @@ const (
 	RefsAheadOfSQL = "refs-ahead-of-sql"
 	SQLAheadOfRefs = "sql-ahead-of-refs"
 	RepoLifecycle  = "repository-lifecycle"
+	// ParkedEvent is an event whose post-receive work waits parked: with
+	// apply, it is retried; it stays until its work commits.
+	ParkedEvent = "parked-event"
 )
 
 // Actions on non-regenerable rows, for the operator.
@@ -122,7 +126,10 @@ func (r *Replicator) Reconcile(ctx context.Context, apply bool) ([]Mismatch, err
 			return nil, fmt.Errorf("this node's table could not be confirmed current (%w): nothing is rebuilt", err)
 		}
 	}
-	var out []Mismatch
+	out, err := r.reconcileParked(ctx, apply)
+	if err != nil {
+		return out, err
+	}
 	for _, key := range r.table.Repos() {
 		if ctx.Err() != nil {
 			return out, ctx.Err()
@@ -191,6 +198,42 @@ func (r *Replicator) Reconcile(ctx context.Context, apply bool) ([]Mismatch, err
 			return out, err
 		}
 		out = append(out, more...)
+	}
+	return out, nil
+}
+
+// reconcileParked lists the parked events and, with apply, retries them
+// first: those whose work committed are reported applied.
+func (r *Replicator) reconcileParked(ctx context.Context, apply bool) ([]Mismatch, error) {
+	before, err := cluster_model.ListParked(ctx)
+	if err != nil {
+		return nil, err
+	}
+	still := map[string]bool{}
+	if apply && len(before) > 0 && r.consumer != nil {
+		if _, err := r.consumer.retryParked(ctx); err != nil {
+			return nil, err
+		}
+		after, err := cluster_model.ListParked(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range after {
+			still[fmt.Sprintf("%s@%d", p.Lineage, p.LogIndex)] = true
+		}
+	}
+	var out []Mismatch
+	seen := map[string]bool{}
+	for _, p := range before {
+		key := fmt.Sprintf("%s@%d", p.Lineage, p.LogIndex)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, Mismatch{
+			Repo: p.Repo, Category: ParkedEvent, Kind: "event", Ref: key, Regenerable: true,
+			Action: p.Reason, Applied: apply && r.consumer != nil && !still[key],
+		})
 	}
 	return out, nil
 }

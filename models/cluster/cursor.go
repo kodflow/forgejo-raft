@@ -19,9 +19,8 @@ const (
 	// CursorDispatch is the consumer's position: every event at or below it
 	// has had its post-receive work committed.
 	CursorDispatch = "dispatch"
-	// CursorBackup is written by the PostgreSQL backup with the dispatch
-	// cursor it captured; trimming never passes it unless it lags beyond its
-	// bound (R9-14).
+	// CursorBackup is written by each checkpoint with the index of its
+	// barrier; trimming never passes it, whatever its lag (R9-14).
 	CursorBackup = "backup"
 )
 
@@ -83,4 +82,19 @@ func AdvanceCursor(ctx context.Context, name string, prev, next Cursor) error {
 		return ErrCursorMoved
 	}
 	return nil
+}
+
+// SetCursor moves a cursor to next whatever it held: the backup cursor,
+// which the checkpoint coordinator alone writes.
+func SetCursor(ctx context.Context, name string, next Cursor) error {
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		cur, err := GetCursor(ctx, name)
+		if err != nil {
+			return err
+		}
+		if cur.Lineage == next.Lineage && cur.Position == next.Position && cur.Closed == next.Closed {
+			return nil
+		}
+		return AdvanceCursor(ctx, name, *cur, next)
+	})
 }

@@ -168,7 +168,45 @@ func checkCluster(r *cluster_service.Replicator, checks checks) status {
 		}
 	}
 	checks["cluster:failure_tolerance"] = []componentStatus{ft}
+	checkClusterSQL(r, checks)
 	return st.Status
+}
+
+// checkClusterSQL warns while SQL is not durable across a failover of the
+// database (the event queue is then not trimmed, and fills) and while
+// events wait parked for their post-receive work.
+func checkClusterSQL(r *cluster_service.Replicator, checks checks) {
+	v := r.ConsumerHealth(context.Background())
+	du := componentStatus{Status: Pass, Time: getCheckTime()}
+	switch {
+	case v.SQLDurabilityChecked.IsZero():
+		du.Output = "not checked yet"
+	case !v.SQLDurable:
+		du.Status, du.Output = warn, "not durable across a database failover, the event queue is not trimmed: "+v.SQLDurability
+	default:
+		du.Output = v.SQLDurability
+	}
+	checks["cluster:sql_durability"] = []componentStatus{du}
+	pk := componentStatus{Status: Pass, Time: getCheckTime()}
+	switch {
+	case v.ParkedEvents < 0:
+		pk.Output = "unknown"
+	case v.ParkedEvents > 0:
+		pk.Status, pk.Output = warn, fmt.Sprintf("%d events wait parked for their post-receive work; the event queue is not trimmed past them; see `forgejo cluster reconcile`", v.ParkedEvents)
+	default:
+		pk.Output = "none"
+	}
+	checks["cluster:parked_events"] = []componentStatus{pk}
+	bk := componentStatus{Status: Pass, Time: getCheckTime()}
+	if v.BackupLag > 0 {
+		bk.Status, bk.Output = warn, fmt.Sprintf("the PostgreSQL backup lags %d entries, trim held: take a checkpoint", v.BackupLag)
+	}
+	checks["cluster:backup_lag"] = []componentStatus{bk}
+	q := componentStatus{Status: Pass, Time: getCheckTime(), Output: fmt.Sprintf("%d of %d bytes", v.EventBytes, v.EventQueueMax)}
+	if v.EventQueueAlarm {
+		q.Status, q.Output = warn, fmt.Sprintf("the event queue holds %d of %d bytes: pushes are refused when it is full; resolve what holds the trim (parked events, backup lag, durability)", v.EventBytes, v.EventQueueMax)
+	}
+	checks["cluster:event_queue"] = []componentStatus{q}
 }
 
 func getCheckTime() string {

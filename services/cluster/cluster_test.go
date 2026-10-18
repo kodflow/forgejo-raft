@@ -134,6 +134,13 @@ func (c *memCursors) get(_ context.Context, name string) (*cluster_model.Cursor,
 	return &v, nil
 }
 
+func (c *memCursors) set(_ context.Context, name string, next cluster_model.Cursor) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[name] = next
+	return nil
+}
+
 func (c *memCursors) advance(_ context.Context, name string, prev, next cluster_model.Cursor) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -150,6 +157,7 @@ type testCluster struct {
 	mem     *memraft.Cluster
 	nodes   []*testNode
 	cursors *memCursors
+	parked  *memParked
 	ctx     context.Context
 	cancel  context.CancelFunc
 	// loops counts the background goroutines, which close waits for so
@@ -186,7 +194,7 @@ func newTestClusterWith(t *testing.T, clusterID consensus.ClusterID, start func(
 	pki := newPKI(t)
 	mem := memraft.New()
 	clusterHex := clusterID.String()
-	tc := &testCluster{t: t, mem: mem, cursors: &memCursors{m: map[string]cluster_model.Cursor{}}}
+	tc := &testCluster{t: t, mem: mem, cursors: &memCursors{m: map[string]cluster_model.Cursor{}}, parked: &memParked{}}
 	ctx, cancel := context.WithCancel(context.Background())
 	tc.ctx, tc.cancel = ctx, cancel
 	t.Cleanup(tc.close)
@@ -226,6 +234,8 @@ func newTestClusterWith(t *testing.T, clusterID consensus.ClusterID, start func(
 		r.consumer.cursor = tc.cursors.get
 		r.consumer.advance = tc.cursors.advance
 		r.consumer.tx = func(ctx context.Context, f func(context.Context) error) error { return f(ctx) }
+		r.consumer.durable = func(context.Context) (bool, string) { return true, "test" }
+		tc.parked.wire(r.consumer)
 		tc.loops.Add(3)
 		go func() { defer tc.loops.Done(); r.projector.run(ctx) }()
 		go func() { defer tc.loops.Done(); r.startupBarrier(ctx) }()

@@ -289,8 +289,18 @@ running the same command again resumes from `<out>/progress.json`:
 6. Verification: the refs against the SQL branch rows, every LFS object
    present, every 2FA secret opening with the restored `SECRET_KEY`; then
    every access token, OAuth2 grant, session and runner token is revoked.
-7. Only then the new cluster, this node its only voter.
-8. The loss, stated: everything after the checkpoint, and the replicated
+7. The identifiers move past the checkpoint, once: every sequence of the
+   database by 1,000,000,000 (`setval`; a sequence whose type leaves less
+   room moves half of what it has left, one at its end stops the recovery),
+   and every repository's numbering (`issue_index`, for issues and pull
+   requests, and `action_run_index`) by 100,000, a repository without a
+   counter getting one past its highest number. Mails, webhooks, runners and
+   other forges hold the IDs and numbers handed out after the checkpoint;
+   they are never handed out again. Each move is printed; the recovery is
+   recorded in the `recovery-advance` cursor, so a resumed run moves nothing
+   twice.
+8. Only then the new cluster, this node its only voter.
+9. The loss, stated: everything after the checkpoint, and the replicated
    history before it.
 
 Then start Forgejo, run `forgejo cluster import` to put the restored refs in

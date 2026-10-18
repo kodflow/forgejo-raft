@@ -24,8 +24,11 @@ bootstrap:
     loop_wait: 5
     retry_timeout: 5
     maximum_lag_on_failover: 1048576
+    # REQUIRED (contrib/cluster/README.md, "PostgreSQL durability"): without
+    # strict mode Patroni acknowledges commits no standby holds when its
+    # standby goes away, and a failover loses them.
     synchronous_mode: on
-    synchronous_mode_strict: false
+    synchronous_mode_strict: true
     failsafe_mode: true
     postgresql:
       use_pg_rewind: true
