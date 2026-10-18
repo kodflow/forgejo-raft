@@ -87,6 +87,11 @@ services:
 
   observer:
     <<: *observer-image
+    # The one service that builds the image the others reuse.
+    build:
+      context: ./observer
+      additional_contexts:
+        cluster-observer: ../cluster/observer
     profiles: [observer]
     hostname: observer
     restart: unless-stopped
