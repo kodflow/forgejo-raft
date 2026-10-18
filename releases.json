@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "releases": [
+    {
+      "version": "18.0.0-dev-raft.1",
+      "upstream": "18.0.0-dev",
+      "url": "https://github.com/kodflow/forgejo-raft/releases/tag/v18.0.0-dev-raft.1",
+      "prerelease": true
+    },
+    {
+      "version": "18.0.0-dev-raft.3",
+      "upstream": "18.0.0-dev",
+      "url": "https://github.com/kodflow/forgejo-raft/releases/tag/v18.0.0-dev-raft.3",
+      "prerelease": true
+    },
+    {
+      "version": "18.0.0-dev-raft.4",
+      "upstream": "18.0.0-dev",
+      "url": "https://github.com/kodflow/forgejo-raft/releases/tag/v18.0.0-dev-raft.4",
+      "prerelease": true
+    },
+    {
+      "version": "18.0.0-dev-raft.5",
+      "upstream": "18.0.0-dev",
+      "url": "https://github.com/kodflow/forgejo-raft/releases/tag/v18.0.0-dev-raft.5",
+      "prerelease": true
+    },
+    {
+      "version": "18.0.0-dev-raft.6",
+      "upstream": "18.0.0-dev",
+      "url": "https://github.com/kodflow/forgejo-raft/releases/tag/v18.0.0-dev-raft.6",
+      "prerelease": true
+    },
+    {
+      "version": "18.0.0-dev-raft.7",
+      "upstream": "18.0.0-dev",
+      "url": "https://github.com/kodflow/forgejo-raft/releases/tag/v18.0.0-dev-raft.7",
+      "prerelease": true
+    }
+  ]
+}
