@@ -245,7 +245,7 @@ ok "PostgreSQL prepared with the observer's configuration, the source's dropped"
 # The comparison: the same replay with recovery_target_inclusive = on, on
 # its own port and socket (on the command line, over both configuration
 # files), then stopped.
-dco exec -T -u git forgejo-r sh -c "sed -i 's/recovery_target_inclusive = off/recovery_target_inclusive = on/; s/^port = .*/port = 5433/; s|unix_socket_directories = .*|unix_socket_directories = '/data/pgsock'|' /data/pg-inclusive-on/postgresql.conf &&
+dco exec -T -u git forgejo-r sh -c "sed -i 's/recovery_target_inclusive = off/recovery_target_inclusive = on/' /data/pg-inclusive-on/postgresql.conf &&
   $PG_CTL -D /data/pg-inclusive-on -o '-p 5433 -k /data/pgsock' -w -t 600 -l /data/pg-inclusive-on/log start >/dev/null || { tail -n 40 /data/pg-inclusive-on/log; exit 1; }"
 ON_STATE="$(dco exec -T -u git forgejo-r psql -h /data/pgsock -p 5433 -U forgejo -d forgejo -Atc \
   "SELECT (SELECT count(*) FROM issue), (SELECT string_agg(commit_id, ',' ORDER BY name) FROM branch WHERE is_deleted = false)" | tr -d '\r')"
