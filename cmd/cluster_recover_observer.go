@@ -201,6 +201,12 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 			fmt.Fprintf(w, "Start PostgreSQL on %s as its owner and let it replay to %s (timeline %d); this node's [database] must reach it. Then run the same command again.\n", c.String("pgdata"), m.Checkpoint.LSN, m.Checkpoint.Timeline)
 			return fmt.Errorf("%w (%v)", errRecoverStopped, err)
 		}
+		// pg_ctl -w returns while PostgreSQL still replays, and without hot
+		// standby it takes no connection until it reached the target and
+		// promoted.
+		if err := waitAccepting(ctx, func() error { _, err := db.GetEngine(ctx).Exec("SELECT 1"); return err }, time.Second, replayWait); err != nil {
+			return err
+		}
 		if err := checkPromoted(ctx, m); err != nil {
 			return err
 		}
@@ -340,6 +346,30 @@ OBSERVER_RECIPIENTS = %s
 func recipientSet(nameKey string) bool {
 	name, key, _ := strings.Cut(nameKey, "=")
 	return setting.Cluster.ObserverRecipients[name] == strings.ToLower(key)
+}
+
+// replayWait bounds the wait for PostgreSQL's replay, as pg_ctl's -t does.
+const replayWait = time.Hour
+
+// waitAccepting retries probe while PostgreSQL answers that it accepts no
+// connection yet (SQLSTATE 57P03: starting, or replaying without hot
+// standby), every interval, for bound at most. Any other answer ends it.
+func waitAccepting(ctx context.Context, probe func() error, interval, bound time.Duration) error {
+	deadline := time.Now().Add(bound)
+	for {
+		err := probe()
+		if err == nil || !strings.Contains(err.Error(), "57P03") {
+			return err
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("PostgreSQL still accepts no connection after %s: %w", bound, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
 }
 
 func runPGCtl(ctx context.Context, ctl, pgdata, action string) error {
