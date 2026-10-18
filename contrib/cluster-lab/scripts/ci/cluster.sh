@@ -52,7 +52,8 @@ push_until() {
   start=$(date +%s)
   sha="$(commit_to "$WORK/repo" "$b")" || return 1
   while :; do
-    if timeout 60 git -C "$WORK/repo" push -q "$(remote "$n" "$REPO")" "$b" 2>"$WORK/push.err"; then
+    # Each try within what is left of the bound.
+    if timeout "$(left_of "$t" "$start")" git -C "$WORK/repo" push -q "$(remote "$n" "$REPO")" "$b" 2>"$WORK/push.err"; then
       echo "$sha"
       return 0
     fi
@@ -60,6 +61,9 @@ push_until() {
     sleep 1
   done
 }
+# left_of <bound> <t0>: the whole seconds left of <bound> since <t0>, 1 at
+# least: the election and the push share one bound from the kill.
+left_of() { local l; l=$(echo "$1 - ($(date +%s.%N) - $2)" | bc); l=${l%.*}; [ "${l:-0}" -gt 0 ] 2>/dev/null && echo "$l" || echo 1; }
 kill_node() { dc kill -s KILL "forgejo-$1" >/dev/null 2>&1; }
 start_node() { dc start "forgejo-$1" >/dev/null 2>&1; }
 cut_off() { docker network disconnect "$RAFT_NET" "$(dc ps -q "forgejo-$1")"; }
@@ -200,7 +204,7 @@ if poll "$ELECTION_BOUND" leader_among "$S1" "$S2"; then
 else
   flunk B.new-leader-after-leader-kill "no leader among forgejo-$S1 and forgejo-$S2 within ${ELECTION_BOUND}s"
 fi
-if sha="$(push_until "$WRITE_RESUME_BOUND" "$S1" b1-after-leader-kill)"; then
+if sha="$(push_until "$(left_of "$WRITE_RESUME_BOUND" "$t0")" "$S1" b1-after-leader-kill)"; then
   took="$(printf '%.1f' "$(echo "$(date +%s.%N) - $t0" | bc)")"
   if poll 10 serves "$S2" "$REPO" refs/heads/b1-after-leader-kill "$sha"; then
     pass B.writes-resume-after-leader-kill "push to forgejo-$S1 ${took}s after the kill, read on forgejo-$S2"
@@ -345,7 +349,7 @@ if poll "$ELECTION_BOUND" leader_among "$S1" "$S2"; then
 else
   flunk B.second-leader-kill-elects "no leader among forgejo-$S1 and forgejo-$S2 within ${ELECTION_BOUND}s"
 fi
-if sha="$(push_until "$WRITE_RESUME_BOUND" "$S1" b7-second-kill)" && poll 10 serves "$S2" "$REPO" refs/heads/b7-second-kill "$sha"; then
+if sha="$(push_until "$(left_of "$WRITE_RESUME_BOUND" "$t0")" "$S1" b7-second-kill)" && poll 10 serves "$S2" "$REPO" refs/heads/b7-second-kill "$sha"; then
   pass B.second-leader-kill-writes-resume "push to forgejo-$S1 $(printf '%.1f' "$(echo "$(date +%s.%N) - $t0" | bc)")s after the kill, read on forgejo-$S2"
 else
   flunk B.second-leader-kill-writes-resume "$(tail -n 2 "$WORK/push.err" | tr '\n' ' ')"

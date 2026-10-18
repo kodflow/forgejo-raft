@@ -10,6 +10,8 @@ source "$(dirname "$0")/lib.sh"
 
 LOG="$LAB_DIR/.build/observer-e2e.log"
 PORTS="$LAB_DIR/.build/observer-ports.txt"
+PORTS_STOP="$LAB_DIR/.build/observer-ports.stop"
+rm -f "$PORTS_STOP"
 dco() {
   docker compose --project-directory "$LAB_DIR" -f "$LAB_DIR/compose.yaml" -f "$LAB_DIR/compose.observer.yaml" \
     --profile observer --profile recover "$@"
@@ -32,6 +34,8 @@ watch_ports() {
   local i seen=0
   : >"$PORTS"
   for ((i = 0; i < 900; i++)); do
+    # The suite ended (the observer may never have started).
+    [ ! -e "$PORTS_STOP" ] || break
     if dco exec -T observer pgrep -f 'cluster observe' >/dev/null 2>&1; then
       seen=$((seen + 1))
       listening >>"$PORTS"
@@ -48,6 +52,7 @@ watch_ports &
 watcher=$!
 "$LAB_DIR/scripts/observer-e2e.sh" 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
+touch "$PORTS_STOP"
 wait "$watcher"
 
 # step <name> <pattern of the observer-e2e line that proves it>
