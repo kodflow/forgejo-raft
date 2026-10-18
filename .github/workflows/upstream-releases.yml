@@ -1,9 +1,10 @@
-# A forgejo-raft release for every official Forgejo release.
+# A forgejo-raft release for every official release of the newest Forgejo
+# major.
 #
-# Daily, after Sync upstream: the official releases Forgejo declares
-# supported (the TXT record of release.forgejo.org, the newest release of each
-# supported major, see .github/scripts/upstream-targets.sh) each go through
-# raft-release.yml, one tag at a time: release branch release/vX.Y.Z (the tag
+# Daily, after Sync upstream: of the official releases Forgejo declares
+# supported (the TXT record of release.forgejo.org), only the newest stable
+# release of the highest major (v17 today, v18 on its own once it ships, see
+# .github/scripts/upstream-targets.sh) goes through raft-release.yml: release branch release/vX.Y.Z (the tag
 # plus the raft delta), cluster-checks and E2E on it, then the release
 # vX.Y.Z-raft.N, not a prerelease. A tag already released, or blocked with
 # nothing new since, costs a few seconds. A conflict or a red check opens the
@@ -15,8 +16,9 @@
 # `dry_run` builds the branch and decides, pushes and publishes nothing.
 # A pull request that changes this machinery runs it as a dry run.
 #
-# Repository variable RAFT_MAJORS (optional, e.g. "17" or "16 17") limits the
-# daily run to those majors.
+# Repository variable RAFT_MAJORS (optional, e.g. "16" or "16 17") is an
+# explicit override: the daily run then covers the supported release of each
+# of those majors instead of the highest major alone.
 #
 # Tokens: the GITHUB_TOKEN is enough. The release branch is pushed without
 # .github, so no workflows permission is needed, and nothing is left to a
@@ -29,7 +31,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: One official release, vX.Y.Z (default, the supported ones)
+        description: One official release, vX.Y.Z (default, the newest major)
         type: string
         default: ""
       dry_run:
@@ -51,6 +53,7 @@ on:
       - .github/workflows/release-publish.yml
       - .github/scripts/raft-release-branch.sh
       - .github/scripts/upstream-targets.sh
+      - .github/scripts/upstream-targets.test.sh
       - .github/scripts/release-plan.sh
 
 permissions: {}
@@ -78,6 +81,9 @@ jobs:
         with:
           sparse-checkout: .github/scripts
           persist-credentials: false
+
+      - name: Test the target selection
+        run: .github/scripts/upstream-targets.test.sh
 
       - name: Official releases to cover
         id: targets

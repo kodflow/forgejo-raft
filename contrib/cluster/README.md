@@ -359,8 +359,11 @@ The lab proves this against a real Nomad: `make nomad-e2e` in
 
 ## Upgrades and release notices
 
-Every official Forgejo release gets a forgejo-raft release built on it,
-`vX.Y.Z-raft.N` (`.github/README.md`, Releases). The admin dashboard tells
+Every official release of the newest Forgejo major gets a forgejo-raft
+release built on it, `vX.Y.Z-raft.N` (`.github/README.md`, Releases): v17
+today, and only 18 once 18.0.0 ships. Older majors, LTS included, get no
+new raft release, so a cluster stays on the newest major to keep receiving
+fixes. Another release is built only on request. The admin dashboard tells
 when one is out: next to Forgejo's notice of a new official release, it
 says whether the raft build of that release is available yet. Upgrade to
 the raft build, never to the official binary, which has no cluster mode.
