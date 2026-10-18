@@ -189,9 +189,14 @@ jobs:
           done
           # Both must start and report the version as their own, not only as
           # the release name. The arm64 one runs through the QEMU set up above.
+          # Bounded: a binary that ignores --version starts the web server and
+          # would otherwise hold the job until its own timeout.
           for arch in amd64 arm64; do
             bin="dist/forgejo-${VERSION#v}-linux-$arch"
-            reported=$("$bin" --version)
+            if ! reported=$(timeout 120 "$bin" --version </dev/null); then
+              echo "::error::$arch binary did not answer --version within 120s (or failed)" >&2
+              exit 1
+            fi
             echo "$arch: $reported"
             case "$reported" in
               "forgejo version $FILE_VERSION "*) ;;
