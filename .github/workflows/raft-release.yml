@@ -8,7 +8,10 @@
 #             anything to release (nothing when the branch is already
 #             released) and the version: N counts the releases on vX.Y.Z.
 # 2. checks   cluster-checks.yml on the branch (build, vet, race tests),
-#             and E2E (e2e.yml, the three suites on a real lab).
+#             and E2E (e2e.yml, the three suites on a real lab). A red one
+#             is run once more on the same commit (checks_retry,
+#             e2e_retry): green then counts, with a warning and a note on
+#             the issue; red twice blocks, and the issue says so.
 # 3. publish  release-publish.yml, as for the development line, as a
 #             release (not a prerelease); marked Latest and image :latest
 #             when it is the highest stable raft version.
@@ -197,9 +200,36 @@ jobs:
     with:
       ref: ${{ needs.prepare.outputs.sha }}
 
+  # One automatic retry of a red check, on the same commit: upstream
+  # Forgejo's own tests can be flaky (a data race of cmd's TestSignal under
+  # -race blocked v17.0.0 once). A check red twice blocks the release, and
+  # the issue says it failed after a retry.
+  checks_retry:
+    needs: [prepare, checks]
+    if: ${{ !cancelled() && needs.prepare.outputs.action == 'test' && needs.checks.result == 'failure' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/cluster-checks.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+      skip_lint: true
+
+  e2e_retry:
+    needs: [prepare, e2e]
+    if: ${{ !cancelled() && needs.prepare.outputs.action == 'test' && needs.e2e.result == 'failure' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/e2e.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+
   publish:
-    needs: [prepare, checks, e2e]
-    if: ${{ needs.prepare.outputs.action == 'test' }}
+    needs: [prepare, checks, checks_retry, e2e, e2e_retry]
+    # Each check green at its first run or at its retry.
+    if: >-
+      ${{ !cancelled() && needs.prepare.outputs.action == 'test'
+          && (needs.checks.result == 'success' || needs.checks_retry.result == 'success')
+          && (needs.e2e.result == 'success' || needs.e2e_retry.result == 'success') }}
     permissions:
       contents: write
       packages: write
@@ -213,7 +243,7 @@ jobs:
       cache_scope: release-${{ inputs.tag }}
 
   report:
-    needs: [prepare, checks, e2e, publish]
+    needs: [prepare, checks, checks_retry, e2e, e2e_retry, publish]
     if: >-
       ${{ always() && !inputs.dry_run
           && (needs.prepare.result != 'success'
@@ -235,11 +265,16 @@ jobs:
       MODE: ${{ needs.prepare.outputs.mode }}
       CONFLICTS: ${{ needs.prepare.outputs.conflicts }}
       VERSION: ${{ needs.prepare.outputs.version }}
+      # A check counts as green when its retry is; a retry that ran is
+      # named, so a release blocked twice says so.
       RESULTS: >-
         prepare=${{ needs.prepare.result }}
-        cluster-checks=${{ needs.checks.result }}
-        e2e=${{ needs.e2e.result }}
+        cluster-checks=${{ needs.checks_retry.result != 'skipped' && needs.checks_retry.result || needs.checks.result }}
+        e2e=${{ needs.e2e_retry.result != 'skipped' && needs.e2e_retry.result || needs.e2e.result }}
         publish=${{ needs.publish.result }}
+      RETRIED: >-
+        ${{ needs.checks_retry.result != 'skipped' && 'cluster-checks' || '' }}
+        ${{ needs.e2e_retry.result != 'skipped' && 'e2e' || '' }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Open, update or close the issue
@@ -254,10 +289,16 @@ jobs:
           for r in $RESULTS; do
             case "$r" in *=success|*=skipped) ;; *) failed="$failed ${r%%=*}" ;; esac
           done
+          retried=$(xargs <<<"$RETRIED")
           if [ "$ACTION" = test ] && [ -z "$failed" ]; then
+            note=
+            if [ -n "$retried" ]; then
+              note=" Verte à la relance automatique de : $retried (un premier échec, probablement un test instable)."
+              echo "::warning::$TAG released after an automatic retry of: $retried"
+            fi
             if [ -n "$issue" ]; then
               gh issue close "$issue" -R "$GITHUB_REPOSITORY" \
-                --comment "Publiée : $VERSION ($RUN_URL)."
+                --comment "Publiée : $VERSION ($RUN_URL).$note"
             fi
             exit 0
           fi
@@ -278,6 +319,9 @@ jobs:
               "Le prochain passage (quotidien, ou Upstream releases lancé avec \`tag: $TAG\`) teste \`$BRANCH\` telle quelle et publie si tout est vert.")"
           else
             why="La branche \`$BRANCH\` (\`${SHA:0:12}\`, mode \`$MODE\`) ne passe pas :${failed}."
+            if [ -n "$retried" ]; then
+              why="$why Échec après une relance automatique sur le même commit ($retried) : ce n'est pas un test instable isolé, sauf si les deux échecs diffèrent (voir les journaux)."
+            fi
             fix="Corriger sur \`$BRANCH\` (un commit de plus, jamais une fusion de \`forgejo\` ni de la branche de développement amont, que le contrôle refuse). Le prochain passage la reteste telle quelle."
           fi
           body="$(printf '%s\n\n%s\n\n%s\n\n%s\n' \

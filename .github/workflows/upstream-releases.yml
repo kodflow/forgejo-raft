@@ -55,8 +55,14 @@ on:
 
 permissions: {}
 
+# Runs never wait on one another here: GitHub keeps one pending run per
+# concurrency group and cancels it when a newer one queues, so a shared
+# group dropped a dispatched tag (v16.0.6 behind v15.0.10). Each run has its
+# own group; the same tag is serialized by raft-release.yml
+# (raft-release-<tag>) and the release index by release-publish.yml.
+# Only a pull request's dry run is replaced by the next push.
 concurrency:
-  group: upstream-releases-${{ github.event_name == 'pull_request' && github.ref || 'run' }}
+  group: upstream-releases-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
