@@ -188,3 +188,45 @@ func TestPayloadVersionRaisedOnlyWhenEveryMemberAppliesIt(t *testing.T) {
 		assert.Equal(t, c1, v.SHA, n.slot)
 	}
 }
+
+// A repository deleted, then its name taken by a rename, both applied on a
+// node before its projector ran: the deleted repository's directory is
+// still there under the new name. It must be set aside, not reused: the
+// renamed repository moves in, and the old directory does not linger.
+func TestRenameIntoAnUnprojectedDeletionSetsTheOldDirectoryAside(t *testing.T) {
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	c1 := commit(t, work, "one")
+	c2 := commit(t, work, "two")
+	zero := strings.Repeat("0", 40)
+	origin, lag := tc.nodes[0], tc.nodes[2]
+	require.True(t, tc.pushVia(origin, work, "s/a.git", "refs/heads/main", zero, c1).OK)
+	require.True(t, tc.pushVia(origin, work, "s/b.git", "refs/heads/old", zero, c2).OK)
+	for _, n := range tc.nodes {
+		require.Eventually(t, func() bool {
+			return gitRef(t, n, "s/a.git", "refs/heads/main") == c1 && gitRef(t, n, "s/b.git", "refs/heads/old") == c2
+		}, 10*time.Second, 20*time.Millisecond)
+	}
+
+	// The lagging node does not project s/b.git while a transaction holds it.
+	nonce := clusterhook.NewNonce()
+	require.NoError(t, lag.r.registry.register(nonce, "s/b.git", nil, os.Getpid()))
+	ctx := context.Background()
+	require.NoError(t, os.RemoveAll(filepath.Join(origin.r.root, "s", "b.git")))
+	require.NoError(t, origin.r.proposeRepoDelete(ctx, "s/b.git", 1))
+	require.NoError(t, os.Rename(filepath.Join(origin.r.root, "s", "a.git"), filepath.Join(origin.r.root, "s", "b.git")))
+	require.NoError(t, origin.r.proposeRepoRename(ctx, "s/a.git", "s/b.git"))
+	require.Eventually(t, func() bool { _, _, ok := lag.r.table.RenamedFrom("s/b.git"); return ok }, 10*time.Second, 10*time.Millisecond)
+	lag.r.registry.release(nonce)
+	lag.r.projector.markDirty("s/b.git")
+
+	srcDir := filepath.Join(lag.r.root, "s", "a.git")
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(srcDir)
+		return os.IsNotExist(err) && gitRef(t, lag, "s/b.git", "refs/heads/main") == c1
+	}, 10*time.Second, 20*time.Millisecond, "the renamed repository moved in")
+	entries, err := os.ReadDir(filepath.Join(lag.r.root, staleDirName))
+	require.NoError(t, err)
+	assert.Len(t, entries, 1, "the deleted repository's directory was set aside")
+}
