@@ -127,10 +127,15 @@ def totp(secret):
 base, user, pw, action = sys.argv[1:5]
 jar = http.cookiejar.CookieJar()
 web = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+# Forgejo checks cross-origin requests by their headers, not a form token
+# (a4642af51a): a request without Origin passes, and pages carry no _csrf.
+# One is still sent when a page has it.
 def csrf(path):
     page = web.open(base + path).read().decode()
-    return page, re.search(r'name="_csrf" value="([^"]+)"', page).group(1)
+    m = re.search(r'name="_csrf" value="([^"]+)"', page)
+    return page, m.group(1) if m else None
 def post(path, **form):
+    form = {k: v for k, v in form.items() if v is not None}
     return web.open(base + path, urllib.parse.urlencode(form).encode())
 _, tok = csrf("/user/login")
 resp = post("/user/login", _csrf=tok, user_name=user, password=pw)
