@@ -127,16 +127,21 @@ def totp(secret):
 base, user, pw, action = sys.argv[1:5]
 jar = http.cookiejar.CookieJar()
 web = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+# Forgejo forms carry no _csrf token any more (cross-origin protection by
+# the Origin and Sec-Fetch-Site headers); one is sent only when present.
 def csrf(path):
     page = web.open(base + path).read().decode()
-    return page, re.search(r'name="_csrf" value="([^"]+)"', page).group(1)
+    m = re.search(r'name="_csrf" value="([^"]+)"', page)
+    return page, m.group(1) if m else None
 def post(path, **form):
+    form = {k: v for k, v in form.items() if v is not None}
     return web.open(base + path, urllib.parse.urlencode(form).encode())
 _, tok = csrf("/user/login")
 resp = post("/user/login", _csrf=tok, user_name=user, password=pw)
 if action == "enroll":
     page, tok = csrf("/user/settings/security/two_factor/enroll")
-    secret = re.search(r"secret=([A-Z2-7]+)", urllib.parse.unquote(page)).group(1)
+    # The page shows the secret as text ("Or enter the secret: ...").
+    secret = re.search(r"secret(?:=|:\s*)([A-Z2-7]{16,})", urllib.parse.unquote(page)).group(1)
     post("/user/settings/security/two_factor/enroll", _csrf=tok, passcode=totp(secret))
     open("/work/totp-secret", "w").write(secret)
 else:
