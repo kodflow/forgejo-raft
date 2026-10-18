@@ -279,3 +279,22 @@ func TestArchiveWALTakesThePartialSegmentOfAPromotion(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, files, "the export serves no .partial file")
 }
+
+// A barrier proposed again after an unknown outcome applies twice under one
+// nonce: the table kept is the first one's, at another index than the
+// position names. The checkpoint is refused rather than recorded with an
+// artifact of another cut.
+func TestCheckpointRefusesATableCapturedAtAnotherBarrier(t *testing.T) {
+	c := &coordinator{}
+	got := c.expect("n")
+	c.capture("n", 5, func() ([]byte, error) { return []byte("at 5"), nil })
+	c.capture("n", 7, func() ([]byte, error) { return []byte("at 7"), nil })
+	_, err := tableAtBarrier(context.Background(), got, 7)
+	require.ErrorContains(t, err, "proposed twice")
+
+	got = c.expect("m")
+	c.capture("m", 9, func() ([]byte, error) { return []byte("at 9"), nil })
+	b, err := tableAtBarrier(context.Background(), got, 9)
+	require.NoError(t, err)
+	assert.Equal(t, "at 9", string(b))
+}
