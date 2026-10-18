@@ -1,12 +1,14 @@
 # Brings Codeberg's forgejo/forgejo into this repository's `forgejo` branch,
-# through a pull request that merges itself once post-commit is green.
+# through a pull request that merges itself once post-commit and
+# cluster-checks are green.
 #
 # - Daily and on demand: merge codeberg.org/forgejo/forgejo `forgejo` into the
 #   branch `sync/upstream`, with a merge commit by github-actions[bot], push
 #   it, and open or update the PR sync/upstream -> forgejo with auto-merge on
 #   (merge commit, never squash or rebase, so upstream's commits become
-#   ancestors of `forgejo`). `forgejo` itself is never pushed: its ruleset
-#   requires the post-commit status and refuses non-fast-forward pushes.
+#   ancestors of `forgejo`). `forgejo` itself is never pushed: its rulesets
+#   require the post-commit and cluster-checks statuses and refuse
+#   non-fast-forward pushes.
 # - sync/upstream is only ever pushed fast-forward. Once its last PR is
 #   merged it is an ancestor of `forgejo` and starts again from there; while a
 #   PR is still open, `forgejo` is merged into it first, then upstream.
@@ -15,7 +17,8 @@
 #   the run fails and pushes nothing.
 #
 # Tokens. A push or a PR made with the GITHUB_TOKEN starts no workflow, so
-# post-commit would never report on the PR and auto-merge would wait forever.
+# post-commit and cluster-checks would never report on the PR and auto-merge
+# would wait forever.
 # Set the secret SYNC_TOKEN, a fine-grained token on this repository only with
 # Contents and Pull requests read and write: the push, the PR and auto-merge
 # then use it, and the checks run. Without it the PR is still opened with the
@@ -135,7 +138,7 @@ jobs:
           set -euo pipefail
           body="$(printf '%s\n\n%s\n\n%s\n' \
             "Mise à jour amont : \`$SYNC_BRANCH\` apporte $AHEAD commits à \`$BASE_BRANCH\`, jusqu'à forgejo/forgejo@$UPSTREAM." \
-            "Ouverte et tenue à jour par le workflow Sync upstream. Elle se fusionne seule (auto-merge, commit de fusion) une fois post-commit au vert." \
+            "Ouverte et tenue à jour par le workflow Sync upstream. Elle se fusionne seule (auto-merge, commit de fusion) une fois post-commit et cluster-checks au vert." \
             "**Fusionner par un commit de fusion**, jamais par squash ou rebase, pour que les commits amont deviennent des ancêtres de \`$BASE_BRANCH\`.")"
           # --head matches a branch name only: a fork's sync/upstream would
           # match too, so only this repository's own head is kept.

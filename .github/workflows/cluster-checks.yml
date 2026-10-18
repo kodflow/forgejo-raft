@@ -1,0 +1,126 @@
+# cluster-checks — the replicated-cluster code builds, vets, passes its race
+# tests and adds no lint issue.
+#
+# These steps used to ride in the post-commit job, so that the one status the
+# `post-commit` ruleset requires covered them too. post-commit is now the
+# central stub, byte for byte (kodflow/post-commit keeps it so), and this
+# repository's upstream history is handled there by its foreign-history mode.
+# The cluster's checks therefore stand on their own, under a job name that is
+# required by a ruleset of its own on `forgejo`: renaming the job leaves that
+# status unreported and blocks every merge.
+#
+# Same triggers as before, same scope: upstream's own CI lives in
+# .forgejo/workflows and does not run here; this one stays bounded to the
+# replicated-cluster code, so a merge from Codeberg passes it as long as it
+# leaves that code building and green. It runs on the upstream sync pull
+# request too.
+name: cluster-checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [forgejo]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TAGS: sqlite sqlite_unlock_notify
+  SCOPE: >-
+    ./services/cluster/...
+    ./routers/web/admin/
+    ./cmd/
+    ./modules/setting/
+    ./services/webhook/
+    ./modules/clusterhook/
+    ./models/cluster/
+
+jobs:
+  cluster-checks:
+    runs-on: ubuntu-latest
+    # The race tests alone are bounded at 20 minutes.
+    timeout-minutes: 30
+    steps:
+      # The merge commit GitHub would produce on a pull request, which is
+      # what the cluster must build against.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The lint's baseline is a merge base or the push's previous commit.
+          fetch-depth: 0
+          # No later step authenticates to git: the token stays out of it.
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build -tags "$TAGS" ./...
+
+      - name: Vet the cluster scope
+        run: |
+          # shellcheck disable=SC2086 # the scope is a list of packages
+          go vet -tags "$TAGS" $SCOPE
+
+      - name: Race tests of the cluster scope
+        run: |
+          # shellcheck disable=SC2086 # the scope is a list of packages
+          go test -race -timeout 20m -count=1 -tags "$TAGS" $SCOPE
+
+      # The baseline is computed here, not by the action's only-new-issues:
+      # that one fetches the pull request's patch from the API, which GitHub
+      # refuses past 20000 lines, and then lints whole packages, upstream
+      # Forgejo's own issues included. --new-from-rev diffs locally instead.
+      - name: Baseline of the lint
+        id: baseline
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          head=$(git rev-parse HEAD)
+          case "$EVENT" in
+            pull_request) rev=$(git merge-base "origin/$BASE_REF" HEAD) ;;
+            push)
+              # A force-push replaces several commits: the baseline is the
+              # common ancestor of the old and new tips, so every replacing
+              # commit is linted. The old tip is no longer referenced once
+              # replaced, so it is fetched by its SHA (the repository is
+              # public). Without it, the run fails rather than lint less.
+              if [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then
+                echo "::error::no previous commit for this push, no baseline" >&2
+                exit 1
+              fi
+              git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+                || git fetch --no-tags origin "$BEFORE" \
+                || { echo "::error::previous commit $BEFORE unavailable" >&2; exit 1; }
+              rev=$(git merge-base "$BEFORE" HEAD) ;;
+            *)
+              rev=$(git merge-base origin/forgejo HEAD)
+              # A manual run on forgejo itself has no older baseline than its
+              # own tip: it checks the last commit.
+              if [ "$rev" = "$head" ]; then rev=$(git rev-parse HEAD~1); fi ;;
+          esac
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - name: Lint the cluster scope (new issues only)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.14.0
+          args: >-
+            --build-tags=sqlite,sqlite_unlock_notify
+            --new-from-rev=${{ steps.baseline.outputs.rev }}
+            ./services/cluster/...
+            ./routers/web/admin/
+            ./cmd/
+            ./modules/setting/
+            ./services/webhook/
+            ./modules/clusterhook/
+            ./models/cluster/
