@@ -64,7 +64,10 @@ synchronous_commit = on      # a commit acknowledged is flushed, so it is before
 `forgejo cluster wal-archive` is idempotent, as PostgreSQL requires: a file
 already archived with the same bytes is success, other bytes under the same
 name are refused, and the archive is never overwritten. Timeline histories
-and backup history files are archived too. Where the PostgreSQL host has no
+and backup history files are archived too, and so is the `.partial` segment
+a promoted standby archives for the old timeline: PostgreSQL retries a
+refused file forever and archives nothing after it. The export never serves
+a `.partial` file. Where the PostgreSQL host has no
 Forgejo binary, `contrib/cluster/observer/archive-wal.sh` does the same in
 POSIX shell. The archive directory must be readable by the Forgejo node's
 export: on the same host, or on a shared volume. Keep at least a week of it,

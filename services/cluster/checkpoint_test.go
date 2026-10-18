@@ -250,5 +250,25 @@ func TestArchiveWALIsIdempotent(t *testing.T) {
 	require.NoError(t, ArchiveWAL(src, "00000002.history", dir))
 	require.NoError(t, ArchiveWAL(src, "000000010000000000000002.00000028.backup", dir))
 	require.Error(t, ArchiveWAL(src, "../escape", dir))
-	require.Error(t, ArchiveWAL(src, "000000010000000000000002.partial", dir))
+	require.Error(t, ArchiveWAL(src, "000000010000000000000002.nope", dir))
+}
+
+// After a promotion PostgreSQL archives the old timeline's last segment as
+// <segment>.partial, and retries a refused file forever without archiving
+// anything after it: a refusal stopped the archive at the first failover,
+// and an observer never covered a checkpoint again. The file is archived;
+// the export does not list it.
+func TestArchiveWALTakesThePartialSegmentOfAPromotion(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "archive")
+	src := filepath.Join(t.TempDir(), "seg")
+	require.NoError(t, os.WriteFile(src, []byte("the old timeline's last segment"), 0o600))
+	name := "00000001000000000000000C.partial"
+	require.NoError(t, ArchiveWAL(src, name, dir))
+	require.NoError(t, ArchiveWAL(src, name, dir), "a retry of the same file succeeds")
+	_, err := os.Stat(filepath.Join(dir, name))
+	require.NoError(t, err)
+
+	files, err := exportSide{archiveDir: dir}.walList("")
+	require.NoError(t, err)
+	assert.Empty(t, files, "the export serves no .partial file")
 }

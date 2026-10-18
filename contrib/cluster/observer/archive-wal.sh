@@ -7,7 +7,9 @@
 # synced before it takes its name.
 set -eu
 dir="$1" src="$2" name="$3"
-echo "$name" | grep -Eq '^([0-9A-F]{24}(\.[0-9A-F]{8}\.backup)?|[0-9A-F]{8}\.history)$' || {
+# A promoted standby archives the old timeline's last segment as .partial;
+# refusing it would stop PostgreSQL's archiving for good.
+echo "$name" | grep -Eq '^([0-9A-F]{24}(\.[0-9A-F]{8}\.backup|\.partial)?|[0-9A-F]{8}\.history)$' || {
   echo "archive-wal: $name is not a WAL file name" >&2
   exit 2
 }
