@@ -11,10 +11,7 @@
 #     cluster   A. formation and B. Raft behaviour (scripts/ci/cluster.sh)
 #     features  C. Forgejo's features node to node (scripts/ci/features.sh)
 #     observer  D. checkpoints and the observer (scripts/ci/observer.sh), on
-#               the lab's manual bootstrap and compose.observer.yaml. PENDING
-#               fix/observer-e2e: until it lands the observer image does not
-#               build, so the job runs only on demand: the dispatch input
-#               `observer`, or a pull request labelled `e2e-observer`.
+#               the lab's manual bootstrap and compose.observer.yaml
 #   Every checkpoint prints `CHECK <name>: PASS|FAIL`; a FAIL fails the job.
 #   The logs of every container are uploaded when a job fails; the lab is
 #   torn down (`docker compose down -v`) whatever happens.
@@ -28,11 +25,6 @@ on:
   schedule:
     - cron: "23 3 * * *"
   workflow_dispatch:
-    inputs:
-      observer:
-        description: Also run suite D, the observer (pending the observer lab fix, fix/observer-e2e)
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -183,12 +175,9 @@ jobs:
         working-directory: ${{ env.LAB }}
         run: docker compose down -v --remove-orphans --timeout 5
 
-  # Suite D. PENDING fix/observer-e2e (the observer lab's own repair): run
-  # on demand only until it lands (dispatch input or `e2e-observer` label),
-  # then on every trigger like the others.
+  # Suite D, on its own lab: the manual bootstrap, then compose.observer.yaml.
   observer:
     needs: images
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.observer) || contains(github.event.pull_request.labels.*.name, 'e2e-observer') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:

@@ -237,8 +237,7 @@ prints one `CHECK <name>: PASS|FAIL` line per checkpoint:
 
 - `observer.sh`: suite D, on the manual bootstrap and `compose.observer.yaml`.
   It runs `scripts/observer-e2e.sh`, turns each step into a checkpoint, and
-  checks from `/proc/net/tcp` that the observer never listens. It runs on
-  demand until the observer scenario's own repair lands.
+  checks from `/proc/net/tcp` that the observer never listens.
 
 To run a suite by hand on the lab:
 
