@@ -264,6 +264,12 @@ func (p *projector) project(ctx context.Context, repo string) error {
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
 		if from, _, ok := p.table.RenamedFrom(repo); ok {
 			src := filepath.Join(p.root, filepath.FromSlash(from))
+			if p.registry.inFlight(from) {
+				// A git process still writes under the old key: moving its
+				// directory now would land its write under the new name,
+				// outside the table. The move waits for the next pass.
+				return nil
+			}
 			if _, err := os.Stat(src); err == nil {
 				if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 					return err
