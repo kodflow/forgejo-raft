@@ -230,3 +230,18 @@ func TestRenameIntoAnUnprojectedDeletionSetsTheOldDirectoryAside(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, entries, 1, "the deleted repository's directory was set aside")
 }
+
+// A repository a peer creates to receive objects is acknowledged once the
+// pack is synced: the directories leading to it must be synced too, or a
+// power loss can take the whole repository the ack vouched for.
+func TestInitBareSyncsTheDirectoriesItCreates(t *testing.T) {
+	root := t.TempDir()
+	var synced []string
+	defer func(prev func(string) error) { syncDirFn = prev }(syncDirFn)
+	syncDirFn = func(d string) error { synced = append(synced, d); return nil }
+	dir := filepath.Join(root, "o", "r.git")
+	require.NoError(t, initBare(context.Background(), dir, "sha1"))
+	for _, d := range []string{filepath.Join(dir, "objects"), filepath.Join(dir, "refs"), dir, filepath.Join(root, "o"), root} {
+		assert.Contains(t, synced, d)
+	}
+}

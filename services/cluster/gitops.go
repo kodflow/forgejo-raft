@@ -142,6 +142,19 @@ func initBare(ctx context.Context, dir, format string) error {
 	default:
 		return fmt.Errorf("object format %q is neither sha1 nor sha256", format)
 	}
-	_, err := gitRun(ctx, filepath.Dir(dir), nil, "init", "--bare", "--object-format="+format, dir)
-	return err
+	if _, err := gitRun(ctx, filepath.Dir(dir), nil, "init", "--bare", "--object-format="+format, dir); err != nil {
+		return err
+	}
+	// The objects about to land here are acknowledged once their pack is
+	// synced: the directories leading to them are synced first, innermost
+	// first, up to the repository root.
+	for _, d := range []string{filepath.Join(dir, "objects"), filepath.Join(dir, "refs"), dir, filepath.Dir(dir), filepath.Dir(filepath.Dir(dir))} {
+		if err := syncDirFn(d); err != nil {
+			return err
+		}
+	}
+	return nil
 }
+
+// syncDirFn syncs a directory; tests replace it.
+var syncDirFn = syncDir
