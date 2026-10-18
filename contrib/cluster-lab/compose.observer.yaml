@@ -26,11 +26,25 @@ x-member-env: &member-env
   FORGEJO__cluster__PG_BASEBACKUP_DSN: "host=10.89.0.30 port=5000 user=replicator passfile=/data/pgpass sslmode=disable"
   FORGEJO__cluster__OBSERVER_RECIPIENTS: ${OBSERVER_RECIPIENTS:-}
   FORGEJO__server__LFS_START_SERVER: "true"
+  # The stored files on one volume every member mounts: a member writes an
+  # LFS object, the leader's export copies it (the cluster replicates git,
+  # not stored files).
+  FORGEJO__lfs__PATH: /stored/lfs
+  FORGEJO__attachment__PATH: /stored/attachments
+  FORGEJO__storage__PATH: /stored
 
 x-pg-archive: &pg-archive
   ARCHIVE_COMMAND: "/usr/local/bin/archive-wal /wal-archive %p %f"
 
 services:
+  stored-init:
+    image: forgejo-cluster-lab/patroni:4.1.5-pg18
+    pull_policy: never
+    user: "0"
+    entrypoint: ["/bin/sh", "-c", "chown 1000:1000 /stored && chmod 0750 /stored"]
+    volumes: [stored:/stored]
+    network_mode: none
+
   wal-archive-init:
     image: forgejo-cluster-lab/patroni:4.1.5-pg18
     pull_policy: never
@@ -75,15 +89,18 @@ services:
   forgejo-1:
     <<: *observer-image
     environment: { <<: *member-env }
-    volumes: ["wal-archive:/wal-archive:ro"]
+    depends_on: { stored-init: { condition: service_completed_successfully } }
+    volumes: ["wal-archive:/wal-archive:ro", "stored:/stored"]
   forgejo-2:
     <<: *observer-image
     environment: { <<: *member-env }
-    volumes: ["wal-archive:/wal-archive:ro"]
+    depends_on: { stored-init: { condition: service_completed_successfully } }
+    volumes: ["wal-archive:/wal-archive:ro", "stored:/stored"]
   forgejo-3:
     <<: *observer-image
     environment: { <<: *member-env }
-    volumes: ["wal-archive:/wal-archive:ro"]
+    depends_on: { stored-init: { condition: service_completed_successfully } }
+    volumes: ["wal-archive:/wal-archive:ro", "stored:/stored"]
 
   observer:
     <<: *observer-image
@@ -168,3 +185,4 @@ volumes:
   observer-keys:
   snapshots:
   forgejo-r:
+  stored:
