@@ -10,8 +10,11 @@
 #               created in the runner only, never pushed.
 #   <N>         1 + the highest N already tagged here for that <upstream>.
 #               A new upstream version starts again at 1.
-# The binary reports <upstream>-raft.<N>+gitea-<compat>: the build writes it to
-# an untracked VERSION file, which the Makefile reads as the whole version.
+# The binary reports <upstream>-raft.<N>+gitea-<compat>: the release tag is
+# created in the runner before the build, so the Makefile's git describe
+# yields it inside the image build (.git is in the build context; a VERSION
+# file is not, Forgejo's .dockerignore excludes it). That tag is never pushed:
+# the last step creates the real one.
 #
 # When: every push to `forgejo`, and on demand. A run releases only when the
 # commit brings at least one non-merge commit that changes a released path
@@ -114,10 +117,19 @@ jobs:
           ref: ${{ needs.plan.outputs.sha }}
           persist-credentials: false
 
-      # Untracked, read by the Makefile in place of git describe: the image
-      # build has no tags to describe.
-      - name: Version file
-        run: printf '%s\n' "$FILE_VERSION" > VERSION
+      # The checkout has no tags, and without one the Makefile's
+      # `git describe --always` gives a bare commit hash, which Forgejo's
+      # migrations refuse as a malformed version. Local only: never pushed.
+      - name: Release tag, in the runner only
+        run: |
+          set -euo pipefail
+          git tag "$VERSION" HEAD
+          made=$(make -s show-version-full)
+          echo "the Makefile derives $made"
+          if [ "$made" != "$FILE_VERSION" ]; then
+            echo "::error::the Makefile derives $made, not $FILE_VERSION" >&2
+            exit 1
+          fi
 
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
@@ -175,14 +187,17 @@ jobs:
             out="dist/forgejo-${VERSION#v}-linux-$arch"
             install -m 755 "$ROOTFS/linux_$arch/app/gitea/gitea" "$out"
           done
-          # The runner is amd64: that binary must start and report the version.
-          reported=$("dist/forgejo-${VERSION#v}-linux-amd64" --version)
-          echo "$reported"
-          case "$reported" in
-            *"$FILE_VERSION"*) ;;
-            *) echo "::error::the binary does not report $FILE_VERSION" >&2; exit 1 ;;
-          esac
-          # And the arm64 one must be an arm64 executable.
+          # Both must start and report the version as their own, not only as
+          # the release name. The arm64 one runs through the QEMU set up above.
+          for arch in amd64 arm64; do
+            bin="dist/forgejo-${VERSION#v}-linux-$arch"
+            reported=$("$bin" --version)
+            echo "$arch: $reported"
+            case "$reported" in
+              "forgejo version $FILE_VERSION "*) ;;
+              *) echo "::error::$arch binary reports '$reported', not version $FILE_VERSION" >&2; exit 1 ;;
+            esac
+          done
           file "dist/forgejo-${VERSION#v}-linux-arm64" | tee /dev/stderr | grep -q 'ARM aarch64'
           (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
 

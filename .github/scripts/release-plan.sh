@@ -81,8 +81,8 @@ changes=$(git rev-list --count --no-merges "${range[@]}" --not "$upstream_ref" -
 release=false
 if [ "$changes" -gt 0 ]; then release=true; fi
 
-# The Makefile reads a VERSION file as the whole version string, and appends
-# the Gitea compatibility suffix only to versions it derives itself.
+# What the Makefile derives from git describe once the release tag exists:
+# the tag without its v, plus the Gitea compatibility suffix.
 compat=$(sed -n 's/^GITEA_COMPATIBILITY ?= //p' Makefile)
 file_version=${version#v}${compat:++$compat}
 
