@@ -138,3 +138,22 @@ func TestClusterSizeOneRefusesAMembersDataDir(t *testing.T) {
 	assert.False(t, Cluster.Enabled, "the operator said so")
 	require.NoError(t, Cluster.ConfigError)
 }
+
+// Each witness signs its own fence receipts: a key listed twice in
+// WITNESS_KEYS would count one witness for two.
+func TestClusterWitnessKeysAreDistinct(t *testing.T) {
+	defer test.MockVariableValue(&DisableGitHooks, true)()
+	k1, k2 := strings.Repeat("ab", 32), strings.Repeat("cd", 32)
+	base := `ENABLED = true
+SLOT = node-a
+LISTEN_ADDR = 192.0.2.1:7480
+TLS_CERT_FILE = /tmp/n.pem
+TLS_CA_FILE = /tmp/ca.pem
+WITNESSES = https://w1.example,https://w2.example
+`
+	loadClusterSection(t, base+"WITNESS_KEYS = "+k1+","+k2+"\n")
+	require.NoError(t, Cluster.ConfigError)
+	loadClusterSection(t, base+"WITNESS_KEYS = "+k1+","+strings.ToUpper(k1)+"\n")
+	require.Error(t, Cluster.ConfigError)
+	assert.Contains(t, Cluster.ConfigError.Error(), "WITNESS_KEYS")
+}
