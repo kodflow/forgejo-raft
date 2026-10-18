@@ -38,3 +38,14 @@ func TestRecoveryWaitsForThePromotion(t *testing.T) {
 	err = waitAccepting(context.Background(), func() error { return notYet }, time.Millisecond, 20*time.Millisecond)
 	require.ErrorContains(t, err, "still accepts no connection")
 }
+
+// The marker that records a recovery's advance of the identifiers fits a
+// cursor and names that recovery alone: resuming it advances nothing
+// twice, a later recovery advances again.
+func TestRecoveryMarker(t *testing.T) {
+	m := recoveryMarker("0123-5-00000000000000000042", "c1")
+	assert.Len(t, m, 64)
+	assert.Equal(t, m, recoveryMarker("0123-5-00000000000000000042", "c1"))
+	assert.NotEqual(t, m, recoveryMarker("0123-5-00000000000000000042", "c2"))
+	assert.NotEqual(t, m, recoveryMarker("0123-5-00000000000000000043", "c1"))
+}

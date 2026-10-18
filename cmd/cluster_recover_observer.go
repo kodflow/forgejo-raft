@@ -6,6 +6,8 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	auth_model "forgejo.org/models/auth"
+	cluster_model "forgejo.org/models/cluster"
 	"forgejo.org/models/db"
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/generate"
@@ -67,6 +70,7 @@ const (
 	stepRefs     = "4-refs-objects-files"
 	stepArchive  = "5-fresh-archive"
 	stepVerify   = "6-verify"
+	stepAdvance  = "6b-advance-identifiers"
 	stepLineage  = "7-new-lineage"
 	rotatedFile  = "rotated.ini"
 	progressFile = "progress.json"
@@ -283,6 +287,20 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		}
 	}
 
+	// 6b. Every ID and every repository's numbers handed out after the
+	// checkpoint are held elsewhere (mails, webhooks, runners, other
+	// forges): the sequences and the numbering move past them, once.
+	if !prog.done(stepAdvance) {
+		if _, err := cluster_model.AdvanceIdentifiers(ctx, recoveryMarker(name, cid.String()), func(f string, a ...any) {
+			fmt.Fprintf(w, f+"\n", a...)
+		}); err != nil {
+			return fmt.Errorf("advancing the identifiers past the checkpoint: %w", err)
+		}
+		if err := save(stepAdvance); err != nil {
+			return err
+		}
+	}
+
 	// 7. Only then the new lineage, this node its only voter.
 	if !prog.done(stepLineage) {
 		spki, err := certSPKI()
@@ -307,6 +325,13 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 	// 8. The loss, stated.
 	fmt.Fprintf(w, "\n%s\n\nNext: start Forgejo on this node with the rotated secrets; run `forgejo cluster import` to put the restored refs in the new table, `forgejo doctor check --all --fix` and `forgejo cluster reconcile --apply` (pull request heads, branches); then add the other members, and re-key the observers with their new key.\n", m.Loss)
 	return nil
+}
+
+// recoveryMarker names one recovery, a checkpoint into a new cluster, in
+// the 64 characters a cursor's lineage holds.
+func recoveryMarker(checkpoint, newCluster string) string {
+	sum := sha256.Sum256([]byte(checkpoint + "\x00" + newCluster))
+	return hex.EncodeToString(sum[:])
 }
 
 // rotatedSecrets writes, once, the secrets the recovered node runs with,

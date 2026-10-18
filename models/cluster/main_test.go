@@ -7,6 +7,11 @@ import (
 	"testing"
 
 	"forgejo.org/models/unittest"
+
+	// The tables the recovery's identifiers advance.
+	_ "forgejo.org/models/actions"
+	_ "forgejo.org/models/issues"
+	_ "forgejo.org/models/repo"
 )
 
 func TestMain(m *testing.M) {
