@@ -12,7 +12,8 @@
 #      killed; two of three killed, no write accepted, then recovery; the
 #      consensus network partitioned, the minority refuses and the majority
 #      accepts, convergence after the heal; never two leaders in one term,
-#      polled throughout; and the lab's own e2e.sh (Patroni failover).
+#      polled throughout; the leader killed again after all that; and the
+#      lab's own e2e.sh (Patroni failover).
 set -uo pipefail
 source "$(dirname "$0")/lib.sh"
 
@@ -254,11 +255,12 @@ elif clear_refusal; then
 else
   flunk B.no-write-without-quorum "refused, but without a clear reason: $(tail -n 2 "$WORK/push.err" | tr '\n' ' ')"
 fi
-code="$(api_code "$SURV" POST "/repos/$REPO/branches" '{"new_branch_name":"b4-api-no-quorum","old_branch_name":"main"}')"
-if [ "${code:0:1}" != 2 ]; then
-  pass B.no-api-ref-write-without-quorum "branch creation through the API on forgejo-$SURV: HTTP $code"
+code="$(curl -s -o "$WORK/api.out" -w '%{http_code}' -m 60 -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
+  -X POST --data '{"new_branch_name":"b4-api-no-quorum","old_branch_name":"main"}' "$(node_url "$SURV")/api/v1/repos/$REPO/branches")"
+if [ "$code" = 503 ] && grep -q 'nothing was written' "$WORK/api.out"; then
+  pass B.no-api-ref-write-without-quorum "branch creation through the API on forgejo-$SURV: HTTP 503, $(jq -r .message "$WORK/api.out" | cut -c1-100)"
 else
-  flunk B.no-api-ref-write-without-quorum "HTTP $code"
+  flunk B.no-api-ref-write-without-quorum "HTTP $code: $(head -c 200 "$WORK/api.out")"
 fi
 if [ "$(all_refs "$SURV" "$REPO")" = "$before_refs" ] && [ "$(field "$SURV" .Role)" != leader ]; then
   pass B.minority-node-is-read-only "forgejo-$SURV serves the same refs, role $(field "$SURV" .Role)"
@@ -333,7 +335,29 @@ else
 fi
 if poll 30 one_leader; then pass B.one-leader-after-heal "forgejo-$(leader)"; else flunk B.one-leader-after-heal "$(leaders | tr '\n' ' ')"; fi
 
-say "B7. The lab's own end-to-end run (leader SIGKILL, Patroni failover, catch-up)"
+say "B7. The leader killed again, after restarts and partitions"
+L="$(leader)" || L=1
+read -r S1 S2 <<<"$(others "$L" | tr '\n' ' ')"
+t0=$(date +%s.%N)
+kill_node "$L"
+if poll "$ELECTION_BOUND" leader_among "$S1" "$S2"; then
+  pass B.second-leader-kill-elects "forgejo-$(leader_among "$S1" "$S2") in ${POLL_TOOK}s (bound ${ELECTION_BOUND}s), forgejo-$L killed"
+else
+  flunk B.second-leader-kill-elects "no leader among forgejo-$S1 and forgejo-$S2 within ${ELECTION_BOUND}s"
+fi
+if sha="$(push_until "$WRITE_RESUME_BOUND" "$S1" b7-second-kill)" && poll 10 serves "$S2" "$REPO" refs/heads/b7-second-kill "$sha"; then
+  pass B.second-leader-kill-writes-resume "push to forgejo-$S1 $(printf '%.1f' "$(echo "$(date +%s.%N) - $t0" | bc)")s after the kill, read on forgejo-$S2"
+else
+  flunk B.second-leader-kill-writes-resume "$(tail -n 2 "$WORK/push.err" | tr '\n' ' ')"
+fi
+start_node "$L"
+if poll "$CATCH_UP_BOUND" healthy "$L" && poll "$CATCH_UP_BOUND" converged 1 2 3; then
+  pass B.second-killed-leader-catches-up "forgejo-$L"
+else
+  flunk B.second-killed-leader-catches-up "forgejo-$L"
+fi
+
+say "B8. The lab's own end-to-end run (leader SIGKILL, Patroni failover, catch-up)"
 if "$LAB_DIR/scripts/e2e.sh" >"$LAB_DIR/.build/lab-e2e.log" 2>&1; then
   pass B.lab-e2e-script "$(grep -c '^OK' "$LAB_DIR/.build/lab-e2e.log") steps, see lab-e2e.log"
 else
@@ -341,7 +365,7 @@ else
 fi
 cat "$LAB_DIR/.build/lab-e2e.log"
 
-say "B8. Never two leaders in one term"
+say "B9. Never two leaders in one term"
 touch "$WATCH_STOP"
 wait
 samples="$(wc -l <"$WATCH_LOG" | tr -d ' ')"
