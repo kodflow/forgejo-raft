@@ -281,7 +281,7 @@ ok "the old access tokens are revoked"
 ok "main is the clean commit ${CLEAN_SHA:0:12}, not the force-push"
 member_r "$NEW_TOKEN" "repos/$USER_NAME/$REPO/issues/1" >/dev/null || fail "the deleted issue is missing"
 ok "the issue the attacker deleted is back"
-client "cd /work && rm -rf check && git clone -q http://$USER_NAME:$NEW_TOKEN@10.89.0.49:3000/$USER_NAME/$REPO.git check && cd check && git lfs pull -q && cmp blob.bin ../blob.bin"
+client "cd /work && rm -rf check && git clone -q http://$USER_NAME:$NEW_TOKEN@10.89.0.49:3000/$USER_NAME/$REPO.git check && cd check && git lfs pull >/dev/null && cmp blob.bin ../blob.bin"
 ok "the LFS object fetches, byte for byte"
 client "python3 /work/web.py http://10.89.0.49:3000 $TFA_USER $TFA_PASS login" >/dev/null
 ok "the 2FA login works with the restored SECRET_KEY"
