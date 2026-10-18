@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	cluster_model "forgejo.org/models/cluster"
 	"forgejo.org/models/db"
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/json"
@@ -89,6 +90,8 @@ type coordinator struct {
 	// files lists the stored files at the fence; tests replace it.
 	files func() ([]clusterhook.FileEntry, error)
 	now   func() time.Time
+	// backup records the backup cursor; tests replace it.
+	backup func(ctx context.Context, name string, next cluster_model.Cursor) error
 
 	mu      sync.Mutex
 	waiting string
@@ -96,7 +99,7 @@ type coordinator struct {
 }
 
 func newCoordinator(r *Replicator, interval time.Duration, dir string, wal walSource) *coordinator {
-	c := &coordinator{r: r, interval: interval, dir: dir, wal: wal, files: storedFiles, now: time.Now}
+	c := &coordinator{r: r, interval: interval, dir: dir, wal: wal, files: storedFiles, now: time.Now, backup: cluster_model.SetCursor}
 	r.table.OnCheckpoint(c.capture)
 	return c
 }
@@ -270,6 +273,14 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 	}
 	if !res.OK {
 		return reftable.CheckpointRecord{}, fmt.Errorf("checkpoint %s refused: %s", name, res.Reason)
+	}
+	// The backup cursor: a PostgreSQL restored to this checkpoint's position
+	// holds the SQL of every entry up to B, and the log must keep what
+	// follows for it to be replayed; the consumer never trims past it.
+	if r.consumer != nil && r.consumer.dbReady() {
+		if err := c.backup(ctx, cluster_model.CursorBackup, cluster_model.Cursor{Lineage: tok.Identity().String(), Position: int64(tok.Index)}); err != nil {
+			log.Warn("cluster checkpoint %s: recording the backup cursor: %v", name, err)
+		}
 	}
 	c.prune()
 	for _, cp := range r.table.Checkpoints() {

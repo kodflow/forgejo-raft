@@ -16,12 +16,57 @@ derive in it is written by a single consumer, on the leader.
 ## Requirements
 
 - Three nodes, each with a management address the other two can reach.
-- A shared PostgreSQL database, declared in the usual `[database]` section.
+- A shared PostgreSQL database, declared in the usual `[database]` section,
+  durable across its own failovers (see "PostgreSQL durability", REQUIRED).
 - A cluster certificate authority, and for each node a certificate carrying a
   single URI SAN `kitsunium-consensus://<CLUSTER_ID>/slot/<SLOT>`, with the
   `serverAuth` and `clientAuth` usages. The key stays on the node.
 - `[security] DISABLE_GIT_HOOKS = true`. Start-up fails without it, since a
   user hook would run inside the replication path.
+
+## PostgreSQL durability (REQUIRED)
+
+The consumer writes what pushes derive in SQL, then trims the replicated
+event queue behind it. A commit PostgreSQL acknowledged and then lost in a
+failover would lose those events for good. The cluster therefore REQUIRES:
+
+- `synchronous_commit` `on` or `remote_apply`, and `fsync` `on`;
+- a synchronous standby: under Patroni, `synchronous_mode: on` AND
+  `synchronous_mode_strict: true`. Without strict mode, Patroni empties
+  `synchronous_standby_names` when its standby goes away and acknowledges
+  commits no standby holds; a failover then rolls them back;
+- Forgejo's role a member of `pg_monitor` (`GRANT pg_monitor TO forgejo`), so
+  it can read the standbys' positions in `pg_stat_replication`.
+
+The cluster checks this at start and before every trim of the event queue:
+it reads the cursors and the parked events, then PostgreSQL's WAL position,
+and trims only once every synchronous standby flushed past it. While the
+check fails, nothing is trimmed (the queue grows, pushes are refused when it
+is full, nothing is lost), `/api/healthz` warns under
+`cluster:sql_durability` and the administration page says why. A strict
+Patroni without a standby blocks writes instead: that is the intended
+trade. SQLite, a local file, is durable by itself; a single PostgreSQL
+without any standby declares `[cluster] SQL_STANDALONE = true`.
+
+If the consumer reads a cursor behind one it saw (a failover or restore that
+lost commits), it logs it, counts
+`forgejo_cluster_consumer_cursor_regressions_total` and replays the events
+past it from the log: they are still there.
+
+## Parked events
+
+An event whose post-receive work keeps failing (5 attempts) or whose
+repository is not projected within 10 minutes is PARKED, never dropped: a
+row of `cluster_parked_event` holding the event commits with the cursor that
+moves past it. The later events of the same repository are parked behind it,
+so its work keeps its order. The event queue is not trimmed at or past a
+parked event. The leader retries the parked events every 30 seconds, and
+`forgejo cluster reconcile --apply` retries them at once; a retry's work and
+the removal of the row commit in one transaction, so each event is applied
+exactly once. The count is on the administration page and under
+`cluster:parked_events` in `/api/healthz`. A parked event that can never
+succeed (its repository or pusher ID was reissued) holds the queue's trim:
+fix its cause, or remove its row by hand, knowingly.
 
 ## The `[cluster]` keys
 
@@ -50,6 +95,7 @@ derive in it is written by a single consumer, on the leader.
 | `READ_AFTER_WRITE_TIMEOUT` | `2s` | How long a request waits for the node to catch up with the caller's last write. |
 | `MAX_LOG_BYTES`, `MAX_SNAPSHOT_BYTES` | 1 GiB | Bounds of the log and of a snapshot. |
 | `ACK_MARGIN` | `1024` | How far the trimming of consumed events lags the cursor. |
+| `SQL_STANDALONE` | `false` | Declares that no replica of the database can ever be promoted (a single PostgreSQL, no standby): the durability check then asks for local durability only. Never set it under Patroni. |
 | `TXN_TTL`, `MAX_TXN_PER_REPO`, `MAX_TXN_TOTAL` | `30s`, `64`, `4096` | Bounds of the git transactions in flight. |
 | `JOIN_GRANT_TTL` | `1h` | How long an operator's permission to join lasts. |
 | `DEAD_MEMBER_TIMEOUT` | `5m`, one minute at least | Autonomous mode: how long a member stays out of the leader's reach before it is removed. |
@@ -234,7 +280,10 @@ With `[metrics] ENABLED = true`, `/metrics` exposes two families.
   `consensus_peer_unreachable` and `consensus_peer_last_contact_seconds` per
   peer.
 - `forgejo_cluster_*`, Forgejo's: readiness, pending projection, event queue,
-  consumer lag and stalls, git transactions in flight, certificate expiry,
+  consumer lag and stalls, parked events (`consumer_parked_events_total`,
+  `consumer_unparked_events_total`), trims held for durability
+  (`consumer_trim_held_total`), cursor regressions, git transactions in
+  flight, certificate expiry,
   transport refusals before TLS, and the counters of proposals, object
   shipments and consumed events. In the autonomous mode,
   `forgejo_cluster_expected_nodes` (the founding size) and

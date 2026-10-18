@@ -36,3 +36,11 @@ func SetCurrentForTesting(r *Replicator) func() {
 		currentMu.Unlock()
 	}
 }
+
+// SetSQLDurabilityForTesting sets the consumer's last durability verdict.
+func SetSQLDurabilityForTesting(r *Replicator, ok bool, reason string) {
+	if r.consumer == nil {
+		r.consumer = &consumer{r: r}
+	}
+	r.consumer.durability.set(ok, reason)
+}

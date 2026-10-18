@@ -32,3 +32,23 @@ func TestCheckClusterFailureTolerance(t *testing.T) {
 	checkCluster(leader, c)
 	assert.Equal(t, warn, c["cluster:failure_tolerance"][0].Status, c["cluster:failure_tolerance"][0].Output)
 }
+
+// SQL that a failover of the database could roll back is a warning: the
+// event queue is not trimmed while it lasts (finding 4).
+func TestCheckClusterSQLDurability(t *testing.T) {
+	_, reps := cluster.NewForTesting(t.TempDir(), "node-a")
+	c := checks{}
+	checkCluster(reps[0], c)
+	assert.Equal(t, Pass, c["cluster:sql_durability"][0].Status, "not checked yet")
+
+	cluster.SetSQLDurabilityForTesting(reps[0], false, "synchronous_standby_names is empty")
+	c = checks{}
+	checkCluster(reps[0], c)
+	assert.Equal(t, warn, c["cluster:sql_durability"][0].Status)
+	assert.Contains(t, c["cluster:sql_durability"][0].Output, "synchronous_standby_names")
+
+	cluster.SetSQLDurabilityForTesting(reps[0], true, "1 synchronous standbys hold every commit read")
+	c = checks{}
+	checkCluster(reps[0], c)
+	assert.Equal(t, Pass, c["cluster:sql_durability"][0].Status)
+}

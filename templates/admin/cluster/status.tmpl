@@ -25,6 +25,8 @@
 			<dt>{{ctx.Locale.Tr "admin.cluster.table_root"}}</dt><dd><code>{{.View.Root}}</code></dd>
 			<dt>{{ctx.Locale.Tr "admin.cluster.repositories"}}</dt><dd>{{.View.Repos}}</dd>
 			<dt>{{ctx.Locale.Tr "admin.cluster.events"}}</dt><dd>{{.View.Events}} ({{ctx.Locale.TrSize .View.EventBytes}}), {{ctx.Locale.Tr "admin.cluster.consumer_lag"}} {{.View.ConsumerLag}}</dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.parked_events"}}</dt><dd>{{if lt .View.ParkedEvents 0}}{{ctx.Locale.Tr "admin.cluster.unknown"}}{{else}}{{.View.ParkedEvents}}{{if gt .View.ParkedEvents 0}} <span class="ui orange label">{{ctx.Locale.Tr "admin.cluster.parked_events_hint"}}</span>{{end}}{{end}}</dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.sql_durability"}}</dt><dd>{{if .View.SQLDurabilityChecked.IsZero}}-{{else}}{{if not .View.SQLDurable}}<span class="ui red label">{{ctx.Locale.Tr "admin.cluster.sql_not_durable"}}</span> {{end}}{{.View.SQLDurability}}{{end}}</dd>
 			<dt>{{ctx.Locale.Tr "admin.cluster.txns_in_flight"}}</dt><dd>{{.View.TxnsInFlight}}</dd>
 		</dl>
 	</div>

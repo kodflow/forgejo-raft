@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	cluster_model "forgejo.org/models/cluster"
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/reftable"
@@ -90,6 +91,7 @@ func withCheckpoints(t *testing.T, tc *testCluster, pg *fakePG) *coordinator {
 	leader := tc.nodes[0].r
 	c := newCoordinator(leader, time.Hour, t.TempDir(), pg)
 	c.files = func() ([]clusterhook.FileEntry, error) { return nil, nil }
+	c.backup = tc.cursors.set
 	leader.checkpoints = c
 	for _, n := range tc.nodes {
 		n.r.export.ckptDir = c.dir
@@ -140,6 +142,11 @@ func TestBarrierCutRefsMatchSQL(t *testing.T) {
 		closed = append(closed, rec)
 	}
 	require.GreaterOrEqual(t, len(closed), 4)
+	// Each checkpoint records the backup cursor at its barrier: the
+	// consumer never trims the events a restore to it would replay.
+	last := closed[len(closed)-1]
+	b, _ := tc.cursors.get(context.Background(), cluster_model.CursorBackup)
+	assert.EqualValues(t, last.Index, b.Position, "the backup cursor is the last checkpoint's barrier")
 
 	pushesSeen, checked := 0, 0
 	for _, rec := range closed {

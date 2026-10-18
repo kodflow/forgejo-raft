@@ -84,3 +84,18 @@ func AdvanceCursor(ctx context.Context, name string, prev, next Cursor) error {
 	}
 	return nil
 }
+
+// SetCursor moves a cursor to next whatever it held: the backup cursor,
+// which the checkpoint coordinator alone writes.
+func SetCursor(ctx context.Context, name string, next Cursor) error {
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		cur, err := GetCursor(ctx, name)
+		if err != nil {
+			return err
+		}
+		if cur.Lineage == next.Lineage && cur.Position == next.Position && cur.Closed == next.Closed {
+			return nil
+		}
+		return AdvanceCursor(ctx, name, *cur, next)
+	})
+}

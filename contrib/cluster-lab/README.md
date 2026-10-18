@@ -9,7 +9,8 @@ repository's README.
 
 - Three Consul servers (`consul-1` to `consul-3`), in Raft.
 - Three PostgreSQL 18 under Patroni (`pg-1` to `pg-3`), Consul as the DCS,
-  synchronous replication. Each PostgreSQL talks to the Consul of its own slot.
+  synchronous replication in strict mode (required: contrib/cluster/README.md).
+  Each PostgreSQL talks to the Consul of its own slot.
 - HAProxy in front of them: port 5000 always leads to the primary, checked
   through `/primary` on Patroni's REST API (port 8008).
 - A lab PKI (`pki`, run once). The cluster id is 16 bytes (32 hex digits).

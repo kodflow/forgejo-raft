@@ -34,6 +34,22 @@ var (
 		Name: metricsNamespace + "consumer_failures_total",
 		Help: "Batches the consumer rolled back because their work failed.",
 	})
+	parkedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: metricsNamespace + "consumer_parked_events_total",
+		Help: "Events whose post-receive work the consumer parked, never dropped, until a retry runs it.",
+	})
+	unparkedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: metricsNamespace + "consumer_unparked_events_total",
+		Help: "Parked events whose post-receive work a retry committed.",
+	})
+	trimHeldTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: metricsNamespace + "consumer_trim_held_total",
+		Help: "Trims of the event queue held back because SQL's durability was not confirmed.",
+	})
+	cursorRegressionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: metricsNamespace + "consumer_cursor_regressions_total",
+		Help: "Times the consumer read a cursor behind one it had seen (a database failover or restore): the events past it are replayed from the log.",
+	})
 	checkpointsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: metricsNamespace + "checkpoints_total",
 		Help: "Checkpoints the coordinator took on this node while it led, by outcome: closed, failed.",
@@ -100,6 +116,10 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	objectShipsTotal.Describe(ch)
 	dispatchedTotal.Describe(ch)
 	dispatchFailuresTotal.Describe(ch)
+	parkedTotal.Describe(ch)
+	unparkedTotal.Describe(ch)
+	trimHeldTotal.Describe(ch)
+	cursorRegressionsTotal.Describe(ch)
 	checkpointsTotal.Describe(ch)
 	exportsTotal.Describe(ch)
 }
@@ -116,6 +136,10 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	objectShipsTotal.Collect(ch)
 	dispatchedTotal.Collect(ch)
 	dispatchFailuresTotal.Collect(ch)
+	parkedTotal.Collect(ch)
+	unparkedTotal.Collect(ch)
+	trimHeldTotal.Collect(ch)
+	cursorRegressionsTotal.Collect(ch)
 	checkpointsTotal.Collect(ch)
 	exportsTotal.Collect(ch)
 	r := Current()
