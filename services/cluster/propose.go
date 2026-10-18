@@ -143,6 +143,16 @@ func (r *Replicator) WriteRefusal(ctx context.Context) error {
 	}
 }
 
+// WriteRefusal is this node's refusal of a ref write now, nil when it can
+// take one or when the cluster is off: the API asks it before a write that
+// would otherwise fail in the reference-transaction hook with a bare 500.
+func WriteRefusal(ctx context.Context) error {
+	if r := Current(); r != nil {
+		return r.WriteRefusal(ctx)
+	}
+	return nil
+}
+
 func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.Request, tx *reftable.RefTxn) *clusterhook.Response {
 	eng := r.Engine()
 	if eng == nil || !r.projector.Ready() {
