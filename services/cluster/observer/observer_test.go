@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/json"
@@ -395,6 +396,10 @@ func TestObserverTakesANewBaseAfterAGap(t *testing.T) {
 	ctx := context.Background()
 	c := newFakeCluster(t)
 	o := newTestObserver(t, c, &hookLog{})
+	// A frozen clock: the base after the gap is taken within the same
+	// second as the first, which must not collide with it.
+	frozen := time.Now()
+	o.cfg.Now = func() time.Time { return frozen }
 	seed(t, c, o)
 	require.NoError(t, o.Step(ctx))
 
