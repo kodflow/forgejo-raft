@@ -19,6 +19,11 @@
 			<dt>{{ctx.Locale.Tr "admin.cluster.commit_applied"}}</dt><dd>{{.View.Commit}} / {{.View.Applied}}{{if .View.ApplyLagEntries}} ({{ctx.Locale.Tr "admin.cluster.apply_lag" .View.ApplyLagEntries}}){{end}}</dd>
 			<dt>{{ctx.Locale.Tr "admin.cluster.lineage"}}</dt><dd><code>{{.View.Identity}}</code></dd>
 			<dt>{{ctx.Locale.Tr "admin.cluster.cluster_version"}}</dt><dd>{{.View.ClusterVersion}}</dd>
+			<dt>{{ctx.Locale.Tr "admin.cluster.payload_version"}}</dt><dd>{{.View.PayloadVersion}}{{if and $op (lt .View.PayloadVersion .View.PayloadMax)}}
+				<form class="tw-inline" method="post" action="{{AppSubUrl}}/admin/cluster/operate">
+					<input type="hidden" name="action" value="raise-payload-version"><input type="hidden" name="target" value="{{.View.PayloadMax}}">
+					<button class="ui mini orange button" data-tooltip-content="{{ctx.Locale.Tr "admin.cluster.op.raise-payload-version.warning"}}">{{ctx.Locale.Tr "admin.cluster.op.raise-payload-version"}} {{.View.PayloadMax}}</button>
+				</form>{{end}}</dd>
 			<dt>{{ctx.Locale.Tr "admin.cluster.failure_tolerance"}}</dt><dd>{{if lt .View.FailureTolerance 0}}{{ctx.Locale.Tr "admin.cluster.unknown"}}{{else}}{{.View.FailureTolerance}}{{end}}{{if and (eq .View.Role "leader") (not .View.QuorumReachable)}} <span class="ui red label">{{ctx.Locale.Tr "admin.cluster.no_quorum"}}</span>{{end}}</dd>
 			<dt>{{ctx.Locale.Tr "admin.cluster.cert_expiry"}}</dt><dd>{{DateUtils.AbsoluteLong .View.CertExpiry}}</dd>
 			<dt>SPKI</dt><dd><code>{{.View.SPKI}}</code></dd>

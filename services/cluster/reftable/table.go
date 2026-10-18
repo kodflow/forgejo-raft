@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -110,6 +111,14 @@ type Table struct {
 	// pending is the open checkpoint barrier; checkpoints the closed ones.
 	pending     *pendingCheckpoint
 	checkpoints []CheckpointRecord
+	// payload is the payload version the cluster agreed to write, 0 for
+	// BaseVersion (WriteVersion).
+	payload uint8
+	// nonces are the nonces of the newest committed ref transactions, with
+	// their index, oldest first: a proposer whose outcome was unknown finds
+	// its own entry there even after another write moved the ref.
+	nonces  []NonceMark
+	byNonce map[string]uint64
 
 	// onChange is called after each Apply, outside the lock. It is not state.
 	onChange func(Change)
@@ -129,7 +138,51 @@ func New() *Table {
 		deleted: map[string]uint64{},
 		renamed: map[string]renameMark{},
 		grants:  map[string]JoinGrant{},
+		byNonce: map[string]uint64{},
 	}
+}
+
+// NonceMark is a committed ref transaction's nonce and index.
+type NonceMark struct {
+	Nonce string `json:"n"`
+	Index uint64 `json:"i"`
+}
+
+// NoncesKept is how many committed nonces the table retains: far more than
+// the transactions in flight at once, which the registry caps.
+const NoncesKept = 4096
+
+func (t *Table) keepNonce(nonce string, index uint64) {
+	if nonce == "" {
+		return
+	}
+	t.nonces = append(t.nonces, NonceMark{Nonce: nonce, Index: index})
+	t.byNonce[nonce] = index
+	if n := len(t.nonces); n > NoncesKept {
+		for _, m := range t.nonces[:n-NoncesKept] {
+			if t.byNonce[m.Nonce] == m.Index {
+				delete(t.byNonce, m.Nonce)
+			}
+		}
+		t.nonces = append([]NonceMark(nil), t.nonces[n-NoncesKept:]...)
+	}
+}
+
+// CommittedNonce reports whether a ref transaction carrying nonce
+// committed and was accepted, and at which index, while it is retained.
+func (t *Table) CommittedNonce(nonce string) (uint64, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	i, ok := t.byNonce[nonce]
+	return i, ok && nonce != ""
+}
+
+// WriteVersion is the payload version a proposer writes: BaseVersion until
+// an Audit entry raised it, once every member could read the new one.
+func (t *Table) WriteVersion() uint8 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return max(t.payload, BaseVersion)
 }
 
 // OnChange registers the projector's notification. It is called under the
@@ -145,6 +198,10 @@ func (t *Table) OnChange(f func(Change)) {
 // because skipping an entry forks the replica (D18).
 func (t *Table) Apply(e consensus.Entry) any {
 	kind, body, err := decode(e.Data)
+	var version uint8
+	if len(e.Data) > 0 {
+		version = e.Data[0]
+	}
 	if err != nil && !errors.Is(err, errMalformed) {
 		panic(err)
 	}
@@ -156,7 +213,7 @@ func (t *Table) Apply(e consensus.Entry) any {
 	} else {
 		switch kind {
 		case KindRefTxn:
-			res, ch = t.applyRefTxn(e, body.(*RefTxn))
+			res, ch = t.applyRefTxn(e, version, body.(*RefTxn))
 		case KindAck:
 			res = t.applyAck(body.(*Ack))
 		case KindAudit:
@@ -213,9 +270,20 @@ func (t *Table) setRef(repo string, r *repoState, ref string, v *RefValue) {
 	t.root = t.root.add(rootTerm(repo, r.hash))
 }
 
-func (t *Table) applyRefTxn(e consensus.Entry, tx *RefTxn) (Result, Change) {
+func (t *Table) applyRefTxn(e consensus.Entry, version uint8, tx *RefTxn) (Result, Change) {
 	if err := ValidRepoKey(tx.Repo); err != nil {
 		return refuse("repository: %v", err), Change{}
+	}
+	if version >= 2 && tx.Push {
+		// A push still running when its repository was deleted or renamed
+		// on another member: it must not bring the key back to life under
+		// a name the database no longer has (payload version 2).
+		if _, deleted := t.deleted[tx.Repo]; deleted {
+			return refuse("the repository %s was deleted", tx.Repo), Change{}
+		}
+		if to, moved := t.movedAwayLocked(tx.Repo); moved {
+			return refuse("the repository %s was renamed to %s", tx.Repo, to), Change{}
+		}
 	}
 	if tx.Format != "sha1" && tx.Format != "sha256" {
 		return refuse("unknown object format %q", tx.Format), Change{}
@@ -330,6 +398,7 @@ func (t *Table) applyRefTxn(e consensus.Entry, tx *RefTxn) (Result, Change) {
 		t.pushEvent(ev)
 	}
 	r.last = e.Index
+	t.keepNonce(tx.Nonce, e.Index)
 	return Result{OK: true, Revs: revs}, Change{Repos: []string{tx.Repo}}
 }
 
@@ -424,6 +493,7 @@ func (t *Table) applyAudit(e consensus.Entry, a *Audit) Result {
 		}
 	}
 	t.audit = append(t.audit, AuditRecord{Audit: *a, Token: e.Token})
+	t.payload = max(t.payload, raisedVersion(a))
 	if len(t.audit) > AuditKeep {
 		t.audit = append([]AuditRecord(nil), t.audit[len(t.audit)-AuditKeep:]...)
 	}
@@ -632,6 +702,24 @@ func (t *Table) RenamedFrom(repo string) (string, uint64, bool) {
 func (t *Table) MovedAway(repo string) (string, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+	return t.movedAwayLocked(repo)
+}
+
+// raisedVersion is the payload version an audit record raises the cluster
+// to, 0 when it raises none. A version this code cannot apply is not
+// adopted: its entries would stop this node anyway.
+func raisedVersion(a *Audit) uint8 {
+	if a.Action != AuditPayloadVersion || a.Outcome != AuditRaised {
+		return 0
+	}
+	v, err := strconv.ParseUint(a.Target, 10, 8)
+	if err != nil || v <= BaseVersion || v > PayloadVersion {
+		return 0
+	}
+	return uint8(v)
+}
+
+func (t *Table) movedAwayLocked(repo string) (string, bool) {
 	if r := t.repos[repo]; r != nil {
 		for _, v := range r.refs {
 			if v.Live() {
@@ -732,6 +820,10 @@ type persisted struct {
 	// checkpoints, which then restore with none.
 	Pending     *pendingCheckpoint `json:"pending,omitempty"`
 	Checkpoints []CheckpointRecord `json:"checkpoints,omitempty"`
+	// Payload and Nonces are absent from older snapshots: the payload
+	// version is then read back from the audit records kept.
+	Payload uint8       `json:"payload,omitempty"`
+	Nonces  []NonceMark `json:"nonces,omitempty"`
 }
 
 type bytesSnapshot struct{ b []byte }
@@ -761,7 +853,7 @@ func (t *Table) persistedLocked() *persisted {
 		Format: SnapshotFormat, Applied: t.applied, Identity: t.identity,
 		Repos: make(map[string]map[string]*RefValue, len(t.repos)), Last: map[string]uint64{},
 		Events: t.events, Audit: t.audit, Deleted: t.deleted, Renamed: t.renamed, Grants: t.grants,
-		Pending: t.pending, Checkpoints: t.checkpoints,
+		Pending: t.pending, Checkpoints: t.checkpoints, Payload: t.payload, Nonces: t.nonces,
 	}
 	for k, r := range t.repos {
 		p.Repos[k] = r.refs
@@ -799,6 +891,13 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 		nt.pushEvent(ev)
 	}
 	nt.audit = p.Audit
+	nt.payload = p.Payload
+	for i := range nt.audit {
+		nt.payload = max(nt.payload, raisedVersion(&nt.audit[i].Audit))
+	}
+	for _, m := range p.Nonces {
+		nt.keepNonce(m.Nonce, m.Index)
+	}
 	if p.Deleted != nil {
 		nt.deleted = p.Deleted
 	}
@@ -813,6 +912,7 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	t.audit, t.deleted, t.renamed, t.grants = nt.audit, nt.deleted, nt.renamed, nt.grants
 	t.applied, t.identity = p.Applied, p.Identity
 	t.pending, t.checkpoints = p.Pending, p.Checkpoints
+	t.payload, t.nonces, t.byNonce = nt.payload, nt.nonces, nt.byNonce
 	if t.onChange != nil {
 		repos := make([]string, 0, len(t.repos))
 		for k := range t.repos {

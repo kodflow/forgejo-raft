@@ -66,9 +66,12 @@ type Replicator struct {
 	// dead is when the leader found each member out of reach; seen is
 	// what this node saw of each member, for the status (autopilot.go,
 	// retire.go).
-	dead   deadClock
-	seenMu sync.Mutex
-	seen   map[consensus.NodeID]memberRecord
+	dead deadClock
+	// payloadProbe is when the autopilot next asks the members which
+	// command version they apply.
+	payloadProbe time.Time
+	seenMu       sync.Mutex
+	seen         map[consensus.NodeID]memberRecord
 	// fence queues this node's own writers while a checkpoint reads
 	// PostgreSQL's position; checkpoints is the coordinator, nil while
 	// [cluster] CHECKPOINT_INTERVAL is 0 (checkpoint.go).

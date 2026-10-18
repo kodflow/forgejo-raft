@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,15 +43,19 @@ type projector struct {
 	// start: no watermark is certified as "everything" before they are.
 	pendingFirst map[string]bool
 	failures     map[string]string
-	wake         chan struct{}
-	waiters      []chan struct{}
+	// deletedAt holds the index of a repository's deletion until this node
+	// removed its directory: a key revived meanwhile by a rename finds the
+	// deleted repository's directory still there.
+	deletedAt map[string]uint64
+	wake      chan struct{}
+	waiters   []chan struct{}
 }
 
 func newProjector(root string, table *reftable.Table, reg *registry) *projector {
 	p := &projector{
 		root: root, table: table, registry: reg,
 		dirty: map[string]uint64{}, watermark: map[string]uint64{},
-		fenced: true, pendingFirst: map[string]bool{}, failures: map[string]string{},
+		fenced: true, pendingFirst: map[string]bool{}, failures: map[string]string{}, deletedAt: map[string]uint64{},
 		wake: make(chan struct{}, 1),
 	}
 	table.OnChange(p.onChange)
@@ -64,6 +69,9 @@ func (p *projector) onChange(ch reftable.Change) {
 		if ch.Index > p.dirty[r] {
 			p.dirty[r] = ch.Index
 		}
+	}
+	for _, r := range ch.Deleted {
+		p.deletedAt[r] = ch.Index
 	}
 	p.mu.Unlock()
 	p.signal()
@@ -257,8 +265,14 @@ func (p *projector) project(ctx context.Context, repo string) error {
 		if err := os.RemoveAll(dir); err != nil {
 			return err
 		}
+		p.mu.Lock()
+		delete(p.deletedAt, repo)
+		p.mu.Unlock()
 		p.certify(repo, at, nil)
 		return nil
+	}
+	if err := p.setAsideDeleted(repo, dir); err != nil {
+		return err
 	}
 	want := tableProjection(refs)
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
@@ -442,4 +456,50 @@ func (p *projector) MayCollectGarbage(repo string) bool {
 	defer p.mu.Unlock()
 	_, dirty := p.dirty[repo]
 	return !p.fenced && !dirty && !p.pendingFirst[repo]
+}
+
+// staleDirName is where, under the repository root, the projector sets aside
+// a directory it must not reuse; its leading dot keeps it outside every
+// repository key.
+const staleDirName = ".cluster-stale"
+
+// setAsideDeleted handles a key deleted and then taken by a rename before
+// this node removed the deleted repository's directory: that directory is
+// the old repository's, and the renamed one must move in instead of being
+// projected into it (other objects, maybe another object format). It is
+// moved under staleDirName, never removed. Only when the rename's source
+// directory is still here: on the node that served the rename, Forgejo
+// already moved the source in, and the directory is the right one. A key
+// revived otherwise (Forgejo creating a repository again) keeps its
+// directory.
+func (p *projector) setAsideDeleted(repo, dir string) error {
+	p.mu.Lock()
+	delIdx, pending := p.deletedAt[repo]
+	delete(p.deletedAt, repo)
+	p.mu.Unlock()
+	if !pending {
+		return nil
+	}
+	from, renIdx, renamed := p.table.RenamedFrom(repo)
+	if !renamed || renIdx <= delIdx {
+		return nil
+	}
+	if _, err := os.Stat(dir); err != nil {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(p.root, filepath.FromSlash(from))); err != nil {
+		return nil
+	}
+	aside := filepath.Join(p.root, staleDirName, fmt.Sprintf("%s-%d", strings.ReplaceAll(repo, "/", "_"), delIdx))
+	if err := os.MkdirAll(filepath.Dir(aside), 0o700); err != nil {
+		return err
+	}
+	if err := os.Rename(dir, aside); err != nil {
+		p.mu.Lock()
+		p.deletedAt[repo] = delIdx
+		p.mu.Unlock()
+		return err
+	}
+	log.Warn("cluster: %s was deleted, then taken by a rename of %s: the deleted repository's directory is set aside in %s", repo, from, aside)
+	return nil
 }

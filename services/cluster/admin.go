@@ -75,16 +75,20 @@ type AlarmView struct {
 
 // View is what the administration and `forgejo cluster status` show.
 type View struct {
-	Slot             string
-	Ready            bool
-	Fenced           bool
-	Role             string
-	Term             uint64
-	Leader           string
-	Commit           uint64
-	Applied          uint64
-	Identity         string
-	ClusterVersion   uint32
+	Slot           string
+	Ready          bool
+	Fenced         bool
+	Role           string
+	Term           uint64
+	Leader         string
+	Commit         uint64
+	Applied        uint64
+	Identity       string
+	ClusterVersion uint32
+	// PayloadVersion is the command version the cluster writes, and
+	// PayloadMax the highest this binary applies.
+	PayloadVersion   uint8
+	PayloadMax       uint8
 	FailureTolerance int
 	QuorumReachable  bool
 	Stopped          bool
@@ -175,6 +179,7 @@ func (r *Replicator) View(ctx context.Context) View {
 		v.Leader = st.Leader.String()
 	}
 	v.Identity, v.ClusterVersion = st.Identity.String(), st.ClusterVersion
+	v.PayloadVersion, v.PayloadMax = r.table.WriteVersion(), reftable.PayloadVersion
 	v.FailureTolerance, v.QuorumReachable, v.Stopped, v.StopReason = h.FailureTolerance, h.QuorumReachable, h.Stopped, h.StopReason
 	v.ApplyLagEntries = h.ApplyLagEntries
 	for _, a := range h.Alarms {
@@ -262,10 +267,13 @@ const (
 	ActionAuthorizeJoin  Action = "authorize-join"
 	ActionGrantOperator  Action = "grant-operator"
 	ActionRevokeOperator Action = "revoke-operator"
+	// ActionRaisePayload makes the cluster write the command version this
+	// binary applies (Target), once every member runs it.
+	ActionRaisePayload Action = "raise-payload-version"
 )
 
 // Actions lists the operations the administration offers.
-var Actions = []Action{ActionAddLearner, ActionPromote, ActionRemove, ActionTransfer, ActionDenyPin, ActionClearNoSpace, ActionUpdateAddress, ActionAuthorizeJoin, ActionGrantOperator, ActionRevokeOperator}
+var Actions = []Action{ActionAddLearner, ActionPromote, ActionRemove, ActionTransfer, ActionDenyPin, ActionClearNoSpace, ActionUpdateAddress, ActionAuthorizeJoin, ActionGrantOperator, ActionRevokeOperator, ActionRaisePayload}
 
 // Valid reports whether a is an operation.
 func (a Action) Valid() bool {
@@ -366,6 +374,12 @@ func (r *Replicator) operate(ctx context.Context, eng consensus.Engine, op conse
 	}
 	if o.Action == ActionGrantOperator || o.Action == ActionRevokeOperator {
 		return changeOperator(ctx, op, o)
+	}
+	if o.Action == ActionRaisePayload {
+		if o.Target != strconv.Itoa(reftable.PayloadVersion) {
+			return fmt.Errorf("this binary raises the payload version to %d only", reftable.PayloadVersion)
+		}
+		return r.RaisePayloadVersion(ctx, op)
 	}
 	if o.Action == ActionClearNoSpace {
 		id, err := strconv.ParseUint(o.Target, 10, 64)

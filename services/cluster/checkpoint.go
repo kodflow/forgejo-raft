@@ -95,7 +95,14 @@ type coordinator struct {
 
 	mu      sync.Mutex
 	waiting string
-	got     chan []byte
+	got     chan capturedTable
+}
+
+// capturedTable is the table as a barrier's Apply encoded it, with that
+// barrier's index.
+type capturedTable struct {
+	b     []byte
+	index uint64
 }
 
 func newCoordinator(r *Replicator, interval time.Duration, dir string, wal walSource) *coordinator {
@@ -106,7 +113,7 @@ func newCoordinator(r *Replicator, interval time.Duration, dir string, wal walSo
 
 // capture keeps the table at the barrier this node is waiting for. It runs
 // under the table's lock: it encodes and hands the bytes over, nothing more.
-func (c *coordinator) capture(nonce string, _ uint64, encode func() ([]byte, error)) {
+func (c *coordinator) capture(nonce string, index uint64, encode func() ([]byte, error)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if nonce != c.waiting || c.got == nil {
@@ -118,15 +125,15 @@ func (c *coordinator) capture(nonce string, _ uint64, encode func() ([]byte, err
 		b = nil
 	}
 	select {
-	case c.got <- b:
+	case c.got <- capturedTable{b: b, index: index}:
 	default:
 	}
 }
 
-func (c *coordinator) expect(nonce string) chan []byte {
+func (c *coordinator) expect(nonce string) chan capturedTable {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.waiting, c.got = nonce, make(chan []byte, 1)
+	c.waiting, c.got = nonce, make(chan capturedTable, 1)
 	return c.got
 }
 
@@ -200,13 +207,9 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 	if err := eng.WaitApplied(bctx, tok); err != nil {
 		return reftable.CheckpointRecord{}, fmt.Errorf("barrier not applied here: %w", err)
 	}
-	var snap []byte
-	select {
-	case snap = <-got:
-	case <-bctx.Done():
-	}
-	if snap == nil {
-		return reftable.CheckpointRecord{}, errors.New("the table was not captured at the barrier")
+	snap, err := tableAtBarrier(bctx, got, tok.Index)
+	if err != nil {
+		return reftable.CheckpointRecord{}, err
 	}
 
 	// 3. The consumer up to B, and no further.
@@ -289,6 +292,25 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 		}
 	}
 	return reftable.CheckpointRecord{}, fmt.Errorf("checkpoint %s committed and not yet applied here", name)
+}
+
+// tableAtBarrier is the table captured at the barrier that committed at
+// index. A barrier proposed again after an unknown outcome applies twice
+// under one nonce: the first capture is then another index than the
+// position names, and the checkpoint is not taken.
+func tableAtBarrier(ctx context.Context, got <-chan capturedTable, index uint64) ([]byte, error) {
+	var c capturedTable
+	select {
+	case c = <-got:
+	case <-ctx.Done():
+	}
+	switch {
+	case c.b == nil:
+		return nil, errors.New("the table was not captured at the barrier")
+	case c.index != index:
+		return nil, fmt.Errorf("the table was captured at %d, the barrier committed at %d: the barrier was proposed twice", c.index, index)
+	}
+	return c.b, nil
 }
 
 // writeArtifact writes one artifact of a checkpoint durably and returns

@@ -9,10 +9,28 @@ import (
 	"fmt"
 )
 
-// PayloadVersion is the version of every command this code writes and the
-// highest it applies. A new version starts only at a gate entry raised by
-// RaiseClusterVersion (ADR 0152 D18); an entry above it stops the node.
-const PayloadVersion = 1
+// PayloadVersion is the highest command version this code applies; an
+// entry above it stops the node, never skipped (ADR 0152 D18).
+//
+// Version 2 adds one rule to Apply: a RefTxn marked Push is refused on a
+// key the table deleted, or renamed away with no live ref since. Version 1
+// entries keep applying exactly as before, whatever binary replays them.
+// This code writes version 1 until the cluster agreed to version 2
+// (Table.WriteVersion): the agreement is a version 1 Audit entry, which a
+// member running an older binary applies as a plain audit record, so a
+// rolling upgrade never hands an older member an entry it cannot read
+// before every member runs this code.
+const PayloadVersion = 2
+
+// BaseVersion is the version written until the cluster raised it.
+const BaseVersion = 1
+
+// The audit record that raises the written version: Action, with Outcome
+// AuditRaised and the version in Target.
+const (
+	AuditPayloadVersion = "payload-version"
+	AuditRaised         = "raised"
+)
 
 // Kind is the command's discriminant, the second byte of the envelope.
 type Kind uint8
@@ -70,6 +88,10 @@ type RefTxn struct {
 	PRID        int64             `json:"pr,omitempty"`
 	IsWiki      bool              `json:"wiki,omitempty"`
 	PushOptions map[string]string `json:"opts,omitempty"`
+	// Push marks a transaction a pusher started (receive-pack). From
+	// version 2, Apply refuses it on a deleted or renamed-away key; a
+	// version 1 entry ignores it.
+	Push bool `json:"push,omitempty"`
 }
 
 // Ack trims the events of a lineage up to an index, once the dispatcher read
@@ -126,13 +148,24 @@ type JoinGrant struct {
 	Operator string `json:"op"`
 }
 
-// Encode writes the envelope: payload version, kind, JSON body.
+// Encode writes the envelope at BaseVersion: payload version, kind, JSON
+// body.
 func Encode(kind Kind, body any) ([]byte, error) {
+	return EncodeVersion(BaseVersion, kind, body)
+}
+
+// EncodeVersion writes the envelope at version v, which the caller read from
+// Table.WriteVersion: a version the cluster has not agreed to would stop
+// the members that cannot read it.
+func EncodeVersion(v uint8, kind Kind, body any) ([]byte, error) {
+	if v < BaseVersion || v > PayloadVersion {
+		return nil, fmt.Errorf("%w: cannot write payload version %d", ErrVersion, v)
+	}
 	b, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	return append([]byte{PayloadVersion, byte(kind)}, b...), nil
+	return append([]byte{v, byte(kind)}, b...), nil
 }
 
 // ErrVersion is a command of a version this node does not know: the node
@@ -148,6 +181,11 @@ func decode(data []byte) (Kind, any, error) {
 	}
 	if data[0] == 0 || data[0] > PayloadVersion {
 		return 0, nil, fmt.Errorf("%w: payload version %d", ErrVersion, data[0])
+	}
+	if data[0] > BaseVersion && Kind(data[1]) != KindRefTxn {
+		// Version 2 changes the ref transaction only: any other kind at
+		// it was written by no version of this code.
+		return 0, nil, fmt.Errorf("%w: command kind %d at payload version %d", ErrVersion, data[1], data[0])
 	}
 	kind := Kind(data[1])
 	var v any

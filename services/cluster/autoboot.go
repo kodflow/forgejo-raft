@@ -23,6 +23,7 @@ import (
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/setting"
 	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/reftable"
 )
 
 // The autonomous mode ([cluster] EXPECTED_NODES from 3): a node is told how
@@ -102,6 +103,9 @@ type hello struct {
 	Index   uint64   `json:"index,omitempty"`
 	Voters  []string `json:"voters,omitempty"`
 	Retired []string `json:"retired,omitempty"`
+	// Payload is the highest command version the answering binary
+	// applies; absent from older binaries, which apply version 1 only.
+	Payload int `json:"payload,omitempty"`
 	// SPKI is the key the handshake proved, never read from the body.
 	SPKI [32]byte `json:"-"`
 }
@@ -139,7 +143,7 @@ func (a *autoMode) noteDisk(member bool) {
 // holds before its engine opens, so a restarting member is never taken for
 // a fresh node, and what its committed membership says once it is open.
 func (r *Replicator) helloOf() hello {
-	h := hello{Slot: r.auto.self, State: helloStarting, Address: r.auto.listen, Expected: r.auto.expected}
+	h := hello{Slot: r.auto.self, State: helloStarting, Address: r.auto.listen, Expected: r.auto.expected, Payload: reftable.PayloadVersion}
 	switch r.auto.disk.Load() {
 	case diskMember:
 		h.State = helloMember
