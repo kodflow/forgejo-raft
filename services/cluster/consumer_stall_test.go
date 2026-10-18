@@ -109,3 +109,36 @@ func TestReplayedBatchRunsSideEffectsOnce(t *testing.T) {
 	require.NoError(t, c.dispatch(context.Background(), "lin", cur, batch))
 	assert.Equal(t, []string{"o/a.git", "o/b.git"}, effects, "each once, after the commit")
 }
+
+// Events of one repository pushed by two users are two groups: the one that
+// keeps failing is skipped after maxAttempts, the other user's push is not
+// skipped with it.
+func TestAFailingPusherDoesNotSkipAnotherPushersEvents(t *testing.T) {
+	var ran [][]int64
+	c := &consumer{
+		work: func(ctx context.Context, evs []reftable.Event) error {
+			var pushers []int64
+			for _, ev := range evs {
+				pushers = append(pushers, ev.PusherID)
+			}
+			if evs[0].PusherID == 7 {
+				return errors.New("always")
+			}
+			ran = append(ran, pushers)
+			return nil
+		},
+		tx:       func(ctx context.Context, f func(context.Context) error) error { return f(ctx) },
+		advance:  func(context.Context, string, cluster_model.Cursor, cluster_model.Cursor) error { return nil },
+		failures: map[uint64]int{}, lastAck: map[string]uint64{},
+	}
+	batch := []reftable.Event{
+		{Token: consensus.Token{Index: 1}, Kind: "ref", Repo: "o/a.git", Ref: "refs/tags/v1", PusherID: 7},
+		{Token: consensus.Token{Index: 2}, Kind: "ref", Repo: "o/a.git", Ref: "refs/heads/main", PusherID: 3},
+	}
+	cur := &cluster_model.Cursor{}
+	for range maxAttempts {
+		require.Error(t, c.dispatch(context.Background(), "lin", cur, batch))
+	}
+	require.NoError(t, c.dispatch(context.Background(), "lin", cur, batch))
+	assert.Equal(t, [][]int64{{3}}, ran, "the second pusher's event ran alone, once the first was skipped")
+}

@@ -83,3 +83,16 @@ func TestRepoKnownThroughTheTableFirst(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, ok)
 }
+
+// A ref Forgejo wrote itself outside receive-pack (a tag made through the
+// API) carries no pusher: its request already wrote the rows and sent the
+// notifications, and the post-receive work does nothing. It used to fail on
+// the missing user, five times, then skip its whole batch.
+func TestPushWorkLeavesPusherlessEventsToTheirRequest(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ev := reftable.Event{
+		Token: consensus.Token{Index: 9}, Kind: reftable.EventRef, Repo: "user2/repo1.git", RepoID: 1,
+		Ref: "refs/tags/api-tag", New: "65f1bf27bc3bf70f64657658635e66094edbcb4d",
+	}
+	require.NoError(t, pushWork(db.DefaultContext, []reftable.Event{ev}))
+}

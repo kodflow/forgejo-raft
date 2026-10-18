@@ -5,6 +5,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"forgejo.org/modules/test"
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/consensus/kitsunium"
 	"forgejo.org/services/cluster/nomadgate"
@@ -496,4 +498,23 @@ func TestCommandsSurviveAStoppedLeader(t *testing.T) {
 		assert.False(t, seen[a.ID], "audit record %s twice", a.ID)
 		seen[a.ID] = true
 	}
+}
+
+// A push to a node cut off from a majority is turned away by the
+// pre-receive hook with the reason, while every node of a healthy cluster
+// takes it: git dies on the reference-transaction hook's refusal, and an
+// HTTP client would read a disconnect instead.
+func TestWriteRefusalOnceTheMajorityIsLost(t *testing.T) {
+	defer test.MockVariableValue(&writeLeaderWait, 2*time.Second)()
+	tc := newTestClusterOn(t, true, "node-a", "node-b", "node-c")
+	for _, n := range tc.nodes {
+		require.Eventually(t, func() bool { return n.r.WriteRefusal(t.Context()) == nil }, 10*time.Second, 20*time.Millisecond,
+			"%s takes a push", n.slot)
+	}
+	require.NoError(t, tc.nodes[0].r.Engine().Close(t.Context()))
+	require.NoError(t, tc.nodes[1].r.Engine().Close(t.Context()))
+	survivor := tc.nodes[2].r
+	require.Eventually(t, func() bool { return errors.Is(survivor.WriteRefusal(t.Context()), errNoLeader) }, 10*time.Second, 50*time.Millisecond,
+		"the survivor turns the push away")
+	assert.ErrorContains(t, survivor.WriteRefusal(t.Context()), "nothing was written")
 }

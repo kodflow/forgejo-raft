@@ -98,6 +98,61 @@ func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook
 	return tx, refs
 }
 
+// errNoLeader is what a push reads on a node whose cluster cannot commit:
+// a majority of its members is out of its reach.
+var errNoLeader = errors.New("this node of the cluster reaches no leader with a majority: the cluster takes no write here until a majority is back; nothing was written")
+
+// writeLeaderWait is how long a push waits for the cluster to commit before
+// it is turned away: an election after a lost leader takes a few seconds,
+// and a push must ride it out rather than fail.
+var writeLeaderWait = 15 * time.Second
+
+// WriteRefusal says why this node cannot take a push now, or nil. The
+// pre-receive hook asks it before git updates anything: the reference-
+// transaction hook refuses the same push later, but git then dies, and the
+// client of a smart HTTP push reads a disconnect instead of the reason. The
+// pre-receive hook's answer reaches it. The test is a barrier, which only a
+// leader answered by a majority completes: a node that still believes in a
+// leader just killed or cut off would pass a mere "leader known". A push
+// that passes may still fail later, at the proposal; this only turns away
+// the pushes that cannot succeed.
+func (r *Replicator) WriteRefusal(ctx context.Context) error {
+	// The last probe ends at the deadline too: a client or a proxy that
+	// gives up first would read a disconnect again.
+	ctx, cancel := context.WithTimeout(ctx, writeLeaderWait)
+	defer cancel()
+	for {
+		eng := r.Engine()
+		if eng == nil || !r.projector.Ready() {
+			return errors.New("this node of the cluster is not ready; retry shortly")
+		}
+		if h := eng.Health(); h.Stopped {
+			return fmt.Errorf("this node of the cluster stopped (%s); nothing was written", h.StopReason)
+		}
+		if probeLeader(ctx, eng) {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return errNoLeader
+		}
+		select {
+		case <-ctx.Done():
+			return errNoLeader
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// WriteRefusal is this node's refusal of a ref write now, nil when it can
+// take one or when the cluster is off: the API asks it before a write that
+// would otherwise fail in the reference-transaction hook with a bare 500.
+func WriteRefusal(ctx context.Context) error {
+	if r := Current(); r != nil {
+		return r.WriteRefusal(ctx)
+	}
+	return nil
+}
+
 func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.Request, tx *reftable.RefTxn) *clusterhook.Response {
 	eng := r.Engine()
 	if eng == nil || !r.projector.Ready() {

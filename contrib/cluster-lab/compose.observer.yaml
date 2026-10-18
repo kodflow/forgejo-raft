@@ -26,11 +26,28 @@ x-member-env: &member-env
   FORGEJO__cluster__PG_BASEBACKUP_DSN: "host=10.89.0.30 port=5000 user=replicator passfile=/data/pgpass sslmode=disable"
   FORGEJO__cluster__OBSERVER_RECIPIENTS: ${OBSERVER_RECIPIENTS:-}
   FORGEJO__server__LFS_START_SERVER: "true"
+  # The stored files on one volume every member mounts: a member writes an
+  # LFS object, the leader's export copies it (the cluster replicates git,
+  # not stored files).
+  FORGEJO__lfs__PATH: /stored/lfs
+  FORGEJO__attachment__PATH: /stored/attachments
+  FORGEJO__storage__PATH: /stored
 
 x-pg-archive: &pg-archive
-  ARCHIVE_COMMAND: "/usr/local/bin/archive-wal /wal-archive %p %f"
+  # The members read the archive as git (gid 1000): the directory is
+  # setgid to that group, and each file is made group-readable once archived
+  # (cp keeps pg_wal's owner-only mode, whatever the umask).
+  ARCHIVE_COMMAND: "/usr/local/bin/archive-wal /wal-archive %p %f && chmod 0640 /wal-archive/%f"
 
 services:
+  stored-init:
+    image: forgejo-cluster-lab/patroni:4.1.5-pg18
+    pull_policy: never
+    user: "0"
+    entrypoint: ["/bin/sh", "-c", "chown 1000:1000 /stored && chmod 0750 /stored"]
+    volumes: [stored:/stored]
+    network_mode: none
+
   wal-archive-init:
     image: forgejo-cluster-lab/patroni:4.1.5-pg18
     pull_policy: never
@@ -39,7 +56,7 @@ services:
       [
         "/bin/sh",
         "-c",
-        "chown postgres:postgres /wal-archive && chmod 0750 /wal-archive",
+        "chown postgres:1000 /wal-archive && chmod 2750 /wal-archive",
       ]
     volumes: [wal-archive:/wal-archive]
     network_mode: none
@@ -74,19 +91,33 @@ services:
 
   forgejo-1:
     <<: *observer-image
-    environment: { <<: *member-env }
-    volumes: ["wal-archive:/wal-archive:ro"]
+    # The scenario's client reaches the members on the lab network: the LFS
+    # hrefs a member answers with come from ROOT_URL.
+    environment: { <<: *member-env, FORGEJO__server__ROOT_URL: "http://10.89.0.41:3000/" }
+    depends_on: { stored-init: { condition: service_completed_successfully } }
+    volumes: ["wal-archive:/wal-archive:ro", "stored:/stored"]
   forgejo-2:
     <<: *observer-image
-    environment: { <<: *member-env }
-    volumes: ["wal-archive:/wal-archive:ro"]
+    # The scenario's client reaches the members on the lab network: the LFS
+    # hrefs a member answers with come from ROOT_URL.
+    environment: { <<: *member-env, FORGEJO__server__ROOT_URL: "http://10.89.0.42:3000/" }
+    depends_on: { stored-init: { condition: service_completed_successfully } }
+    volumes: ["wal-archive:/wal-archive:ro", "stored:/stored"]
   forgejo-3:
     <<: *observer-image
-    environment: { <<: *member-env }
-    volumes: ["wal-archive:/wal-archive:ro"]
+    # The scenario's client reaches the members on the lab network: the LFS
+    # hrefs a member answers with come from ROOT_URL.
+    environment: { <<: *member-env, FORGEJO__server__ROOT_URL: "http://10.89.0.43:3000/" }
+    depends_on: { stored-init: { condition: service_completed_successfully } }
+    volumes: ["wal-archive:/wal-archive:ro", "stored:/stored"]
 
   observer:
     <<: *observer-image
+    # The one service that builds the image the others reuse.
+    build:
+      context: ./observer
+      additional_contexts:
+        cluster-observer: ../cluster/observer
     profiles: [observer]
     hostname: observer
     restart: unless-stopped
@@ -130,7 +161,7 @@ services:
       USER_UID: "1000"
       USER_GID: "1000"
       FORGEJO__server__HTTP_PORT: "3000"
-      FORGEJO__server__ROOT_URL: "http://localhost:3009/"
+      FORGEJO__server__ROOT_URL: "http://10.89.0.49:3000/"
       FORGEJO__server__DISABLE_SSH: "true"
       FORGEJO__server__START_SSH_SERVER: "false"
       FORGEJO__server__OFFLINE_MODE: "true"
@@ -163,3 +194,4 @@ volumes:
   observer-keys:
   snapshots:
   forgejo-r:
+  stored:

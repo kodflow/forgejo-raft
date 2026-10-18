@@ -30,10 +30,17 @@ dco() {
     --profile observer --profile recover "$@"
 }
 # client <script>: git, git-lfs and python3 in a one-off container on the lab
-# network, the scratch directory mounted on /work.
+# network, the scratch directory mounted on /work. Plain docker run: a
+# compose run of observer would claim the observer's fixed address, which
+# the running observer holds.
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-client() { dco run --rm --no-deps -T -u 0 -v "$WORK:/work" --entrypoint /bin/sh observer -c "$1"; }
+# The client writes into $WORK as root: the files go through a container,
+# and a cleanup that fails never becomes the script's exit status.
+trap 'docker run --rm -u 0 -v "$WORK:/work" --entrypoint /bin/sh forgejo-cluster-lab/forgejo:observer -c "rm -rf /work/* /work/.[!.]*" >/dev/null 2>&1; rm -rf "$WORK" 2>/dev/null || true' EXIT
+client() {
+  docker run --rm -i -u 0 --network "${COMPOSE_PROJECT_NAME}_lab" -v "$WORK:/work" \
+    --entrypoint /bin/sh forgejo-cluster-lab/forgejo:observer -c "$1"
+}
 # member <n> <cmd...>: a command as git on a running member.
 member() { local n="$1"; shift; dco exec -T -u git "forgejo-$n" /usr/local/bin/gitea "$@"; }
 # observer_list: the observer's checkpoints, read-only, as JSON.
@@ -44,7 +51,7 @@ protected_after() {
   observer_list | python3 -c '
 import json, sys, datetime
 since = float(sys.argv[1])
-for cp in json.load(sys.stdin):
+for cp in json.load(sys.stdin) or []:
     t = datetime.datetime.fromisoformat(cp["time"].replace("Z", "+00:00")).timestamp()
     if cp["state"] == "PROTECTED" and not cp.get("problem") and t > since:
         print(cp["name"]); break' "$1"
@@ -75,7 +82,7 @@ via_haproxy "DO \$\$ BEGIN CREATE ROLE forgejo_checkpoint NOLOGIN; EXCEPTION WHE
   GRANT EXECUTE ON FUNCTION pg_create_restore_point(text) TO forgejo_checkpoint;
   GRANT EXECUTE ON FUNCTION pg_switch_wal() TO forgejo_checkpoint;
   GRANT EXECUTE ON FUNCTION pg_control_system() TO forgejo_checkpoint;
-  GRANT forgejo_checkpoint TO forgejo;" >/dev/null
+  GRANT forgejo_checkpoint TO forgejo;" forgejo >/dev/null
 ok "checkpoint role granted to forgejo"
 dco run --rm --no-deps -T -u 0 --entrypoint /bin/sh observer -c \
   'chown -R git:git /keys && [ -s /keys/id_ed25519 ] || su-exec git /usr/local/bin/gitea cluster observe keygen --name lab-observer --out /keys' >"$WORK/keygen.txt"
@@ -122,16 +129,21 @@ def totp(secret):
 base, user, pw, action = sys.argv[1:5]
 jar = http.cookiejar.CookieJar()
 web = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+# Forgejo forms carry no _csrf token any more (cross-origin protection by
+# the Origin and Sec-Fetch-Site headers); one is sent only when present.
 def csrf(path):
     page = web.open(base + path).read().decode()
-    return page, re.search(r'name="_csrf" value="([^"]+)"', page).group(1)
+    m = re.search(r'name="_csrf" value="([^"]+)"', page)
+    return page, m.group(1) if m else None
 def post(path, **form):
+    form = {k: v for k, v in form.items() if v is not None}
     return web.open(base + path, urllib.parse.urlencode(form).encode())
 _, tok = csrf("/user/login")
 resp = post("/user/login", _csrf=tok, user_name=user, password=pw)
 if action == "enroll":
     page, tok = csrf("/user/settings/security/two_factor/enroll")
-    secret = re.search(r"secret=([A-Z2-7]+)", urllib.parse.unquote(page)).group(1)
+    # The page shows the secret as text ("Or enter the secret: ...").
+    secret = re.search(r"secret(?:=|:\s*)([A-Z2-7]{16,})", urllib.parse.unquote(page)).group(1)
     post("/user/settings/security/two_factor/enroll", _csrf=tok, passcode=totp(secret))
     open("/work/totp-secret", "w").write(secret)
 else:
@@ -143,7 +155,7 @@ else:
 print("ok")
 PY
 client "python3 /work/web.py $BASE $TFA_USER $TFA_PASS enroll" >/dev/null
-via_haproxy "SELECT count(*) FROM two_factor" | grep -qx 1 || fail "2FA enrolment"
+via_haproxy "SELECT count(*) FROM two_factor" forgejo | grep -qx 1 || fail "2FA enrolment"
 ok "$TFA_USER enrolled in TOTP 2FA"
 head -c 2048 /dev/urandom >"$WORK/blob.bin"
 client "cd /work && git init -q -b main repo && cd repo && git lfs install --local >/dev/null && git lfs track '*.bin' >/dev/null &&
@@ -158,7 +170,7 @@ ok "checkpoint $CLEAN protected ${RPO}s after the push (measured RPO; budget 60 
 say "3. The attacker: a force-push and a SQL DELETE, through the normal paths"
 client "cd /work/repo && git checkout -q --orphan ransom && git rm -qrf . && echo pay >note.txt && git add note.txt &&
   git -c user.name=x -c user.email=x@x commit -qm ransom && git push -qf http://$USER_NAME:$TOKEN@10.89.0.41:3000/$USER_NAME/$REPO.git ransom:main"
-via_haproxy "DELETE FROM issue WHERE repo_id = (SELECT id FROM repository WHERE lower_name = lower('$REPO'))" >/dev/null
+via_haproxy "DELETE FROM issue WHERE repo_id = (SELECT id FROM repository WHERE lower_name = lower('$REPO'))" forgejo >/dev/null
 POISON_AT="$(date +%s)"
 POISONED="$(wait_protected_after "$POISON_AT")"
 ok "the poisoned history is checkpoint $POISONED: protected like any other, the observer cannot tell"
@@ -171,8 +183,10 @@ for ((i = 0; i < 60; i++)); do
   sleep 1
 done
 [ -n "$(haproxy_primary || true)" ] || fail "no primary behind HAProxy after the switchover"
+# Forgejo's pooled connections die with the old primary: the first requests
+# after the switch may fail, as in e2e.sh, so the push is retried.
 client "cd /work/repo && echo after-failover >g.txt && git add g.txt && git -c user.name=x -c user.email=x@x commit -qm failover &&
-  git push -qf http://$USER_NAME:$TOKEN@10.89.0.41:3000/$USER_NAME/$REPO.git HEAD:refs/heads/after-failover"
+  for i in \$(seq 60); do git push -qf http://$USER_NAME:$TOKEN@10.89.0.41:3000/$USER_NAME/$REPO.git HEAD:refs/heads/after-failover && exit 0; sleep 1; done; exit 1"
 FAILOVER="$(wait_protected_after "$(date +%s)")"
 NEW_TLI="$(observer_list | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["timeline"])')"
 [ "$NEW_TLI" -gt "$OLD_TLI" ] || fail "the checkpoint after the failover is on timeline $NEW_TLI, not past $OLD_TLI"
@@ -185,7 +199,7 @@ ok "the old cluster is gone; the observer's snapshots remain"
 say "6. A new node recovers the CLEAN checkpoint"
 NEW="$(openssl rand -hex 16)"
 dco run --rm --no-deps -T -v "$LAB_DIR/pki/recert.sh:/lab/recert.sh:ro" \
-  -v forgejo-cluster-lab_pki:/pki -v forgejo-cluster-lab_forgejo-r:/nodes/node-r --user 0 --entrypoint /bin/sh pki -c \
+  -v "${COMPOSE_PROJECT_NAME}_pki:/pki" -v "${COMPOSE_PROJECT_NAME}_forgejo-r:/nodes/node-r" --user 0 --entrypoint /bin/sh pki -c \
   "mkdir -p /nodes/node-r/tls && { [ -s /nodes/node-r/tls/node.key ] || openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /nodes/node-r/tls/node.key; } && cp /pki/ca.pem /nodes/node-r/tls/ca.pem && /lab/recert.sh node-r $NEW"
 dco run --rm --no-deps -T -u 0 --entrypoint /bin/sh observer -c \
   'rm -rf /keys/new && su-exec git /usr/local/bin/gitea cluster observe keygen --name lab-observer --out /keys/new' >"$WORK/keygen-new.txt"
@@ -204,8 +218,12 @@ rexec() {
 RECOVER=(cluster recover --from-observer "$CLEAN" --new-cluster "$NEW" --observer-dir "/snapshots/$CLEAN"
   --secrets-key /keys/secrets.key --new-observer-recipient "$NEW_RECIPIENT" --out /data/recover
   --pgdata /data/pg --pg-socket-dir /data/pgsock --pg-hba-file /data/lab-hba.conf --wal-archive-dir /data/wal-archive)
-rexec cluster observe list --dir "/snapshots/$CLEAN" | grep -q "^$CLEAN .*PROTECTED.*yes" || fail "$CLEAN does not restore from its snapshot"
-ok "$CLEAN listed PROTECTED and restorable from its snapshot"
+rexec cluster observe list --dir "/snapshots/$CLEAN" >"$WORK/list.txt" 2>&1 || true
+# In its own snapshot a checkpoint reads VERIFIED: the hook takes the
+# snapshot, then the observer writes the PROTECTED record (the live
+# directory said PROTECTED in step 2). What matters here is that it restores.
+grep -Eq "^$CLEAN .*(VERIFIED|PROTECTED).* yes\$" "$WORK/list.txt" || fail "$CLEAN does not restore from its snapshot: $(cat "$WORK/list.txt")"
+ok "$CLEAN listed and restorable from its snapshot"
 
 # Run 1 stops for the rotation: nothing restored yet.
 if rexec "${RECOVER[@]}" >"$WORK/run1.txt" 2>&1; then fail "the recovery did not stop for the rotation"; fi
@@ -227,9 +245,13 @@ dco exec -T -u git forgejo-r sh -c 'grep -q "recovery_target_inclusive = off" /d
 ok "PostgreSQL prepared with the observer's configuration, the source's dropped"
 
 # The comparison: the same replay with recovery_target_inclusive = on, on
-# its own port, then stopped.
-dco exec -T -u git forgejo-r sh -c "sed -i 's/recovery_target_inclusive = off/recovery_target_inclusive = on/; s/^port = .*/port = 5433/; s|unix_socket_directories = .*|unix_socket_directories = '/data/pgsock'|' /data/pg-inclusive-on/postgresql.conf &&
-  $PG_CTL -D /data/pg-inclusive-on -w -t 600 -l /data/pg-inclusive-on/log start >/dev/null"
+# its own port and socket (on the command line, over both configuration
+# files), then stopped.
+dco exec -T -u git forgejo-r sh -c "sed -i 's/recovery_target_inclusive = off/recovery_target_inclusive = on/' /data/pg-inclusive-on/postgresql.conf &&
+  $PG_CTL -D /data/pg-inclusive-on -o '-p 5433 -k /data/pgsock' -w -t 600 -l /data/pg-inclusive-on/log start >/dev/null || { tail -n 40 /data/pg-inclusive-on/log; exit 1; }"
+# pg_ctl -w returns once the server runs in recovery; without hot standby
+# it answers only after the replay reached its target and promoted.
+wait_for 300 "the inclusive-on replay promoted" dco exec -T -u git forgejo-r psql -h /data/pgsock -p 5433 -U forgejo -d forgejo -Atc "SELECT 1"
 ON_STATE="$(dco exec -T -u git forgejo-r psql -h /data/pgsock -p 5433 -U forgejo -d forgejo -Atc \
   "SELECT (SELECT count(*) FROM issue), (SELECT string_agg(commit_id, ',' ORDER BY name) FROM branch WHERE is_deleted = false)" | tr -d '\r')"
 dco exec -T -u git forgejo-r "$PG_CTL" -D /data/pg-inclusive-on -w stop >/dev/null
@@ -240,7 +262,7 @@ rexec "${RECOVER[@]}" --pg-ctl "$PG_CTL" | tee "$WORK/run3.txt"
 grep -q "verified: .* refs and SQL rows match" "$WORK/run3.txt" || fail "refs and SQL not verified"
 grep -q "verified: .* 2FA secrets open" "$WORK/run3.txt" || fail "2FA secrets not verified"
 grep -q "verified: .* LFS objects present" "$WORK/run3.txt" || fail "LFS objects not verified"
-grep -q "every push, SQL write and stored file after them is lost" "$WORK/run3.txt" || fail "the loss is not stated"
+grep -q "Every push, SQL write and stored file after them is lost" "$WORK/run3.txt" || fail "the loss is not stated"
 OFF_STATE="$(dco exec -T -u git forgejo-r psql -h /data/pgsock -p 5432 -U forgejo -d forgejo -Atc \
   "SELECT (SELECT count(*) FROM issue), (SELECT string_agg(commit_id, ',' ORDER BY name) FROM branch WHERE is_deleted = false)" | tr -d '\r')"
 [ "$OFF_STATE" = "$ON_STATE" ] || fail "inclusive off ($OFF_STATE) and on ($ON_STATE) disagree"
@@ -261,7 +283,7 @@ ok "the old access tokens are revoked"
 ok "main is the clean commit ${CLEAN_SHA:0:12}, not the force-push"
 member_r "$NEW_TOKEN" "repos/$USER_NAME/$REPO/issues/1" >/dev/null || fail "the deleted issue is missing"
 ok "the issue the attacker deleted is back"
-client "cd /work && rm -rf check && git clone -q http://$USER_NAME:$NEW_TOKEN@10.89.0.49:3000/$USER_NAME/$REPO.git check && cd check && git lfs pull -q && cmp blob.bin ../blob.bin"
+client "cd /work && rm -rf check && git clone -q http://$USER_NAME:$NEW_TOKEN@10.89.0.49:3000/$USER_NAME/$REPO.git check && cd check && git lfs pull >/dev/null && cmp blob.bin ../blob.bin"
 ok "the LFS object fetches, byte for byte"
 client "python3 /work/web.py http://10.89.0.49:3000 $TFA_USER $TFA_PASS login" >/dev/null
 ok "the 2FA login works with the restored SECRET_KEY"

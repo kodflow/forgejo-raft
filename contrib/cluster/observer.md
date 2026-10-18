@@ -64,7 +64,10 @@ synchronous_commit = on      # a commit acknowledged is flushed, so it is before
 `forgejo cluster wal-archive` is idempotent, as PostgreSQL requires: a file
 already archived with the same bytes is success, other bytes under the same
 name are refused, and the archive is never overwritten. Timeline histories
-and backup history files are archived too. Where the PostgreSQL host has no
+and backup history files are archived too, and so is the `.partial` segment
+a promoted standby archives for the old timeline: PostgreSQL retries a
+refused file forever and archives nothing after it. The export never serves
+a `.partial` file. Where the PostgreSQL host has no
 Forgejo binary, `contrib/cluster/observer/archive-wal.sh` does the same in
 POSIX shell. The archive directory must be readable by the Forgejo node's
 export: on the same host, or on a shared volume. Keep at least a week of it,
@@ -247,7 +250,9 @@ A human act, on a new node, every member of the old cluster off:
 
 1. Choose the checkpoint: `forgejo cluster observe list --dir <snapshot>`
    lists them, newest first, with their age, their state and whether they
-   restore from that directory. Mount the chosen snapshot read-only.
+   restore from that directory. In its own snapshot a checkpoint reads
+   VERIFIED, not PROTECTED: the hook takes the snapshot, and the PROTECTED
+   record is written once it exists. Mount the chosen snapshot read-only.
 2. Make the observers' new keys (`observe keygen`): every key the old
    cluster saw is rotated.
 3. On the new node, Forgejo stopped, its certificate issued for a new cluster

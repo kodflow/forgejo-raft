@@ -907,7 +907,21 @@ func (o *Observer) fetchBase(ctx context.Context, leader string) error {
 		return err
 	}
 	defer body.Close()
+	// A label is to the second: a second base within the same second (a
+	// gap right after a scheduled base) takes the next free suffix, which
+	// still sorts after the first, instead of failing on the rename.
 	label := o.cfg.Now().UTC().Format("20060102T150405Z")
+	for i, first := 1, label; ; i++ {
+		_, err := os.Stat(o.store.path("pg", "base", label))
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			// A storage failure is reported, never taken for a used label.
+			return fmt.Errorf("base backup label %s: %w", label, err)
+		}
+		label = fmt.Sprintf("%s-%02d", first, i)
+	}
 	stage := o.store.path("pg", "staging", label)
 	if err := os.MkdirAll(stage, 0o700); err != nil {
 		return err

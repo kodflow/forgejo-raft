@@ -242,7 +242,11 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 	err := c.tx(ctx, func(ctx context.Context) error {
 		start := 0
 		for i := 1; i <= len(batch); i++ {
-			if i < len(batch) && batch[i].Repo == batch[start].Repo && batch[i].Kind == batch[start].Kind && batch[i].Trigger == batch[start].Trigger {
+			// One group per pusher too: the work attributes its branch rows to
+			// the group's first pusher, and a group skipped after maxAttempts
+			// must not take another user's push down with it.
+			if i < len(batch) && batch[i].Repo == batch[start].Repo && batch[i].Kind == batch[start].Kind &&
+				batch[i].Trigger == batch[start].Trigger && batch[i].PusherID == batch[start].PusherID {
 				continue
 			}
 			group := batch[start:i]
@@ -355,6 +359,15 @@ func pushWork(ctx context.Context, evs []reftable.Event) error {
 	if first.Kind != reftable.EventRef || first.IsWiki {
 		// Repository deletion and rename change SQL in the request that
 		// asked for them; wikis have no post-receive work.
+		return nil
+	}
+	if first.PusherID == 0 {
+		// No pusher: Forgejo wrote the ref itself, outside receive-pack (a
+		// tag or a branch deletion through the API, a branch rename, a pull
+		// mirror's fetch). The request that did it writes its rows and sends
+		// its notifications, as it does without the cluster; post-receive
+		// work here would repeat them, and fails on the missing user.
+		// dispatch groups events by pusher, so the whole group is such.
 		return nil
 	}
 	repo, err := lookupRepo(ctx, first)

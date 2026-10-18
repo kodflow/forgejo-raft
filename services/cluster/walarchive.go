@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 )
 
 // ArchiveWAL is PostgreSQL's archive_command on a member: it copies one
@@ -20,9 +21,13 @@ import (
 // archiving a shared segment both meet; different bytes under the same name
 // are refused, and the archive is never overwritten. The copy is synced
 // before it takes its name. Timeline histories and backup history files are
-// archived like segments.
+// archived like segments, and so is the old timeline's last segment that a
+// promoted standby archives with a .partial suffix: PostgreSQL retries a
+// refused file forever and archives nothing after it, so refusing it would
+// stop the archive at the first failover. The export never serves it; the
+// new timeline's copy of that segment is what a recovery replays.
 func ArchiveWAL(src, name, dir string) error {
-	if !ValidWALName(name) {
+	if !validArchiveName(name) {
 		return fmt.Errorf("%q is not a WAL file name", name)
 	}
 	if dir == "" {
@@ -68,4 +73,13 @@ func ArchiveWAL(src, name, dir string) error {
 		return err
 	}
 	return syncDir(dir)
+}
+
+// partialWALPattern is the old timeline's last segment after a promotion.
+var partialWALPattern = regexp.MustCompile(`^[0-9A-F]{24}\.partial$`)
+
+// validArchiveName accepts what archive_command is given: the export's WAL
+// names and the .partial segment of a promotion.
+func validArchiveName(name string) bool {
+	return ValidWALName(name) || partialWALPattern.MatchString(name)
 }

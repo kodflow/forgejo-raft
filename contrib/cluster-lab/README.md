@@ -203,6 +203,50 @@ The outputs of the latest full runs from scratch are in
 - `make e2e` reads the Raft leader from `forgejo cluster status --json`,
   field `Role`, on each node.
 
+## The CI end-to-end suite
+
+`.github/workflows/e2e.yml` runs the lab on GitHub's runners, on every pull
+request into `forgejo`, every push to it, nightly and on demand. It lays
+`compose.ci.yaml` over `compose.yaml`:
+
+- the autonomous mode (`EXPECTED_NODES = 3` and `PEERS`): no `make
+  bootstrap`, the three nodes found the cluster by themselves;
+- the consensus and the object channel on their own internal network,
+  `raft` (10.89.1.0/24): a partition cuts that network alone, so the node
+  keeps its HTTP port and PostgreSQL, and what refuses its writes is the
+  consensus;
+- LFS, attachments, avatars and archives on one volume every node mounts
+  (the cluster does not replicate non-git files);
+- Forgejo's own SSH server (127.0.0.1:2221 to 2223) and a webhook receiver
+  (`ci/receiver.py`, 10.89.0.85:8080).
+
+Each job brings up its own lab and runs one suite of `scripts/ci/`, which
+prints one `CHECK <name>: PASS|FAIL` line per checkpoint:
+
+- `cluster.sh`: the formation (one leader, three voters, the same status and
+  commit index on every node), then the leader killed, the old leader back
+  as a follower, a follower killed, two of three killed (no write, then
+  recovery), a follower and then the leader partitioned (the minority
+  refuses, the majority accepts, no divergence after the heal), the lab's
+  own `e2e.sh` (with a Patroni failover), and never two leaders in one term,
+  read from `/metrics` throughout;
+- `features.sh`: accounts, an organisation and a repository, push and clone
+  across nodes, branches, tags, issues, comments, labels, a reviewed and
+  merged pull request, webhooks delivered exactly once, LFS, archives, the
+  login page and git over SSH, each write read back from another node.
+
+- `observer.sh`: suite D, on the manual bootstrap and `compose.observer.yaml`.
+  It runs `scripts/observer-e2e.sh`, turns each step into a checkpoint, and
+  checks from `/proc/net/tcp` that the observer never listens.
+
+To run a suite by hand on the lab:
+
+```sh
+export COMPOSE_FILE="$PWD/compose.yaml:$PWD/compose.ci.yaml"
+docker compose up -d consul-1 consul-2 consul-3 pg-1 pg-2 pg-3 haproxy forgejo-1 forgejo-2 forgejo-3 receiver
+scripts/ci/cluster.sh
+```
+
 ## The observer scenario
 
 `compose.observer.yaml` lays the observer over the lab

@@ -9,4 +9,4 @@ USER root
 RUN apk add --no-cache openssh-server postgresql18 postgresql18-client git-lfs python3
 COPY --chmod=0755 snapshot-hook.sh /usr/local/bin/observer-snapshot
 COPY --chmod=0755 sshd-export.sh /usr/local/bin/sshd-export
-COPY --chmod=0755 archive-wal.sh /usr/local/bin/archive-wal
+COPY --chmod=0755 --from=cluster-observer archive-wal.sh /usr/local/bin/archive-wal
