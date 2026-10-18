@@ -49,7 +49,7 @@ protected_after() {
   observer_list | python3 -c '
 import json, sys, datetime
 since = float(sys.argv[1])
-for cp in json.load(sys.stdin):
+for cp in json.load(sys.stdin) or []:
     t = datetime.datetime.fromisoformat(cp["time"].replace("Z", "+00:00")).timestamp()
     if cp["state"] == "PROTECTED" and not cp.get("problem") and t > since:
         print(cp["name"]); break' "$1"

@@ -34,7 +34,9 @@ x-member-env: &member-env
   FORGEJO__storage__PATH: /stored
 
 x-pg-archive: &pg-archive
-  ARCHIVE_COMMAND: "/usr/local/bin/archive-wal /wal-archive %p %f"
+  # The members read the archive as git (gid 1000): the directory is
+  # setgid to that group, and the files group-readable.
+  ARCHIVE_COMMAND: "umask 027 && /usr/local/bin/archive-wal /wal-archive %p %f"
 
 services:
   stored-init:
@@ -53,7 +55,7 @@ services:
       [
         "/bin/sh",
         "-c",
-        "chown postgres:postgres /wal-archive && chmod 0750 /wal-archive",
+        "chown postgres:1000 /wal-archive && chmod 2750 /wal-archive",
       ]
     volumes: [wal-archive:/wal-archive]
     network_mode: none
