@@ -260,7 +260,7 @@ rexec "${RECOVER[@]}" --pg-ctl "$PG_CTL" | tee "$WORK/run3.txt"
 grep -q "verified: .* refs and SQL rows match" "$WORK/run3.txt" || fail "refs and SQL not verified"
 grep -q "verified: .* 2FA secrets open" "$WORK/run3.txt" || fail "2FA secrets not verified"
 grep -q "verified: .* LFS objects present" "$WORK/run3.txt" || fail "LFS objects not verified"
-grep -q "every push, SQL write and stored file after them is lost" "$WORK/run3.txt" || fail "the loss is not stated"
+grep -q "Every push, SQL write and stored file after them is lost" "$WORK/run3.txt" || fail "the loss is not stated"
 OFF_STATE="$(dco exec -T -u git forgejo-r psql -h /data/pgsock -p 5432 -U forgejo -d forgejo -Atc \
   "SELECT (SELECT count(*) FROM issue), (SELECT string_agg(commit_id, ',' ORDER BY name) FROM branch WHERE is_deleted = false)" | tr -d '\r')"
 [ "$OFF_STATE" = "$ON_STATE" ] || fail "inclusive off ($OFF_STATE) and on ($ON_STATE) disagree"
