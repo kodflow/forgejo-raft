@@ -98,22 +98,24 @@ func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook
 	return tx, refs
 }
 
-// errNoLeader is what a push reads on a node that knows no leader: cut off
-// from a majority, its leader stepped down or its followers gave up on it.
-var errNoLeader = errors.New("this node of the cluster reaches no leader: a majority of its members is out of reach, and the cluster takes no write here until it is back; nothing was written")
+// errNoLeader is what a push reads on a node whose cluster cannot commit:
+// a majority of its members is out of its reach.
+var errNoLeader = errors.New("this node of the cluster reaches no leader with a majority: the cluster takes no write here until a majority is back; nothing was written")
 
-// writeLeaderWait is how long a push waits for a leader before it is turned
-// away: an election after a lost leader takes a few seconds, and a push must
-// ride it out rather than fail.
+// writeLeaderWait is how long a push waits for the cluster to commit before
+// it is turned away: an election after a lost leader takes a few seconds,
+// and a push must ride it out rather than fail.
 var writeLeaderWait = 15 * time.Second
 
 // WriteRefusal says why this node cannot take a push now, or nil. The
 // pre-receive hook asks it before git updates anything: the reference-
 // transaction hook refuses the same push later, but git then dies, and the
 // client of a smart HTTP push reads a disconnect instead of the reason. The
-// pre-receive hook's answer reaches it. A node that knows a leader may still
-// fail later, at the proposal; this only turns away the pushes that cannot
-// succeed.
+// pre-receive hook's answer reaches it. The test is a barrier, which only a
+// leader answered by a majority completes: a node that still believes in a
+// leader just killed or cut off would pass a mere "leader known". A push
+// that passes may still fail later, at the proposal; this only turns away
+// the pushes that cannot succeed.
 func (r *Replicator) WriteRefusal(ctx context.Context) error {
 	deadline := time.Now().Add(writeLeaderWait)
 	for {
@@ -121,14 +123,13 @@ func (r *Replicator) WriteRefusal(ctx context.Context) error {
 		if eng == nil || !r.projector.Ready() {
 			return errors.New("this node of the cluster is not ready; retry shortly")
 		}
-		h := eng.Health()
-		if h.Stopped {
+		if h := eng.Health(); h.Stopped {
 			return fmt.Errorf("this node of the cluster stopped (%s); nothing was written", h.StopReason)
 		}
-		if h.LeaderKnown {
+		if probeLeader(ctx, eng) {
 			return nil
 		}
-		if !time.Now().Before(deadline) {
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
 			return errNoLeader
 		}
 		select {
