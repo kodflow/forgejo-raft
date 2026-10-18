@@ -235,6 +235,11 @@ prints one `CHECK <name>: PASS|FAIL` line per checkpoint:
   merged pull request, webhooks delivered exactly once, LFS, archives, the
   login page and git over SSH, each write read back from another node.
 
+- `observer.sh`: suite D, on the manual bootstrap and `compose.observer.yaml`.
+  It runs `scripts/observer-e2e.sh`, turns each step into a checkpoint, and
+  checks from `/proc/net/tcp` that the observer never listens. It runs on
+  demand until the observer scenario's own repair lands.
+
 To run a suite by hand on the lab:
 
 ```sh

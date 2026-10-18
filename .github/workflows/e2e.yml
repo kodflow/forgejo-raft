@@ -10,6 +10,11 @@
 #   SSH, a webhook receiver):
 #     cluster   A. formation and B. Raft behaviour (scripts/ci/cluster.sh)
 #     features  C. Forgejo's features node to node (scripts/ci/features.sh)
+#     observer  D. checkpoints and the observer (scripts/ci/observer.sh), on
+#               the lab's manual bootstrap and compose.observer.yaml. PENDING
+#               fix/observer-e2e: until it lands the observer image does not
+#               build, so the job runs only on demand: the dispatch input
+#               `observer`, or a pull request labelled `e2e-observer`.
 #   Every checkpoint prints `CHECK <name>: PASS|FAIL`; a FAIL fails the job.
 #   The logs of every container are uploaded when a job fails; the lab is
 #   torn down (`docker compose down -v`) whatever happens.
@@ -23,6 +28,11 @@ on:
   schedule:
     - cron: "23 3 * * *"
   workflow_dispatch:
+    inputs:
+      observer:
+        description: Also run suite D, the observer (pending the observer lab fix, fix/observer-e2e)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -172,3 +182,83 @@ jobs:
         if: always()
         working-directory: ${{ env.LAB }}
         run: docker compose down -v --remove-orphans --timeout 5
+
+  # Suite D. PENDING fix/observer-e2e (the observer lab's own repair): run
+  # on demand only until it lands (dispatch input or `e2e-observer` label),
+  # then on every trigger like the others.
+  observer:
+    needs: images
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.observer) || contains(github.event.pull_request.labels.*.name, 'e2e-observer') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      FORGEJO_SRC: ${{ github.workspace }}
+      FORGEJO_DOCKERFILE: Dockerfile
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: e2e-images
+          path: ${{ runner.temp }}/images
+
+      - name: Load the images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar; do docker load -i "$f"; done
+          rm -rf "$RUNNER_TEMP/images"
+
+      - name: Bring the lab up and found the cluster
+        working-directory: ${{ env.LAB }}
+        run: |
+          set -euo pipefail
+          scripts/secrets.sh
+          mkdir -p .build
+          docker compose up -d --no-build --wait --wait-timeout 300 \
+            consul-1 consul-2 consul-3 pg-1 pg-2 pg-3 haproxy
+          docker compose up -d --no-build forgejo-1 forgejo-2 forgejo-3
+          scripts/bootstrap.sh
+
+      - name: Suite observer
+        working-directory: ${{ env.LAB }}
+        run: |
+          set -o pipefail
+          bash scripts/ci/observer.sh 2>&1 | tee .build/observer.log
+
+      - name: Checkpoints
+        if: always()
+        working-directory: ${{ env.LAB }}
+        run: |
+          {
+            echo "### observer"
+            echo '```text'
+            cat .build/checks.txt 2>/dev/null || echo "no checkpoint ran"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          test -s .build/checks.txt
+          ! grep -q ': FAIL' .build/checks.txt
+
+      - name: Collect the logs
+        if: failure()
+        working-directory: ${{ env.LAB }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          cp .build/*.log .build/*.txt "$RUNNER_TEMP/logs/" 2>/dev/null || true
+          dco() { docker compose -f compose.yaml -f compose.observer.yaml --profile observer --profile recover "$@"; }
+          dco ps -a > "$RUNNER_TEMP/logs/ps.txt" 2>&1 || true
+          dco ps -a --services | while IFS= read -r s; do
+            dco logs --no-color --timestamps "$s" > "$RUNNER_TEMP/logs/$s.log" 2>&1 || true
+          done
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: e2e-logs-observer
+          path: ${{ runner.temp }}/logs
+          retention-days: 7
+
+      - name: Tear down
+        if: always()
+        working-directory: ${{ env.LAB }}
+        run: docker compose -f compose.yaml -f compose.observer.yaml --profile observer --profile recover down -v --remove-orphans --timeout 5
