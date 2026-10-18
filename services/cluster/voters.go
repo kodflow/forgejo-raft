@@ -4,6 +4,7 @@
 package cluster
 
 import (
+	"fmt"
 	"slices"
 
 	"forgejo.org/services/cluster/consensus"
@@ -70,4 +71,20 @@ func Removable(m consensus.Membership, id consensus.NodeID) bool {
 		voters--
 	}
 	return voters >= minVotingMembers
+}
+
+// formingRefusal refuses a write while the autonomous cluster has fewer
+// than three voters: below three members nobody is promoted, so the founder
+// votes alone and commits on its own disk only. Once three voters were
+// there, Removable never goes below them, and a dead one leaves two copies
+// of every write. Outside the autonomous mode the operator chose the
+// voters, and nil is returned.
+func formingRefusal(auto *autoMode, m consensus.Membership) error {
+	if auto == nil {
+		return nil
+	}
+	if n := m.Voters(); n < minVotingMembers {
+		return fmt.Errorf("the cluster is still forming (%d of %d voters): a write would rest on too few disks; nothing was written", n, minVotingMembers)
+	}
+	return nil
 }

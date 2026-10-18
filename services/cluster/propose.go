@@ -179,16 +179,21 @@ func (r *Replicator) WriteRefusal(ctx context.Context) error {
 		if h := eng.Health(); h.Stopped {
 			return fmt.Errorf("this node of the cluster stopped (%s); nothing was written", h.StopReason)
 		}
-		if probeLeader(ctx, eng) {
+		forming := formingRefusal(r.auto, eng.Membership())
+		if forming == nil && probeLeader(ctx, eng) {
 			return nil
 		}
-		if ctx.Err() != nil {
-			return errNoLeader
+		if ctx.Err() == nil {
+			select {
+			case <-ctx.Done():
+			case <-time.After(100 * time.Millisecond):
+			}
 		}
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
+			if forming != nil {
+				return forming
+			}
 			return errNoLeader
-		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
@@ -219,6 +224,9 @@ func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.
 	if err := r.writerGate(eng); err != nil {
 		return fail(err)
 	}
+	if err := r.waitFormed(ctx, eng); err != nil {
+		return fail(err)
+	}
 
 	// Objects before refs: written and synced on a majority first.
 	var wants, haves []string
@@ -247,6 +255,25 @@ func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.
 		return fail(err)
 	}
 	return r.proposeWithRetry(ctx, repo, req.Nonce, tx, data)
+}
+
+// waitFormed waits, within writeLeaderWait, until the autonomous cluster
+// has three voters (formingRefusal): the autopilot promotes the members
+// that joined within seconds of the formation.
+func (r *Replicator) waitFormed(ctx context.Context, eng consensus.Engine) error {
+	ctx, cancel := context.WithTimeout(ctx, writeLeaderWait)
+	defer cancel()
+	for {
+		err := formingRefusal(r.auto, eng.Membership())
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // retryDelay paces the retries of a proposal while a leader is elected.
