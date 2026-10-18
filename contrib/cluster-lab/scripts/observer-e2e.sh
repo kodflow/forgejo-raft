@@ -247,6 +247,9 @@ ok "PostgreSQL prepared with the observer's configuration, the source's dropped"
 # files), then stopped.
 dco exec -T -u git forgejo-r sh -c "sed -i 's/recovery_target_inclusive = off/recovery_target_inclusive = on/' /data/pg-inclusive-on/postgresql.conf &&
   $PG_CTL -D /data/pg-inclusive-on -o '-p 5433 -k /data/pgsock' -w -t 600 -l /data/pg-inclusive-on/log start >/dev/null || { tail -n 40 /data/pg-inclusive-on/log; exit 1; }"
+# pg_ctl -w returns once the server runs in recovery; without hot standby
+# it answers only after the replay reached its target and promoted.
+wait_for 300 "the inclusive-on replay promoted" dco exec -T -u git forgejo-r psql -h /data/pgsock -p 5433 -U forgejo -d forgejo -Atc "SELECT 1"
 ON_STATE="$(dco exec -T -u git forgejo-r psql -h /data/pgsock -p 5433 -U forgejo -d forgejo -Atc \
   "SELECT (SELECT count(*) FROM issue), (SELECT string_agg(commit_id, ',' ORDER BY name) FROM branch WHERE is_deleted = false)" | tr -d '\r')"
 dco exec -T -u git forgejo-r "$PG_CTL" -D /data/pg-inclusive-on -w stop >/dev/null
