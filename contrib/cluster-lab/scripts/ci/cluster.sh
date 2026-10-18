@@ -29,7 +29,10 @@ REPO="$ADMIN/$REPO_NAME"
 WORK="$(mktemp -d)"
 WATCH_LOG="$LAB_DIR/.build/leader-watch.log"
 WATCH_STOP="$WORK/watch.stop"
-trap 'touch "$WATCH_STOP"; rm -rf "$WORK"' EXIT
+WATCH_PID=""
+# The watcher is killed too: an early exit would otherwise remove its stop
+# file with $WORK and leave it writing to tee's pipe, hanging the job.
+trap 'touch "$WATCH_STOP"; [ -z "$WATCH_PID" ] || kill "$WATCH_PID" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 # ---------------------------------------------------------------- helpers
 
@@ -112,6 +115,7 @@ for n in 1 2 3; do poll "$FORM_BOUND" healthy "$n" || all_ready=0; done
 if [ "$all_ready" = 1 ]; then pass A.nodes-ready; else flunk A.nodes-ready "a node is not ready after ${FORM_BOUND}s"; fi
 
 leader_watch &
+WATCH_PID=$!
 
 autonomous() {
   local n id first=""
