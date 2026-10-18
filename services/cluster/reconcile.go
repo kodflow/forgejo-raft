@@ -111,6 +111,17 @@ func (r *Replicator) Reconcile(ctx context.Context, apply bool) ([]Mismatch, err
 	if db.DefaultContext == nil {
 		return nil, errors.New("database not ready")
 	}
+	if apply {
+		// The rows are rebuilt from this node's table: one that lags the
+		// cluster would restore a branch the cluster deleted. A commit
+		// boundary a quorum confirmed is applied here first.
+		if r.Engine() == nil {
+			return nil, errors.New("the cluster is not running: nothing is rebuilt")
+		}
+		if _, err := r.confirm(ctx); err != nil {
+			return nil, fmt.Errorf("this node's table could not be confirmed current (%w): nothing is rebuilt", err)
+		}
+	}
 	var out []Mismatch
 	for _, key := range r.table.Repos() {
 		if ctx.Err() != nil {
