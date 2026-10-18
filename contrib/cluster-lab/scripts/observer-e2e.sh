@@ -127,28 +127,16 @@ def totp(secret):
 base, user, pw, action = sys.argv[1:5]
 jar = http.cookiejar.CookieJar()
 web = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-# Forgejo checks cross-origin requests by their headers, not a form token
-# (a4642af51a): a request without Origin passes, and pages carry no _csrf.
-# One is still sent when a page has it.
 def csrf(path):
     page = web.open(base + path).read().decode()
-    m = re.search(r'name="_csrf" value="([^"]+)"', page)
-    return page, m.group(1) if m else None
+    return page, re.search(r'name="_csrf" value="([^"]+)"', page).group(1)
 def post(path, **form):
-    form = {k: v for k, v in form.items() if v is not None}
     return web.open(base + path, urllib.parse.urlencode(form).encode())
 _, tok = csrf("/user/login")
 resp = post("/user/login", _csrf=tok, user_name=user, password=pw)
 if action == "enroll":
-    if resp.geturl().rstrip("/").endswith("/user/login"):
-        sys.exit("the login of %s failed" % user)
     page, tok = csrf("/user/settings/security/two_factor/enroll")
-    # The secret is the QR code's alternative text (the QR code itself is a
-    # PNG data URL); older pages carried it in an otpauth URI.
-    m = re.search(r'alt="([A-Z2-7]{16,})"', page) or re.search(r"secret=([A-Z2-7]+)", urllib.parse.unquote(page))
-    if not m:
-        sys.exit("no TOTP secret on the enrolment page (%s)" % resp.geturl())
-    secret = m.group(1)
+    secret = re.search(r"secret=([A-Z2-7]+)", urllib.parse.unquote(page)).group(1)
     post("/user/settings/security/two_factor/enroll", _csrf=tok, passcode=totp(secret))
     open("/work/totp-secret", "w").write(secret)
 else:

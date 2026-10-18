@@ -907,7 +907,7 @@ func (o *Observer) fetchBase(ctx context.Context, leader string) error {
 		return err
 	}
 	defer body.Close()
-	label := o.baseLabel()
+	label := o.cfg.Now().UTC().Format("20060102T150405Z")
 	stage := o.store.path("pg", "staging", label)
 	if err := os.MkdirAll(stage, 0o700); err != nil {
 		return err
@@ -943,27 +943,6 @@ func (o *Observer) fetchBase(ctx context.Context, leader string) error {
 	o.state.Bases = append(o.state.Bases, info)
 	log.Info("cluster observer: base backup %s at %s on timeline %d (%d bytes)", label, info.Start, info.Timeline, n)
 	return o.store.saveState(o.state)
-}
-
-// baseLabel names a new base backup after the time, to the second, with a
-// suffix when a base of that second exists already: the base after a WAL
-// gap may follow the previous one within the same second, and taking its
-// name would fail the rename and lose the base.
-func (o *Observer) baseLabel() string {
-	label := o.cfg.Now().UTC().Format("20060102T150405Z")
-	taken := func(l string) bool {
-		_, errBase := os.Stat(o.store.path("pg", "base", l))
-		_, errStage := os.Stat(o.store.path("pg", "staging", l))
-		return errBase == nil || errStage == nil
-	}
-	if !taken(label) {
-		return label
-	}
-	for i := 2; ; i++ {
-		if l := fmt.Sprintf("%s-%d", label, i); !taken(l) {
-			return l
-		}
-	}
 }
 
 // ---- protection ----
