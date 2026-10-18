@@ -46,12 +46,15 @@ jobs:
         with:
           persist-credentials: false
 
-      # Read by the Makefile in place of git describe: the build has no tags.
-      - name: Version file
+      # The Makefile names the build after `git describe`; .dockerignore
+      # keeps VERSION out of the image's context, and a checkout has no
+      # tags, so describe would print a bare commit hash, which Forgejo's
+      # migrations refuse as a version. A tag in the runner only, never
+      # pushed, gives it a valid one.
+      - name: Version
         run: |
-          v="0.0.0-e2e-${GITHUB_SHA::12}+gitea-1.22.0"
-          printf '%s\n' "$v" > VERSION
-          echo "E2E_VERSION=$v" >> "$GITHUB_ENV"
+          git tag v0.0.0-e2e
+          echo "E2E_VERSION=0.0.0-e2e+gitea-1.22.0" >> "$GITHUB_ENV"
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
