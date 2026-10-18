@@ -660,7 +660,9 @@ announced.
   changed outside the delta. When a later patch release conflicts, the
   branch of the previous one of the same major, already resolved, is
   carried onto it instead.
-- **Gate**: cluster-checks and the E2E suites on `release/vX.Y.Z`, then a
+- **Gate**: cluster-checks and the E2E suites on `release/vX.Y.Z`, each
+  run once more on the same commit when red (upstream's own tests can be
+  flaky): green at the retry counts, with a warning; red twice blocks. Then a
   release (not a prerelease), marked Latest and image `:latest` when it is
   the highest stable raft version.
 - **Blocked**: a conflict or a red check releases nothing and opens the
