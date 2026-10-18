@@ -5,6 +5,7 @@ package cron
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	activities_model "forgejo.org/models/activities"
@@ -135,6 +136,7 @@ func registerUpdateGiteaChecker() {
 		BaseConfig
 		HTTPEndpoint   string
 		DomainEndpoint string
+		RaftEndpoint   string
 	}
 	RegisterTaskFatal("update_checker", &UpdateCheckerConfig{
 		BaseConfig: BaseConfig{
@@ -144,9 +146,13 @@ func registerUpdateGiteaChecker() {
 		},
 		HTTPEndpoint:   "https://dl.gitea.com/gitea/version.json",
 		DomainEndpoint: "release.forgejo.org",
+		RaftEndpoint:   updatechecker.RaftReleasesEndpoint,
 	}, func(ctx context.Context, _ *user_model.User, config Config) error {
 		updateCheckerConfig := config.(*UpdateCheckerConfig)
-		return updatechecker.GiteaUpdateChecker(updateCheckerConfig.HTTPEndpoint, updateCheckerConfig.DomainEndpoint)
+		return errors.Join(
+			updatechecker.GiteaUpdateChecker(updateCheckerConfig.HTTPEndpoint, updateCheckerConfig.DomainEndpoint),
+			updatechecker.RaftUpdateChecker(ctx, updateCheckerConfig.RaftEndpoint),
+		)
 	})
 }
 

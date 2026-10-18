@@ -13,6 +13,19 @@
 				<p>{{ctx.Locale.Tr "admin.dashboard.update_checker_error" .UpdateCheckerError "https://forgejo.org/releases/"}}</p>
 			</div>
 		{{end}}
+		{{if .RaftCheckerError}}
+			<div class="ui warning message">
+				<p>{{ctx.Locale.Tr "admin.dashboard.raft_checker_error" .RaftCheckerError "https://github.com/kodflow/forgejo-raft/releases"}}</p>
+			</div>
+		{{else if and .RaftNotice .RaftNotice.Available}}
+			<div class="ui info message" id="raft-release-notice">
+				<p>{{ctx.Locale.Tr "admin.dashboard.raft_release_available" .RaftNotice.Release.Version .RaftNotice.Release.URL AppVer}}</p>
+			</div>
+		{{else if and .RaftNotice .RaftNotice.Pending}}
+			<div class="ui warning message" id="raft-release-notice">
+				<p>{{ctx.Locale.Tr "admin.dashboard.raft_release_pending" .RaftNotice.Official .RaftNotice.Page AppVer}}</p>
+			</div>
+		{{end}}
 		<h4 class="ui top attached header">
 			{{ctx.Locale.Tr "admin.dashboard.operations"}}
 		</h4>

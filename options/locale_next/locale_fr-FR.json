@@ -1373,5 +1373,8 @@
 	"admin.cluster.op.transfer-leadership.warning": "Le meneur cesse d'accepter des propositions, met la cible à jour et lui passe la direction. Les écritures en cours sont validées avant.",
 	"admin.cluster.op.deny-pin.warning": "La clé du membre est retirée tout de suite : chaque nœud ferme ses connexions et refuse ses poignées de main. Il compte encore dans le quorum jusqu'à son retrait, donc les pannes tolérées baissent.",
 	"admin.cluster.op.clear-no-space.warning": "Ne levez cette alarme de manque d'espace qu'une fois l'espace revenu. Une alarme levée depuis n'est pas effacée par cette demande.",
-	"admin.cluster.op.update-address.warning": "L'adresse du membre change dans les membres répliqués. Élargissez d'abord la règle du pare-feu aux deux adresses, un nœud à la fois."
+	"admin.cluster.op.update-address.warning": "L'adresse du membre change dans les membres répliqués. Élargissez d'abord la règle du pare-feu aux deux adresses, un nœud à la fois.",
+	"admin.dashboard.raft_release_available": "forgejo-raft %[1]s est disponible, vous utilisez la version %[3]s. <a target=\"_blank\" rel=\"noreferrer\" href=\"%[2]s\">Voir la publication</a>.",
+	"admin.dashboard.raft_release_pending": "La version forgejo-raft de Forgejo %[1]s n'est pas encore disponible, vous utilisez la version %[3]s. Elle est publiée dès que ses tests passent : suivez <a target=\"_blank\" rel=\"noreferrer\" href=\"%[2]s\">les publications de forgejo-raft</a>.",
+	"admin.dashboard.raft_checker_error": "forgejo-raft a rencontré une erreur en cherchant ses propres publications. Vérifier <a target=\"_blank\" rel=\"noreferrer\" href=\"%[2]s\">les publications de forgejo-raft</a> manuellement. Message d'erreur : %[1]s"
 }

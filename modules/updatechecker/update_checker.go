@@ -172,7 +172,7 @@ func GetReleaseState(ctx context.Context) (*ReleaseState, error) {
 		return &ReleaseState{}, nil // zero-value indicates no upgrade necessary
 	}
 
-	currentVersion, err := version.NewVersion(setting.AppVer)
+	currentVersion, err := currentUpstreamVersion(setting.AppVer)
 	if err != nil {
 		log.Warn("update checker unable to parse current version; update notifications will be disabled: %s", err)
 		return nil, fmt.Errorf("update checker unable to parse current version: %w", err)
