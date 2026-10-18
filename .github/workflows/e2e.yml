@@ -246,6 +246,12 @@ jobs:
           dco ps -a --services | while IFS= read -r s; do
             dco logs --no-color --timestamps "$s" > "$RUNNER_TEMP/logs/$s.log" 2>&1 || true
           done
+          # The WAL archive and each PostgreSQL's archiver, when PostgreSQL
+          # still runs.
+          for n in 1 2 3; do
+            dco exec -T "pg-$n" sh -c 'ls -ln /wal-archive; psql -h /var/run/postgresql -U postgres -Atc "select pg_is_in_recovery(), * from pg_stat_archiver"' \
+              > "$RUNNER_TEMP/logs/wal-archive-pg-$n.txt" 2>&1 || true
+          done
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
