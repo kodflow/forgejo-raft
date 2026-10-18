@@ -147,6 +147,7 @@ func Dashboard(ctx *context.Context) {
 			ctx.Data["RemoteVersion"] = rec
 		}
 	}
+	prepareRaftNotice(ctx)
 
 	entries := []string{
 		"delete_inactive_accounts",

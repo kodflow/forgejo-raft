@@ -226,6 +226,26 @@ func syncGitConfig() (err error) {
 		return err
 	}
 
+	// In a cluster the projector owns garbage collection: no git process
+	// may prune behind its back (kitsunium ADR 0152 D19).
+	// The global config persists in HomeDir(): once the cluster is off,
+	// these values are removed again, unless [git.config] sets the key.
+	for _, kv := range [][2]string{{"gc.auto", "0"}, {"maintenance.auto", "false"}, {"receive.autogc", "false"}} {
+		if setting.Cluster.Enabled {
+			if err := configSet(kv[0], kv[1]); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, userSet := setting.GitConfig.Options[kv[0]]; userSet {
+			continue
+		}
+		// Only our exact value goes: another one, set by hand, stays.
+		if err := configUnsetAll(kv[0], kv[1]); err != nil {
+			return err
+		}
+	}
+
 	// Set git some configurations - these must be set to these values for forgejo to work correctly
 	if err := configSet("core.quotePath", "false"); err != nil {
 		return err

@@ -1,0 +1,439 @@
+// Copyright 2026 The Forgejo Authors. All rights reserved.
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package cluster
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+	"time"
+
+	"forgejo.org/modules/json"
+	"forgejo.org/modules/log"
+	"forgejo.org/services/cluster/reftable"
+)
+
+// projector is the ONLY authority over git on this node (ADR 0152 D19,
+// R2-35). It makes the local repositories match the table, from state and
+// never from replay, and certifies a per-repository watermark once a
+// repository matches.
+type projector struct {
+	root     string
+	table    *reftable.Table
+	registry *registry
+	// fetch brings missing objects from the other members.
+	fetch func(ctx context.Context, repo, dir string, shas []string) error
+
+	mu sync.Mutex
+	// dirty maps a repository to the highest index that touched it and is
+	// not yet certified.
+	dirty map[string]uint64
+	// watermark is the certified index of each repository.
+	watermark map[string]uint64
+	// fenced holds projection and certification until a quorum-confirmed
+	// commit boundary has been applied after the start (R4-19, R5-03).
+	fenced bool
+	// pendingFirst counts repositories not yet reconciled once since the
+	// start: no watermark is certified as "everything" before they are.
+	pendingFirst map[string]bool
+	failures     map[string]string
+	wake         chan struct{}
+	waiters      []chan struct{}
+}
+
+func newProjector(root string, table *reftable.Table, reg *registry) *projector {
+	p := &projector{
+		root: root, table: table, registry: reg,
+		dirty: map[string]uint64{}, watermark: map[string]uint64{},
+		fenced: true, pendingFirst: map[string]bool{}, failures: map[string]string{},
+		wake: make(chan struct{}, 1),
+	}
+	table.OnChange(p.onChange)
+	return p
+}
+
+// onChange is called by the table under its lock: it only records.
+func (p *projector) onChange(ch reftable.Change) {
+	p.mu.Lock()
+	for _, r := range ch.Repos {
+		if ch.Index > p.dirty[r] {
+			p.dirty[r] = ch.Index
+		}
+	}
+	p.mu.Unlock()
+	p.signal()
+}
+
+func (p *projector) signal() {
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
+}
+
+// markDirty asks for a reconciliation, after a native git transaction
+// finished: the pre-write it made is checked against the table.
+func (p *projector) markDirty(repo string) {
+	_, idx := p.table.RepoHash(repo)
+	pos, _ := p.table.Applied()
+	if pos.Index > idx {
+		idx = pos.Index
+	}
+	p.mu.Lock()
+	if idx > p.dirty[repo] {
+		p.dirty[repo] = idx
+	} else if _, ok := p.dirty[repo]; !ok {
+		p.dirty[repo] = idx
+	}
+	p.mu.Unlock()
+	p.signal()
+}
+
+// unfence lifts the start-up fence once a barrier's index is applied, and
+// schedules every repository the table knows for a first reconciliation.
+func (p *projector) unfence() {
+	repos := p.table.Repos()
+	pos, _ := p.table.Applied()
+	p.mu.Lock()
+	for _, r := range repos {
+		p.pendingFirst[r] = true
+		if p.dirty[r] < pos.Index {
+			p.dirty[r] = pos.Index
+		}
+	}
+	p.fenced = false
+	p.mu.Unlock()
+	p.signal()
+}
+
+// Fenced reports whether the start-up fence still holds.
+func (p *projector) Fenced() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fenced
+}
+
+// Ready reports whether projection caught up once since the start.
+func (p *projector) Ready() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.fenced && len(p.pendingFirst) == 0
+}
+
+// Projected returns the index up to which every entry touching repo is
+// projected on this node. The applied index is read BEFORE the dirty set,
+// and the table marks a repository dirty before its new applied index is
+// visible, so the answer never runs ahead of git.
+func (p *projector) Projected(repo string) uint64 {
+	pos, _ := p.table.Applied()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.fenced || p.pendingFirst[repo] {
+		return 0
+	}
+	if _, ok := p.dirty[repo]; ok {
+		return p.watermark[repo]
+	}
+	return pos.Index
+}
+
+// Wait blocks until repo is projected at index or ctx ends.
+func (p *projector) Wait(ctx context.Context, repo string, index uint64) error {
+	for {
+		if p.Projected(repo) >= index {
+			return nil
+		}
+		ch := make(chan struct{})
+		p.mu.Lock()
+		p.waiters = append(p.waiters, ch)
+		p.mu.Unlock()
+		if p.Projected(repo) >= index {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ch:
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+func (p *projector) notifyWaiters() {
+	p.mu.Lock()
+	ws := p.waiters
+	p.waiters = nil
+	p.mu.Unlock()
+	for _, w := range ws {
+		close(w)
+	}
+}
+
+// Lag lists the repositories not yet certified at their last change, with
+// how far behind they are, for the administration.
+type RepoLag struct {
+	Repo      string
+	Watermark uint64
+	Target    uint64
+	Error     string
+}
+
+func (p *projector) Lag() []RepoLag {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]RepoLag, 0, len(p.dirty))
+	for r, idx := range p.dirty {
+		out = append(out, RepoLag{Repo: r, Watermark: p.watermark[r], Target: idx, Error: p.failures[r]})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Target-out[i].Watermark > out[j].Target-out[j].Watermark })
+	return out
+}
+
+// run projects until ctx ends.
+func (p *projector) run(ctx context.Context) {
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.wake:
+		case <-tick.C:
+		}
+		p.pass(ctx)
+	}
+}
+
+// pass projects every dirty repository once.
+func (p *projector) pass(ctx context.Context) {
+	p.mu.Lock()
+	if p.fenced {
+		p.mu.Unlock()
+		return
+	}
+	work := make([]string, 0, len(p.dirty))
+	for r := range p.dirty {
+		work = append(work, r)
+	}
+	p.mu.Unlock()
+	// A rename's target goes first, so its directory moves before the old
+	// key, whose refs are all tombstones, is projected.
+	sort.Slice(work, func(i, j int) bool {
+		_, _, ri := p.table.RenamedFrom(work[i])
+		_, _, rj := p.table.RenamedFrom(work[j])
+		if ri != rj {
+			return ri
+		}
+		return work[i] < work[j]
+	})
+	for _, repo := range work {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := p.project(ctx, repo); err != nil {
+			log.Warn("cluster: projecting %s: %v", repo, err)
+			p.mu.Lock()
+			p.failures[repo] = err.Error()
+			p.mu.Unlock()
+		}
+	}
+	p.notifyWaiters()
+}
+
+// project makes one repository match the table, then certifies it.
+func (p *projector) project(ctx context.Context, repo string) error {
+	if p.registry.inFlight(repo) {
+		return nil // retried at the next pass, once git is done
+	}
+	dir := filepath.Join(p.root, filepath.FromSlash(repo))
+	refs, at := p.table.Refs(repo)
+
+	if _, deleted := p.table.Deleted(repo); deleted {
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
+		p.certify(repo, at, nil)
+		return nil
+	}
+	want := tableProjection(refs)
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		if from, _, ok := p.table.RenamedFrom(repo); ok {
+			src := filepath.Join(p.root, filepath.FromSlash(from))
+			if _, err := os.Stat(src); err == nil {
+				if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+					return err
+				}
+				if err := os.Rename(src, dir); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		if len(want) == 0 {
+			p.certify(repo, at, nil)
+			return nil
+		}
+		format := ""
+		for _, v := range refs {
+			if v.Format != "" {
+				format = v.Format
+				break
+			}
+		}
+		if err := initBare(ctx, dir, format); err != nil {
+			return err
+		}
+	}
+
+	have, err := readGitRefs(ctx, dir)
+	if err != nil {
+		return err
+	}
+	set := map[string]reftable.RefValue{}
+	var del []string
+	var need []string
+	for name, v := range refs {
+		g, ok := have[name]
+		switch {
+		case !v.Live():
+			if ok && name != "HEAD" {
+				del = append(del, name)
+			}
+		case v.Symbolic != "":
+			if !ok || g.Symbolic != v.Symbolic {
+				set[name] = v
+			}
+		default:
+			if !ok || g.SHA != v.SHA {
+				set[name] = v
+				need = append(need, v.SHA)
+			}
+		}
+	}
+	if len(need) > 0 {
+		missing, err := missingObjects(ctx, dir, need)
+		if err != nil {
+			return err
+		}
+		if len(missing) > 0 {
+			if p.fetch == nil {
+				return fmt.Errorf("%d objects missing and no object channel", len(missing))
+			}
+			if err := p.fetch(ctx, repo, dir, missing); err != nil {
+				return fmt.Errorf("fetching %d missing objects: %w", len(missing), err)
+			}
+		}
+	}
+	if len(set) > 0 || len(del) > 0 {
+		if err := writeRefs(ctx, dir, set, del); err != nil {
+			return err
+		}
+	}
+	// Certification re-reads git under the registry's lock, so a native
+	// transaction cannot publish between the check and the watermark (R3-12).
+	// When a transaction registered meanwhile, certify does nothing and the
+	// repository stays dirty for the next pass.
+	var verr error
+	p.registry.certify(repo, func() {
+		now, err := readGitRefs(ctx, dir)
+		if err != nil {
+			verr = err
+			return
+		}
+		got := reftable.ProjectionDigest(filterTracked(now, refs))
+		if got != reftable.ProjectionDigest(want) {
+			verr = errors.New("git does not match the table after projection")
+			return
+		}
+		p.certify(repo, at, writeStamp(dir, at, reftable.ProjectionDigest(want)))
+	})
+	return verr
+}
+
+// filterTracked keeps the refs of git the table knows about: a ref the
+// table never held (one from before the cluster) is reported elsewhere and
+// left alone, never deleted by the projector.
+func filterTracked(git map[string]reftable.ProjectedRef, refs map[string]reftable.RefValue) map[string]reftable.ProjectedRef {
+	out := map[string]reftable.ProjectedRef{}
+	for name, r := range git {
+		if _, known := refs[name]; known {
+			out[name] = r
+		}
+	}
+	return out
+}
+
+// certify sets the watermark of repo to at, and clears it from the dirty set
+// unless a newer change arrived meanwhile.
+func (p *projector) certify(repo string, at uint64, stampErr error) {
+	if stampErr != nil {
+		log.Warn("cluster: projection stamp of %s: %v", repo, stampErr)
+	}
+	p.mu.Lock()
+	if at > p.watermark[repo] {
+		p.watermark[repo] = at
+	}
+	if p.dirty[repo] <= at {
+		delete(p.dirty, repo)
+	}
+	delete(p.pendingFirst, repo)
+	delete(p.failures, repo)
+	p.mu.Unlock()
+}
+
+// stamp is the per-repository projection record (D19): the watermark and
+// the projected digest. A repository restored from a backup carries a stale
+// stamp, which the start-up reconciliation reprojects anyway.
+type stamp struct {
+	Watermark uint64 `json:"watermark"`
+	Digest    string `json:"digest"`
+	Written   int64  `json:"written"`
+}
+
+// writeStamp records the projection AFTER the refs, through a rename.
+func writeStamp(dir string, at uint64, digest reftable.Sum) error {
+	b, err := json.Marshal(stamp{Watermark: at, Digest: digest.String(), Written: time.Now().Unix()})
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(dir, "forgejo-cluster-stamp.tmp")
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(dir, "forgejo-cluster-stamp"))
+}
+
+// Verify compares a repository's git state with the table under the
+// projection rules, and schedules a reprojection on a difference.
+func (p *projector) Verify(ctx context.Context, repo string) (bool, error) {
+	dir := filepath.Join(p.root, filepath.FromSlash(repo))
+	refs, _ := p.table.Refs(repo)
+	want := tableProjection(refs)
+	have, err := readGitRefs(ctx, dir)
+	if err != nil {
+		return false, err
+	}
+	same := reftable.ProjectionDigest(filterTracked(have, refs)) == reftable.ProjectionDigest(want)
+	if !same {
+		p.markDirty(repo)
+	}
+	return same, nil
+}
+
+// MayCollectGarbage is the projector's gate for git gc: projected, no native
+// transaction in flight, and no unconsumed event pinning objects of it.
+func (p *projector) MayCollectGarbage(repo string) bool {
+	if p.registry.inFlight(repo) || len(p.table.PinnedObjects(repo)) > 0 {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, dirty := p.dirty[repo]
+	return !p.fenced && !dirty && !p.pendingFirst[repo]
+}

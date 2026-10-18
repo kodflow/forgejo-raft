@@ -179,6 +179,7 @@ func innerNewMainApp(version, versionExtra string, subCmdsStandaloneArgs, subCmd
 		cmdMigrateStorage(),
 		cmdDumpRepository(),
 		cmdRestoreRepository(),
+		cmdCluster(),
 	}
 
 	subCmdWithConfig = append(subCmdWithConfig, subCmdWithConfigArgs...)
@@ -195,7 +196,10 @@ func innerNewMainApp(version, versionExtra string, subCmdsStandaloneArgs, subCmd
 	globalFlags := func() []cli.Flag {
 		return append(appGlobalFlags(), globalFlagsArgs()...)
 	}
-	app.Flags = append(app.Flags, cli.VersionFlag)
+	// The version flag is not appended here: urfave/cli adds its own copy to the
+	// root command and, since v3.10.0, only that copy is checked for --version.
+	// Appending cli.VersionFlag makes it skip its copy, so --version would fall
+	// through to the default command (web).
 	app.Flags = append(app.Flags, globalFlags()...)
 	app.Before = PrepareConsoleLoggerLevel(log.INFO)
 	for i := range subCmdWithConfig {

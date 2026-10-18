@@ -1,0 +1,23 @@
+# Slot node-b: the template's StatefulSet, named forgejo-raft-b, with
+# its slot label and its own certificate Secret only.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+patches:
+  - target:
+      kind: StatefulSet
+      name: forgejo-raft
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: forgejo-raft-b
+      - op: replace
+        path: /spec/selector/matchLabels/forgejo-raft~1slot
+        value: node-b
+      - op: replace
+        path: /spec/template/metadata/labels/forgejo-raft~1slot
+        value: node-b
+      - op: replace
+        path: /spec/template/spec/volumes/0/secret/secretName
+        value: forgejo-raft-node-b-tls

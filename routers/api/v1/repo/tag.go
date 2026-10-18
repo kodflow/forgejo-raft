@@ -228,6 +228,9 @@ func CreateTag(ctx *context.APIContext) {
 		return
 	}
 
+	if refWritesRefused(ctx) {
+		return
+	}
 	if err := release_service.CreateNewTag(ctx, ctx.Doer(), ctx.Repo().Repository, commit.ID.String(), form.TagName, form.Message); err != nil {
 		if models.IsErrTagAlreadyExists(err) {
 			ctx.Error(http.StatusConflict, "tag exist", err)
@@ -310,6 +313,9 @@ func DeleteTag(ctx *context.APIContext) {
 		return
 	}
 
+	if refWritesRefused(ctx) {
+		return
+	}
 	if err = release_service.DeleteReleaseByID(ctx, ctx.Repo().Repository, tag, ctx.Doer(), true); err != nil {
 		if models.IsErrProtectedTagName(err) {
 			ctx.Error(http.StatusUnprocessableEntity, "delTag", "user not allowed to delete protected tag")

@@ -154,3 +154,8 @@ RENDER_COMMAND = echo .def.ghi.jkl.md renderer used
 [webhook]
 # webhook should only be tested against localhost
 ALLOWED_HOST_LIST=loopback
+
+[cluster]
+# One node is the standard product: every integration test runs with it
+# (TestClusterSizeOneIsTheStandardProduct).
+EXPECTED_NODES = 1

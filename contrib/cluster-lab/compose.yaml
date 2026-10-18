@@ -1,0 +1,334 @@
+# Forgejo cluster lab: 3 Consul servers, 3 PostgreSQL 18 under Patroni
+# (Consul DCS, synchronous replication) behind HAProxy, and 3 Forgejo nodes
+# replicating refs through the in-process consensus (kitsunium ADR 0152,
+# D19, D20). Everything is local and disposable: `make reset` wipes it.
+#
+# Slots: node-a = forgejo-1, node-b = forgejo-2, node-c = forgejo-3.
+# Fixed addresses so a node partitioned with `docker network disconnect`
+# comes back on the same IP (LISTEN_ADDR must name an explicit address).
+name: forgejo-cluster-lab
+
+# Secrets: no value lives here. scripts/secrets.sh (run by every make target)
+# writes random ones into the git-ignored .env, which compose reads. Each one
+# is written ${NAME:?}: compose refuses to start while it is missing (run
+# scripts/secrets.sh, or any make target).
+
+x-consul: &consul
+  image: ${CONSUL_IMAGE:-hashicorp/consul:2.0.4@sha256:1c59f007df8ea1c21b2558dc73ef8d99047bc895d9e52e635d1e745e35fe9a54}
+  restart: unless-stopped
+  mem_limit: 192m
+  healthcheck:
+    test: ["CMD", "consul", "operator", "raft", "list-peers"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+
+x-patroni: &patroni
+  build:
+    context: ./patroni
+  image: forgejo-cluster-lab/patroni:4.1.5-pg18
+  restart: unless-stopped
+  mem_limit: 384m
+  shm_size: 128m
+  environment: &patroni-env
+    PG_SUPERUSER_PASSWORD: ${PG_SUPERUSER_PASSWORD:?}
+    PG_REPLICATION_PASSWORD: ${PG_REPLICATION_PASSWORD:?}
+    FORGEJO_DB_PASSWORD: ${FORGEJO_DB_PASSWORD:?}
+  healthcheck:
+    # /health is 200 as soon as PostgreSQL runs, primary or replica.
+    test: ["CMD", "curl", "-sf", "http://127.0.0.1:8008/health"]
+    interval: 5s
+    timeout: 3s
+    retries: 40
+    start_period: 20s
+
+x-forgejo: &forgejo
+  # The upstream image, built from the root of the forgejo-raft tree.
+  build:
+    context: ${FORGEJO_SRC:-../../../forgejo-raft-cluster}
+    # make build writes it from the tree's own (forgejo/dockerfile.sh), with
+    # a .dockerignore that keeps the host's node_modules out.
+    dockerfile: ${FORGEJO_DOCKERFILE:-Dockerfile}
+    target: forgejo
+    additional_contexts:
+      # Unused unless SDK_SRC is set (the go.work Dockerfile reads it).
+      sdk: ${SDK_SRC:-./forgejo}
+  image: forgejo-cluster-lab/forgejo:raft-cluster
+  restart: unless-stopped
+  mem_limit: 512m
+  depends_on:
+    pki:
+      condition: service_completed_successfully
+    haproxy:
+      condition: service_healthy
+  # The cluster id is drawn by the pki job at run time: read it from the
+  # node's own volume, then hand over to the image's entrypoint (s6), whose
+  # setup turns every FORGEJO__section__KEY into app.ini.
+  entrypoint: ["/bin/sh", "-c", "export FORGEJO__cluster__CLUSTER_ID=\"$$(cat /data/tls/cluster-id)\" && exec /usr/bin/entrypoint \"$$@\"", "--"]
+  command: ["/usr/bin/s6-svscan", "/etc/s6"]
+  environment: &forgejo-env
+    USER_UID: "1000"
+    USER_GID: "1000"
+    FORGEJO__server__HTTP_PORT: "3000"
+    FORGEJO__server__DISABLE_SSH: "true"
+    FORGEJO__server__START_SSH_SERVER: "false"
+    FORGEJO__server__OFFLINE_MODE: "true"
+    FORGEJO__server__LFS_START_SERVER: "false"
+    FORGEJO__database__DB_TYPE: postgres
+    FORGEJO__database__HOST: haproxy:5000
+    FORGEJO__database__NAME: forgejo
+    FORGEJO__database__USER: forgejo
+    FORGEJO__database__PASSWD: ${FORGEJO_DB_PASSWORD:?}
+    FORGEJO__database__SSL_MODE: disable
+    FORGEJO__database__MAX_OPEN_CONNS: "20"
+    FORGEJO__database__CONN_MAX_LIFETIME: 30s
+    FORGEJO__security__INSTALL_LOCK: "true"
+    FORGEJO__security__SECRET_KEY: ${FORGEJO_SECRET_KEY:?}
+    # Required by [cluster]: a user hook would run inside the replication path.
+    FORGEJO__security__DISABLE_GIT_HOOKS: "true"
+    FORGEJO__service__DISABLE_REGISTRATION: "true"
+    FORGEJO__session__PROVIDER: db
+    FORGEJO__cache__ADAPTER: memory
+    FORGEJO__indexer__REPO_INDEXER_ENABLED: "false"
+    FORGEJO__cluster__ENABLED: ${CLUSTER_ENABLED:-true}
+    FORGEJO__cluster__DATA_DIR: /data/gitea/cluster
+    FORGEJO__cluster__OBJECT_PORT: "7481"
+    FORGEJO__cluster__PEERS: node-a=10.89.0.41:7480,node-b=10.89.0.42:7480,node-c=10.89.0.43:7480
+    FORGEJO__cluster__TLS_CERT_FILE: /data/tls/node.pem
+    FORGEJO__cluster__TLS_KEY_FILE: /data/tls/node.key
+    FORGEJO__cluster__TLS_CA_FILE: /data/tls/ca.pem
+    # Seeds the operator permission only while nobody holds it.
+    FORGEJO__cluster__OPERATORS: lab-admin
+    # forgejo_cluster_* (role, term, applied_index, failure_tolerance, peer_lag_entries...).
+    FORGEJO__metrics__ENABLED: "true"
+    # The Recover witnesses (make witnesses fills .env): empty, the boot
+    # fence is not checked; set, a node refuses to start (exit 77) when a
+    # witness says its cluster was superseded, or when none answers.
+    FORGEJO__cluster__WITNESSES: ${WITNESS_URLS:-}
+    FORGEJO__cluster__WITNESS_KEYS: ${WITNESS_KEYS:-}
+    FORGEJO__cluster__WITNESS_OVERRIDE_SHA256: ${WITNESS_OVERRIDE_SHA256:-}
+    # The in-process certificate renewer (make vault-renew-e2e fills .env):
+    # empty, it is off.
+    FORGEJO__cluster__RENEW_VAULT_ADDR: ${RENEW_VAULT_ADDR:-}
+    FORGEJO__cluster__RENEW_VAULT_TOKEN_FILE: ${RENEW_VAULT_TOKEN_FILE:-}
+  healthcheck:
+    test: ["CMD", "curl", "-sf", "http://127.0.0.1:3000/api/healthz"]
+    interval: 5s
+    timeout: 3s
+    retries: 60
+    start_period: 30s
+
+x-witness: &witness
+  image: forgejo-cluster-lab/forgejo:raft-cluster
+  pull_policy: never  # built by `make build`
+  restart: unless-stopped
+  mem_limit: 64m
+  # Forgejo refuses to run as root: the volume is handed to the git user,
+  # then the witness runs as git.
+  user: "0"
+  entrypoint: ["/bin/sh", "-c", "chown -R git:git /witness && exec su-exec git /bin/sh -c '/app/gitea/gitea cluster witness init --dir /witness/state | grep -E \"^[0-9a-f]{64}$\" >/witness/public-key && exec /app/gitea/gitea cluster witness serve --dir /witness/state --listen 0.0.0.0:7482'"]
+  environment:
+    GITEA_WORK_DIR: /tmp
+    GITEA_CUSTOM: /tmp
+  healthcheck:
+    test: ["CMD-SHELL", "test -s /witness/public-key && curl -s -o /dev/null http://127.0.0.1:7482/v1/status"]
+    interval: 3s
+    timeout: 3s
+    retries: 20
+
+services:
+  consul-1:
+    <<: *consul
+    hostname: consul-1
+    command: agent -server -bootstrap-expect=3 -node=consul-node-a -datacenter=lab -client=0.0.0.0 -retry-join=10.89.0.12 -retry-join=10.89.0.13 -ui
+    ports: ["127.0.0.1:8500:8500"]
+    volumes: [consul-1:/consul/data]
+    networks: {lab: {ipv4_address: 10.89.0.11}}
+  consul-2:
+    <<: *consul
+    hostname: consul-2
+    command: agent -server -bootstrap-expect=3 -node=consul-node-b -datacenter=lab -client=0.0.0.0 -retry-join=10.89.0.11 -retry-join=10.89.0.13
+    volumes: [consul-2:/consul/data]
+    networks: {lab: {ipv4_address: 10.89.0.12}}
+  consul-3:
+    <<: *consul
+    hostname: consul-3
+    command: agent -server -bootstrap-expect=3 -node=consul-node-c -datacenter=lab -client=0.0.0.0 -retry-join=10.89.0.11 -retry-join=10.89.0.12
+    volumes: [consul-3:/consul/data]
+    networks: {lab: {ipv4_address: 10.89.0.13}}
+
+  pg-1:
+    <<: *patroni
+    hostname: pg-1
+    environment: {<<: *patroni-env, PATRONI_NAME: pg-1, CONSUL_HOST: consul-1}
+    depends_on: {consul-1: {condition: service_healthy}}
+    volumes: [pg-1:/var/lib/postgresql/patroni]
+    networks: {lab: {ipv4_address: 10.89.0.21}}
+  pg-2:
+    <<: *patroni
+    hostname: pg-2
+    environment: {<<: *patroni-env, PATRONI_NAME: pg-2, CONSUL_HOST: consul-2}
+    depends_on: {consul-2: {condition: service_healthy}}
+    volumes: [pg-2:/var/lib/postgresql/patroni]
+    networks: {lab: {ipv4_address: 10.89.0.22}}
+  pg-3:
+    <<: *patroni
+    hostname: pg-3
+    environment: {<<: *patroni-env, PATRONI_NAME: pg-3, CONSUL_HOST: consul-3}
+    depends_on: {consul-3: {condition: service_healthy}}
+    volumes: [pg-3:/var/lib/postgresql/patroni]
+    networks: {lab: {ipv4_address: 10.89.0.23}}
+
+  haproxy:
+    image: ${HAPROXY_IMAGE:-haproxy:3.2@sha256:89c31eabc1ce443a13a42725a04df034b992c9d60580f4e6ef8b7bf5b15deddf}
+    restart: unless-stopped
+    mem_limit: 64m
+    volumes: ["./haproxy:/usr/local/etc/haproxy:ro"]
+    ports: ["127.0.0.1:5000:5000", "127.0.0.1:7000:7000"]
+    depends_on:
+      pg-1: {condition: service_healthy}
+      pg-2: {condition: service_healthy}
+      pg-3: {condition: service_healthy}
+    healthcheck:
+      # Healthy only once a primary is routed: the stats CSV shows it UP.
+      test: ["CMD", "bash", "/usr/local/etc/haproxy/primary-up.sh"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+    networks: {lab: {ipv4_address: 10.89.0.30}}
+
+  # One-shot: a CA, one key and certificate per slot with the single URI SAN
+  # kitsunium-consensus://<cluster>/slot/<slot>, and the SPKI SHA-256 of each
+  # (pki/pki-init.sh).
+  pki:
+    # The Patroni image already carries openssl: no extra image to pull.
+    image: forgejo-cluster-lab/patroni:4.1.5-pg18
+    pull_policy: never  # built by `make build`, from the pg-* services
+    user: "0"
+    entrypoint: ["/bin/sh", "/lab/pki-init.sh"]
+    # The CA stays in "pki"; each node key is born in that node's volume.
+    volumes:
+      - "./pki/pki-init.sh:/lab/pki-init.sh:ro"
+      - "pki:/pki"
+      - "forgejo-1:/nodes/node-a"
+      - "forgejo-2:/nodes/node-b"
+      - "forgejo-3:/nodes/node-c"
+    network_mode: none
+
+  forgejo-1:
+    <<: *forgejo
+    hostname: forgejo-1
+    environment: {<<: *forgejo-env, FORGEJO__cluster__SLOT: node-a, FORGEJO__cluster__LISTEN_ADDR: "10.89.0.41:7480", FORGEJO__server__ROOT_URL: "http://localhost:3001/"}
+    ports: ["127.0.0.1:3001:3000"]
+    volumes: [forgejo-1:/data]
+    networks: {lab: {ipv4_address: 10.89.0.41}}
+  forgejo-2:
+    <<: *forgejo
+    hostname: forgejo-2
+    # Started after forgejo-1, which usually wins the first migration; s6
+    # restarts a node that loses the race.
+    depends_on:
+      pki: {condition: service_completed_successfully}
+      haproxy: {condition: service_healthy}
+      forgejo-1: {condition: service_started}
+    environment: {<<: *forgejo-env, FORGEJO__cluster__SLOT: node-b, FORGEJO__cluster__LISTEN_ADDR: "10.89.0.42:7480", FORGEJO__server__ROOT_URL: "http://localhost:3002/"}
+    ports: ["127.0.0.1:3002:3000"]
+    volumes: [forgejo-2:/data]
+    networks: {lab: {ipv4_address: 10.89.0.42}}
+  forgejo-3:
+    <<: *forgejo
+    hostname: forgejo-3
+    # Started after forgejo-1, which usually wins the first migration; s6
+    # restarts a node that loses the race.
+    depends_on:
+      pki: {condition: service_completed_successfully}
+      haproxy: {condition: service_healthy}
+      forgejo-1: {condition: service_started}
+    environment: {<<: *forgejo-env, FORGEJO__cluster__SLOT: node-c, FORGEJO__cluster__LISTEN_ADDR: "10.89.0.43:7480", FORGEJO__server__ROOT_URL: "http://localhost:3003/"}
+    ports: ["127.0.0.1:3003:3000"]
+    volumes: [forgejo-3:/data]
+    networks: {lab: {ipv4_address: 10.89.0.43}}
+
+  # The Recover witnesses, one per witness host in a deployment (ADR 0152 R9-08 to
+  # R9-11): the Forgejo image's `cluster witness serve`. The operator writes
+  # a superseded lineage with `cluster witness supersede` inside the
+  # container, never over the network.
+  witness-a:
+    <<: *witness
+    hostname: witness-a
+    volumes: [witness-a:/witness]
+    networks: {lab: {ipv4_address: 10.89.0.51}}
+  witness-b:
+    <<: *witness
+    hostname: witness-b
+    volumes: [witness-b:/witness]
+    networks: {lab: {ipv4_address: 10.89.0.52}}
+
+  # A Vault in dev mode, for the certificate renewer only: its pki-consensus
+  # mount imports the lab CA, one role per slot (scripts/vault-renew-e2e.sh).
+  vault:
+    image: ${VAULT_IMAGE:-hashicorp/vault:1.21@sha256:4e33b126a59c0c333b76fb4e894722462659a6bec7c48c9ee8cea56fccfd2569}
+    restart: unless-stopped
+    mem_limit: 128m
+    cap_add: [IPC_LOCK]
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_TOKEN:?}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    ports: ["127.0.0.1:8200:8200"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8200/v1/sys/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: {lab: {ipv4_address: 10.89.0.60}}
+
+  # A Nomad dev agent for `make nomad-e2e`: workload identities for the
+  # Vault login, the witness prestart, and a node to drain for the JOIN
+  # check. It reads slot node-a's certificate (read-only) to renew a copy.
+  nomad:
+    build:
+      context: ./nomad
+    image: forgejo-cluster-lab/nomad:2.0.7
+    pull_policy: never  # built by `make build`, after the Forgejo image
+    restart: unless-stopped
+    mem_limit: 384m
+    # Nomad's client manages cgroups v2: in a container, it needs the host's
+    # cgroup namespace to create its own tree.
+    privileged: true
+    cgroup: host
+    # ACLs on, bootstrapped with NOMAD_TOKEN: raw_exec runs as root in a
+    # privileged container, so no anonymous caller may submit a job. The
+    # port stays on 127.0.0.1 for nomad-e2e's Go test.
+    entrypoint: ["/bin/sh", "/etc/nomad.d/entrypoint.sh"]
+    command: ["-dev", "-bind", "0.0.0.0", "-network-interface", "eth0", "-config", "/etc/nomad.d/lab.hcl"]
+    environment:
+      NOMAD_TOKEN: ${NOMAD_TOKEN:?}
+    ports: ["127.0.0.1:4646:4646"]
+    volumes: [forgejo-1:/lab/node-a:ro, nomad-data:/lab/nomad]
+    healthcheck:
+      test: ["CMD", "nomad", "node", "status", "-self"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    networks: {lab: {ipv4_address: 10.89.0.70}}
+
+networks:
+  lab:
+    ipam:
+      config:
+        - subnet: 10.89.0.0/24
+
+volumes:
+  consul-1:
+  consul-2:
+  consul-3:
+  pg-1:
+  pg-2:
+  pg-3:
+  pki:
+  forgejo-1:
+  forgejo-2:
+  forgejo-3:
+  witness-a:
+  witness-b:
+  nomad-data:

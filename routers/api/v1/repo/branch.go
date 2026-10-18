@@ -149,6 +149,9 @@ func DeleteBranch(ctx *context.APIContext) {
 		}
 	}
 
+	if refWritesRefused(ctx) {
+		return
+	}
 	if err := repo_service.DeleteBranch(ctx, ctx.Doer(), ctx.Repo().Repository, ctx.Repo().GitRepo, branchName); err != nil {
 		switch {
 		case git.IsErrBranchNotExist(err):
@@ -244,6 +247,9 @@ func CreateBranch(ctx *context.APIContext) {
 		}
 	}
 
+	if refWritesRefused(ctx) {
+		return
+	}
 	err = repo_service.CreateNewBranchFromCommit(ctx, ctx.Doer(), ctx.Repo().Repository, ctx.Repo().GitRepo, oldCommit.ID.String(), opt.BranchName)
 	if err != nil {
 		if git_model.IsErrBranchNotExist(err) {

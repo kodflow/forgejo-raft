@@ -22,6 +22,7 @@ import (
 	git_model "forgejo.org/models/git"
 	"forgejo.org/models/perm"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/json"
 	"forgejo.org/modules/lfs"
@@ -369,6 +370,38 @@ func runServ(ctx context.Context, c *cli.Command) error {
 	// to avoid breaking, here only use the minimal environment variables for the "gitea serv" command.
 	// it could be re-considered whether to use the same git.CommonGitCmdEnvs() as "git" command later.
 	gitcmd.Env = append(gitcmd.Env, git.CommonCmdServEnvs()...)
+	if setting.Cluster.Enabled && verb == "git-receive-pack" {
+		// The SSH path registers its transaction nonce with the replicator
+		// before git runs, and sets it last so nothing overrides it
+		// (kitsunium ADR 0152 D19, R7-37).
+		nonce := clusterhook.NewNonce()
+		rctx, rcancel := context.WithTimeout(ctx, 10*time.Second)
+		// The key comes from the resolved repository, not from the SSH
+		// path, which may lack ".git" (git accepts both).
+		gitDir := filepath.Join(setting.RepoRootPath, filepath.FromSlash(clusterhook.RepoKey(results.OwnerName, results.RepoName, results.IsWiki)))
+		resp, err := clusterhook.Call(rctx, setting.Cluster.HookSocket, &clusterhook.Request{
+			Op: clusterhook.OpRegister, Nonce: nonce, GitDir: gitDir, PID: os.Getpid(),
+		})
+		rcancel()
+		if err != nil {
+			return fail(ctx, "The cluster is unavailable, nothing was written", "cluster register: %v", err)
+		}
+		if !resp.OK {
+			return fail(ctx, "The cluster is unavailable, nothing was written", "cluster register refused: %s", resp.Message)
+		}
+		gitcmd.Env = append(gitcmd.Env, clusterhook.EnvTxn+"="+nonce)
+		// git runs the reference-transaction hook only when refs change: a
+		// push refused by pre-receive, a no-op or a dropped client never
+		// releases the registration, which would hold the repository's
+		// projection and count against its transaction cap until the TTL.
+		defer func() {
+			actx, acancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer acancel()
+			if _, err := clusterhook.Call(actx, setting.Cluster.HookSocket, &clusterhook.Request{Op: clusterhook.OpAborted, Nonce: nonce, GitDir: gitDir}); err != nil {
+				log.Warn("cluster: releasing transaction %s: %v", nonce, err)
+			}
+		}()
+	}
 
 	if err = gitcmd.Run(); err != nil {
 		return fail(ctx, "Failed to execute git command", "Failed to execute git command: %v", err)

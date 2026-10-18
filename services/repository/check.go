@@ -12,6 +12,7 @@ import (
 	"forgejo.org/models/db"
 	repo_model "forgejo.org/models/repo"
 	system_model "forgejo.org/models/system"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/log"
 	repo_module "forgejo.org/modules/repository"
@@ -84,6 +85,13 @@ func GitGcRepos(ctx context.Context, timeout time.Duration, args git.TrustedCmdA
 
 // GitGcRepo calls 'git gc' to remove unnecessary files and optimize the local repository
 func GitGcRepo(ctx context.Context, repo *repo_model.Repository, timeout time.Duration, args git.TrustedCmdArgs) error {
+	// In a cluster the projector owns garbage collection: no gc while the
+	// repository is not projected or still has unconsumed events, whose
+	// objects are pinned (kitsunium ADR 0152 D19, R8-27).
+	if !clusterhook.MayCollectGarbage(clusterhook.RepoKey(repo.OwnerName, repo.Name, false)) {
+		log.Info("Skipping git gc on %-v: the cluster has work pending on it", repo)
+		return nil
+	}
 	log.Trace("Running git gc on %-v", repo)
 	command := git.NewCommand(ctx, "gc").AddArguments(args...).
 		SetDescription(fmt.Sprintf("Repository Garbage Collection: %s", repo.FullName()))

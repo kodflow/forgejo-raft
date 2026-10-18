@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git/internal" //nolint:depguard // only this file can use the internal type CmdArg, other files and packages should use AddXxx functions
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/process"
@@ -336,6 +337,8 @@ func (c *Command) Run(opts *RunOpts) error {
 
 	process.SetupCancellableCommand(cmd)
 	cmd.Env = append(cmd.Env, CommonGitCmdEnvs()...)
+	// The cluster's transaction nonce goes last, so no inherited value wins.
+	cmd.Env = append(cmd.Env, clusterhook.TxnEnv(c.parentContext)...)
 	cmd.Dir = opts.Dir
 	cmd.Stdout = opts.Stdout
 	cmd.Stderr = opts.Stderr

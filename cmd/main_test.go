@@ -173,3 +173,21 @@ func TestCliCmdError(t *testing.T) {
 	assert.Empty(t, r.Stdout)
 	assert.Empty(t, r.Stderr)
 }
+
+func TestCliCmdVersion(t *testing.T) {
+	for _, flag := range []string{"--version", "-v"} {
+		t.Run(flag, func(t *testing.T) {
+			defaultActionCalled := false
+			app := newTestApp(func(_ context.Context, ctx *cli.Command) error {
+				defaultActionCalled = true
+				return nil
+			})
+			r, err := runTestApp(app, "./gitea", flag)
+			require.NoError(t, err)
+			assert.False(t, defaultActionCalled, "%s must not run the default command", flag)
+			assert.Equal(t, -1, r.ExitCode)
+			assert.Equal(t, "forgejo version versionversion-extra\n", r.Stdout)
+			assert.Empty(t, r.Stderr)
+		})
+	}
+}

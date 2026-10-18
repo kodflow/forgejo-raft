@@ -23,6 +23,7 @@ import (
 	"forgejo.org/models/unit"
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/cache"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/references"
@@ -251,9 +252,15 @@ func Merge(ctx context.Context, pr *issues_model.PullRequest, doer *user_model.U
 		AddTestPullRequestTask(ctx, doer, pr.BaseRepo.ID, pr.BaseBranch, false, "", "", 0)
 	}()
 
-	_, err = doMergeAndPush(ctx, pr, doer, mergeStyle, expectedHeadCommitID, message, repo_module.PushTriggerPRMergeToBase)
+	// In a cluster, Merge answers once the log consumer has derived the SQL of
+	// its own push (kitsunium ADR 0152 D19, R9-15).
+	mergeCtx, writes := clusterhook.WithCollector(ctx)
+	_, err = doMergeAndPush(mergeCtx, pr, doer, mergeStyle, expectedHeadCommitID, message, repo_module.PushTriggerPRMergeToBase)
 	if err != nil {
 		return err
+	}
+	if !clusterhook.WaitWrites(ctx, writes) {
+		log.Warn("Merge %-v: the cluster has not derived the merge's SQL yet; pages may lag", pr)
 	}
 
 	// reload pull request because it has been updated by post receive hook

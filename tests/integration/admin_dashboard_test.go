@@ -9,11 +9,14 @@ import (
 	"testing"
 
 	"forgejo.org/modules/setting"
+	"forgejo.org/modules/system"
 	"forgejo.org/modules/test"
 	"forgejo.org/modules/translation"
+	"forgejo.org/modules/updatechecker"
 	"forgejo.org/tests"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var commonEntries = []string{
@@ -95,5 +98,35 @@ func TestAdminDashboard(t *testing.T) {
 
 		page = NewHTMLParser(t, session.MakeRequest(t, NewRequest(t, "GET", url), http.StatusOK).Body)
 		assert.Contains(t, page.Find(selector).Text(), "МиБ")
+	})
+
+	t.Run("forgejo-raft notice", func(t *testing.T) {
+		defer tests.PrintCurrentTest(t)()
+		defer test.MockVariableValue(&setting.AppVer, "17.0.0-raft.1+gitea-1.22.0")()
+		ctx := t.Context()
+		set := func(supported []string, releases []updatechecker.RaftRelease) {
+			require.NoError(t, system.AppState.Set(ctx, &updatechecker.CheckerState{SupportedVersions: supported}))
+			require.NoError(t, system.AppState.Set(ctx, &updatechecker.RaftCheckerState{Releases: releases}))
+		}
+		defer set(nil, nil)
+		notice := func() string {
+			page := NewHTMLParser(t, session.MakeRequest(t, NewRequest(t, "GET", url), http.StatusOK).Body)
+			return page.Find("#raft-release-notice").Text()
+		}
+		raft1 := updatechecker.RaftRelease{Version: "17.0.0-raft.1", Upstream: "17.0.0", URL: "https://example.invalid/r1"}
+		raft2 := updatechecker.RaftRelease{Version: "17.0.0-raft.2", Upstream: "17.0.0", URL: "https://example.invalid/r2"}
+		official := updatechecker.RaftRelease{Version: "17.0.1-raft.1", Upstream: "17.0.1", URL: "https://example.invalid/o1"}
+
+		set([]string{"17.0.0"}, []updatechecker.RaftRelease{raft1})
+		assert.Empty(t, notice(), "up to date")
+
+		set([]string{"17.0.0"}, []updatechecker.RaftRelease{raft1, raft2})
+		assert.Contains(t, notice(), "forgejo-raft 17.0.0-raft.2 is available")
+
+		set([]string{"17.0.1"}, []updatechecker.RaftRelease{raft1})
+		assert.Contains(t, notice(), "The forgejo-raft build of Forgejo 17.0.1 is not available yet")
+
+		set([]string{"17.0.1"}, []updatechecker.RaftRelease{raft1, official})
+		assert.Contains(t, notice(), "forgejo-raft 17.0.1-raft.1 is available")
 	})
 }

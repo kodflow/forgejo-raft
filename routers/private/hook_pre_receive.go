@@ -25,6 +25,7 @@ import (
 	"forgejo.org/modules/private"
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/web"
+	cluster_service "forgejo.org/services/cluster"
 	app_context "forgejo.org/services/context"
 	pull_service "forgejo.org/services/pull"
 )
@@ -203,6 +204,16 @@ func (ctx *preReceiveContext) quotaExceeded() {
 // HookPreReceive checks whether a individual commit is acceptable
 func HookPreReceive(ctx *app_context.PrivateContext) {
 	opts := web.GetForm(ctx).(*private.HookOptions)
+
+	// A node of the cluster that cannot take the write says why here, where
+	// the client reads it; refused later by the cluster's own hook, the push
+	// would only end in a disconnect over HTTP.
+	if r := cluster_service.Current(); r != nil {
+		if err := r.WriteRefusal(ctx); err != nil {
+			ctx.JSON(http.StatusServiceUnavailable, private.Response{UserMsg: err.Error()})
+			return
+		}
+	}
 
 	ourCtx := &preReceiveContext{
 		PrivateContext: ctx,

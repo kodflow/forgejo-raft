@@ -52,6 +52,8 @@ import (
 	"forgejo.org/routers/web/user/setting/security"
 	auth_service "forgejo.org/services/auth"
 	auth_method "forgejo.org/services/auth/method"
+	cluster_service "forgejo.org/services/cluster"
+	"forgejo.org/services/cluster/consensus/kitsunium"
 	"forgejo.org/services/context"
 	"forgejo.org/services/forms"
 	"forgejo.org/services/lfs"
@@ -386,6 +388,9 @@ func Routes() *web.Route {
 
 	if setting.Metrics.Enabled {
 		prometheus.MustRegister(metrics.NewCollector())
+		if setting.Cluster.Enabled {
+			prometheus.MustRegister(cluster_service.NewCollector(), kitsunium.NewCollector())
+		}
 		routes.Get("/metrics", gzipMid, Metrics)
 	}
 
@@ -411,14 +416,14 @@ func Routes() *web.Route {
 		func() {
 			registerRoutes(routes)
 		},
-		gzipMid, sessioner, context.Contexter(), webAuth(buildAuthGroup()),
+		gzipMid, cluster_service.ReadAfterWrite, sessioner, context.Contexter(), webAuth(buildAuthGroup()),
 		// TODO: GetNotificationCount & GetActiveStopwatch really seem like things that could be folded into Contexter or as helper functions
 		user.GetNotificationCount, repo.GetActiveStopwatch,
 		goGet)
 	routes.Group("",
 		func() {
 			registerMixedRoutes(routes)
-		}, gzipMid, sessioner, context.Contexter(), webAuth(buildMixedAuthGroup()), goGet)
+		}, gzipMid, cluster_service.ReadAfterWrite, sessioner, context.Contexter(), webAuth(buildMixedAuthGroup()), goGet)
 	routes.Group("",
 		func() {
 			registerGitLFSRoutes(routes)
@@ -909,6 +914,15 @@ func registerRoutes(m *web.Route) {
 			m.Get("/settings", admin.ConfigSettings)
 		})
 
+		m.Group("/cluster", func() {
+			m.Get("", admin.Cluster)
+			m.Post("/operate", admin.ClusterOperate)
+			m.Post("/operate/confirm", admin.ClusterOperateConfirm)
+			m.Get("/operate/pending", admin.ClusterOperatePending)
+			m.Post("/stepup", admin.ClusterStepUp)
+			m.Get("/stepup/callback", admin.ClusterStepUpCallback)
+		})
+
 		m.Group("/monitor", func() {
 			m.Get("/stats", admin.MonitorStats)
 			m.Get("/cron", admin.CronTasks)
@@ -1015,7 +1029,7 @@ func registerRoutes(m *web.Route) {
 				m.Get("/hosts/{id}", admin.FederationHost)
 			})
 		}
-	}, adminReq, ctxDataSet("EnableOAuth2", setting.OAuth2.Enabled, "EnablePackages", setting.Packages.Enabled, "EnableModeration", setting.Moderation.Enabled))
+	}, adminReq, ctxDataSet("EnableOAuth2", setting.OAuth2.Enabled, "EnablePackages", setting.Packages.Enabled, "EnableModeration", setting.Moderation.Enabled, "EnableCluster", setting.Cluster.Enabled))
 	// ***** END: Admin *****
 
 	m.Group("", func() {

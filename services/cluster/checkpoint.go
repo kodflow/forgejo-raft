@@ -1,0 +1,556 @@
+// Copyright 2026 The Forgejo Authors. All rights reserved.
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package cluster
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"forgejo.org/models/db"
+	"forgejo.org/modules/clusterhook"
+	"forgejo.org/modules/json"
+	"forgejo.org/modules/log"
+	"forgejo.org/modules/setting"
+	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/reftable"
+)
+
+// The checkpoint coordinator runs on the leader. Each period it pairs the
+// table at one index with PostgreSQL at one WAL position, so an observer
+// holds refs and SQL of the same cut (observer plan v4, causal cut):
+//
+//  1. the leader's own writers queue behind its fence, and the log
+//     consumer is held at the last applied index;
+//  2. a barrier entry commits at B; its Apply captures the table at B;
+//  3. the consumer is let through to B and no further, and drained: the
+//     SQL of every entry up to B committed;
+//  4. under that fence, PostgreSQL's flushed WAL position L, its timeline
+//     and system identifier are read, and a restore point is created;
+//  5. the fence is released, the WAL switched so L is archived soon, the
+//     artifacts written, and a position entry closing B proposed.
+//
+// SQL committed after step 4 is past L, whatever entry it derives from.
+// Followers' pushes are ordered after B by the log, and their SQL is held
+// by the consumer. What a web request writes to SQL beside a push is
+// reconciled after a Recover (doctor, pull request heads). Nothing here
+// waits on an observer.
+
+// readToCommitBound is how long the position may take to commit once read:
+// a checkpoint that exceeds it is discarded and taken again.
+const readToCommitBound = 5 * time.Second
+
+// drainBound is how long the fence waits for the consumer to reach B.
+const drainBound = 5 * time.Second
+
+// checkpointArtifactsKept is how many checkpoints' artifacts the leader
+// keeps for the export; older checkpoints stay in the table, without them.
+const checkpointArtifactsKept = 8
+
+// walMark is PostgreSQL's position as the coordinator read it.
+type walMark struct {
+	LSN         string
+	Timeline    uint32
+	SystemID    string
+	SegmentSize int64
+}
+
+// walSource is the primary PostgreSQL, as the coordinator and the export
+// see it; tests replace it.
+type walSource interface {
+	// Mark reads the flushed WAL position, its timeline and the system
+	// identifier, then creates a restore point named name.
+	Mark(ctx context.Context, name string) (walMark, error)
+	// SwitchWAL closes the current segment, so the archive gets it now.
+	SwitchWAL(ctx context.Context) error
+	// Foreign lists the databases beside Forgejo's, template0, template1
+	// and postgres, and the tablespaces beside pg_default and pg_global:
+	// an export of the whole PostgreSQL cluster must hold Forgejo alone.
+	Foreign(ctx context.Context) (databases, tablespaces []string, err error)
+}
+
+type coordinator struct {
+	r        *Replicator
+	interval time.Duration
+	dir      string
+	wal      walSource
+	// files lists the stored files at the fence; tests replace it.
+	files func() ([]clusterhook.FileEntry, error)
+	now   func() time.Time
+
+	mu      sync.Mutex
+	waiting string
+	got     chan []byte
+}
+
+func newCoordinator(r *Replicator, interval time.Duration, dir string, wal walSource) *coordinator {
+	c := &coordinator{r: r, interval: interval, dir: dir, wal: wal, files: storedFiles, now: time.Now}
+	r.table.OnCheckpoint(c.capture)
+	return c
+}
+
+// capture keeps the table at the barrier this node is waiting for. It runs
+// under the table's lock: it encodes and hands the bytes over, nothing more.
+func (c *coordinator) capture(nonce string, _ uint64, encode func() ([]byte, error)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if nonce != c.waiting || c.got == nil {
+		return
+	}
+	b, err := encode()
+	if err != nil {
+		log.Error("cluster checkpoint: encoding the table at the barrier: %v", err)
+		b = nil
+	}
+	select {
+	case c.got <- b:
+	default:
+	}
+}
+
+func (c *coordinator) expect(nonce string) chan []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.waiting, c.got = nonce, make(chan []byte, 1)
+	return c.got
+}
+
+func (c *coordinator) run(ctx context.Context) {
+	t := time.NewTicker(c.interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		eng := c.r.Engine()
+		if eng == nil || eng.Status().Role != consensus.RoleLeader || c.r.writerGate(eng) != nil {
+			continue
+		}
+		rec, err := c.take(ctx)
+		if err != nil {
+			checkpointsTotal.WithLabelValues("failed").Inc()
+			log.Warn("cluster checkpoint: %v; the next period takes another", err)
+			continue
+		}
+		checkpointsTotal.WithLabelValues("closed").Inc()
+		log.Info("cluster checkpoint %s closed: index %d, PostgreSQL %s on timeline %d", rec.Name(), rec.Index, rec.LSN, rec.Timeline)
+	}
+}
+
+// take runs one checkpoint, steps 1 to 5.
+func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, error) {
+	r := c.r
+	eng := r.Engine()
+	nonce := clusterhook.NewNonce()
+	got := c.expect(nonce)
+	defer c.expect("")
+
+	// 1. The fence: the leader's writers queue, the consumer holds. A
+	// writer in flight (objects on their way to a majority) is not waited
+	// for past the bound: this period is skipped instead.
+	for deadline := c.now().Add(drainBound); !r.fence.TryLock(); {
+		if c.now().After(deadline) {
+			return reftable.CheckpointRecord{}, errors.New("writers kept the fence for longer than the bound")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	fenced := true
+	release := func() {
+		if fenced {
+			r.consumer.release()
+			r.fence.Unlock()
+			fenced = false
+		}
+	}
+	defer release()
+	applied, _ := r.table.Applied()
+	r.consumer.holdAt(applied.Index)
+
+	// 2. The barrier, and the table at it.
+	data, err := reftable.Encode(reftable.KindCheckpointBarrier, &reftable.CheckpointBarrier{Nonce: nonce, Time: c.now().UnixNano()})
+	if err != nil {
+		return reftable.CheckpointRecord{}, err
+	}
+	bctx, cancel := context.WithTimeout(ctx, drainBound)
+	defer cancel()
+	tok, res, err := r.proposeCommand(bctx, data, nil)
+	if err != nil {
+		return reftable.CheckpointRecord{}, fmt.Errorf("barrier: %w", err)
+	}
+	if !res.OK {
+		return reftable.CheckpointRecord{}, fmt.Errorf("barrier refused: %s", res.Reason)
+	}
+	if err := eng.WaitApplied(bctx, tok); err != nil {
+		return reftable.CheckpointRecord{}, fmt.Errorf("barrier not applied here: %w", err)
+	}
+	var snap []byte
+	select {
+	case snap = <-got:
+	case <-bctx.Done():
+	}
+	if snap == nil {
+		return reftable.CheckpointRecord{}, errors.New("the table was not captured at the barrier")
+	}
+
+	// 3. The consumer up to B, and no further.
+	r.consumer.holdAt(tok.Index)
+	r.signalConsumer()
+	for {
+		ok, err := r.consumer.drained(bctx, tok)
+		if err == nil && ok {
+			break
+		}
+		select {
+		case <-bctx.Done():
+			return reftable.CheckpointRecord{}, fmt.Errorf("the SQL of the entries up to %d did not drain within %s", tok.Index, drainBound)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	// 4. PostgreSQL's position under the fence, and the files present.
+	name := reftable.CheckpointName(tok.Identity().String(), tok.Index)
+	mark, err := c.wal.Mark(bctx, name)
+	if err != nil {
+		return reftable.CheckpointRecord{}, fmt.Errorf("reading PostgreSQL's position: %w", err)
+	}
+	readAt := c.now()
+	files, err := c.files()
+	if err != nil {
+		return reftable.CheckpointRecord{}, fmt.Errorf("listing the stored files: %w", err)
+	}
+
+	// 5. Released: the rest is bounded, and waits on nobody.
+	release()
+	if err := c.wal.SwitchWAL(ctx); err != nil {
+		log.Warn("cluster checkpoint: switching the WAL segment: %v", err)
+	}
+	manifest, err := json.Marshal(clusterhook.FilesManifest{Checkpoint: name, Files: files})
+	if err != nil {
+		return reftable.CheckpointRecord{}, err
+	}
+	refsSum, err := c.writeArtifact(name, "refs.snapshot", snap)
+	if err != nil {
+		return reftable.CheckpointRecord{}, err
+	}
+	filesSum, err := c.writeArtifact(name, "files.json", manifest)
+	if err != nil {
+		return reftable.CheckpointRecord{}, err
+	}
+	pos := &reftable.CheckpointPosition{
+		Nonce: nonce, Index: tok.Index, LSN: mark.LSN, Timeline: mark.Timeline, SystemID: mark.SystemID,
+		RestorePoint: name, WALSegmentSize: mark.SegmentSize, RefsSHA256: refsSum, FilesSHA256: filesSum,
+		ReadAt: readAt.UnixNano(),
+	}
+	if data, err = reftable.Encode(reftable.KindCheckpointPosition, pos); err != nil {
+		return reftable.CheckpointRecord{}, err
+	}
+	left := readToCommitBound - c.now().Sub(readAt)
+	if left <= 0 {
+		return reftable.CheckpointRecord{}, fmt.Errorf("checkpoint %s discarded: %s between the read and the proposal", name, readToCommitBound)
+	}
+	pctx, pcancel := context.WithTimeout(ctx, left)
+	defer pcancel()
+	_, res, err = r.proposeCommand(pctx, data, nil)
+	if err != nil {
+		return reftable.CheckpointRecord{}, fmt.Errorf("checkpoint %s discarded: the position did not commit within %s: %w", name, readToCommitBound, err)
+	}
+	if !res.OK {
+		return reftable.CheckpointRecord{}, fmt.Errorf("checkpoint %s refused: %s", name, res.Reason)
+	}
+	c.prune()
+	for _, cp := range r.table.Checkpoints() {
+		if cp.Nonce == nonce {
+			return cp, nil
+		}
+	}
+	return reftable.CheckpointRecord{}, fmt.Errorf("checkpoint %s committed and not yet applied here", name)
+}
+
+// writeArtifact writes one artifact of a checkpoint durably and returns
+// its SHA-256, which the position entry carries.
+func (c *coordinator) writeArtifact(name, file string, b []byte) (string, error) {
+	dir := filepath.Join(c.dir, name)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	tmp := filepath.Join(dir, file+".partial")
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", err
+	}
+	_, err = f.Write(b)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, filepath.Join(dir, file))
+	}
+	if err == nil {
+		err = syncDir(dir)
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// prune keeps the artifacts of the newest checkpoints only.
+func (c *coordinator) prune() {
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() && checkpointNamePattern.MatchString(e.Name()) {
+			names = append(names, e.Name())
+		}
+	}
+	// Names sort by lineage, then by the zero-padded index.
+	sort.Strings(names)
+	for len(names) > checkpointArtifactsKept {
+		_ = os.RemoveAll(filepath.Join(c.dir, names[0]))
+		names = names[1:]
+	}
+}
+
+var checkpointNamePattern = regexp.MustCompile(`^[0-9a-f]{32}-[0-9]+-[0-9]{20}$`)
+
+// ---- the consumer's side of the fence ----
+
+// holdAt lets the consumer dispatch the events up to index, no further.
+func (c *consumer) holdAt(index uint64) {
+	c.gate.Lock()
+	c.hold = index
+	c.held = true
+	c.gate.Unlock()
+}
+
+// release lifts the hold.
+func (c *consumer) release() {
+	c.gate.Lock()
+	c.held = false
+	c.gate.Unlock()
+}
+
+// limit returns the index the consumer may dispatch up to, and whether
+// one is set.
+func (c *consumer) limit() (uint64, bool) {
+	c.gate.RLock()
+	defer c.gate.RUnlock()
+	return c.hold, c.held
+}
+
+// drained reports whether the SQL of every event up to tok committed.
+func (c *consumer) drained(ctx context.Context, tok consensus.Token) (bool, error) {
+	var last uint64
+	for _, ev := range c.r.table.Events() {
+		if ev.Token.Identity() == tok.Identity() && ev.Token.Index <= tok.Index && ev.Token.Index > last {
+			last = ev.Token.Index
+		}
+	}
+	if last == 0 {
+		return true, nil
+	}
+	lin := tok.Identity().String()
+	cur, err := c.cursor(ctx, cursorName(lin))
+	if err != nil {
+		return false, err
+	}
+	return cur.Lineage == lin && uint64(cur.Position) >= last, nil
+}
+
+// ---- PostgreSQL ----
+
+// pgWAL is the primary PostgreSQL through Forgejo's own connection. The
+// restore point and the WAL switch run under [cluster] CHECKPOINT_ROLE, a
+// role granted EXECUTE on pg_create_restore_point, pg_switch_wal and
+// pg_control_system only, which Forgejo's user may SET ROLE to.
+type pgWAL struct{ role string }
+
+var pgIdentifier = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
+
+func (p pgWAL) asRole(ctx context.Context, f func(e db.Engine) error) error {
+	if !pgIdentifier.MatchString(p.role) {
+		return fmt.Errorf("CHECKPOINT_ROLE %q is not a plain PostgreSQL identifier", p.role)
+	}
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		e := db.GetEngine(ctx)
+		if _, err := e.Exec("SET LOCAL ROLE " + p.role); err != nil {
+			return err
+		}
+		return f(e)
+	})
+}
+
+func queryOne(e db.Engine, query string, args ...any) (map[string]string, error) {
+	rows, err := e.Query(append([]any{query}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) != 1 {
+		return nil, fmt.Errorf("%d rows for %q", len(rows), query)
+	}
+	out := map[string]string{}
+	for k, v := range rows[0] {
+		out[k] = string(v)
+	}
+	return out, nil
+}
+
+func (p pgWAL) Mark(ctx context.Context, name string) (walMark, error) {
+	var m walMark
+	err := p.asRole(ctx, func(e db.Engine) error {
+		// pg_walfile_name refuses to run on a standby: the position is the
+		// primary's, and the file name carries its timeline.
+		row, err := queryOne(e, `SELECT pg_current_wal_flush_lsn()::text AS lsn,
+			pg_walfile_name(pg_current_wal_flush_lsn()) AS walfile,
+			(SELECT system_identifier::text FROM pg_control_system()) AS sysid,
+			current_setting('wal_segment_size') AS segsize`)
+		if err != nil {
+			return err
+		}
+		tli, err := strconv.ParseUint(row["walfile"][:8], 16, 32)
+		if err != nil || len(row["walfile"]) != 24 {
+			return fmt.Errorf("WAL file name %q", row["walfile"])
+		}
+		size, err := parsePGSize(row["segsize"])
+		if err != nil {
+			return err
+		}
+		m = walMark{LSN: strings.ToUpper(row["lsn"]), Timeline: uint32(tli), SystemID: row["sysid"], SegmentSize: size}
+		_, err = queryOne(e, "SELECT pg_create_restore_point(?)::text AS rp", name)
+		return err
+	})
+	return m, err
+}
+
+func (p pgWAL) SwitchWAL(ctx context.Context) error {
+	return p.asRole(ctx, func(e db.Engine) error {
+		_, err := queryOne(e, "SELECT pg_switch_wal()::text AS lsn")
+		return err
+	})
+}
+
+func (p pgWAL) Foreign(ctx context.Context) ([]string, []string, error) {
+	var dbs, spcs []string
+	err := db.WithTx(ctx, func(ctx context.Context) error {
+		e := db.GetEngine(ctx)
+		rows, err := e.Query("SELECT datname FROM pg_database WHERE datname NOT IN (current_database(), 'template0', 'template1', 'postgres') ORDER BY datname")
+		if err != nil {
+			return err
+		}
+		for _, r := range rows {
+			dbs = append(dbs, string(r["datname"]))
+		}
+		rows, err = e.Query("SELECT spcname FROM pg_tablespace WHERE spcname NOT IN ('pg_default', 'pg_global') ORDER BY spcname")
+		if err != nil {
+			return err
+		}
+		for _, r := range rows {
+			spcs = append(spcs, string(r["spcname"]))
+		}
+		return nil
+	})
+	return dbs, spcs, err
+}
+
+// parsePGSize reads a size as current_setting prints it: 16MB, 1GB.
+func parsePGSize(s string) (int64, error) {
+	units := map[string]int64{"kB": 1 << 10, "MB": 1 << 20, "GB": 1 << 30}
+	for u, mul := range units {
+		if n, ok := strings.CutSuffix(s, u); ok {
+			v, err := strconv.ParseInt(n, 10, 64)
+			return v * mul, err
+		}
+	}
+	return strconv.ParseInt(s, 10, 64)
+}
+
+// ---- stored files ----
+
+// The storages a checkpoint covers, by the name the export uses.
+const (
+	StorageLFS         = "lfs"
+	StorageAttachments = "attachments"
+	StoragePackages    = "packages"
+)
+
+// storageRoots returns the local roots of the stored files; a storage that
+// is not local is refused, since the export cannot copy it.
+func storageRoots() (map[string]string, error) {
+	out := map[string]string{}
+	for name, st := range map[string]*setting.Storage{
+		StorageLFS: setting.LFS.Storage, StorageAttachments: setting.Attachment.Storage, StoragePackages: setting.Packages.Storage,
+	} {
+		if st == nil {
+			continue
+		}
+		if st.Type != setting.LocalStorageType {
+			return nil, fmt.Errorf("the %s storage is %q: observers support local storage only", name, st.Type)
+		}
+		out[name] = st.Path
+	}
+	return out, nil
+}
+
+// storedFiles lists every stored file, by storage and relative path.
+func storedFiles() ([]clusterhook.FileEntry, error) {
+	roots, err := storageRoots()
+	if err != nil {
+		return nil, err
+	}
+	var out []clusterhook.FileEntry
+	for name, root := range roots {
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil
+				}
+				return err
+			}
+			if !d.Type().IsRegular() {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			out = append(out, clusterhook.FileEntry{Storage: name, Path: filepath.ToSlash(rel), Size: info.Size()})
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Storage != out[j].Storage {
+			return out[i].Storage < out[j].Storage
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out, nil
+}
