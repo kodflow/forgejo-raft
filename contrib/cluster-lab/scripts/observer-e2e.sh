@@ -140,8 +140,15 @@ def post(path, **form):
 _, tok = csrf("/user/login")
 resp = post("/user/login", _csrf=tok, user_name=user, password=pw)
 if action == "enroll":
+    if resp.geturl().rstrip("/").endswith("/user/login"):
+        sys.exit("the login of %s failed" % user)
     page, tok = csrf("/user/settings/security/two_factor/enroll")
-    secret = re.search(r"secret=([A-Z2-7]+)", urllib.parse.unquote(page)).group(1)
+    # The secret is the QR code's alternative text (the QR code itself is a
+    # PNG data URL); older pages carried it in an otpauth URI.
+    m = re.search(r'alt="([A-Z2-7]{16,})"', page) or re.search(r"secret=([A-Z2-7]+)", urllib.parse.unquote(page))
+    if not m:
+        sys.exit("no TOTP secret on the enrolment page (%s)" % resp.geturl())
+    secret = m.group(1)
     post("/user/settings/security/two_factor/enroll", _csrf=tok, passcode=totp(secret))
     open("/work/totp-secret", "w").write(secret)
 else:
