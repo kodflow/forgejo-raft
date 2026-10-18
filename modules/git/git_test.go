@@ -113,6 +113,21 @@ func TestSyncConfigClusterGarbageCollection(t *testing.T) {
 	assert.True(t, gitConfigContains("auto = 0"))
 }
 
+// In a cluster an object counts toward the majority that holds it from the
+// moment git wrote it: loose objects too must reach the disk before git
+// reports them written, which git's default (committed,-loose-object) does
+// not do. Turning the cluster off restores git's default.
+func TestSyncConfigClusterHardensObjects(t *testing.T) {
+	defer test.MockProtect(&setting.GitConfig)()
+	defer test.MockVariableValue(&setting.Cluster.Enabled, true)()
+	require.NoError(t, syncGitConfig())
+	assert.True(t, gitConfigContains("fsync = committed"))
+
+	setting.Cluster.Enabled = false
+	require.NoError(t, syncGitConfig())
+	assert.False(t, gitConfigContains("fsync = committed"))
+}
+
 func TestSyncConfigGPGFormat(t *testing.T) {
 	defer test.MockProtect(&setting.GitConfig)()
 
