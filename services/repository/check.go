@@ -16,6 +16,7 @@ import (
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/log"
 	repo_module "forgejo.org/modules/repository"
+	"forgejo.org/modules/setting"
 	"forgejo.org/modules/util"
 
 	"xorm.io/builder"
@@ -83,6 +84,23 @@ func GitGcRepos(ctx context.Context, timeout time.Duration, args git.TrustedCmdA
 	return nil
 }
 
+// clusterGCArgs drops a --prune that expires unreachable objects at once
+// (now, all, never mind the age): in a cluster, objects arrive on a member
+// before the ref that names them commits, shipped to a majority that this
+// node counts in. Pruned then, the committed ref would name objects this
+// node told the proposer it holds. git's default expiry is kept.
+func clusterGCArgs(args git.TrustedCmdArgs) git.TrustedCmdArgs {
+	out := make(git.TrustedCmdArgs, 0, len(args))
+	for _, a := range args {
+		if v, ok := strings.CutPrefix(string(a), "--prune="); ok && (v == "now" || v == "all") {
+			log.Warn("git gc: %s is ignored in a cluster: objects shipped for a write not yet committed would be pruned", a)
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
 // GitGcRepo calls 'git gc' to remove unnecessary files and optimize the local repository
 func GitGcRepo(ctx context.Context, repo *repo_model.Repository, timeout time.Duration, args git.TrustedCmdArgs) error {
 	// In a cluster the projector owns garbage collection: no gc while the
@@ -91,6 +109,9 @@ func GitGcRepo(ctx context.Context, repo *repo_model.Repository, timeout time.Du
 	if !clusterhook.MayCollectGarbage(clusterhook.RepoKey(repo.OwnerName, repo.Name, false)) {
 		log.Info("Skipping git gc on %-v: the cluster has work pending on it", repo)
 		return nil
+	}
+	if setting.Cluster.Enabled {
+		args = clusterGCArgs(args)
 	}
 	log.Trace("Running git gc on %-v", repo)
 	command := git.NewCommand(ctx, "gc").AddArguments(args...).
