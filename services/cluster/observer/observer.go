@@ -912,8 +912,13 @@ func (o *Observer) fetchBase(ctx context.Context, leader string) error {
 	// still sorts after the first, instead of failing on the rename.
 	label := o.cfg.Now().UTC().Format("20060102T150405Z")
 	for i, first := 1, label; ; i++ {
-		if _, err := os.Stat(o.store.path("pg", "base", label)); errors.Is(err, os.ErrNotExist) {
+		_, err := os.Stat(o.store.path("pg", "base", label))
+		if errors.Is(err, os.ErrNotExist) {
 			break
+		}
+		if err != nil {
+			// A storage failure is reported, never taken for a used label.
+			return fmt.Errorf("base backup label %s: %w", label, err)
 		}
 		label = fmt.Sprintf("%s-%02d", first, i)
 	}
