@@ -623,18 +623,18 @@ The `[cluster]` section of `app.ini` (also settable as
 
 ## Releases
 
-Every merge that brings cluster code to the `forgejo` branch is released by
-`.github/workflows/release.yml`, with no manual step.
+Two lines of releases, both built and published by the same workflow
+(`.github/workflows/release-publish.yml`), with no manual step.
+
+**The development line**, `.github/workflows/release.yml`: every merge that
+brings cluster code to the `forgejo` branch.
 
 - **Version** `v<upstream>-raft.<N>`, for example `v18.0.0-dev-raft.1`.
   `<upstream>` is the upstream Forgejo version the code is built on, found
   as Forgejo's Makefile finds it (`git describe` on the nearest upstream
   tag). `<N>` counts the releases on that upstream version and starts again
   at 1 when it changes. `forgejo --version` reports the same version.
-- **Assets**: static `forgejo` binaries for linux/amd64 and linux/arm64
-  (SQLite, embedded assets) and their `SHA256SUMS`, plus the image
-  `ghcr.io/kodflow/forgejo-raft:<version>` (and `:latest`), built with
-  Forgejo's own Dockerfile. The binaries are the ones inside the image.
+- Published as a **prerelease**, image alias `:dev`.
 - **Notes** list the cluster commits since the previous release, upstream
   commits left out.
 - **Upstream syncs and tooling changes release nothing.** A push releases
@@ -642,8 +642,55 @@ Every merge that brings cluster code to the `forgejo` branch is released by
   upstream Forgejo and changes something outside `.github/`,
   `.coderabbit.yaml` and `contrib/cluster-lab/`.
 
+**Official Forgejo releases**, `.github/workflows/upstream-releases.yml`:
+every official release gets its raft release, `vX.Y.Z-raft.N`, the day it is
+announced.
+
+- **Which**: the versions Forgejo declares supported in the TXT record of
+  `release.forgejo.org` (what Forgejo's own update checker reads), that is
+  the newest release of each supported major, LTS included. Checked daily
+  after the upstream sync. No backfill: an older release is built on demand
+  (`tag` input). Release candidates are not built.
+- **How**: the raft delta (what `forgejo` changes relative to the upstream
+  commit it last merged, tooling excluded) is applied onto the official tag
+  by a three-way merge, committed on the branch `release/vX.Y.Z` with the
+  tag as its only parent. Never a merge of `forgejo` into the tag, which
+  would bring upstream's development commits. The run checks it: no commit
+  of upstream's development branch or of `forgejo` after the tag, no file
+  changed outside the delta. When a later patch release conflicts, the
+  branch of the previous one of the same major, already resolved, is
+  carried onto it instead.
+- **Gate**: cluster-checks and the E2E suites on `release/vX.Y.Z`, then a
+  release (not a prerelease), marked Latest and image `:latest` when it is
+  the highest stable raft version.
+- **Blocked**: a conflict or a red check releases nothing and opens the
+  issue `raft release vX.Y.Z blocked`, with the files or the failed jobs
+  and how to fix it on `release/vX.Y.Z`. The next run tests the branch as
+  it stands.
+- **Notes** link the official release notes and summarize the raft delta.
+- **Assets** of both lines: static `forgejo` binaries for linux/amd64 and
+  linux/arm64 (SQLite, embedded assets) and their `SHA256SUMS`, plus the
+  image `ghcr.io/kodflow/forgejo-raft:<version>`, built with Forgejo's own
+  Dockerfile. The binaries are the ones inside the image.
+
 `.github/scripts/release-plan.sh --dry-run` shows, from a local clone, the
-version and notes a push of the current commit would produce.
+version and notes a push of the current commit would produce, and
+`TAG=vX.Y.Z .github/scripts/raft-release-branch.sh --dry-run` what an
+official release would give (clean, carried, or the conflicted files).
+
+### Knowing that a release is out
+
+- **In Forgejo**: the update checker (`[cron.update_checker]`, weekly by
+  default) also reads the raft release index. The admin dashboard then
+  says, next to Forgejo's own notice that an official release is out,
+  either that `forgejo-raft X.Y.Z-raft.N` is available or that the raft
+  build of `X.Y.Z` is not available yet. The index is `releases.json` on
+  the branch `release-index`, rewritten after every release;
+  `RAFT_ENDPOINT` points elsewhere, or is set empty to turn this off.
+- **Feed**: https://github.com/kodflow/forgejo-raft/releases.atom
+- **GitHub**: Watch, Custom, Releases on this repository.
+- **Images**: `ghcr.io/kodflow/forgejo-raft`, tags `vX.Y.Z-raft.N`,
+  `:latest` (highest stable) and `:dev` (development line).
 
 ## Limits and status
 

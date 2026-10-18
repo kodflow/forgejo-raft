@@ -15,6 +15,9 @@
 #   Every checkpoint prints `CHECK <name>: PASS|FAIL`; a FAIL fails the job.
 #   The logs of every container are uploaded when a job fails; the lab is
 #   torn down (`docker compose down -v`) whatever happens.
+#
+# raft-release.yml calls it on a release branch (release/vX.Y.Z, which carries
+# no .github of its own) with `ref`.
 name: E2E
 
 on:
@@ -25,12 +28,18 @@ on:
   schedule:
     - cron: "23 3 * * *"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit or branch to test, default the event's
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: e2e-${{ github.ref }}
+  group: e2e-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -44,6 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       # The Makefile names the build after `git describe`; .dockerignore
@@ -106,6 +116,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -192,6 +203,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2

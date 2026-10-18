@@ -1,0 +1,102 @@
+# A forgejo-raft release for every official Forgejo release.
+#
+# Daily, after Sync upstream: the official releases Forgejo declares
+# supported (the TXT record of release.forgejo.org, the newest release of each
+# supported major, see .github/scripts/upstream-targets.sh) each go through
+# raft-release.yml, one tag at a time: release branch release/vX.Y.Z (the tag
+# plus the raft delta), cluster-checks and E2E on it, then the release
+# vX.Y.Z-raft.N, not a prerelease. A tag already released, or blocked with
+# nothing new since, costs a few seconds. A conflict or a red check opens the
+# issue "raft release vX.Y.Z blocked".
+#
+# On demand: `tag` releases one official release (an older one included),
+# `refresh` rebuilds its existing branch from the current delta (a fix made
+# by hand there is dropped), `force` retries a blocked attempt as it is,
+# `dry_run` builds the branch and decides, pushes and publishes nothing.
+# A pull request that changes this machinery runs it as a dry run.
+#
+# Repository variable RAFT_MAJORS (optional, e.g. "17" or "16 17") limits the
+# daily run to those majors.
+#
+# Tokens: the GITHUB_TOKEN is enough. The release branch is pushed without
+# .github, so no workflows permission is needed, and nothing is left to a
+# push trigger: the checks are called from here.
+name: Upstream releases
+
+on:
+  schedule:
+    - cron: "53 5 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: One official release, vX.Y.Z (default, the supported ones)
+        type: string
+        default: ""
+      dry_run:
+        description: Build the branch and decide, push and publish nothing
+        type: boolean
+        default: false
+      refresh:
+        description: Rebuild an existing release branch from the current delta
+        type: boolean
+        default: false
+      force:
+        description: Retry an attempt already blocked
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - .github/workflows/upstream-releases.yml
+      - .github/workflows/raft-release.yml
+      - .github/workflows/release-publish.yml
+      - .github/scripts/raft-release-branch.sh
+      - .github/scripts/upstream-targets.sh
+      - .github/scripts/release-plan.sh
+
+permissions: {}
+
+concurrency:
+  group: upstream-releases-${{ github.event_name == 'pull_request' && github.ref || 'run' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  targets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tags: ${{ steps.targets.outputs.tags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Official releases to cover
+        id: targets
+        env:
+          TAG: ${{ inputs.tag }}
+          RAFT_MAJORS: ${{ vars.RAFT_MAJORS }}
+        run: .github/scripts/upstream-targets.sh
+
+  release:
+    needs: targets
+    if: ${{ needs.targets.outputs.tags != '[]' && needs.targets.outputs.tags != '' }}
+    strategy:
+      # One at a time: each may run the E2E suites, and the release index
+      # is rewritten after each.
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.targets.outputs.tags) }}
+    permissions:
+      contents: write
+      packages: write
+      issues: write
+    uses: ./.github/workflows/raft-release.yml
+    with:
+      tag: ${{ matrix.tag }}
+      dry_run: ${{ github.event_name == 'pull_request' || inputs.dry_run == true }}
+      refresh: ${{ inputs.refresh == true }}
+      force: ${{ inputs.force == true }}

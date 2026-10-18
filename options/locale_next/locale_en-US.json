@@ -1374,5 +1374,8 @@
 	"admin.cluster.op.deny-pin.warning": "The member's key is withdrawn at once: every node closes its connections and refuses its handshakes. It still counts in the quorum until it is removed, so the failure tolerance drops.",
 	"admin.cluster.op.clear-no-space.warning": "Clear this no-space alarm only once space is back. An alarm raised since is not cleared by this request.",
 	"admin.cluster.op.update-address.warning": "The member's address changes in the replicated membership. Widen the firewall rule to both addresses before, one node at a time.",
+	"admin.dashboard.raft_release_available": "forgejo-raft %[1]s is available, you are running %[3]s. <a target=\"_blank\" rel=\"noreferrer\" href=\"%[2]s\">See the release</a>.",
+	"admin.dashboard.raft_release_pending": "The forgejo-raft build of Forgejo %[1]s is not available yet, you are running %[3]s. It is published once its tests pass: watch <a target=\"_blank\" rel=\"noreferrer\" href=\"%[2]s\">the forgejo-raft releases</a>.",
+	"admin.dashboard.raft_checker_error": "forgejo-raft failed while checking for its own releases. Check <a target=\"_blank\" rel=\"noreferrer\" href=\"%[2]s\">the forgejo-raft releases</a> manually. Error was: %[1]s",
 	"meta.last_line": "Thank you for translating Forgejo! This line isn't seen by the users but it serves other purposes in the translation management. You can place a fun fact in the translation instead of translating it."
 }

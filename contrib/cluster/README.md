@@ -283,6 +283,24 @@ reports nothing.
 The lab proves this against a real Nomad: `make nomad-e2e` in
 `contrib/cluster-lab`.
 
+## Upgrades and release notices
+
+Every official Forgejo release gets a forgejo-raft release built on it,
+`vX.Y.Z-raft.N` (`.github/README.md`, Releases). The admin dashboard tells
+when one is out: next to Forgejo's notice of a new official release, it
+says whether the raft build of that release is available yet. Upgrade to
+the raft build, never to the official binary, which has no cluster mode.
+
+```ini
+[cron.update_checker]
+; default, empty disables the raft check only
+RAFT_ENDPOINT = https://raw.githubusercontent.com/kodflow/forgejo-raft/release-index/releases.json
+```
+
+Outside Forgejo: the feed https://github.com/kodflow/forgejo-raft/releases.atom,
+Watch, Custom, Releases on GitHub, or the tags of
+`ghcr.io/kodflow/forgejo-raft`.
+
 ## Known limits
 
 - A push must reach a majority of the nodes, objects included, within the

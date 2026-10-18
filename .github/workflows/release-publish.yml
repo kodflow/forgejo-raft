@@ -1,0 +1,254 @@
+# Publishes one forgejo-raft release: called by release.yml (the development
+# line, on every cluster change to `forgejo`) and by raft-release.yml (an
+# official Forgejo release plus the raft delta, branch release/vX.Y.Z).
+#
+# Output: forgejo binaries for linux/amd64 and linux/arm64 with SHA256SUMS,
+# and ghcr.io/<owner>/forgejo-raft:<version>, built with Forgejo's own
+# Dockerfile (bindata, timetzdata, sqlite, sqlite_unlock_notify, static). The
+# binaries are the image's /app/gitea/gitea, exported from the same cached
+# build, so release and image hold the same build. The tag is created last: a
+# failed build tags nothing.
+#
+# Prerelease, image aliases, "Latest":
+#   upstream version with a suffix (18.0.0-dev): a GitHub prerelease, image
+#     alias :dev. It was :latest before stable raft releases existed.
+#   stable upstream version (17.0.1): a release; when it is the highest
+#     stable raft version, it is marked Latest and the image gets :latest.
+#     An older line released later (16.0.7-raft.1 after 17.0.1-raft.1) takes
+#     neither.
+#
+# Then the release index (releases.json on the branch release-index) is
+# rewritten from the GitHub releases; raft builds read it to tell their
+# administrators that a raft release is out.
+name: Release publish
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Release tag, v<upstream>-raft.<N>
+        type: string
+        required: true
+      file_version:
+        description: What the Makefile derives once the tag exists
+        type: string
+        required: true
+      upstream_version:
+        type: string
+        required: true
+      sha:
+        description: Commit to release
+        type: string
+        required: true
+      notes:
+        type: string
+        required: true
+      cache_scope:
+        description: Buildx cache scope
+        type: string
+        default: release
+
+permissions: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ inputs.version }}
+      FILE_VERSION: ${{ inputs.file_version }}
+      UPSTREAM_VERSION: ${{ inputs.upstream_version }}
+      SHA: ${{ inputs.sha }}
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      # The checkout has no tags, and without one the Makefile's
+      # `git describe --always` gives a bare commit hash, which Forgejo's
+      # migrations refuse as a malformed version. Local only: never pushed.
+      - name: Release tag, in the runner only
+        run: |
+          set -euo pipefail
+          git tag "$VERSION" HEAD
+          made=$(make -s show-version-full)
+          echo "the Makefile derives $made"
+          if [ "$made" != "$FILE_VERSION" ]; then
+            echo "::error::the Makefile derives $made, not $FILE_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Prerelease, Latest, image tags
+        id: kind
+        run: |
+          set -euo pipefail
+          prerelease=false latest=false
+          tags="$IMAGE:$VERSION"
+          case "$UPSTREAM_VERSION" in
+            *-*)
+              prerelease=true
+              tags="$tags"$'\n'"$IMAGE:dev" ;;
+            *)
+              highest=$( { git ls-remote --tags --refs "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" 'refs/tags/v*-raft.*' |
+                sed 's|.*refs/tags/||'; echo "$VERSION"; } |
+                grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-raft\.[0-9]+$' | sort -V | tail -1)
+              if [ "$highest" = "$VERSION" ]; then
+                latest=true
+                tags="$tags"$'\n'"$IMAGE:latest"
+              fi ;;
+          esac
+          echo "prerelease=$prerelease latest=$latest"
+          {
+            echo "prerelease=$prerelease"
+            echo "latest=$latest"
+            echo "tags<<EOF"
+            echo "$tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: RELEASE_VERSION=${{ inputs.file_version }}
+          push: true
+          tags: ${{ steps.kind.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ inputs.version }}
+            org.opencontainers.image.revision=${{ inputs.sha }}
+            org.opencontainers.image.title=forgejo-raft
+          cache-from: type=gha,scope=${{ inputs.cache_scope }}
+          cache-to: type=gha,scope=${{ inputs.cache_scope }},mode=max
+
+      # The same build again, every layer from the cache the step above just
+      # filled, exported as files instead of pulled back from the registry:
+      # pulling one digest for two platforms into the runner's image store
+      # fails ("cannot overwrite digest"). A multi-platform local export puts
+      # each platform's root filesystem under its own directory.
+      - name: Image filesystems, per platform
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: RELEASE_VERSION=${{ inputs.file_version }}
+          outputs: type=local,dest=${{ runner.temp }}/rootfs
+          cache-from: type=gha,scope=${{ inputs.cache_scope }}
+
+      - name: Binaries from the image
+        env:
+          ROOTFS: ${{ runner.temp }}/rootfs
+        run: |
+          set -euo pipefail
+          mkdir dist
+          for arch in amd64 arm64; do
+            out="dist/forgejo-${VERSION#v}-linux-$arch"
+            install -m 755 "$ROOTFS/linux_$arch/app/gitea/gitea" "$out"
+          done
+          # Both must start and report the version as their own, not only as
+          # the release name. The arm64 one runs through the QEMU set up above.
+          # Bounded: a binary that ignores --version starts the web server and
+          # would otherwise hold the job until its own timeout.
+          for arch in amd64 arm64; do
+            bin="dist/forgejo-${VERSION#v}-linux-$arch"
+            if ! reported=$(timeout 120 "$bin" --version </dev/null); then
+              echo "::error::$arch binary did not answer --version within 120s (or failed)" >&2
+              exit 1
+            fi
+            echo "$arch: $reported"
+            case "$reported" in
+              "forgejo version $FILE_VERSION "*) ;;
+              *) echo "::error::$arch binary reports '$reported', not version $FILE_VERSION" >&2; exit 1 ;;
+            esac
+          done
+          file "dist/forgejo-${VERSION#v}-linux-arm64" | tee /dev/stderr | grep -q 'ARM aarch64'
+          (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ inputs.notes }}
+          PRERELEASE: ${{ steps.kind.outputs.prerelease }}
+          LATEST: ${{ steps.kind.outputs.latest }}
+        run: |
+          set -euo pipefail
+          {
+            printf '%s\n\n' "$NOTES"
+            printf 'Container image: %s%s:%s%s\n' '`' "$IMAGE" "$VERSION" '`'
+          } > "$RUNNER_TEMP/notes.md"
+          kind=(--latest="$LATEST")
+          if [ "$PRERELEASE" = true ]; then kind=(--prerelease --latest=false); fi
+          gh release create "$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "$VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "${kind[@]}"
+
+  index:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    # Two releases finishing together would otherwise race on the branch;
+    # each run rewrites the whole file from the releases, so the last wins
+    # and is right.
+    concurrency:
+      group: release-index
+      cancel-in-progress: false
+    steps:
+      # The workflow's own commit, for the script: a release branch carries
+      # no .github.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Rewrite releases.json on release-index
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          .github/scripts/release-index.sh > "$RUNNER_TEMP/releases.json"
+          jq -c '.releases[] | .version' "$RUNNER_TEMP/releases.json" | head -20
+          dir="$RUNNER_TEMP/index"
+          git init -q "$dir"
+          cd "$dir"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "$GITHUB_SERVER_URL/$REPO.git"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          if git -c http.extraheader="$auth" fetch -q --depth=1 origin release-index; then
+            git checkout -q -B release-index FETCH_HEAD
+          else
+            git checkout -q --orphan release-index
+          fi
+          cp "$RUNNER_TEMP/releases.json" releases.json
+          git add releases.json
+          if git diff --cached --quiet; then
+            echo "releases.json unchanged"
+            exit 0
+          fi
+          git commit -q -m "chore(release): release index"
+          git -c http.extraheader="$auth" push -q origin HEAD:refs/heads/release-index
