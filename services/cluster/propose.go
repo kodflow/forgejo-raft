@@ -117,7 +117,10 @@ var writeLeaderWait = 15 * time.Second
 // that passes may still fail later, at the proposal; this only turns away
 // the pushes that cannot succeed.
 func (r *Replicator) WriteRefusal(ctx context.Context) error {
-	deadline := time.Now().Add(writeLeaderWait)
+	// The last probe ends at the deadline too: a client or a proxy that
+	// gives up first would read a disconnect again.
+	ctx, cancel := context.WithTimeout(ctx, writeLeaderWait)
+	defer cancel()
 	for {
 		eng := r.Engine()
 		if eng == nil || !r.projector.Ready() {
@@ -129,7 +132,7 @@ func (r *Replicator) WriteRefusal(ctx context.Context) error {
 		if probeLeader(ctx, eng) {
 			return nil
 		}
-		if ctx.Err() != nil || !time.Now().Before(deadline) {
+		if ctx.Err() != nil {
 			return errNoLeader
 		}
 		select {

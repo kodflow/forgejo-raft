@@ -516,5 +516,5 @@ func TestWriteRefusalOnceTheMajorityIsLost(t *testing.T) {
 	survivor := tc.nodes[2].r
 	require.Eventually(t, func() bool { return errors.Is(survivor.WriteRefusal(t.Context()), errNoLeader) }, 10*time.Second, 50*time.Millisecond,
 		"the survivor turns the push away")
-	assert.Contains(t, errNoLeader.Error(), "nothing was written")
+	assert.ErrorContains(t, survivor.WriteRefusal(t.Context()), "nothing was written")
 }
