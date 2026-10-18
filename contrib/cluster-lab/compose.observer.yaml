@@ -35,8 +35,9 @@ x-member-env: &member-env
 
 x-pg-archive: &pg-archive
   # The members read the archive as git (gid 1000): the directory is
-  # setgid to that group, and the files group-readable.
-  ARCHIVE_COMMAND: "umask 027 && /usr/local/bin/archive-wal /wal-archive %p %f"
+  # setgid to that group, and each file is made group-readable once archived
+  # (cp keeps pg_wal's owner-only mode, whatever the umask).
+  ARCHIVE_COMMAND: "/usr/local/bin/archive-wal /wal-archive %p %f && chmod 0640 /wal-archive/%f"
 
 services:
   stored-init:
