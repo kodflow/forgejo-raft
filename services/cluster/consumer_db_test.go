@@ -167,7 +167,10 @@ func TestPushWorkRefusesAReusedPusherID(t *testing.T) {
 func TestParkedEventCommitsWithItsCursorAndReconcileAppliesIt(t *testing.T) {
 	require.NoError(t, unittest.PrepareTestDatabase())
 	ctx := db.DefaultContext
-	r := newReplicator(t.TempDir(), newRegistry(0, 1, 1))
+	// Reconcile --apply runs on a node whose table a quorum confirmed.
+	_, reps := NewForTesting(t.TempDir(), "node-a")
+	r := reps[0]
+	require.Eventually(t, func() bool { return r.Engine().Status().Role == consensus.RoleLeader }, 5*time.Second, 10*time.Millisecond)
 	c := newConsumer(r)
 	r.consumer = c
 	tok := consensus.Token{Cluster: consensus.ClusterID{8}, Epoch: 1, Term: 1, Index: 5}
