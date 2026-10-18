@@ -184,6 +184,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
+      # The overlay from the start: PostgreSQL archives its WAL before its
+      # first promotion, so the archive holds every timeline's history.
+      COMPOSE_FILE: ${{ github.workspace }}/contrib/cluster-lab/compose.yaml:${{ github.workspace }}/contrib/cluster-lab/compose.observer.yaml
       FORGEJO_SRC: ${{ github.workspace }}
       FORGEJO_DOCKERFILE: Dockerfile
     steps:
@@ -207,6 +210,7 @@ jobs:
           set -euo pipefail
           scripts/secrets.sh
           mkdir -p .build
+          docker compose --profile observer build observer
           docker compose up -d --no-build --wait --wait-timeout 300 \
             consul-1 consul-2 consul-3 pg-1 pg-2 pg-3 haproxy
           docker compose up -d --no-build forgejo-1 forgejo-2 forgejo-3
