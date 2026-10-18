@@ -87,7 +87,7 @@ func TestWriteVersionIsRaisedByAnAuditRecord(t *testing.T) {
 	require.NoError(t, nt.Restore(bytes.NewReader(buf.Bytes()), consensus.SnapshotMeta{}))
 	assert.Equal(t, uint8(2), nt.WriteVersion())
 
-	var fields map[string]json.RawMessage
+	var fields map[string]any
 	require.NoError(t, json.Unmarshal(buf.Bytes(), &fields))
 	require.Contains(t, fields, "payload")
 	delete(fields, "payload")
