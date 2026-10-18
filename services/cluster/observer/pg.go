@@ -6,6 +6,7 @@ package observer
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"forgejo.org/modules/json"
 )
 
 // PostgreSQL as the observer keeps it: base backups and the WAL archive as
@@ -156,8 +159,12 @@ func (p TimelinePath) contains(tli uint32, l LSN) bool {
 
 // BaseInfo describes a base backup the observer holds.
 type BaseInfo struct {
-	Label    string `json:"label"`
-	Start    string `json:"start"`
+	Label string `json:"label"`
+	Start string `json:"start"`
+	// End is where the backup becomes consistent, from its manifest's
+	// WAL-Ranges: a recovery cannot stop before it. Empty for a backup
+	// taken without a manifest, or ingested before it was read.
+	End      string `json:"end,omitempty"`
 	Timeline uint32 `json:"timeline"`
 	SystemID string `json:"sysid"`
 	Size     int64  `json:"size"`
@@ -212,6 +219,14 @@ func Cover(bases []BaseInfo, sysid string, target LSN, tli uint32, segSize int64
 		start, err := ParseLSN(b.Start)
 		if err != nil || b.SystemID != sysid || start > target || !path.contains(b.Timeline, start) {
 			continue
+		}
+		if b.End != "" {
+			// PostgreSQL refuses to stop a recovery before the backup's
+			// end: a base still being copied at the position does not
+			// restore it, an older one may.
+			if end, err := ParseLSN(b.End); err != nil || end > target {
+				continue
+			}
 		}
 		var segs []string
 		missing := ""
@@ -284,6 +299,16 @@ func ScanBaseTar(r io.Reader) (BaseInfo, error) {
 				return info, err
 			}
 			label = true
+		case "backup_manifest":
+			// pg_basebackup -Ft -D - injects the manifest into the tar; its
+			// WAL-Ranges, at the end, give where the backup is consistent.
+			tail := &tailBuffer{max: 1 << 20}
+			if _, err := io.Copy(tail, tr); err != nil {
+				return info, err
+			}
+			if info.End, err = manifestEnd(tail.b); err != nil {
+				return info, err
+			}
 		case "global/pg_control":
 			var head [8]byte
 			if _, err := io.ReadFull(tr, head[:]); err != nil {
@@ -299,6 +324,54 @@ func ScanBaseTar(r io.Reader) (BaseInfo, error) {
 		return info, errors.New("the base backup has no backup_label or no global/pg_control")
 	}
 	return info, nil
+}
+
+// tailBuffer keeps the last max bytes written to it.
+type tailBuffer struct {
+	b   []byte
+	max int
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.b = append(t.b, p...)
+	if len(t.b) > t.max {
+		t.b = append(t.b[:0], t.b[len(t.b)-t.max:]...)
+	}
+	return len(p), nil
+}
+
+// manifestEnd reads the highest End-LSN of a backup manifest's WAL-Ranges,
+// from the manifest's tail.
+func manifestEnd(tail []byte) (string, error) {
+	_, rest, ok := bytes.CutLast(tail, []byte(`"WAL-Ranges"`))
+	if !ok {
+		return "", errors.New("the backup manifest has no WAL-Ranges")
+	}
+	open := bytes.IndexByte(rest, '[')
+	end := bytes.IndexByte(rest, ']')
+	if open < 0 || end < open {
+		return "", errors.New("the backup manifest's WAL-Ranges is malformed")
+	}
+	var ranges []struct {
+		End string `json:"End-LSN"`
+	}
+	if err := json.Unmarshal(rest[open:end+1], &ranges); err != nil {
+		return "", fmt.Errorf("the backup manifest's WAL-Ranges: %w", err)
+	}
+	var max LSN
+	for _, r := range ranges {
+		l, err := ParseLSN(r.End)
+		if err != nil {
+			return "", fmt.Errorf("the backup manifest's End-LSN: %w", err)
+		}
+		if l > max {
+			max = l
+		}
+	}
+	if len(ranges) == 0 {
+		return "", errors.New("the backup manifest's WAL-Ranges is empty")
+	}
+	return max.String(), nil
 }
 
 func safeTarName(n string) (string, error) {
