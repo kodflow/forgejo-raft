@@ -7,10 +7,12 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	cluster_model "forgejo.org/models/cluster"
 	"forgejo.org/models/db"
 	"forgejo.org/models/unittest"
+	user_model "forgejo.org/models/user"
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/reftable"
 
@@ -95,4 +97,66 @@ func TestPushWorkLeavesPusherlessEventsToTheirRequest(t *testing.T) {
 		Ref: "refs/tags/api-tag", New: "65f1bf27bc3bf70f64657658635e66094edbcb4d",
 	}
 	require.NoError(t, pushWork(db.DefaultContext, []reftable.Event{ev}))
+}
+
+// An event whose repository ID now names another repository is refused:
+// the row it was written for was lost (a failover that dropped PostgreSQL's
+// tail, a recovery to an earlier position) and the sequence reissued its ID.
+// Its branch rows, webhooks and CI used to land on the other repository.
+func TestPushWorkRefusesAReusedRepoID(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ev := reftable.Event{
+		Token: consensus.Token{Index: 9}, Kind: reftable.EventRef, Repo: "alice/lost.git", RepoID: 1, PusherID: 2,
+		Ref: "refs/tags/v1", New: "65f1bf27bc3bf70f64657658635e66094edbcb4d",
+	}
+	err := pushWork(db.DefaultContext, []reftable.Event{ev})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reused")
+}
+
+// A rename after the event leads it to the repository's new key; a rename
+// before it, or none, does not.
+func TestEventLeadsToFollowsLaterRenames(t *testing.T) {
+	marks := map[string]struct {
+		from string
+		idx  uint64
+	}{
+		"bob/c.git":   {"bob/b.git", 20},
+		"bob/b.git":   {"alice/a.git", 10},
+		"carol/x.git": {"carol/y.git", 3},
+		// A rename undone: y -> z at 30, z -> y at 40.
+		"dave/y.git": {"dave/z.git", 40},
+		"dave/z.git": {"dave/y.git", 30},
+	}
+	rf := func(k string) (string, uint64, bool) { m, ok := marks[k]; return m.from, m.idx, ok }
+	at := func(repo string, i uint64) reftable.Event {
+		return reftable.Event{Repo: repo, Token: consensus.Token{Index: i}}
+	}
+	assert.True(t, eventLeadsTo(at("bob/c.git", 25), "bob/c.git", rf))
+	assert.True(t, eventLeadsTo(at("alice/a.git", 5), "bob/c.git", rf))
+	assert.True(t, eventLeadsTo(at("bob/b.git", 15), "bob/c.git", rf))
+	assert.False(t, eventLeadsTo(at("alice/a.git", 15), "bob/c.git", rf), "renamed before the event")
+	assert.False(t, eventLeadsTo(at("carol/y.git", 5), "carol/x.git", rf), "renamed before the event")
+	assert.False(t, eventLeadsTo(at("alice/lost.git", 5), "bob/c.git", rf))
+	assert.False(t, eventLeadsTo(at("alice/a.git", 5), "bob/c.git", nil))
+	assert.False(t, eventLeadsTo(at("dave/q.git", 1), "dave/y.git", rf), "a rename and its undo do not loop")
+}
+
+// A pusher ID that names an account created after the push was reissued:
+// the push is not credited to that account.
+func TestPushWorkRefusesAReusedPusherID(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ctx := db.DefaultContext
+	u := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	ev := reftable.Event{
+		Token: consensus.Token{Index: 9}, Kind: reftable.EventRef, Repo: "user2/repo1.git", RepoID: 1, PusherID: 2,
+		Ref: "refs/tags/v1", New: "65f1bf27bc3bf70f64657658635e66094edbcb4d",
+		Time: time.Unix(int64(u.CreatedUnix), 0).Add(-time.Hour).UnixNano(),
+	}
+	err := pushWork(ctx, []reftable.Event{ev})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "pusher ID 2")
+
+	assert.False(t, pusherReissued(u, reftable.Event{Time: time.Unix(int64(u.CreatedUnix), 0).Add(-time.Minute).UnixNano()}), "within the clock skew")
+	assert.False(t, pusherReissued(u, reftable.Event{Time: time.Unix(int64(u.CreatedUnix), 0).Add(time.Hour).UnixNano()}))
 }

@@ -79,7 +79,9 @@ const (
 
 func newConsumer(r *Replicator) *consumer {
 	return &consumer{
-		r: r, work: pushWork,
+		r: r, work: func(ctx context.Context, evs []reftable.Event) error {
+			return pushWorkWith(ctx, evs, r.table.RenamedFrom)
+		},
 		dbReady: func() bool { return db.DefaultContext != nil },
 		cursor:  cluster_model.GetCursor, advance: cluster_model.AdvanceCursor, tx: db.WithTx,
 		lastAck: map[string]uint64{}, failures: map[uint64]int{},
@@ -353,8 +355,16 @@ func (c *consumer) waitCursor(ctx context.Context, tok consensus.Token) error {
 
 // pushWork is the post-receive work of a group of events of one repository:
 // branch rows, then push actions, webhooks, CI triggers and pull request
-// updates, as the node-local post-receive hook did before the cluster.
+// updates, as the node-local post-receive hook did before the cluster. It
+// knows no rename: the consumer uses pushWorkWith and the table's.
 func pushWork(ctx context.Context, evs []reftable.Event) error {
+	return pushWorkWith(ctx, evs, nil)
+}
+
+// renamedFromFunc is the table's RenamedFrom.
+type renamedFromFunc func(repo string) (from string, index uint64, ok bool)
+
+func pushWorkWith(ctx context.Context, evs []reftable.Event, renamedFrom renamedFromFunc) error {
 	first := evs[0]
 	if first.Kind != reftable.EventRef || first.IsWiki {
 		// Repository deletion and rename change SQL in the request that
@@ -373,6 +383,18 @@ func pushWork(ctx context.Context, evs []reftable.Event) error {
 	repo, err := lookupRepo(ctx, first)
 	if err != nil {
 		return err
+	}
+	if first.RepoID > 0 && !eventLeadsTo(first, clusterhook.RepoKey(repo.OwnerName, repo.Name, first.IsWiki), renamedFrom) {
+		// The event's ID now names another repository: the row it was
+		// written for is gone (a PostgreSQL failover that lost its tail, a
+		// recovery to an earlier position) and the sequence handed its ID
+		// out again. Its branch rows, webhooks and CI must not land there.
+		return fmt.Errorf("repository ID %d is %s/%s, which the event's %s does not lead to: the ID was reused; run `forgejo cluster reconcile`", first.RepoID, repo.OwnerName, repo.Name, first.Repo)
+	}
+	if u, err := user_model.GetUserByID(ctx, first.PusherID); err == nil && pusherReissued(u, first) {
+		// The same loss reissues user IDs: an account created after the
+		// push cannot have made it, and must not be credited with it.
+		return fmt.Errorf("pusher ID %d is %s, created after the push at %d: the ID was reused; run `forgejo cluster reconcile`", first.PusherID, u.Name, first.Token.Index)
 	}
 	var updates []*repo_module.PushUpdateOptions
 	var branches []string
@@ -425,6 +447,38 @@ func pushWork(ctx context.Context, evs []reftable.Event) error {
 		return nil
 	}
 	return repo_service.PushUpdatesNow(clusterhook.WithCommand(ctx, first.Token.String()), updates)
+}
+
+// pusherClockSkew bounds the clock difference between the node that
+// proposed a push and the one that created its pusher's account.
+const pusherClockSkew = 5 * time.Minute
+
+// pusherReissued reports whether u was created after the event, beyond the
+// clock skew between nodes: its ID was handed out again.
+func pusherReissued(u *user_model.User, ev reftable.Event) bool {
+	if ev.Time <= 0 || u.CreatedUnix <= 0 {
+		return false
+	}
+	return time.Unix(int64(u.CreatedUnix), 0).After(time.Unix(0, ev.Time).Add(pusherClockSkew))
+}
+
+// eventLeadsTo reports whether the repository an event was written for is
+// the one now keyed key: the same key, or a key it was renamed to after the
+// event, following the table's renames backwards. Each step must go back
+// in the log, so a rename and its undo cannot loop.
+func eventLeadsTo(ev reftable.Event, key string, renamedFrom renamedFromFunc) bool {
+	at := uint64(1<<64 - 1)
+	for key != ev.Repo {
+		if renamedFrom == nil {
+			return false
+		}
+		from, idx, ok := renamedFrom(key)
+		if !ok || idx <= ev.Token.Index || idx >= at {
+			return false
+		}
+		key, at = from, idx
+	}
+	return true
 }
 
 func lookupRepo(ctx context.Context, ev reftable.Event) (*repo_model.Repository, error) {

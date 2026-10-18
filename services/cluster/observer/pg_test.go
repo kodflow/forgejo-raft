@@ -100,3 +100,55 @@ func TestScanBaseTarRefusesWhatARestoreWouldNotExtract(t *testing.T) {
 	_, err = ScanBaseTar(bytes.NewReader(tarOf(t, ok[0])))
 	require.ErrorContains(t, err, "pg_control")
 }
+
+// A base backup still being copied at the position does not restore it:
+// PostgreSQL refuses to stop before the backup's end. The coverage falls
+// back to an older base that ends before the position.
+func TestCoverSkipsABaseThatEndsPastThePosition(t *testing.T) {
+	const seg = 16 << 20
+	have := func(string) bool { return true }
+	bases := []BaseInfo{
+		{Label: "old", Start: "0/2000028", End: "0/2000100", Timeline: 1, SystemID: "42"},
+		{Label: "new", Start: "0/5000028", End: "0/8000100", Timeline: 1, SystemID: "42"},
+	}
+	cov, err := Cover(bases, "42", LSN(6*seg), 1, seg, have, nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "old", cov.Base.Label)
+
+	// Past its end, the newest base covers.
+	cov, err = Cover(bases, "42", LSN(9*seg), 1, seg, have, nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "new", cov.Base.Label)
+
+	// Alone, it covers nothing before its end.
+	_, err = Cover(bases[1:], "42", LSN(6*seg), 1, seg, have, nil, nil)
+	require.ErrorIs(t, err, ErrNoCoverage)
+}
+
+// The backup's end is read from the manifest pg_basebackup injects into
+// the tar it writes on stdout.
+func TestScanBaseTarReadsTheManifestEnd(t *testing.T) {
+	manifest := `{ "PostgreSQL-Backup-Manifest-Version": 1,
+"Files": [ { "Path": "backup_label", "Size": 225 } ],
+"WAL-Ranges": [
+{ "Timeline": 1, "Start-LSN": "0/2000028", "End-LSN": "0/2000100" },
+{ "Timeline": 2, "Start-LSN": "0/2000100", "End-LSN": "0/3000138" }
+],
+"Manifest-Checksum": "00" }
+`
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, f := range []struct{ name, body string }{
+		{"backup_label", "START WAL LOCATION: 0/2000028 (file 000000010000000000000002)\nSTART TIMELINE: 1\n"},
+		{"global/pg_control", strings.Repeat("x", 16)},
+		{"backup_manifest", manifest},
+	} {
+		require.NoError(t, tw.WriteHeader(&tar.Header{Name: f.name, Typeflag: tar.TypeReg, Mode: 0o600, Size: int64(len(f.body))}))
+		_, err := tw.Write([]byte(f.body))
+		require.NoError(t, err)
+	}
+	require.NoError(t, tw.Close())
+	info, err := ScanBaseTar(&buf)
+	require.NoError(t, err)
+	assert.Equal(t, "0/3000138", info.End)
+}
