@@ -470,6 +470,16 @@ func validateCluster() error {
 	if len(Cluster.Witnesses) != len(Cluster.WitnessKeys) {
 		errs = append(errs, errors.New("WITNESSES and WITNESS_KEYS must pair one key with each witness"))
 	}
+	seenWitnessKeys := map[string]bool{}
+	for _, k := range Cluster.WitnessKeys {
+		// Each witness signs its own fence receipts: one key listed twice
+		// would count one witness for two.
+		k = strings.ToLower(strings.TrimSpace(k))
+		if seenWitnessKeys[k] {
+			errs = append(errs, fmt.Errorf("WITNESS_KEYS lists the key %s twice: each witness has its own", k))
+		}
+		seenWitnessKeys[k] = true
+	}
 	if Cluster.RenewVaultAddr != "" && Cluster.RenewVaultTokenFile == "" && Cluster.RenewVaultJWTFile == "" {
 		errs = append(errs, errors.New("RENEW_VAULT_JWT_FILE or RENEW_VAULT_TOKEN_FILE is required with RENEW_VAULT_ADDR"))
 	}

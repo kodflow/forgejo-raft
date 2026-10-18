@@ -227,10 +227,14 @@ func syncGitConfig() (err error) {
 	}
 
 	// In a cluster the projector owns garbage collection: no git process
-	// may prune behind its back (kitsunium ADR 0152 D19).
+	// may prune behind its back (kitsunium ADR 0152 D19). And an object
+	// counts toward the majority that holds it as soon as git wrote it, so
+	// loose objects are synced too: git's default, committed,-loose-object,
+	// leaves the objects of a small push in the page cache, where a power
+	// loss on the node that took the push takes them with it.
 	// The global config persists in HomeDir(): once the cluster is off,
 	// these values are removed again, unless [git.config] sets the key.
-	for _, kv := range [][2]string{{"gc.auto", "0"}, {"maintenance.auto", "false"}, {"receive.autogc", "false"}} {
+	for _, kv := range [][2]string{{"gc.auto", "0"}, {"maintenance.auto", "false"}, {"receive.autogc", "false"}, {"core.fsync", "committed"}} {
 		if setting.Cluster.Enabled {
 			if err := configSet(kv[0], kv[1]); err != nil {
 				return err

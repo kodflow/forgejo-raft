@@ -45,6 +45,43 @@ func ParseWitnesses(urls, keys []string) ([]Witness, error) {
 	return out, nil
 }
 
+// RecoverKeys parses the witness keys a Recover requires a receipt from,
+// for every old voter it fences (R9-09). They are two at least and all
+// different: one key given twice would pass for both witnesses while the
+// other one, never told of the fence, answers "clear" when a fenced voter
+// boots. When the nodes are configured with witnesses ([cluster]
+// WITNESS_KEYS), every one of them must be among the keys: a node asks
+// them all at boot, and a single "clear" lets it start.
+func RecoverKeys(given, configured []string) ([]ed25519.PublicKey, error) {
+	var out []ed25519.PublicKey
+	seen := map[string]bool{}
+	for _, k := range given {
+		pub, err := ParsePublicKey(k)
+		if err != nil {
+			return nil, err
+		}
+		h := hex.EncodeToString(pub)
+		if seen[h] {
+			return nil, fmt.Errorf("witness key %s is given twice: each witness signs its own receipt", h)
+		}
+		seen[h] = true
+		out = append(out, pub)
+	}
+	if len(out) < 2 {
+		return nil, errors.New("Recover needs the keys of both witnesses (--witness-key twice, or [cluster] WITNESS_KEYS)")
+	}
+	for _, k := range configured {
+		pub, err := ParsePublicKey(k)
+		if err != nil {
+			return nil, err
+		}
+		if h := hex.EncodeToString(pub); !seen[h] {
+			return nil, fmt.Errorf("witness key %s is configured in [cluster] WITNESS_KEYS but not given: the nodes ask it at boot, so it must sign the fence too", h)
+		}
+	}
+	return out, nil
+}
+
 // ParsePublicKey reads a hex Ed25519 public key.
 func ParsePublicKey(s string) (ed25519.PublicKey, error) {
 	b, err := hex.DecodeString(strings.TrimSpace(s))

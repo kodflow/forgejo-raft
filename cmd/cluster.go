@@ -343,19 +343,15 @@ func runClusterRecover(ctx context.Context, c *cli.Command) error {
 	if len(keys) == 0 {
 		keys = setting.Cluster.WitnessKeys
 	}
-	var pubs []ed25519.PublicKey
-	for _, k := range keys {
-		pub, err := witness.ParsePublicKey(k)
-		if err != nil {
-			return fmt.Errorf("--witness-key: %w", err)
-		}
-		pubs = append(pubs, pub)
-		opt.WitnessKeys = append(opt.WitnessKeys, pub)
-	}
 	// Both witnesses must have recorded the fence before the survivor
-	// serves (R9-09): a receipt from every key, for every old voter.
-	if len(pubs) < 2 {
-		return errors.New("Recover needs the keys of both witnesses (--witness-key twice, or [cluster] WITNESS_KEYS)")
+	// serves (R9-09): a receipt from every key, for every old voter, and
+	// every key the nodes ask at boot among them.
+	pubs, err := witness.RecoverKeys(keys, setting.Cluster.WitnessKeys)
+	if err != nil {
+		return fmt.Errorf("RECOVER_REFUSED: %w", err)
+	}
+	for _, pub := range pubs {
+		opt.WitnessKeys = append(opt.WitnessKeys, pub)
 	}
 	if err := witness.VerifyReceipts(pubs, old, cid, opt.Fenced); err != nil {
 		return fmt.Errorf("RECOVER_REFUSED: %w", err)

@@ -27,7 +27,13 @@ func (r *Replicator) prepared(ctx context.Context, req *clusterhook.Request) *cl
 	if err != nil {
 		return fail(err)
 	}
-	tx, refs := r.buildTxn(ctx, repo, req)
+	if err := r.pushTargetGone(repo, req); err != nil {
+		return fail(err)
+	}
+	tx, refs, err := r.buildTxn(ctx, repo, req)
+	if err != nil {
+		return fail(err)
+	}
 	if len(tx.Updates) == 0 {
 		// Only pseudo-refs outside refs/, which the table does not hold.
 		return &clusterhook.Response{OK: true}
@@ -46,9 +52,50 @@ func (r *Replicator) prepared(ctx context.Context, req *clusterhook.Request) *cl
 	return resp
 }
 
+// pushTargetGone refuses a push into a key the table deleted or renamed
+// away: a push still running when the repository was deleted or renamed on
+// another node. Its new branch would bring the key back to life under a
+// name the database no longer has, reported a success and then lost, its
+// objects moved or removed with the directory. Forgejo creating a
+// repository again under a freed name is no push: `git init` writes HEAD
+// without a pusher, which revives the key. A deletion or rename this node
+// has not applied yet is not seen here; this closes the window down to the
+// proposal's own latency.
+func (r *Replicator) pushTargetGone(repo string, req *clusterhook.Request) error {
+	if req.PusherID == 0 {
+		return nil
+	}
+	if _, deleted := r.table.Deleted(repo); deleted {
+		return fmt.Errorf("the repository %s was deleted in the cluster; nothing was written", repo)
+	}
+	if to, moved := r.table.MovedAway(repo); moved {
+		return fmt.Errorf("the repository %s was renamed to %s in the cluster: push there; nothing was written", repo, to)
+	}
+	return nil
+}
+
+// errStaleCreate refuses a push that creates a ref the table already holds:
+// git on this node had not projected it yet, and the cluster must not take
+// a creation for an overwrite.
+type errStaleCreate struct{ ref string }
+
+func (e errStaleCreate) Error() string {
+	return fmt.Sprintf("%s already exists in the cluster, this node had not shown it yet: fetch, then push again; nothing was written", e.ref)
+}
+
 // buildTxn turns the hook's lines into a proposal, reading each ref's
 // revision from the table.
-func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook.Request) (*reftable.RefTxn, []string) {
+//
+// A push (a pusher is named) that creates a ref gives git a zero old value,
+// which receive-pack reads as "must not exist" and checks against THIS
+// node's git only. When the table already holds a live value, git was
+// behind the table: proposing with the table's revision would overwrite a
+// branch the pusher never saw, a non-fast-forward no one forced. Such a
+// line is refused. The revision read here is the one Apply checks, so a
+// ref that becomes live after this check is refused by Apply instead.
+// Forgejo's own updates without an old value (update-ref, a forced
+// rewrite) carry no pusher and keep their meaning.
+func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook.Request) (*reftable.RefTxn, []string, error) {
 	tx := &reftable.RefTxn{
 		Repo: repo, RepoID: req.RepoID, PusherID: req.PusherID, Time: time.Now().UnixNano(),
 		Nonce: req.Nonce, Trigger: req.Trigger, PRID: req.PRID, IsWiki: req.IsWiki, PushOptions: req.PushOptions,
@@ -74,6 +121,9 @@ func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook
 			u.Old = l.Old
 		}
 		if v, ok := r.table.Get(repo, l.Ref); ok {
+			if req.PusherID != 0 && reftable.IsZeroSHA(l.Old) && !u.Delete && v.Live() {
+				return nil, nil, errStaleCreate{ref: l.Ref}
+			}
 			u.ExpectRev = v.Rev
 		}
 		tx.Updates = append(tx.Updates, u)
@@ -95,7 +145,7 @@ func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook
 			tx.Format = "sha256"
 		}
 	}
-	return tx, refs
+	return tx, refs, nil
 }
 
 // errNoLeader is what a push reads on a node whose cluster cannot commit:
@@ -129,16 +179,21 @@ func (r *Replicator) WriteRefusal(ctx context.Context) error {
 		if h := eng.Health(); h.Stopped {
 			return fmt.Errorf("this node of the cluster stopped (%s); nothing was written", h.StopReason)
 		}
-		if probeLeader(ctx, eng) {
+		forming := formingRefusal(r.auto, eng.Membership())
+		if forming == nil && probeLeader(ctx, eng) {
 			return nil
 		}
-		if ctx.Err() != nil {
-			return errNoLeader
+		if ctx.Err() == nil {
+			select {
+			case <-ctx.Done():
+			case <-time.After(100 * time.Millisecond):
+			}
 		}
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
+			if forming != nil {
+				return forming
+			}
 			return errNoLeader
-		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
@@ -169,6 +224,9 @@ func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.
 	if err := r.writerGate(eng); err != nil {
 		return fail(err)
 	}
+	if err := r.waitFormed(ctx, eng); err != nil {
+		return fail(err)
+	}
 
 	// Objects before refs: written and synced on a majority first.
 	var wants, haves []string
@@ -197,6 +255,25 @@ func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.
 		return fail(err)
 	}
 	return r.proposeWithRetry(ctx, repo, req.Nonce, tx, data)
+}
+
+// waitFormed waits, within writeLeaderWait, until the autonomous cluster
+// has three voters (formingRefusal): the autopilot promotes the members
+// that joined within seconds of the formation.
+func (r *Replicator) waitFormed(ctx context.Context, eng consensus.Engine) error {
+	ctx, cancel := context.WithTimeout(ctx, writeLeaderWait)
+	defer cancel()
+	for {
+		err := formingRefusal(r.auto, eng.Membership())
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // retryDelay paces the retries of a proposal while a leader is elected.

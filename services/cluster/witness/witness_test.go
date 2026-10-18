@@ -6,12 +6,14 @@ package witness
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"forgejo.org/services/cluster/consensus"
@@ -177,4 +179,32 @@ func TestStatusRefusesANonceWithControlBytes(t *testing.T) {
 		resp.Body.Close()
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "%q", nonce)
 	}
+}
+
+// Recover takes the witness keys whose receipts it requires: two at least,
+// all different, and every key the nodes are configured to ask at boot.
+// One key given twice would pass for "both witnesses" while the other
+// witness, never told of the fence, answers "clear" to a fenced voter.
+func TestRecoverKeysCoverEveryConfiguredWitness(t *testing.T) {
+	k := func() string {
+		pub, _, err := ed25519.GenerateKey(rand.Reader)
+		require.NoError(t, err)
+		return hex.EncodeToString(pub)
+	}
+	a, b, c := k(), k(), k()
+
+	got, err := RecoverKeys([]string{a, b}, nil)
+	require.NoError(t, err)
+	assert.Len(t, got, 2)
+	_, err = RecoverKeys([]string{a, b}, []string{b, a})
+	require.NoError(t, err)
+
+	_, err = RecoverKeys([]string{a}, nil)
+	require.ErrorContains(t, err, "both witnesses")
+	_, err = RecoverKeys([]string{a, strings.ToUpper(a)}, nil)
+	require.ErrorContains(t, err, "twice")
+	_, err = RecoverKeys([]string{a, b}, []string{a, b, c})
+	require.ErrorContains(t, err, c)
+	_, err = RecoverKeys([]string{a, "zz"}, nil)
+	require.Error(t, err)
 }

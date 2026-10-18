@@ -7,11 +7,13 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"forgejo.org/models/db"
 	"forgejo.org/models/unittest"
 	"forgejo.org/modules/setting"
 	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/consensus/memraft"
 	"forgejo.org/services/cluster/reftable"
 
 	"github.com/stretchr/testify/assert"
@@ -57,4 +59,24 @@ func TestReconcileClassifiesRows(t *testing.T) {
 		assert.False(t, m.Regenerable)
 		assert.Equal(t, ActionReleaseNoTag, m.Action)
 	}
+}
+
+// Reconcile with apply rebuilds SQL rows from this node's table: a table
+// that lags the cluster would bring back a branch the cluster deleted. The
+// apply runs only once a commit boundary a quorum confirmed is applied
+// here; a node that cannot confirm one changes nothing.
+func TestReconcileApplyNeedsAConfirmedTable(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	mem, rs := NewForTesting(setting.RepoRootPath, "node-a", "node-b", "node-c")
+	r := rs[0]
+	for _, other := range rs[1:] {
+		mem.SetDown(other.Engine().(*memraft.Node), true)
+	}
+	ctx, cancel := context.WithTimeout(db.DefaultContext, time.Second)
+	defer cancel()
+	_, err := r.Reconcile(ctx, true)
+	require.Error(t, err)
+
+	_, err = r.Reconcile(db.DefaultContext, false)
+	require.NoError(t, err, "a dry run reads the local table as it is")
 }
