@@ -15,11 +15,18 @@ dco() {
     --profile observer --profile recover "$@"
 }
 
-# The observer's sockets in LISTEN state (0A), TCP and UDP bound alike,
-# from /proc: the image needs no ss or netstat for it.
+# The LISTEN sockets the observer's own process holds: the inodes of the
+# LISTEN entries of /proc/net/tcp{,6} that are among its file descriptors.
+# Other listeners of the container's network namespace, such as Docker's
+# embedded DNS on 127.0.0.11, are not the observer's.
 listening() {
-  dco exec -T observer sh -c 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null' |
-    awk 'NR > 1 && $4 == "0A" { print $2 }' | grep -v '^local_address' || true
+  # shellcheck disable=SC2016 # expanded inside the container
+  dco exec -T -u 0 observer sh -c '
+    pid="$(pgrep -f "[g]itea cluster observe" | head -n 1)"
+    [ -n "$pid" ] || exit 0
+    for ino in $(cat /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null | awk "NR > 1 && (\$4 == \"0A\" || \$4 == \"07\") { print \$10 }"); do
+      ls -l "/proc/$pid/fd" 2>/dev/null | grep -q "socket:\[$ino\]" && echo "socket inode $ino"
+    done' || true
 }
 watch_ports() {
   local i seen=0
@@ -68,7 +75,7 @@ step D.old-tokens-revoked 'old access tokens are revoked'
 samples="$(sed -n 's/^samples //p' "$PORTS")"
 bound="$(grep -v '^samples' "$PORTS" | sort -u | tr '\n' ' ')"
 if [ "${samples:-0}" -gt 0 ] && [ -z "$bound" ]; then
-  pass D.observer-opens-no-listening-port "$samples samples of /proc/net/tcp{,6} in the observer: no LISTEN socket"
+  pass D.observer-opens-no-listening-port "$samples samples: no listening TCP or bound UDP socket held by the observer process"
 else
   flunk D.observer-opens-no-listening-port "${bound:-the observer was never seen running}"
 fi
