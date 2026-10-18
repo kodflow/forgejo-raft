@@ -30,10 +30,15 @@ dco() {
     --profile observer --profile recover "$@"
 }
 # client <script>: git, git-lfs and python3 in a one-off container on the lab
-# network, the scratch directory mounted on /work.
+# network, the scratch directory mounted on /work. Plain docker run: a
+# compose run of observer would claim the observer's fixed address, which
+# the running observer holds.
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-client() { dco run --rm --no-deps -T -u 0 -v "$WORK:/work" --entrypoint /bin/sh observer -c "$1"; }
+client() {
+  docker run --rm -i -u 0 --network "${COMPOSE_PROJECT_NAME}_lab" -v "$WORK:/work" \
+    --entrypoint /bin/sh forgejo-cluster-lab/forgejo:observer -c "$1"
+}
 # member <n> <cmd...>: a command as git on a running member.
 member() { local n="$1"; shift; dco exec -T -u git "forgejo-$n" /usr/local/bin/gitea "$@"; }
 # observer_list: the observer's checkpoints, read-only, as JSON.
