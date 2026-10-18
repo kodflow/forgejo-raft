@@ -81,3 +81,60 @@ func TestRenameWaitsForATransactionInFlightOnTheOldKey(t *testing.T) {
 	_, err := os.Stat(oldDir)
 	assert.True(t, os.IsNotExist(err))
 }
+
+// A push still running on one node when the repository is deleted or renamed
+// on another: its new branch must not bring the old key back to life in the
+// table, under a name the database no longer has, where its push would be
+// reported a success and then be lost.
+func TestPushToADeletedOrRenamedKeyIsRefused(t *testing.T) {
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	c1 := commit(t, work, "one")
+	c2 := commit(t, work, "two")
+	zero := strings.Repeat("0", 40)
+	ctx := context.Background()
+	origin, other := tc.nodes[0], tc.nodes[2]
+
+	require.True(t, tc.pushVia(origin, work, "p/del.git", "refs/heads/main", zero, c1).OK)
+	require.True(t, tc.pushVia(origin, work, "p/old.git", "refs/heads/main", zero, c1).OK)
+	for _, n := range tc.nodes {
+		require.Eventually(t, func() bool {
+			return gitRef(t, n, "p/del.git", "refs/heads/main") == c1 && gitRef(t, n, "p/old.git", "refs/heads/main") == c1
+		}, 10*time.Second, 20*time.Millisecond)
+	}
+
+	require.NoError(t, os.RemoveAll(filepath.Join(origin.r.root, "p", "del.git")))
+	require.NoError(t, origin.r.proposeRepoDelete(ctx, "p/del.git", 1))
+	require.NoError(t, os.Rename(filepath.Join(origin.r.root, "p", "old.git"), filepath.Join(origin.r.root, "p", "new.git")))
+	require.NoError(t, origin.r.proposeRepoRename(ctx, "p/old.git", "p/new.git"))
+	require.Eventually(t, func() bool {
+		_, deleted := other.r.table.Deleted("p/del.git")
+		_, _, renamed := other.r.table.RenamedFrom("p/new.git")
+		return deleted && renamed
+	}, 10*time.Second, 10*time.Millisecond)
+	for _, repo := range []string{"del.git", "old.git"} {
+		require.Eventually(t, func() bool {
+			_, err := os.Stat(filepath.Join(other.r.root, "p", repo))
+			return os.IsNotExist(err)
+		}, 10*time.Second, 10*time.Millisecond, repo)
+	}
+
+	for _, repo := range []string{"p/del.git", "p/old.git"} {
+		resp := tc.pushVia(other, work, repo, "refs/heads/late", zero, c2)
+		assert.False(t, resp.OK, repo)
+		_, ok := other.r.table.Get(repo, "refs/heads/late")
+		assert.False(t, ok, repo)
+	}
+	_, deleted := other.r.table.Deleted("p/del.git")
+	assert.True(t, deleted, "the deleted key stays deleted")
+
+	// Forgejo creating a repository again under a freed name is no push:
+	// its HEAD is written, and the name lives again.
+	dir := filepath.Join(other.r.root, "p", "del.git")
+	resp := other.r.Handle(ctx, &clusterhook.Request{
+		Op: clusterhook.OpPrepared, Nonce: clusterhook.NewNonce(), GitDir: dir,
+		Lines: []clusterhook.Line{{Old: zero, New: "ref:refs/heads/main", Ref: "HEAD"}},
+	})
+	require.True(t, resp.OK, resp.Message)
+}

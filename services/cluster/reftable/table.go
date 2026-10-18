@@ -626,6 +626,28 @@ func (t *Table) RenamedFrom(repo string) (string, uint64, bool) {
 	return m.From, m.Index, ok
 }
 
+// MovedAway reports where a rename moved repo's refs, when it did and no
+// live ref was written under repo since: the key is free, and only a new
+// repository may take it again. The newest rename wins.
+func (t *Table) MovedAway(repo string) (string, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if r := t.repos[repo]; r != nil {
+		for _, v := range r.refs {
+			if v.Live() {
+				return "", false
+			}
+		}
+	}
+	to, at, found := "", uint64(0), false
+	for k, m := range t.renamed {
+		if m.From == repo && (!found || m.Index > at || m.Index == at && k < to) {
+			to, at, found = k, m.Index, true
+		}
+	}
+	return to, found
+}
+
 // Events returns the pending events, in log order.
 func (t *Table) Events() []Event {
 	t.mu.RLock()

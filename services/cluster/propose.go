@@ -27,6 +27,9 @@ func (r *Replicator) prepared(ctx context.Context, req *clusterhook.Request) *cl
 	if err != nil {
 		return fail(err)
 	}
+	if err := r.pushTargetGone(repo, req); err != nil {
+		return fail(err)
+	}
 	tx, refs, err := r.buildTxn(ctx, repo, req)
 	if err != nil {
 		return fail(err)
@@ -47,6 +50,28 @@ func (r *Replicator) prepared(ctx context.Context, req *clusterhook.Request) *cl
 		r.registry.release(req.Nonce)
 	}
 	return resp
+}
+
+// pushTargetGone refuses a push into a key the table deleted or renamed
+// away: a push still running when the repository was deleted or renamed on
+// another node. Its new branch would bring the key back to life under a
+// name the database no longer has, reported a success and then lost, its
+// objects moved or removed with the directory. Forgejo creating a
+// repository again under a freed name is no push: `git init` writes HEAD
+// without a pusher, which revives the key. A deletion or rename this node
+// has not applied yet is not seen here; this closes the window down to the
+// proposal's own latency.
+func (r *Replicator) pushTargetGone(repo string, req *clusterhook.Request) error {
+	if req.PusherID == 0 {
+		return nil
+	}
+	if _, deleted := r.table.Deleted(repo); deleted {
+		return fmt.Errorf("the repository %s was deleted in the cluster; nothing was written", repo)
+	}
+	if to, moved := r.table.MovedAway(repo); moved {
+		return fmt.Errorf("the repository %s was renamed to %s in the cluster: push there; nothing was written", repo, to)
+	}
+	return nil
 }
 
 // errStaleCreate refuses a push that creates a ref the table already holds:
