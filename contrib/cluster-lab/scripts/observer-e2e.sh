@@ -217,8 +217,11 @@ RECOVER=(cluster recover --from-observer "$CLEAN" --new-cluster "$NEW" --observe
   --secrets-key /keys/secrets.key --new-observer-recipient "$NEW_RECIPIENT" --out /data/recover
   --pgdata /data/pg --pg-socket-dir /data/pgsock --pg-hba-file /data/lab-hba.conf --wal-archive-dir /data/wal-archive)
 rexec cluster observe list --dir "/snapshots/$CLEAN" >"$WORK/list.txt" 2>&1 || true
-grep -q "^$CLEAN .*PROTECTED.*yes" "$WORK/list.txt" || fail "$CLEAN does not restore from its snapshot: $(cat "$WORK/list.txt")"
-ok "$CLEAN listed PROTECTED and restorable from its snapshot"
+# In its own snapshot a checkpoint reads VERIFIED: the hook takes the
+# snapshot, then the observer writes the PROTECTED record (the live
+# directory said PROTECTED in step 2). What matters here is that it restores.
+grep -Eq "^$CLEAN .*(VERIFIED|PROTECTED).* yes\$" "$WORK/list.txt" || fail "$CLEAN does not restore from its snapshot: $(cat "$WORK/list.txt")"
+ok "$CLEAN listed and restorable from its snapshot"
 
 # Run 1 stops for the rotation: nothing restored yet.
 if rexec "${RECOVER[@]}" >"$WORK/run1.txt" 2>&1; then fail "the recovery did not stop for the rotation"; fi

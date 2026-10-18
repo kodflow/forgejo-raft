@@ -250,7 +250,9 @@ A human act, on a new node, every member of the old cluster off:
 
 1. Choose the checkpoint: `forgejo cluster observe list --dir <snapshot>`
    lists them, newest first, with their age, their state and whether they
-   restore from that directory. Mount the chosen snapshot read-only.
+   restore from that directory. In its own snapshot a checkpoint reads
+   VERIFIED, not PROTECTED: the hook takes the snapshot, and the PROTECTED
+   record is written once it exists. Mount the chosen snapshot read-only.
 2. Make the observers' new keys (`observe keygen`): every key the old
    cluster saw is rotated.
 3. On the new node, Forgejo stopped, its certificate issued for a new cluster
