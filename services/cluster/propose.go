@@ -27,7 +27,10 @@ func (r *Replicator) prepared(ctx context.Context, req *clusterhook.Request) *cl
 	if err != nil {
 		return fail(err)
 	}
-	tx, refs := r.buildTxn(ctx, repo, req)
+	tx, refs, err := r.buildTxn(ctx, repo, req)
+	if err != nil {
+		return fail(err)
+	}
 	if len(tx.Updates) == 0 {
 		// Only pseudo-refs outside refs/, which the table does not hold.
 		return &clusterhook.Response{OK: true}
@@ -46,9 +49,28 @@ func (r *Replicator) prepared(ctx context.Context, req *clusterhook.Request) *cl
 	return resp
 }
 
+// errStaleCreate refuses a push that creates a ref the table already holds:
+// git on this node had not projected it yet, and the cluster must not take
+// a creation for an overwrite.
+type errStaleCreate struct{ ref string }
+
+func (e errStaleCreate) Error() string {
+	return fmt.Sprintf("%s already exists in the cluster, this node had not shown it yet: fetch, then push again; nothing was written", e.ref)
+}
+
 // buildTxn turns the hook's lines into a proposal, reading each ref's
 // revision from the table.
-func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook.Request) (*reftable.RefTxn, []string) {
+//
+// A push (a pusher is named) that creates a ref gives git a zero old value,
+// which receive-pack reads as "must not exist" and checks against THIS
+// node's git only. When the table already holds a live value, git was
+// behind the table: proposing with the table's revision would overwrite a
+// branch the pusher never saw, a non-fast-forward no one forced. Such a
+// line is refused. The revision read here is the one Apply checks, so a
+// ref that becomes live after this check is refused by Apply instead.
+// Forgejo's own updates without an old value (update-ref, a forced
+// rewrite) carry no pusher and keep their meaning.
+func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook.Request) (*reftable.RefTxn, []string, error) {
 	tx := &reftable.RefTxn{
 		Repo: repo, RepoID: req.RepoID, PusherID: req.PusherID, Time: time.Now().UnixNano(),
 		Nonce: req.Nonce, Trigger: req.Trigger, PRID: req.PRID, IsWiki: req.IsWiki, PushOptions: req.PushOptions,
@@ -74,6 +96,9 @@ func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook
 			u.Old = l.Old
 		}
 		if v, ok := r.table.Get(repo, l.Ref); ok {
+			if req.PusherID != 0 && reftable.IsZeroSHA(l.Old) && !u.Delete && v.Live() {
+				return nil, nil, errStaleCreate{ref: l.Ref}
+			}
 			u.ExpectRev = v.Rev
 		}
 		tx.Updates = append(tx.Updates, u)
@@ -95,7 +120,7 @@ func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook
 			tx.Format = "sha256"
 		}
 	}
-	return tx, refs
+	return tx, refs, nil
 }
 
 // errNoLeader is what a push reads on a node whose cluster cannot commit:
