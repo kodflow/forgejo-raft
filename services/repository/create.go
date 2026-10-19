@@ -15,6 +15,7 @@ import (
 	"forgejo.org/models/db"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/log"
@@ -243,6 +244,9 @@ func CreateRepositoryDirectly(ctx context.Context, doer, u *user_model.User, opt
 	}
 
 	var rollbackRepo *repo_model.Repository
+	// initialized is set once git may have written the repository: a
+	// failed creation then removes it, from the cluster's table too.
+	initialized := false
 
 	if err := db.WithTx(ctx, func(ctx context.Context) error {
 		if err := repo_module.CreateRepositoryByExample(ctx, doer, u, repo, false, false); err != nil {
@@ -275,13 +279,8 @@ func CreateRepositoryDirectly(ctx context.Context, doer, u *user_model.User, opt
 			}
 		}
 
+		initialized = true
 		if err = initRepository(ctx, repoPath, doer, repo, opts); err != nil {
-			if err2 := util.RemoveAll(repoPath); err2 != nil {
-				log.Error("initRepository: %v", err)
-				return fmt.Errorf(
-					"delete repo directory %s/%s failed(2): %v", u.Name, repo.Name, err2,
-				)
-			}
 			return fmt.Errorf("initRepository: %w", err)
 		}
 
@@ -313,9 +312,32 @@ func CreateRepositoryDirectly(ctx context.Context, doer, u *user_model.User, opt
 				log.Error("Rollback deleteRepository: %v", errDelete)
 			}
 		}
+		if initialized {
+			if errDelete := removeAbandonedRepo(ctx, u.Name, repo.Name); errDelete != nil {
+				log.Error("CreateRepository: %v", errDelete)
+				return nil, fmt.Errorf("%w; and the repository's files were not removed: %v", err, errDelete)
+			}
+		}
 
 		return nil, err
 	}
 
 	return repo, nil
+}
+
+// removeAbandonedRepo removes the files of a repository whose creation
+// failed, its rows rolled back. In a cluster, `git init` already wrote HEAD
+// into the replicated table, and every member created the directory: the
+// key is deleted from the table first, so no member keeps the name taken
+// or hands its refs to the next repository created under it. When the
+// cluster does not record it, the files stay, matching the table, until
+// `forgejo cluster reconcile --apply` deletes a key SQL does not have. It
+// runs on a context detached from the failed request.
+func removeAbandonedRepo(ctx context.Context, owner, name string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clusterhook.DefaultTimeout)
+	defer cancel()
+	if err := clusterhook.RepoDeleted(ctx, owner, name, 0); err != nil {
+		return fmt.Errorf("the cluster did not record the removal of %s/%s, its files are kept until `forgejo cluster reconcile --apply`: %w", owner, name, err)
+	}
+	return util.RemoveAll(repo_model.RepoPath(owner, name))
 }

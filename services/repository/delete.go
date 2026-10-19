@@ -359,19 +359,25 @@ func DeleteRepositoryDirectly(ctx context.Context, repoID int64, opts DeleteRepo
 	// We should always delete the files after the database transaction succeed. If
 	// we delete the file but the database rollback, the repository will be broken.
 
-	// Remove repository files.
-	repoPath := repo.RepoPath()
-	system_model.RemoveAllWithNotice(ctx, "Delete repository files", repoPath)
+	// In a cluster the deletion goes into the replicated table first, and
+	// every member, this one included, removes its copy from there. Files
+	// removed here without it would come back from the other members, and
+	// a repository created again under the name would inherit its refs.
+	// When the cluster does not record it, the files stay everywhere,
+	// matching the table, until `forgejo cluster reconcile --apply`
+	// records the deletion of a repository SQL no longer has.
+	clusterErr := clusterhook.RepoDeleted(ctx, repo.OwnerName, repo.Name, repo.ID)
+	if clusterErr != nil {
+		log.Error("cluster: the deletion of %s/%s was not recorded, its files are kept on every node until `forgejo cluster reconcile --apply`: %v", repo.OwnerName, repo.Name, clusterErr)
+	} else {
+		// Remove repository files.
+		repoPath := repo.RepoPath()
+		system_model.RemoveAllWithNotice(ctx, "Delete repository files", repoPath)
 
-	// Remove wiki files
-	if repo.HasWiki() {
-		system_model.RemoveAllWithNotice(ctx, "Delete repository wiki", repo.WikiPath())
-	}
-
-	// In a cluster, the other members remove their copies once the deletion
-	// is in the replicated table.
-	if err := clusterhook.RepoDeleted(ctx, repo.OwnerName, repo.Name, repo.ID); err != nil {
-		log.Error("cluster: the deletion of %s/%s was not replicated, other nodes keep their copy until reconciled: %v", repo.OwnerName, repo.Name, err)
+		// Remove wiki files
+		if repo.HasWiki() {
+			system_model.RemoveAllWithNotice(ctx, "Delete repository wiki", repo.WikiPath())
+		}
 	}
 
 	// Remove archives
@@ -426,6 +432,9 @@ func DeleteRepositoryDirectly(ctx context.Context, repoID int64, opts DeleteRepo
 		}
 	}
 
+	if clusterErr != nil {
+		return fmt.Errorf("the repository's rows are deleted, but the cluster did not record the deletion of its files (run `forgejo cluster reconcile --apply`): %w", clusterErr)
+	}
 	return nil
 }
 

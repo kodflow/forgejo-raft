@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	cluster_model "forgejo.org/models/cluster"
 	"forgejo.org/models/db"
@@ -17,6 +18,7 @@ import (
 	issues_model "forgejo.org/models/issues"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/modules/gitrepo"
+	"forgejo.org/modules/log"
 	"forgejo.org/modules/optional"
 	repo_module "forgejo.org/modules/repository"
 	"forgejo.org/services/cluster/reftable"
@@ -130,18 +132,39 @@ func (r *Replicator) Reconcile(ctx context.Context, apply bool) ([]Mismatch, err
 	if err != nil {
 		return out, err
 	}
-	for _, key := range r.table.Repos() {
+	keys := r.table.Repos()
+	inTable := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		inTable[key] = true
+	}
+	orphans := map[string]bool{}
+	for _, key := range keys {
 		if ctx.Err() != nil {
 			return out, ctx.Err()
 		}
-		if strings.HasSuffix(key, ".wiki.git") {
+		if wiki, ok := strings.CutSuffix(key, ".wiki.git"); ok {
+			// A wiki is reconciled with its repository, or alone when the
+			// table holds no repository key for it.
+			if main := wiki + ".git"; !inTable[main] {
+				if known, err := repoKnownInDB(ctx, main); err == nil && !known {
+					if m, ok := r.reconcileOrphan(ctx, main, apply, orphans); ok {
+						out = append(out, m)
+					}
+				}
+			}
 			continue
 		}
 		_, deleted := r.table.Deleted(key)
 		repo, err := lookupRepo(ctx, reftable.Event{Repo: key})
 		if err != nil {
 			if !deleted {
-				out = append(out, Mismatch{Repo: key, Category: RepoLifecycle})
+				m := Mismatch{Repo: key, Category: RepoLifecycle}
+				if repo_model.IsErrRepoNotExist(err) {
+					if o, ok := r.reconcileOrphan(ctx, key, apply, orphans); ok {
+						m = o
+					}
+				}
+				out = append(out, m)
 			}
 			continue
 		}
@@ -199,7 +222,95 @@ func (r *Replicator) Reconcile(ctx context.Context, apply bool) ([]Mismatch, err
 		}
 		out = append(out, more...)
 	}
+	r.forgetOrphans(orphans)
 	return out, nil
+}
+
+// orphanGrace is how long a repository the table holds alive, and SQL
+// does not know, must stay unchanged in the table before `reconcile
+// --apply` deletes it from the cluster. A creation or a fork writes its
+// refs before its row commits, a fork's copy taking up to ten minutes.
+var orphanGrace = 30 * time.Minute
+
+// orphanMark is when reconcile first saw an orphaned key at an index.
+type orphanMark struct {
+	last  uint64
+	since time.Time
+}
+
+// reconcileOrphan handles a repository the table holds alive and SQL does
+// not know, with its wiki: the files of a deletion or of a failed creation
+// the cluster did not record (R-D4, R-D5). Every member keeps them, and a
+// repository created again under the name would inherit their refs. With
+// apply, once the keys stayed unchanged for orphanGrace since this node's
+// reconcile first saw them, and SQL still has no row, their deletion is
+// proposed and every member removes the files. It reports false when the
+// table holds no live ref under either key: nothing is left to delete.
+func (r *Replicator) reconcileOrphan(ctx context.Context, key string, apply bool, seen map[string]bool) (Mismatch, bool) {
+	wiki := strings.TrimSuffix(key, ".git") + ".wiki.git"
+	var live []string
+	var last uint64
+	for _, k := range []string{key, wiki} {
+		refs, _ := r.table.Refs(k)
+		for _, v := range refs {
+			if v.Live() {
+				live = append(live, k)
+				_, at := r.table.RepoHash(k)
+				last = max(last, at)
+				break
+			}
+		}
+	}
+	if len(live) == 0 {
+		return Mismatch{}, false
+	}
+	seen[key] = true
+	r.orphansMu.Lock()
+	if r.orphans == nil {
+		r.orphans = map[string]orphanMark{}
+	}
+	mark, ok := r.orphans[key]
+	if !ok || mark.last != last {
+		mark = orphanMark{last: last, since: time.Now()}
+		r.orphans[key] = mark
+	}
+	r.orphansMu.Unlock()
+
+	m := Mismatch{Repo: key, Category: RepoLifecycle}
+	if wait := orphanGrace - time.Since(mark.since); wait > 0 {
+		m.Action = fmt.Sprintf("the table holds this repository, SQL has no row for it: `forgejo cluster reconcile --apply` deletes it from the cluster once it stayed unchanged for %s, from %s on", orphanGrace, mark.since.Add(orphanGrace).UTC().Format(time.RFC3339))
+		return m, true
+	}
+	m.Action = "the table holds this repository, SQL has no row for it: `forgejo cluster reconcile --apply` deletes it from the cluster"
+	if !apply {
+		return m, true
+	}
+	// SQL is read again last: a creation that committed meanwhile keeps
+	// its repository.
+	if known, err := repoKnownInDB(ctx, key); err != nil || known {
+		return m, true
+	}
+	for _, k := range live {
+		if err := r.proposeRepoDelete(ctx, k, 0); err != nil {
+			log.Error("cluster reconcile: deleting %s, which SQL does not know: %v", k, err)
+			return m, true
+		}
+	}
+	log.Warn("cluster reconcile: deleted %s from the cluster: the table held it alive, unchanged since %s, and SQL has no row for it", strings.Join(live, ", "), mark.since.UTC().Format(time.RFC3339))
+	m.Applied = true
+	return m, true
+}
+
+// forgetOrphans drops, after a whole pass, the marks of the keys it did
+// not find orphaned.
+func (r *Replicator) forgetOrphans(seen map[string]bool) {
+	r.orphansMu.Lock()
+	defer r.orphansMu.Unlock()
+	for k := range r.orphans {
+		if !seen[k] {
+			delete(r.orphans, k)
+		}
+	}
 }
 
 // reconcileParked lists the parked events and, with apply, retries them
