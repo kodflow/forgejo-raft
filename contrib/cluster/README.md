@@ -117,7 +117,7 @@ entries": take a checkpoint.
 | `STEP_UP_MAX_AGE` | `5m` | How long a re-authentication allows further operations. |
 | `STEP_UP_OIDC_SOURCE`, `STEP_UP_ACR` | empty | The OpenID Connect source every operator re-authenticates with, and the authentication class required. Without a source, password and TOTP apply. |
 | `STEP_UP_PASSWORD_OPERATORS` | empty | Break-glass logins that keep password and TOTP when `STEP_UP_OIDC_SOURCE` is set. |
-| `READ_AFTER_WRITE_TIMEOUT` | `2s` | How long a request waits for the node to catch up with the caller's last write. |
+| `READ_AFTER_WRITE_TIMEOUT` | `2s` | How long a request waits for the node to catch up with the caller's last write, and a git request (fetch, clone, push over HTTP or SSH) with the cluster's commit index. |
 | `MAX_LOG_BYTES`, `MAX_SNAPSHOT_BYTES` | 1 GiB | Bounds of the log and of a snapshot. |
 | `ACK_MARGIN` | `1024` | How far the trimming of consumed events lags the cursor. |
 | `SQL_STANDALONE` | `false` | Declares that no replica of the database can ever be promoted (a single PostgreSQL, no standby): the durability check then asks for local durability only. Never set it under Patroni. |
@@ -304,7 +304,9 @@ With `[metrics] ENABLED = true`, `/metrics` exposes two families.
   and fsync latencies, and on the leader `consensus_peer_match_lag_entries`,
   `consensus_peer_unreachable` and `consensus_peer_last_contact_seconds` per
   peer.
-- `forgejo_cluster_*`, Forgejo's: readiness, pending projection, event queue,
+- `forgejo_cluster_*`, Forgejo's: readiness, pending projection and the
+  repositories whose projection keeps failing
+  (`projection_failing_repositories`, alert when it stays above zero), event queue,
   consumer lag and stalls, parked events (`consumer_parked_events_total`,
   `consumer_unparked_events_total`), trims held for durability
   (`consumer_trim_held_total`), cursor regressions, git transactions in

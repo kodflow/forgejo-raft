@@ -705,6 +705,22 @@ func (t *Table) MovedAway(repo string) (string, bool) {
 	return t.movedAwayLocked(repo)
 }
 
+// RenamedInto reports the key the newest rename before index moved from's
+// refs to, while that key still names from as its origin: in a chain of
+// renames (from to Z, then another key to from), the directory a node still
+// holds under from belongs to Z until it is moved there.
+func (t *Table) RenamedInto(from string, before uint64) (string, uint64, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	to, at, found := "", uint64(0), false
+	for k, m := range t.renamed {
+		if m.From == from && m.Index < before && (!found || m.Index > at || m.Index == at && k < to) {
+			to, at, found = k, m.Index, true
+		}
+	}
+	return to, at, found
+}
+
 // raisedVersion is the payload version an audit record raises the cluster
 // to, 0 when it raises none. A version this code cannot apply is not
 // adopted: its entries would stop this node anyway.

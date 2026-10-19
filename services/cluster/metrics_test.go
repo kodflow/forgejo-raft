@@ -28,7 +28,7 @@ func TestMetricsExposeTheReplicator(t *testing.T) {
 	for _, mf := range mfs {
 		names[mf.GetName()] = true
 	}
-	for _, want := range []string{"forgejo_cluster_failure_tolerance", "forgejo_cluster_applied_index", "forgejo_cluster_peer_lag_entries", "forgejo_cluster_role", "forgejo_cluster_ready"} {
+	for _, want := range []string{"forgejo_cluster_failure_tolerance", "forgejo_cluster_applied_index", "forgejo_cluster_peer_lag_entries", "forgejo_cluster_role", "forgejo_cluster_ready", "forgejo_cluster_projection_failing_repositories"} {
 		assert.True(t, names[want], want)
 	}
 	for n := range names {

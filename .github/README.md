@@ -250,7 +250,16 @@ for instance) follow within moments.
 cookie naming its log entry. If the next request lands on a node that has
 not applied that entry yet, the node waits for it (up to
 `READ_AFTER_WRITE_TIMEOUT`, 2 s by default), so a user never sees their own
-push disappear when the load balancer switches nodes.
+push disappear when the load balancer switches nodes. git clients carry no
+cookie: a git request (fetch, clone or push, over HTTP or SSH) first waits,
+within the same bound, until the node serves the repository at the commit
+index the cluster confirms when the request starts. A push acknowledged by
+any node is then visible to the fetch that follows it, the pusher's or a CI
+job's. Past the bound git is served as the node has it, and over SSH the
+client is told the node may be behind. Outside a Recover, which starts a
+new history from one survivor, a node never shows a ref the cluster did
+not commit; other pages, without the cookie, may lag by the
+projection's few moments.
 
 ## When things fail
 

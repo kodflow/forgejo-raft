@@ -370,6 +370,19 @@ func runServ(ctx context.Context, c *cli.Command) error {
 	// to avoid breaking, here only use the minimal environment variables for the "gitea serv" command.
 	// it could be re-considered whether to use the same git.CommonGitCmdEnvs() as "git" command later.
 	gitcmd.Env = append(gitcmd.Env, git.CommonCmdServEnvs()...)
+	if setting.Cluster.Enabled {
+		// git serves this node's projection of the refs: it first catches up
+		// with what the cluster committed, so a push any node acknowledged is
+		// visible to the fetch that follows it. When it cannot within
+		// READ_AFTER_WRITE_TIMEOUT, git still runs, and the client is told.
+		key := clusterhook.RepoKey(results.OwnerName, results.RepoName, results.IsWiki)
+		fctx, fcancel := context.WithTimeout(ctx, setting.Cluster.ReadAfterWriteTimeout+5*time.Second)
+		resp, err := clusterhook.Call(fctx, setting.Cluster.HookSocket, &clusterhook.Request{Op: clusterhook.OpFresh, Repo: key})
+		fcancel()
+		if err != nil || !resp.OK {
+			fmt.Fprintln(os.Stderr, "Forgejo: this node of the cluster may not show the cluster's last writes yet; fetch again shortly")
+		}
+	}
 	if setting.Cluster.Enabled && verb == "git-receive-pack" {
 		// The SSH path registers its transaction nonce with the replicator
 		// before git runs, and sets it last so nothing overrides it

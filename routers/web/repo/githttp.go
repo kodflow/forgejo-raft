@@ -25,6 +25,7 @@ import (
 	access_model "forgejo.org/models/perm/access"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unit"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/log"
 	repo_module "forgejo.org/modules/repository"
@@ -286,6 +287,15 @@ func httpBase(ctx *context.Context) *serviceHandler {
 	}
 
 	environ = append(environ, repo_module.EnvRepoID+fmt.Sprintf("=%d", repo.ID))
+
+	// In a cluster git serves this node's projection of the refs: a smart
+	// request first catches up with what the cluster committed, so a push
+	// any node acknowledged is visible to the fetch that follows it, git
+	// clients carrying no read-after-write cookie. Past
+	// READ_AFTER_WRITE_TIMEOUT it is served as the node has it.
+	if service != "" || strings.HasSuffix(ctx.Req.URL.Path, "-pack") {
+		clusterhook.WaitFresh(ctx, clusterhook.RepoKey(owner.Name, repo.Name, isWiki))
+	}
 
 	ctx.Req.URL.Path = strings.ToLower(ctx.Req.URL.Path) // blue: In case some repo name has upper case name
 

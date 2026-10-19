@@ -106,6 +106,11 @@ func (r *Replicator) Handle(ctx context.Context, req *clusterhook.Request) *clus
 		return &clusterhook.Response{OK: true}
 	case clusterhook.OpPrepared:
 		return r.prepared(ctx, req)
+	case clusterhook.OpFresh:
+		if !r.WaitFresh(ctx, req.Repo) {
+			return fail(errors.New("this node of the cluster may be behind the cluster's last writes"))
+		}
+		return &clusterhook.Response{OK: true}
 	case clusterhook.OpCommitted, clusterhook.OpAborted:
 		r.finished(req)
 		return &clusterhook.Response{OK: true}
