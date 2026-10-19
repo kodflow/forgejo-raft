@@ -117,7 +117,8 @@ entries": take a checkpoint.
 | `STEP_UP_MAX_AGE` | `5m` | How long a re-authentication allows further operations. |
 | `STEP_UP_OIDC_SOURCE`, `STEP_UP_ACR` | empty | The OpenID Connect source every operator re-authenticates with, and the authentication class required. Without a source, password and TOTP apply. |
 | `STEP_UP_PASSWORD_OPERATORS` | empty | Break-glass logins that keep password and TOTP when `STEP_UP_OIDC_SOURCE` is set. |
-| `READ_AFTER_WRITE_TIMEOUT` | `2s` | How long a request waits for the node to catch up with the caller's last write, and a git request (fetch, clone, push over HTTP or SSH) with the cluster's commit index. |
+| `READ_AFTER_WRITE_TIMEOUT` | `2s` | How long a request waits for the node to catch up with the caller's last write, and a git request (fetch, clone, push over HTTP or SSH) with the cluster's commit index. Without a known leader a git request does not wait: it is served as the node has it. |
+| `HOOK_TIMEOUT` | `1m`, between `20s` and `1h` | How long one ref transaction may take in the cluster: its objects written on a majority, then its entry committed. A push that needs longer fails with nothing written; its retry ships only the objects the peers still lack. The proxies in front of Forgejo must allow at least as long. |
 | `MAX_LOG_BYTES`, `MAX_SNAPSHOT_BYTES` | 1 GiB | Bounds of the log and of a snapshot. |
 | `ACK_MARGIN` | `1024` | How far the trimming of consumed events lags the cursor. |
 | `SQL_STANDALONE` | `false` | Declares that no replica of the database can ever be promoted (a single PostgreSQL, no standby): the durability check then asks for local durability only. Never set it under Patroni. |
@@ -382,11 +383,27 @@ Watch, Custom, Releases on GitHub, or the tags of
 
 ## Known limits
 
-- A push must reach a majority of the nodes, objects included, within the
-  hook's budget (about fifty seconds). A very large push over a slow link may
-  be refused. A first large repository goes through `forgejo cluster import`,
-  which has its own 30-minute budget, like `reconcile`, `objects backfill` and
+- A push must reach a majority of the nodes, objects included, within
+  `HOOK_TIMEOUT` less ten seconds (fifty seconds by default). A very large
+  push over a slow link may be refused; its shipment goes on in the
+  background for five minutes, and a retry skips the members that already
+  hold its objects. Raise `HOOK_TIMEOUT` for larger pushes. A first large
+  repository goes through `forgejo cluster import`, which has its own
+  30-minute budget, like `reconcile`, `objects backfill` and
   `snapshot save`.
+- A push is committed whole or not at all. With git 2.54 and later, a
+  non-atomic push of several refs is one git transaction that may reject
+  some refs; the cluster cannot commit only the others, so when git would
+  reject one ref (another writer's lock, a ref that moved on this node) the
+  whole push is refused and the client reads every ref rejected. Pushing
+  again succeeds once the other writer is done.
+- A ref name must be valid UTF-8. git accepts other bytes, which the
+  replicated table, in JSON, cannot carry unchanged.
+- The object channel accepts what Forgejo accepts on a push: the fsck
+  checks Forgejo ignores (`badTimezone`, `missingSpaceBeforeDate`,
+  `zeroPaddedFilemode`, and any `receive.fsck.*` of `[git.config]`) are
+  ignored there too. A transfer between members that makes no progress for
+  two minutes is cut, and the next member is asked.
 - The drain check covers the joiner's Nomad node. That the old member was
   drained or purged remains the responsibility of the operator who grants the
   join.

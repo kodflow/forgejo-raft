@@ -35,27 +35,33 @@ func gitRun(ctx context.Context, dir string, stdin io.Reader, args ...string) (s
 }
 
 // readGitRefs lists what git shows of a repository: every ref under refs/
-// with its value, symbolic refs by target, and HEAD.
+// with its value, symbolic refs by target, and HEAD. Fields are separated by
+// NUL, which no ref name holds, and the name comes last, byte for byte: git
+// accepts Unicode spaces in a name (U+00A0, U+3000), and a split on white
+// space would read "refs/heads/main<U+00A0>x" as refs/heads/main.
 func readGitRefs(ctx context.Context, dir string) (map[string]reftable.ProjectedRef, error) {
-	out, err := gitRun(ctx, dir, nil, "for-each-ref", "--format=%(objectname) %(refname) %(symref)")
+	out, err := gitRun(ctx, dir, nil, "for-each-ref", "--format=%(objectname)%00%(symref)%00%(refname)")
 	if err != nil {
 		return nil, err
 	}
 	refs := map[string]reftable.ProjectedRef{}
-	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
-		f := strings.Fields(line)
-		if len(f) < 2 {
+	for line := range strings.SplitSeq(out, "\n") {
+		if line == "" {
 			continue
 		}
-		if len(f) == 3 && f[2] != "" {
-			refs[f[1]] = reftable.ProjectedRef{Symbolic: f[2]}
+		f := strings.SplitN(line, "\x00", 3)
+		if len(f) != 3 || f[2] == "" {
+			return nil, fmt.Errorf("git for-each-ref: unexpected line %q", line)
+		}
+		if f[1] != "" {
+			refs[f[2]] = reftable.ProjectedRef{Symbolic: f[1]}
 			continue
 		}
-		refs[f[1]] = reftable.ProjectedRef{SHA: f[0]}
+		refs[f[2]] = reftable.ProjectedRef{SHA: f[0]}
 	}
 	head, err := gitRun(ctx, dir, nil, "symbolic-ref", "-q", "HEAD")
-	if err == nil && strings.TrimSpace(head) != "" {
-		refs["HEAD"] = reftable.ProjectedRef{Symbolic: strings.TrimSpace(head)}
+	if head = strings.TrimSuffix(head, "\n"); err == nil && head != "" {
+		refs["HEAD"] = reftable.ProjectedRef{Symbolic: head}
 	}
 	return refs, nil
 }

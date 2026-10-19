@@ -24,6 +24,7 @@ import (
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/json"
 	"forgejo.org/modules/log"
+	"forgejo.org/modules/setting"
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/reftable"
 )
@@ -96,6 +97,7 @@ func (oc *objectChannel) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/push", oc.handlePush)
 	mux.HandleFunc("POST /v1/fetch", oc.handleFetch)
+	mux.HandleFunc("POST /v1/have", oc.handleHave)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 			http.Error(w, "client certificate required", http.StatusUnauthorized)
@@ -171,8 +173,11 @@ func (oc *objectChannel) handlePush(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	body := http.MaxBytesReader(w, r.Body, maxPackBytes)
-	if err := receivePack(r.Context(), dir, body); err != nil {
+	// A sender that stalls mid-pack must not hold index-pack forever.
+	ctx, cancel := context.WithTimeout(r.Context(), objectBudget)
+	defer cancel()
+	body := &idleBody{r: http.MaxBytesReader(w, r.Body, maxPackBytes), rc: http.NewResponseController(w)}
+	if err := receivePack(ctx, dir, body); err != nil {
 		// A pack whose bases this node lacks fails --strict; the sender
 		// retries with a complete pack.
 		http.Error(w, err.Error(), http.StatusConflict)
@@ -211,10 +216,116 @@ func (oc *objectChannel) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 	haves, _ := presentObjects(r.Context(), dir, req.Haves)
 	w.Header().Set("Content-Type", "application/x-git-packfile")
-	if err := packObjects(r.Context(), dir, req.Wants, haves, w); err != nil {
+	// The answer starts now: the fetcher times the pack from here.
+	w.WriteHeader(http.StatusOK)
+	_ = http.NewResponseController(w).Flush()
+	// A fetcher that stops reading must not hold pack-objects forever.
+	ctx, cancel := context.WithTimeout(r.Context(), objectBudget)
+	defer cancel()
+	out := &idleWriter{w: w, rc: http.NewResponseController(w)}
+	if err := packObjectsFn(ctx, dir, req.Wants, haves, out); err != nil {
 		log.Warn("cluster objects: pack for %s: %v", req.Repo, err)
 	}
 }
+
+// haveAnswer lists the wants a member lacks.
+type haveAnswer struct {
+	Missing []string `json:"missing"`
+}
+
+// handleHave tells a sender which of its wants this member already holds:
+// a retried push whose objects an earlier attempt's shipment delivered in
+// the background ships nothing again. A member holds an object only once
+// it is synced, as for an acknowledged shipment.
+func (oc *objectChannel) handleHave(w http.ResponseWriter, r *http.Request) {
+	var req fetchRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<20)).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	dir, code, err := oc.repoDir(r.Context(), req.Repo)
+	if err != nil {
+		http.Error(w, err.Error(), code)
+		return
+	}
+	for _, s := range req.Wants {
+		if !isHex(s) {
+			http.Error(w, "invalid object id", http.StatusBadRequest)
+			return
+		}
+	}
+	ans := haveAnswer{Missing: req.Wants}
+	if _, err := os.Stat(dir); err == nil {
+		if ans.Missing, err = missingObjects(r.Context(), dir, req.Wants); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if ans.Missing == nil {
+		// "Nothing missing" is an empty list: an absent one is no answer.
+		ans.Missing = []string{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(ans)
+}
+
+// Bounds of the object channel beside the hook's own budget: a transfer
+// that makes no progress for objectIdle is cut, and none runs longer than
+// objectBudget, so a peer that stalls mid-stream never freezes the
+// projector or a handler.
+var (
+	objectIdle   = 2 * time.Minute
+	objectBudget = 30 * time.Minute
+)
+
+// idleBody pushes a request body's read deadline forward on each read.
+type idleBody struct {
+	r  io.Reader
+	rc *http.ResponseController
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	_ = b.rc.SetReadDeadline(time.Now().Add(objectIdle))
+	return b.r.Read(p)
+}
+
+// idleWriter pushes a response's write deadline forward on each write.
+type idleWriter struct {
+	w  io.Writer
+	rc *http.ResponseController
+}
+
+func (iw *idleWriter) Write(p []byte) (int, error) {
+	_ = iw.rc.SetWriteDeadline(time.Now().Add(objectIdle))
+	return iw.w.Write(p)
+}
+
+// watchdog cancels a request that makes no progress for idle: no answer,
+// or no byte of its body.
+type watchdog struct {
+	timer *time.Timer
+	idle  time.Duration
+}
+
+func newWatchdog(idle time.Duration, cancel context.CancelFunc) *watchdog {
+	return &watchdog{timer: time.AfterFunc(idle, cancel), idle: idle}
+}
+
+func (w *watchdog) body(r io.Reader) io.Reader {
+	return readerFunc(func(p []byte) (int, error) {
+		n, err := r.Read(p)
+		if n > 0 {
+			w.timer.Reset(w.idle)
+		}
+		return n, err
+	})
+}
+
+func (w *watchdog) stop() { w.timer.Stop() }
+
+type readerFunc func(p []byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
 
 // ---- git plumbing ----
 
@@ -243,6 +354,9 @@ func presentObjects(ctx context.Context, dir string, shas []string) ([]string, e
 	}
 	return out, nil
 }
+
+// packObjectsFn is what /v1/fetch packs with; tests replace it.
+var packObjectsFn = packObjects
 
 // packObjects writes a self-contained pack of wants minus what haves reach.
 func packObjects(ctx context.Context, dir string, wants, haves []string, w io.Writer) error {
@@ -280,9 +394,9 @@ func receivePack(ctx context.Context, dir string, body io.Reader) error {
 		"GIT_OBJECT_DIRECTORY="+quarantine,
 		"GIT_ALTERNATE_OBJECT_DIRECTORIES="+objects,
 	)
-	cmd := git.NewCommand(ctx, "-c", "core.hooksPath=/dev/null", "index-pack", "--strict", "--stdin")
+	cmd := git.NewCommand(ctx, "-c", "core.hooksPath=/dev/null", "index-pack").AddArguments(git.ToTrustedCmdArgs([]string{indexPackStrict(), "--stdin"})...)
 	if err := cmd.Run(&git.RunOpts{Dir: dir, Env: env, Stdin: body, Stdout: io.Discard, Stderr: &stderr, UseContextTimeout: true}); err != nil {
-		return fmt.Errorf("index-pack --strict: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("index-pack %s: %w: %s", indexPackStrict(), err, strings.TrimSpace(stderr.String()))
 	}
 	entries, err := os.ReadDir(filepath.Join(quarantine, "pack"))
 	if err != nil {
@@ -306,6 +420,32 @@ func receivePack(ctx context.Context, dir string, body io.Reader) error {
 		}
 	}
 	return syncDir(dst)
+}
+
+// indexPackStrict is index-pack's --strict with the fsck severities Forgejo
+// sets for a push (modules/setting/git.go: badTimezone,
+// missingSpaceBeforeDate and zeroPaddedFilemode ignored, and [git.config]).
+// --strict reads none of the fsck.* settings and raises every warning to an
+// error: a history Forgejo accepts on push or migration, such as an old
+// tree with zero-padded modes, would be refused by every peer, and the
+// repository could never be written again in the cluster.
+func indexPackStrict() string {
+	var ids []string
+	for key, v := range setting.GitConfig.Options {
+		id, ok := strings.CutPrefix(key, "receive.fsck.")
+		if !ok || id == "" || strings.Trim(id, "abcdefghijklmnopqrstuvwxyz") != "" {
+			continue
+		}
+		switch v = strings.ToLower(v); v {
+		case "ignore", "warn", "error":
+			ids = append(ids, id+"="+v)
+		}
+	}
+	if len(ids) == 0 {
+		return "--strict"
+	}
+	sort.Strings(ids)
+	return "--strict=" + strings.Join(ids, ",")
 }
 
 func syncDir(dir string) error {
@@ -415,13 +555,9 @@ func (oc *objectChannel) shipToMajority(ctx context.Context, repo, dir, format s
 		return errNoMajority
 	}
 	haves, _ = presentObjects(ctx, dir, haves)
-	thin, err := packToFile(ctx, dir, wants, haves)
-	if err != nil {
-		return err
-	}
-	var full string
-	var fullOnce sync.Once
-	var fullErr error
+	var thin, full string
+	var thinOnce, fullOnce sync.Once
+	var thinErr, fullErr error
 
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stragglerBudget)
 	acks := make(chan error, len(peers))
@@ -430,7 +566,19 @@ func (oc *objectChannel) shipToMajority(ctx context.Context, repo, dir, format s
 		wg.Add(1)
 		go func(m consensus.Member) {
 			defer wg.Done()
-			err := oc.pushFile(sendCtx, m, repo, format, thin)
+			// A peer that already holds every want acknowledges at once: a
+			// retry of a push whose objects an earlier attempt's background
+			// shipment delivered ships nothing again, instead of starting
+			// over within the same budget.
+			if oc.peerHolds(sendCtx, m, repo, wants) {
+				acks <- nil
+				return
+			}
+			thinOnce.Do(func() { thin, thinErr = packToFile(sendCtx, dir, wants, haves) })
+			err := thinErr
+			if err == nil {
+				err = oc.pushFile(sendCtx, m, repo, format, thin)
+			}
 			if errors.Is(err, errNeedsFull) {
 				fullOnce.Do(func() { full, fullErr = packToFile(sendCtx, dir, wants, nil) })
 				if fullErr != nil {
@@ -448,13 +596,16 @@ func (oc *objectChannel) shipToMajority(ctx context.Context, repo, dir, format s
 	go func() {
 		wg.Wait()
 		cancel()
-		os.Remove(thin)
+		if thin != "" {
+			os.Remove(thin)
+		}
 		if full != "" {
 			os.Remove(full)
 		}
 	}()
 
 	ok, failed := 0, 0
+	var firstErr error
 	for ok < need && ok+failed < len(peers) {
 		select {
 		case err := <-acks:
@@ -462,15 +613,54 @@ func (oc *objectChannel) shipToMajority(ctx context.Context, repo, dir, format s
 				ok++
 			} else {
 				failed++
+				if firstErr == nil {
+					firstErr = err
+				}
 			}
 		case <-ctx.Done():
 			return errNoMajority
 		}
 	}
 	if ok < need {
+		if firstErr != nil {
+			return fmt.Errorf("%w: %v", errNoMajority, firstErr)
+		}
 		return errNoMajority
 	}
 	return nil
+}
+
+// probeTimeout bounds the question asked of a peer before a shipment.
+const probeTimeout = 5 * time.Second
+
+// peerHolds asks a peer whether it holds all of wants. A peer that does not
+// answer, answers otherwise, or runs a binary without /v1/have, lacks them:
+// it is shipped to as before.
+func (oc *objectChannel) peerHolds(ctx context.Context, m consensus.Member, repo string, wants []string) bool {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	u, err := oc.objectURL(m, "/v1/have")
+	if err != nil {
+		return false
+	}
+	body, _ := json.Marshal(fetchRequest{Repo: repo, Wants: wants})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	resp, err := oc.client(m).Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var ans haveAnswer
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&ans); err != nil {
+		return false
+	}
+	return ans.Missing != nil && len(ans.Missing) == 0
 }
 
 var errNeedsFull = errors.New("peer lacks the bases of a thin pack")
@@ -566,10 +756,17 @@ func (oc *objectChannel) fetchFrom(ctx context.Context, m consensus.Member, repo
 		return err
 	}
 	body, _ := json.Marshal(fetchRequest{Repo: repo, Wants: wants, Haves: haves})
+	// A member that stalls mid-pack is cut after objectIdle without a byte,
+	// and the next member is asked: the projector's single pass must not
+	// wait on it.
+	ctx, cancel := context.WithTimeout(ctx, objectBudget)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
+	watch := newWatchdog(objectIdle, cancel)
+	defer watch.stop()
 	resp, err := oc.client(m).Do(req)
 	if err != nil {
 		return err
@@ -578,5 +775,11 @@ func (oc *objectChannel) fetchFrom(ctx context.Context, m consensus.Member, repo
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s answered %s", m.Slot, resp.Status)
 	}
-	return receivePack(ctx, dir, io.LimitReader(resp.Body, maxPackBytes))
+	if err := receivePack(ctx, dir, watch.body(io.LimitReader(resp.Body, maxPackBytes))); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("%s stalled or overran the object budget: %w", m.Slot, err)
+		}
+		return err
+	}
+	return nil
 }

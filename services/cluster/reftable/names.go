@@ -7,6 +7,7 @@ import (
 	"errors"
 	"path"
 	"strings"
+	"unicode/utf8"
 )
 
 // The validators below are pure Go and pinned to the payload version
@@ -16,9 +17,19 @@ import (
 // ValidRefName applies the rules of git check-ref-format, without
 // --allow-onelevel, plus the one symbolic name the table holds at the top
 // level, HEAD. Version 1 of the payload.
+//
+// A name must also be valid UTF-8, which git does not require: the entries
+// are JSON, whose encoder replaces an invalid byte with U+FFFD, so the
+// table would hold another name than git's, and two names would become
+// one. The rule changes no verdict of Apply on any entry, whatever its
+// version: encoding/json decodes every string as valid UTF-8. It refuses
+// such a name before it is proposed.
 func ValidRefName(name string) error {
 	if name == "HEAD" {
 		return nil
+	}
+	if !utf8.ValidString(name) {
+		return errors.New("ref name is not valid UTF-8")
 	}
 	if !strings.HasPrefix(name, "refs/") {
 		return errors.New("ref outside refs/")

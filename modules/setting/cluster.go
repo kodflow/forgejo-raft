@@ -67,6 +67,11 @@ var Cluster = struct {
 	// HookSocket is the private socket the reference-transaction hook and
 	// the offline commands reach the replicator on (ADR 0148).
 	HookSocket string
+	// HookTimeout bounds one call of the reference-transaction hook: the
+	// objects shipped to a majority, the proposal and its commit. A push
+	// that needs longer fails, nothing written, and its retry ships only
+	// what the peers still lack.
+	HookTimeout time.Duration
 	// Operators seed the cluster-operator permission, held in the database,
 	// when nobody holds it yet; afterwards they are ignored.
 	Operators container.Set[string]
@@ -159,6 +164,7 @@ var Cluster = struct {
 	ObjectPort:            "7481",
 	StepUpMaxAge:          5 * time.Minute,
 	ReadAfterWriteTimeout: 2 * time.Second,
+	HookTimeout:           60 * time.Second,
 	MaxLogBytes:           1 << 30,
 	MaxSnapshotBytes:      1 << 30,
 	AckMargin:             1024,
@@ -271,6 +277,7 @@ func loadClusterFrom(rootCfg ConfigProvider) {
 	Cluster.Operators = container.SetOf(sec.Key("OPERATORS").Strings(",")...)
 	Cluster.StepUpMaxAge = clusterDuration(sec, "STEP_UP_MAX_AGE", Cluster.StepUpMaxAge)
 	Cluster.ReadAfterWriteTimeout = clusterDuration(sec, "READ_AFTER_WRITE_TIMEOUT", Cluster.ReadAfterWriteTimeout)
+	Cluster.HookTimeout = clusterDuration(sec, "HOOK_TIMEOUT", time.Minute)
 	Cluster.MaxLogBytes = sec.Key("MAX_LOG_BYTES").MustInt64(Cluster.MaxLogBytes)
 	Cluster.MaxSnapshotBytes = sec.Key("MAX_SNAPSHOT_BYTES").MustInt64(Cluster.MaxSnapshotBytes)
 	Cluster.AckMargin = uint64(sec.Key("ACK_MARGIN").MustInt64(int64(Cluster.AckMargin)))
@@ -458,6 +465,9 @@ func validateCluster() error {
 		errs = append(errs, errors.New("LISTEN_ADDR is required: the node's management service address"))
 	} else if host, _, err := net.SplitHostPort(Cluster.ListenAddr); err != nil || host == "" || host == "0.0.0.0" || host == "::" {
 		errs = append(errs, errors.New("LISTEN_ADDR must name the management address explicitly, never a wildcard"))
+	}
+	if Cluster.HookTimeout < 20*time.Second || Cluster.HookTimeout > time.Hour {
+		errs = append(errs, fmt.Errorf("HOOK_TIMEOUT %s must be between 20s and 1h", Cluster.HookTimeout))
 	}
 	if Cluster.TLSCertFile == "" || Cluster.TLSCAFile == "" {
 		errs = append(errs, errors.New("TLS_CERT_FILE and TLS_CA_FILE are required"))

@@ -218,6 +218,12 @@ func (p *projector) run(ctx context.Context) {
 	}
 }
 
+// projectBudget bounds the projection of one repository in a pass: the
+// pass is serial, and a repository whose git or whose members stall must
+// not hold every other one behind it. The object channel cuts a stalled
+// transfer much sooner (objectIdle).
+var projectBudget = time.Hour
+
 // pass projects every dirty repository once.
 func (p *projector) pass(ctx context.Context) {
 	p.mu.Lock()
@@ -253,7 +259,10 @@ func (p *projector) pass(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := p.project(ctx, repo); err != nil {
+		pctx, cancel := context.WithTimeout(ctx, projectBudget)
+		err := p.project(pctx, repo)
+		cancel()
+		if err != nil {
 			log.Warn("cluster: projecting %s: %v", repo, err)
 			p.mu.Lock()
 			p.failures[repo] = err.Error()

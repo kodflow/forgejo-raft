@@ -255,8 +255,8 @@ cookie: a git request (fetch, clone or push, over HTTP or SSH) first waits,
 within the same bound, until the node serves the repository at the commit
 index the cluster confirms when the request starts. A push acknowledged by
 any node is then visible to the fetch that follows it, the pusher's or a CI
-job's. Past the bound git is served as the node has it, and over SSH the
-client is told the node may be behind. Outside a Recover, which starts a
+job's. Past the bound, or at once when the node knows no leader, git is served
+as the node has it, and over SSH the client is told the node may be behind. Outside a Recover, which starts a
 new history from one survivor, a node never shows a ref the cluster did
 not commit; other pages, without the cookie, may lag by the
 projection's few moments.
@@ -625,6 +625,7 @@ The `[cluster]` section of `app.ini` (also settable as
 | `OPERATORS` | | Bootstrap only: logins given the operator permission when nobody holds it. |
 | `STEP_UP_MAX_AGE`, `STEP_UP_OIDC_SOURCE`, `STEP_UP_ACR` | `5m` | Re-authentication before an operation. |
 | `READ_AFTER_WRITE_TIMEOUT` | `2s` | How long a request waits for the caller's last write. |
+| `HOOK_TIMEOUT` | `1m` | How long one push may take to reach a majority and commit, 20 s to 1 h. |
 | `WITNESSES`, `WITNESS_KEYS`, `WITNESS_OVERRIDE_SHA256` | | The Recover fence. |
 | `RENEW_VAULT_*`, `RENEW_TTL` | off | The in-process certificate renewer. |
 | `NOMAD_ADDR`, `NOMAD_TOKEN_FILE`, `NOMAD_SLOT_META` | off | The JOIN drain check. |
@@ -716,6 +717,13 @@ official release would give (clean, carried, or the conflicted files).
 - **Three voters.** The tooling and examples target three voting members.
 - **Git hooks are disabled** cluster-wide (server-side hooks in the
   repository settings). Webhooks and Forgejo Actions work as usual.
+- **A push is committed whole or not at all.** When git would reject one
+  ref of a push (a lock held by another writer, a ref that moved on this
+  node), the cluster refuses the whole push, nothing written, and the
+  client reads every ref rejected: push again. A ref name must be valid
+  UTF-8 (git also accepts other bytes).
+- **Large pushes** must reach a majority within `HOOK_TIMEOUT` (one minute
+  by default). A retry ships only what the members still lack.
 - **Every ref write must go through Forgejo.** Editing a repository on disk
   behind Forgejo's back is not replicated; the projector will put the refs
   back to what the table says.
