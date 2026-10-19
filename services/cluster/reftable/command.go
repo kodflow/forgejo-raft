@@ -47,6 +47,10 @@ const (
 	// first: an older one stops on them (D18).
 	KindCheckpointBarrier  Kind = 7
 	KindCheckpointPosition Kind = 8
+	// KindRevokeKey is proposed only by an operator's Remove or DenyPin,
+	// which every member's binary must know first: an older one stops on
+	// it (D18).
+	KindRevokeKey Kind = 9
 )
 
 // Limits pinned to the payload version: they are part of Apply's verdict, so
@@ -148,6 +152,17 @@ type JoinGrant struct {
 	Operator string `json:"op"`
 }
 
+// RevokeKey refuses a node key for good: a JOIN presenting it is refused
+// whatever the grant or the CA says, and the object channel admits no
+// member holding it. An operator's Remove and DenyPin write it; the
+// autopilot's removal of a dead member does not, so that member returns.
+type RevokeKey struct {
+	SPKI     string `json:"spki"`
+	Slot     string `json:"slot"`
+	Operator string `json:"op"`
+	Time     int64  `json:"t"`
+}
+
 // Encode writes the envelope at BaseVersion: payload version, kind, JSON
 // body.
 func Encode(kind Kind, body any) ([]byte, error) {
@@ -206,6 +221,8 @@ func decode(data []byte) (Kind, any, error) {
 		v = &CheckpointBarrier{}
 	case KindCheckpointPosition:
 		v = &CheckpointPosition{}
+	case KindRevokeKey:
+		v = &RevokeKey{}
 	default:
 		return 0, nil, fmt.Errorf("%w: command kind %d", ErrVersion, kind)
 	}

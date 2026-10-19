@@ -64,6 +64,20 @@ const (
 	writerDemoted
 )
 
+// writerMark is the term and lineage a node was promoted in: a leadership
+// lost and won back between two passes of the autopilot is another term,
+// and the hook runs again before the node writes, since another node may
+// have been promoted in between.
+type writerMark struct {
+	Term     uint64
+	Identity consensus.LogIdentity
+}
+
+func (r *Replicator) promotedFor(st consensus.Status) bool {
+	m := r.writerAt.Load()
+	return writerState(r.writer.Load()) == writerReady && m != nil && m.Term == st.Term && m.Identity == st.Identity
+}
+
 // errBecomingWriter refuses a write on a leader whose hook has not
 // promoted it yet.
 var errBecomingWriter = errors.New("this node leads the cluster but is not ready to write yet (its writer hook has not completed); retry shortly")
@@ -78,11 +92,15 @@ func (r *Replicator) stepWriter(ctx context.Context, eng consensus.Engine) {
 	// Only the autopilot's goroutine steps: no two hook calls overlap.
 	cur := writerState(r.writer.Load())
 	switch leads := st.Role == consensus.RoleLeader; {
-	case leads && cur != writerReady:
+	case leads && !r.promotedFor(st):
+		// Writes stop here first: a promotion of an earlier term does not
+		// cover this one.
+		r.writer.Store(uint32(writerUnknown))
 		if err := r.writerHook.Promote(ctx, t); err != nil {
 			log.Error("cluster: writer hook: promoting %s: %v; writes stay refused, retried", st.Slot, err)
 			return
 		}
+		r.writerAt.Store(&writerMark{Term: st.Term, Identity: st.Identity})
 		r.writer.Store(uint32(writerReady))
 		log.Warn("cluster: writer hook: %s promoted, writes accepted", st.Slot)
 	case !leads && cur != writerDemoted:
@@ -102,10 +120,14 @@ func (r *Replicator) stepWriter(ctx context.Context, eng consensus.Engine) {
 // forwards is committed by the engine without it: what the hook moves must
 // not make the ref log wait, only what derives from it.
 func (r *Replicator) writerGate(eng consensus.Engine) error {
-	if r.writerHook == nil || eng == nil || eng.Status().Role != consensus.RoleLeader {
+	if r.writerHook == nil || eng == nil {
 		return nil
 	}
-	if writerState(r.writer.Load()) != writerReady {
+	st := eng.Status()
+	if st.Role != consensus.RoleLeader {
+		return nil
+	}
+	if !r.promotedFor(st) {
 		return errBecomingWriter
 	}
 	return nil

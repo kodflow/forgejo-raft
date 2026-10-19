@@ -33,11 +33,13 @@ func TestFoundingRule(t *testing.T) {
 	abc := []string{"node-a", "node-b", "node-c"}
 	j := func(slot string) hello { return helloFrom(slot, helloJoining, 3) }
 
-	// From PEERS: the lowest slot founds once it reaches a majority.
+	// From PEERS: the lowest slot founds once every expected node answers.
 	what, _ := decide("node-a", 3, abc, nil)
 	assert.Equal(t, formWait, what, "alone: one of three")
 	what, _ = decide("node-a", 3, abc, []hello{j("node-b")})
-	assert.Equal(t, formFound, what, "two of three")
+	assert.Equal(t, formWait, what, "two of three: the silent one may hold the log")
+	what, _ = decide("node-a", 3, abc, []hello{j("node-b"), j("node-c")})
+	assert.Equal(t, formFound, what, "three of three")
 	what, _ = decide("node-b", 3, abc, nil)
 	assert.Equal(t, formJoin, what, "not the lowest: join, whoever answers")
 
@@ -55,6 +57,18 @@ func TestFoundingRule(t *testing.T) {
 	// nothing is founded while one answers so.
 	what, _ = decide("node-a", 3, abc, []hello{j("node-b"), helloFrom("node-c", helloStarting, 3)})
 	assert.Equal(t, formWait, what)
+}
+
+// A wiped founder that hears a joining node and not the last member, the
+// one node still holding the log, waits: founding would start a second
+// cluster under the same id, which that log can never rejoin.
+func TestAWipedFounderWaitsForTheSilentMember(t *testing.T) {
+	abc := []string{"node-a", "node-b", "node-c"}
+	what, why := decide("node-a", 3, abc, []hello{helloFrom("node-c", helloJoining, 3)})
+	assert.Equal(t, formWait, what, why)
+	abcde := []string{"node-a", "node-b", "node-c", "node-d", "node-e"}
+	what, why = decide("node-a", 5, abcde, []hello{helloFrom("node-d", helloJoining, 5), helloFrom("node-e", helloJoining, 5)})
+	assert.Equal(t, formWait, what, why)
 }
 
 // Whatever subset of the others a node hears, only the lowest slot ever
@@ -191,4 +205,63 @@ func TestAutonomousAdmission(t *testing.T) {
 	r.auto = nil
 	_, err = r.authorizeJoin(ctx, consensus.JoinRequest{Slot: "node-c", SPKI: key})
 	require.ErrorContains(t, err, "no operator granted")
+}
+
+// A member an operator removes has its key revoked: under a new id, with
+// the same CA-signed certificate, it is refused at the JOIN and on the
+// object channel, while the autopilot's removal of a dead member leaves
+// the key alone so the member returns.
+func TestRemovedKeyIsRevoked(t *testing.T) {
+	mem, rs := NewForTesting(t.TempDir(), "node-a")
+	r := rs[0]
+	r.auto = &autoMode{expected: 3, self: "node-a", peers: map[string]string{"node-a": "a:7480", "node-b": "b:7480", "node-c": "c:7480"}}
+	ctx := context.Background()
+	keyB := sha256.Sum256([]byte("node-b"))
+	keyC := sha256.Sum256([]byte("node-c"))
+	mem.Add("node-b", keyB, reftable.New())
+	mem.Add("node-c", keyC, reftable.New())
+	// Five members, so two removals keep the floor of three voters.
+	mem.Add("node-d", sha256.Sum256([]byte("node-d")), reftable.New())
+	mem.Add("node-e", sha256.Sum256([]byte("node-e")), reftable.New())
+	idOf := func(slot string) consensus.NodeID {
+		for _, m := range r.Engine().Membership().Members {
+			if m.Slot == slot {
+				return m.ID
+			}
+		}
+		t.Fatalf("no member at %s", slot)
+		return 0
+	}
+	idB, idC := idOf("node-b"), idOf("node-c")
+
+	require.NoError(t, r.Operate(ctx, OperatorFor(1), Operation{Action: ActionRemove, Target: idB.String()}))
+	_, err := r.authorizeJoin(ctx, consensus.JoinRequest{Slot: "node-b", SPKI: keyB})
+	require.ErrorContains(t, err, "revoked")
+	err = r.Operate(ctx, OperatorFor(1), Operation{Action: ActionAuthorizeJoin, Target: "node-b"})
+	require.NoError(t, err)
+	_, err = r.authorizeJoin(ctx, consensus.JoinRequest{Slot: "node-b", SPKI: keyB})
+	require.ErrorContains(t, err, "revoked", "a grant does not lift a revocation")
+	_, err = r.authorizeJoin(ctx, consensus.JoinRequest{Slot: "node-b", SPKI: sha256.Sum256([]byte("node-b, new key"))})
+	require.NoError(t, err, "a new key for the slot is admitted")
+
+	// The autopilot's removal revokes nothing.
+	r.autoChange(ctx, ActionRemove, idC, "out of reach", r.Engine().Remove)
+	_, err = r.authorizeJoin(ctx, consensus.JoinRequest{Slot: "node-c", SPKI: keyC})
+	require.NoError(t, err)
+}
+
+// A grant that admits a node is bound to its key: another key does not
+// join under it, the same key may retry.
+func TestAGrantIsBoundToTheKeyItAdmits(t *testing.T) {
+	_, rs := NewForTesting(t.TempDir(), "node-a")
+	r := rs[0]
+	ctx := context.Background()
+	require.NoError(t, r.Operate(ctx, OperatorFor(1), Operation{Action: ActionAuthorizeJoin, Target: "node-d"}))
+	first := sha256.Sum256([]byte("node-d"))
+	_, err := r.authorizeJoin(ctx, consensus.JoinRequest{Slot: "node-d", SPKI: first})
+	require.NoError(t, err)
+	_, err = r.authorizeJoin(ctx, consensus.JoinRequest{Slot: "node-d", SPKI: first})
+	require.NoError(t, err, "the same key retries")
+	_, err = r.authorizeJoin(ctx, consensus.JoinRequest{Slot: "node-d", SPKI: sha256.Sum256([]byte("another"))})
+	require.ErrorContains(t, err, "another key")
 }

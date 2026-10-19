@@ -104,8 +104,10 @@ type Table struct {
 	// refs are written under its key again.
 	deleted map[string]uint64
 	// renamed maps a new key to the old one and the index of the rename.
-	renamed  map[string]renameMark
-	grants   map[string]JoinGrant
+	renamed map[string]renameMark
+	grants  map[string]JoinGrant
+	// revoked maps a revoked key, 64 hex digits, to its revocation.
+	revoked  map[string]RevokeKey
 	applied  consensus.Position
 	identity consensus.LogIdentity
 	// pending is the open checkpoint barrier; checkpoints the closed ones.
@@ -138,6 +140,7 @@ func New() *Table {
 		deleted: map[string]uint64{},
 		renamed: map[string]renameMark{},
 		grants:  map[string]JoinGrant{},
+		revoked: map[string]RevokeKey{},
 		byNonce: map[string]uint64{},
 	}
 }
@@ -228,6 +231,8 @@ func (t *Table) Apply(e consensus.Entry) any {
 			res = t.applyCheckpointBarrier(e, body.(*CheckpointBarrier))
 		case KindCheckpointPosition:
 			res = t.applyCheckpointPosition(e, body.(*CheckpointPosition))
+		case KindRevokeKey:
+			res = t.applyRevokeKey(body.(*RevokeKey))
 		}
 	}
 	t.applied = e.Position
@@ -608,6 +613,28 @@ func validSlot(s string) bool {
 	return true
 }
 
+func (t *Table) applyRevokeKey(k *RevokeKey) Result {
+	if !validSlot(k.Slot) || consensus.Operator(k.Operator).Validate() != nil || !(len(k.SPKI) == 64 && validSHA(k.SPKI, "sha256")) {
+		return refuse("malformed key revocation")
+	}
+	if _, ok := t.revoked[k.SPKI]; !ok {
+		t.revoked[k.SPKI] = *k
+	}
+	// A grant bound to the revoked key admits nothing any more.
+	if g, ok := t.grants[k.Slot]; ok && g.SPKI == k.SPKI {
+		delete(t.grants, k.Slot)
+	}
+	return Result{OK: true}
+}
+
+// KeyRevoked reports whether an operator revoked spki, 64 hex digits.
+func (t *Table) KeyRevoked(spki string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	_, ok := t.revoked[spki]
+	return ok
+}
+
 // JoinGrant returns the latest grant for a slot.
 func (t *Table) JoinGrant(slot string) (JoinGrant, bool) {
 	t.mu.RLock()
@@ -846,6 +873,7 @@ type persisted struct {
 	Deleted  map[string]uint64               `json:"deleted"`
 	Renamed  map[string]renameMark           `json:"renamed"`
 	Grants   map[string]JoinGrant            `json:"grants,omitempty"`
+	Revoked  map[string]RevokeKey            `json:"revoked,omitempty"`
 	// Pending and Checkpoints are absent from snapshots older than the
 	// checkpoints, which then restore with none.
 	Pending     *pendingCheckpoint `json:"pending,omitempty"`
@@ -882,7 +910,7 @@ func (t *Table) persistedLocked() *persisted {
 	p := &persisted{
 		Format: SnapshotFormat, Applied: t.applied, Identity: t.identity,
 		Repos: make(map[string]map[string]*RefValue, len(t.repos)), Last: map[string]uint64{},
-		Events: t.events, Audit: t.audit, Deleted: t.deleted, Renamed: t.renamed, Grants: t.grants,
+		Events: t.events, Audit: t.audit, Deleted: t.deleted, Renamed: t.renamed, Grants: t.grants, Revoked: t.revoked,
 		Pending: t.pending, Checkpoints: t.checkpoints, Payload: t.payload, Nonces: t.nonces,
 	}
 	for k, r := range t.repos {
@@ -937,9 +965,12 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	if p.Grants != nil {
 		nt.grants = p.Grants
 	}
+	if p.Revoked != nil {
+		nt.revoked = p.Revoked
+	}
 	t.mu.Lock()
 	t.repos, t.root, t.events, t.eventBytes = nt.repos, nt.root, nt.events, nt.eventBytes
-	t.audit, t.deleted, t.renamed, t.grants = nt.audit, nt.deleted, nt.renamed, nt.grants
+	t.audit, t.deleted, t.renamed, t.grants, t.revoked = nt.audit, nt.deleted, nt.renamed, nt.grants, nt.revoked
 	t.applied, t.identity = p.Applied, p.Identity
 	t.pending, t.checkpoints = p.Pending, p.Checkpoints
 	t.payload, t.nonces, t.byNonce = nt.payload, nt.nonces, nt.byNonce

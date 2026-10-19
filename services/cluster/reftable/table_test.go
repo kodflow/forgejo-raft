@@ -298,6 +298,30 @@ func TestJoinGrants(t *testing.T) {
 	assert.Equal(t, "forgejo-user:1", g.Operator)
 }
 
+// A revoked key is kept for good, survives a snapshot, and voids a grant
+// bound to it.
+func TestRevokedKeys(t *testing.T) {
+	h := newHarness(t)
+	key := strings.Repeat("ab", 32)
+	assert.False(t, h.apply(KindRevokeKey, &RevokeKey{SPKI: "xyz", Slot: "node-b", Operator: "forgejo-user:1"}).OK)
+	assert.False(t, h.apply(KindRevokeKey, &RevokeKey{SPKI: key, Slot: "Bad Slot", Operator: "forgejo-user:1"}).OK)
+	require.True(t, h.apply(KindJoinGrant, &JoinGrant{Slot: "node-b", SPKI: key, Expires: 10, Operator: "forgejo-user:1"}).OK)
+	assert.False(t, h.table.KeyRevoked(key))
+	require.True(t, h.apply(KindRevokeKey, &RevokeKey{SPKI: key, Slot: "node-b", Operator: "forgejo-user:1"}).OK)
+	assert.True(t, h.table.KeyRevoked(key))
+	_, ok := h.table.JoinGrant("node-b")
+	assert.False(t, ok, "a grant bound to the revoked key is gone")
+
+	snap, err := h.table.Snapshot()
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+	c := New()
+	require.NoError(t, c.Restore(&buf, consensus.SnapshotMeta{}))
+	assert.True(t, c.KeyRevoked(key))
+}
+
 func TestAuditRetryIsKeptOnce(t *testing.T) {
 	h := newHarness(t)
 	a := &Audit{ID: "abc", Operator: "forgejo-user:1", Action: "promote", Outcome: "ok"}
