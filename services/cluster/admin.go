@@ -334,7 +334,10 @@ func (r *Replicator) Operate(ctx context.Context, op consensus.Operator, o Opera
 	r.audit(ctx, op, recorded, "requested", "")
 	err := r.operate(ctx, eng, op, o)
 	outcome, detail := "ok", ""
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrRevocationPending):
+		detail = err.Error()
+	case err != nil:
 		outcome, detail = "failed", err.Error()
 	}
 	log.Warn("cluster: operator %s %s %s: %s %s", op, o.Action, o.Target, outcome, detail)
@@ -382,7 +385,11 @@ func (r *Replicator) operate(ctx context.Context, eng consensus.Engine, op conse
 		if o.Target != strconv.Itoa(reftable.PayloadVersion) {
 			return fmt.Errorf("this binary raises the payload version to %d only", reftable.PayloadVersion)
 		}
-		return r.RaisePayloadVersion(ctx, op)
+		if err := r.RaisePayloadVersion(ctx, op); err != nil {
+			return err
+		}
+		r.flushRevocations(ctx)
+		return nil
 	}
 	if o.Action == ActionClearNoSpace {
 		id, err := strconv.ParseUint(o.Target, 10, 64)
@@ -401,18 +408,22 @@ func (r *Replicator) operate(ctx context.Context, eng consensus.Engine, op conse
 	switch o.Action {
 	case ActionPromote:
 		return eng.Promote(ctx, op, id)
-	case ActionRemove:
-		if err := r.revokeMember(ctx, eng, op, id); err != nil {
+	case ActionRemove, ActionDenyPin:
+		pending, err := r.revokeMember(ctx, eng, op, id)
+		if err != nil {
 			return err
 		}
-		return eng.Remove(ctx, op, id)
+		if o.Action == ActionRemove {
+			err = eng.Remove(ctx, op, id)
+		} else {
+			err = eng.DenyPin(ctx, op, id)
+		}
+		if err == nil && pending {
+			return ErrRevocationPending
+		}
+		return err
 	case ActionTransfer:
 		return eng.TransferLeadership(ctx, op, id)
-	case ActionDenyPin:
-		if err := r.revokeMember(ctx, eng, op, id); err != nil {
-			return err
-		}
-		return eng.DenyPin(ctx, op, id)
 	case ActionUpdateAddress:
 		if _, _, err := net.SplitHostPort(o.Address); err != nil {
 			return fmt.Errorf("address: %w", err)
@@ -555,30 +566,94 @@ func (r *Replicator) bindGrant(ctx context.Context, g reftable.JoinGrant, spki [
 	return nil
 }
 
+// ErrRevocationPending says an operation was done while the key it
+// revokes is not revoked yet: the cluster writes a revocation once every
+// member applies payload version reftable.RevokeVersion, and the node
+// writes it then by itself.
+var ErrRevocationPending = errors.New("the key is not revoked yet: some members run a binary that cannot apply a key revocation; it is written by itself once every member runs this version")
+
 // revokeMember revokes the key of member id before an operator removes it
 // or denies its pin: a removed node presenting that key, under any id, is
 // refused at the JOIN and on the object channel. The autopilot's removal of
 // a dead member does not come here, so that member returns.
-func (r *Replicator) revokeMember(ctx context.Context, eng consensus.Engine, op consensus.Operator, id consensus.NodeID) error {
+//
+// A revocation is written at payload version reftable.RevokeVersion only,
+// which an older binary stops on: while the cluster writes an older
+// version, it is recorded as a pending audit record, which every binary
+// applies, and pending reports it; flushRevocations writes it once the
+// version is raised.
+func (r *Replicator) revokeMember(ctx context.Context, eng consensus.Engine, op consensus.Operator, id consensus.NodeID) (pending bool, err error) {
 	for _, m := range eng.Membership().Members {
 		if m.ID != id || m.SPKI == ([32]byte{}) {
 			continue
 		}
-		k := &reftable.RevokeKey{SPKI: hex.EncodeToString(m.SPKI[:]), Slot: m.Slot, Operator: string(op), Time: time.Now().Unix()}
-		data, err := reftable.Encode(reftable.KindRevokeKey, k)
-		if err != nil {
-			return err
+		k := reftable.RevokeKey{SPKI: hex.EncodeToString(m.SPKI[:]), Slot: m.Slot, Operator: string(op), Time: time.Now().Unix()}
+		if r.table.WriteVersion() < reftable.RevokeVersion {
+			if err := r.recordPendingRevocation(ctx, k); err != nil {
+				return false, fmt.Errorf("recording the revocation of %s: %w", id, err)
+			}
+			log.Warn("cluster: the key of %s (slot %s) is not revoked yet: the cluster writes payload version %d, the revocation waits for %d", id, m.Slot, r.table.WriteVersion(), reftable.RevokeVersion)
+			return true, nil
 		}
-		_, result, err := r.proposeCommand(ctx, data, func() bool { return r.table.KeyRevoked(k.SPKI) })
-		if err != nil {
-			return fmt.Errorf("revoking the key of %s: %w", id, err)
-		}
-		if !result.OK {
-			return fmt.Errorf("revoking the key of %s: %s", id, result.Reason)
-		}
-		return nil
+		return false, r.writeRevocation(ctx, k)
+	}
+	return false, nil
+}
+
+// recordPendingRevocation records a revocation the cluster cannot write
+// yet, as a version 1 audit record every binary applies.
+func (r *Replicator) recordPendingRevocation(ctx context.Context, k reftable.RevokeKey) error {
+	id := clusterhook.NewNonce()
+	data, err := reftable.Encode(reftable.KindAudit, &reftable.Audit{
+		ID: id, Operator: k.Operator, Action: reftable.AuditRevokeKey, Target: k.Slot + ":" + k.SPKI,
+		Outcome: reftable.AuditPending, Time: k.Time,
+	})
+	if err != nil {
+		return err
+	}
+	_, result, err := r.proposeCommand(ctx, data, func() bool { return r.table.HasAudit(id) })
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return errors.New(result.Reason)
 	}
 	return nil
+}
+
+// writeRevocation writes one revocation, at reftable.RevokeVersion.
+func (r *Replicator) writeRevocation(ctx context.Context, k reftable.RevokeKey) error {
+	if r.table.WriteVersion() < reftable.RevokeVersion {
+		return ErrRevocationPending
+	}
+	data, err := reftable.EncodeVersion(reftable.RevokeVersion, reftable.KindRevokeKey, &k)
+	if err != nil {
+		return err
+	}
+	_, result, err := r.proposeCommand(ctx, data, func() bool { return r.table.KeyRevoked(k.SPKI) })
+	if err != nil {
+		return fmt.Errorf("revoking the key of slot %s: %w", k.Slot, err)
+	}
+	if !result.OK {
+		return fmt.Errorf("revoking the key of slot %s: %s", k.Slot, result.Reason)
+	}
+	return nil
+}
+
+// flushRevocations writes the pending revocations once the cluster writes
+// reftable.RevokeVersion; before, it does nothing. The leader's autopilot
+// calls it at each pass, and a raise of the payload version right after.
+func (r *Replicator) flushRevocations(ctx context.Context) {
+	if r.table.WriteVersion() < reftable.RevokeVersion {
+		return
+	}
+	for _, k := range r.table.PendingRevocations() {
+		if err := r.writeRevocation(ctx, k); err != nil {
+			log.Warn("cluster: writing the pending revocation of slot %s: %v; retried", k.Slot, err)
+			return
+		}
+		log.Warn("cluster: the key of slot %s is revoked, the cluster now writes payload version %d", k.Slot, reftable.RevokeVersion)
+	}
 }
 
 // authorizeJoin is Forgejo's JoinAuthorizer (R8-09). The engine has already

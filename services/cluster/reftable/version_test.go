@@ -5,6 +5,7 @@ package reftable
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"forgejo.org/modules/json"
@@ -110,6 +111,21 @@ func TestVersion2OfAnotherKindStopsTheNode(t *testing.T) {
 	assert.Panics(t, func() {
 		h.table.Apply(consensus.Entry{Term: 1, Index: 1, Kind: consensus.EntryCommand, Data: data})
 	})
+}
+
+// A key revocation travels at RevokeVersion: at version 2 it stops the
+// node like any other kind there, and a version 2 binary, which applies
+// up to 2, stops on the version 3 envelope (it is never written before
+// every member applies it).
+func TestRevokeKeyOnlyAtVersion3(t *testing.T) {
+	h := newHarness(t)
+	data, err := EncodeVersion(RevokeVersion, KindRevokeKey, &RevokeKey{SPKI: strings.Repeat("ab", 32), Slot: "node-b", Operator: "op"})
+	require.NoError(t, err)
+	data[0] = 2
+	assert.Panics(t, func() {
+		h.table.Apply(consensus.Entry{Term: 1, Index: 1, Kind: consensus.EntryCommand, Data: data})
+	})
+	assert.Equal(t, 3, RevokeVersion)
 }
 
 // The nonce of an accepted transaction is kept: a proposer whose outcome

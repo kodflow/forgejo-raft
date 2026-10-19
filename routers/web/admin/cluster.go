@@ -216,7 +216,9 @@ func ClusterOperateConfirm(ctx *context.Context) {
 	}
 	opCtx, cancel := go_context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if err := r.Operate(opCtx, cluster_service.OperatorFor(ctx.Doer.ID), o); err != nil {
+	if err := r.Operate(opCtx, cluster_service.OperatorFor(ctx.Doer.ID), o); errors.Is(err, cluster_service.ErrRevocationPending) {
+		ctx.Flash.Warning(ctx.Tr("admin.cluster.op.revocation_pending", ctx.Locale.TrString("admin.cluster.op."+string(o.Action)), o.Target))
+	} else if err != nil {
 		reason := err.Error()
 		switch {
 		case errors.Is(err, cluster_service.ErrLastOperator):

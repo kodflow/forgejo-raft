@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"forgejo.org/modules/json"
 	"forgejo.org/services/cluster/consensus"
 
 	"github.com/stretchr/testify/assert"
@@ -299,15 +300,17 @@ func TestJoinGrants(t *testing.T) {
 }
 
 // A revoked key is kept for good, survives a snapshot, and voids a grant
-// bound to it.
+// bound to it. It is written at RevokeVersion only: an older envelope is
+// refused, never applied.
 func TestRevokedKeys(t *testing.T) {
 	h := newHarness(t)
 	key := strings.Repeat("ab", 32)
-	assert.False(t, h.apply(KindRevokeKey, &RevokeKey{SPKI: "xyz", Slot: "node-b", Operator: "forgejo-user:1"}).OK)
-	assert.False(t, h.apply(KindRevokeKey, &RevokeKey{SPKI: key, Slot: "Bad Slot", Operator: "forgejo-user:1"}).OK)
+	assert.False(t, h.applyAt(RevokeVersion, KindRevokeKey, &RevokeKey{SPKI: "xyz", Slot: "node-b", Operator: "forgejo-user:1"}).OK)
+	assert.False(t, h.applyAt(RevokeVersion, KindRevokeKey, &RevokeKey{SPKI: key, Slot: "Bad Slot", Operator: "forgejo-user:1"}).OK)
 	require.True(t, h.apply(KindJoinGrant, &JoinGrant{Slot: "node-b", SPKI: key, Expires: 10, Operator: "forgejo-user:1"}).OK)
+	assert.False(t, h.apply(KindRevokeKey, &RevokeKey{SPKI: key, Slot: "node-b", Operator: "forgejo-user:1"}).OK, "below RevokeVersion")
 	assert.False(t, h.table.KeyRevoked(key))
-	require.True(t, h.apply(KindRevokeKey, &RevokeKey{SPKI: key, Slot: "node-b", Operator: "forgejo-user:1"}).OK)
+	require.True(t, h.applyAt(RevokeVersion, KindRevokeKey, &RevokeKey{SPKI: key, Slot: "node-b", Operator: "forgejo-user:1"}).OK)
 	assert.True(t, h.table.KeyRevoked(key))
 	_, ok := h.table.JoinGrant("node-b")
 	assert.False(t, ok, "a grant bound to the revoked key is gone")
@@ -320,6 +323,39 @@ func TestRevokedKeys(t *testing.T) {
 	c := New()
 	require.NoError(t, c.Restore(&buf, consensus.SnapshotMeta{}))
 	assert.True(t, c.KeyRevoked(key))
+}
+
+// A revocation asked for before the cluster writes RevokeVersion waits as
+// a version 1 audit record: it revokes nothing yet, an older member keeps
+// it as a plain record, and a snapshot cut by such a member, without the
+// field, reads it back from the audit kept. Writing it ends the wait.
+func TestPendingRevocationWaitsAsAnAuditRecord(t *testing.T) {
+	h := newHarness(t)
+	key := strings.Repeat("cd", 32)
+	require.True(t, h.apply(KindAudit, &Audit{ID: "r1", Operator: "forgejo-user:1", Action: AuditRevokeKey, Target: "node-b:" + key, Outcome: AuditPending}).OK)
+	require.True(t, h.apply(KindAudit, &Audit{Operator: "forgejo-user:1", Action: AuditRevokeKey, Target: "node-b:junk", Outcome: AuditPending}).OK)
+	assert.False(t, h.table.KeyRevoked(key))
+	require.Len(t, h.table.PendingRevocations(), 1)
+	assert.Equal(t, RevokeKey{SPKI: key, Slot: "node-b", Operator: "forgejo-user:1"}, h.table.PendingRevocations()[0])
+
+	snap, err := h.table.Snapshot()
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+	var fields map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &fields))
+	require.Contains(t, fields, "pending_revoke")
+	delete(fields, "pending_revoke")
+	old, err := json.Marshal(fields)
+	require.NoError(t, err)
+	c := New()
+	require.NoError(t, c.Restore(bytes.NewReader(old), consensus.SnapshotMeta{}))
+	require.Len(t, c.PendingRevocations(), 1, "read back from the audit kept")
+
+	require.True(t, h.applyAt(RevokeVersion, KindRevokeKey, &RevokeKey{SPKI: key, Slot: "node-b", Operator: "forgejo-user:1"}).OK)
+	assert.True(t, h.table.KeyRevoked(key))
+	assert.Empty(t, h.table.PendingRevocations())
 }
 
 func TestAuditRetryIsKeptOnce(t *testing.T) {

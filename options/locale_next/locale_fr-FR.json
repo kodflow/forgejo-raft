@@ -1374,6 +1374,7 @@
 	"admin.cluster.op.step_up_no_password": "Votre compte n'a pas de mot de passe local, il ne peut donc pas se réauthentifier ici : rien n'a été fait.",
 	"admin.cluster.op.failed": "L'opération %s a échoué : %s",
 	"admin.cluster.op.done": "L'opération %s sur %s est faite.",
+	"admin.cluster.op.revocation_pending": "L'opération %s sur %s est faite, mais sa clé n'est pas encore révoquée : des membres tournent sur un binaire plus ancien. La révocation s'écrit d'elle-même dès que tous les membres tournent sur cette version.",
 	"admin.cluster.op.add-learner": "Ajouter un apprenant",
 	"admin.cluster.op.promote": "Promouvoir",
 	"admin.cluster.op.remove": "Retirer",

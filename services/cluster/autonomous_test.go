@@ -6,11 +6,13 @@ package cluster
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -233,6 +235,7 @@ func TestRemovedKeyIsRevoked(t *testing.T) {
 		return 0
 	}
 	idB, idC := idOf("node-b"), idOf("node-c")
+	require.NoError(t, r.RaisePayloadVersion(ctx, "op"), "every member applies RevokeVersion")
 
 	require.NoError(t, r.Operate(ctx, OperatorFor(1), Operation{Action: ActionRemove, Target: idB.String()}))
 	_, err := r.authorizeJoin(ctx, consensus.JoinRequest{Slot: "node-b", SPKI: keyB})
@@ -282,7 +285,65 @@ func TestObjectChannelRefusesARevokedKey(t *testing.T) {
 			idB = m.ID
 		}
 	}
-	require.NoError(t, r.revokeMember(context.Background(), r.Engine(), OperatorFor(1), idB))
+	require.NoError(t, r.RaisePayloadVersion(context.Background(), "op"))
+	pending, err := r.revokeMember(context.Background(), r.Engine(), OperatorFor(1), idB)
+	require.NoError(t, err)
+	require.False(t, pending)
 	_, err = oc.admit(peer{Slot: "node-b", SPKI: keyB})
 	require.ErrorContains(t, err, "revoked")
+}
+
+// In a cluster that does not write RevokeVersion yet (a member may run an
+// older binary, which stops on it), an operator's Remove goes through
+// without the revocation: no entry above version 2 and no revocation is
+// written, the operator is told the key is not revoked yet, and the
+// revocation is written by itself once the version is raised.
+func TestRevocationWaitsForEveryMember(t *testing.T) {
+	mem, rs := NewForTesting(t.TempDir(), "node-a")
+	r := rs[0]
+	ctx := context.Background()
+	keyB := sha256.Sum256([]byte("node-b"))
+	mem.Add("node-b", keyB, reftable.New())
+	mem.Add("node-c", sha256.Sum256([]byte("node-c")), reftable.New())
+	mem.Add("node-d", sha256.Sum256([]byte("node-d")), reftable.New())
+	var idB consensus.NodeID
+	for _, m := range r.Engine().Membership().Members {
+		if m.Slot == "node-b" {
+			idB = m.ID
+		}
+	}
+	entries := func() []consensus.Entry {
+		cr, ok := r.Engine().(consensus.CommittedReader)
+		require.True(t, ok)
+		out, err := cr.ReadCommitted(ctx, 1, r.Engine().Status().Commit, 1<<30)
+		require.NoError(t, err)
+		return out
+	}
+	revocationsWritten := func() int {
+		n := 0
+		for _, e := range entries() {
+			if e.Kind == consensus.EntryCommand && len(e.Data) > 1 {
+				require.LessOrEqual(t, e.Data[0], uint8(2), "an entry an older member could not read")
+				if reftable.Kind(e.Data[1]) == reftable.KindRevokeKey {
+					n++
+				}
+			}
+		}
+		return n
+	}
+
+	require.Less(t, r.table.WriteVersion(), uint8(reftable.RevokeVersion))
+	err := r.Operate(ctx, OperatorFor(1), Operation{Action: ActionRemove, Target: idB.String()})
+	require.ErrorIs(t, err, ErrRevocationPending)
+	for _, m := range r.Engine().Membership().Members {
+		assert.NotEqual(t, idB, m.ID, "the member is removed all the same")
+	}
+	assert.False(t, r.table.KeyRevoked(hex.EncodeToString(keyB[:])))
+	require.Len(t, r.table.PendingRevocations(), 1)
+	r.flushRevocations(ctx)
+	assert.Zero(t, revocationsWritten(), "nothing above version 2 before the raise")
+
+	require.NoError(t, r.Operate(ctx, OperatorFor(1), Operation{Action: ActionRaisePayload, Target: strconv.Itoa(reftable.PayloadVersion)}))
+	assert.True(t, r.table.KeyRevoked(hex.EncodeToString(keyB[:])), "written once the version is raised")
+	assert.Empty(t, r.table.PendingRevocations())
 }

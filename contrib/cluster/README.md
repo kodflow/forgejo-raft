@@ -198,11 +198,15 @@ revokes its key: the revocation is a replicated entry, so every member
 refuses that key at the JOIN, under any id and whatever grant the slot has,
 and the object channel no longer admits it. The node comes back only with a
 new key, which the CA signs. The autopilot's removal of a dead member revokes
-nothing, so a node that was only out of reach returns by itself. Every member
-must run a binary that knows the revocation before an operator removes a
-member: an older binary stops on the entry, as on any command it does not
-know. A JOIN grant is bound to the key it first admits: that node may retry,
-another key does not join under it.
+nothing, so a node that was only out of reach returns by itself. The
+revocation is a command of payload version 3, which an older binary cannot
+read: while a member still runs one, the cluster writes an older version,
+the Remove or Deny pin goes through without the revocation, and the
+administration says the key is not revoked yet. The request is kept in the
+log, and the revocation is written by itself once every member runs this
+version (the autopilot raises the version; in the manual mode, the
+operator raises it from the administration page). A JOIN grant is bound to the key it first admits:
+that node may retry, another key does not join under it.
 
 **A compromised CA** is replaced, never revoked in place. Sign new
 certificates under a new CA, add the new CA to `TLS_CA_FILE` beside the old

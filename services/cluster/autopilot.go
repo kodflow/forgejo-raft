@@ -96,6 +96,7 @@ func (r *Replicator) autopilotStep(ctx context.Context) {
 		return
 	}
 	r.maybeRaisePayload(pctx, m)
+	r.flushRevocations(pctx)
 }
 
 // payloadProbeEvery paces the leader's question "does every member apply
