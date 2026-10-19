@@ -459,6 +459,15 @@ Watch, Custom, Releases on GitHub, or the tags of
   once the other writer is done; a lock left behind by a crashed git is
   removed by hand. An empty lock younger than two minutes, on a ref the
   push deletes, cannot be told from git's own.
+- A deleted or renamed repository leaves its key in the replicated table
+  for good: tombstoned refs, a deletion mark, a rename mark. Each costs a
+  few hundred bytes in every snapshot, and the projector's first pass
+  after a restart visits every key. Purging them changes the state machine
+  (a new command and payload version, every node purging at the same
+  index, the push-into-a-deleted-key refusal and the consumer's rename
+  tracking kept intact for events still queued), so it is not done yet:
+  an instance that deletes repositories by the hundred thousand should
+  watch the snapshot size.
 - A ref name must be valid UTF-8. git accepts other bytes, which the
   replicated table, in JSON, cannot carry unchanged.
 - The object channel accepts what Forgejo accepts on a push: the fsck
