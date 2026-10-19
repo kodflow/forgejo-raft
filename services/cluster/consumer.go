@@ -125,7 +125,7 @@ const (
 func newConsumer(r *Replicator) *consumer {
 	c := &consumer{
 		r: r, work: func(ctx context.Context, evs []reftable.Event) error {
-			return pushWorkWith(ctx, evs, r.table.RenamedFrom)
+			return pushWorkWith(ctx, evs, r.table)
 		},
 		dbReady: func() bool { return db.DefaultContext != nil },
 		cursor:  cluster_model.GetCursor, advance: cluster_model.AdvanceCursor, tx: db.WithTx,
@@ -663,7 +663,8 @@ func (c *consumer) waitCursor(ctx context.Context, tok consensus.Token) error {
 // pushWork is the post-receive work of a group of events of one repository:
 // branch rows, then push actions, webhooks, CI triggers and pull request
 // updates, as the node-local post-receive hook did before the cluster. It
-// knows no rename: the consumer uses pushWorkWith and the table's.
+// knows no rename nor deletion: the consumer uses pushWorkWith and the
+// table.
 func pushWork(ctx context.Context, evs []reftable.Event) error {
 	return pushWorkWith(ctx, evs, nil)
 }
@@ -671,7 +672,19 @@ func pushWork(ctx context.Context, evs []reftable.Event) error {
 // renamedFromFunc is the table's RenamedFrom.
 type renamedFromFunc func(repo string) (from string, index uint64, ok bool)
 
-func pushWorkWith(ctx context.Context, evs []reftable.Event, renamedFrom renamedFromFunc) error {
+// lifecycleTable is what the post-receive work reads of the table: the
+// renames and deletions that happened to a repository after an event.
+type lifecycleTable interface {
+	RenamedFrom(repo string) (string, uint64, bool)
+	RenamedAfter(from string, after uint64) (string, uint64, bool)
+	Deleted(repo string) (uint64, bool)
+}
+
+func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable) error {
+	var renamedFrom renamedFromFunc
+	if tbl != nil {
+		renamedFrom = tbl.RenamedFrom
+	}
 	first := evs[0]
 	if first.Kind != reftable.EventRef || first.IsWiki {
 		// Repository deletion and rename change SQL in the request that
@@ -689,6 +702,14 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, renamedFrom renamed
 	}
 	repo, err := lookupRepo(ctx, first)
 	if err != nil {
+		if repo_model.IsErrRepoNotExist(err) && deletedAfter(tbl, first) {
+			// The repository was deleted after the push: its rows are gone
+			// with it, and the work has nothing left to land on. Kept, it
+			// would fail at every retry, parked for good, and hold back
+			// the trim of the whole event queue.
+			log.Info("cluster consumer: %s was deleted after the event at %d; its post-receive work is dropped", first.Repo, first.Token.Index)
+			return nil
+		}
 		return err
 	}
 	if first.RepoID > 0 && !eventLeadsTo(first, clusterhook.RepoKey(repo.OwnerName, repo.Name, first.IsWiki), renamedFrom) {
@@ -786,6 +807,29 @@ func eventLeadsTo(ev reftable.Event, key string, renamedFrom renamedFromFunc) bo
 		key, at = from, idx
 	}
 	return true
+}
+
+// deletedAfter reports whether the table deleted the repository an event
+// was written for after the event, following its renames forward. A
+// repository still being created (its row not committed yet) has no such
+// deletion, and neither has a key written again since: only those events
+// are dropped whose repository the cluster saw go.
+func deletedAfter(tbl lifecycleTable, ev reftable.Event) bool {
+	if tbl == nil {
+		return false
+	}
+	key, at := ev.Repo, ev.Token.Index
+	for range 64 {
+		if idx, deleted := tbl.Deleted(key); deleted && idx > at {
+			return true
+		}
+		to, idx, ok := tbl.RenamedAfter(key, at)
+		if !ok {
+			return false
+		}
+		key, at = to, idx
+	}
+	return false
 }
 
 func lookupRepo(ctx context.Context, ev reftable.Event) (*repo_model.Repository, error) {

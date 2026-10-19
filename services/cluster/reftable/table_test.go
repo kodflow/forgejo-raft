@@ -338,3 +338,23 @@ func TestRenameMovesSeveralRepositoriesAtomically(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "o/r.wiki.git", from)
 }
+
+// RenamedAfter walks forward from an event: the oldest rename after it.
+func TestRenamedAfter(t *testing.T) {
+	h := newHarness(t)
+	require.True(t, h.apply(KindRefTxn, push("a/b.git", RefUpdate{Ref: "refs/heads/x", New: sha1A})).OK)
+	require.True(t, h.apply(KindRepoRename, &RepoRename{From: "a/b.git", To: "a/c.git"}).OK)
+	require.True(t, h.apply(KindRepoRename, &RepoRename{From: "a/c.git", To: "a/d.git"}).OK)
+
+	to, at, ok := h.table.RenamedAfter("a/b.git", 1)
+	require.True(t, ok)
+	assert.Equal(t, "a/c.git", to)
+	assert.EqualValues(t, 2, at)
+	to, _, ok = h.table.RenamedAfter("a/c.git", at)
+	require.True(t, ok)
+	assert.Equal(t, "a/d.git", to)
+	_, _, ok = h.table.RenamedAfter("a/b.git", 2)
+	assert.False(t, ok, "the rename is not after index 2")
+	_, _, ok = h.table.RenamedAfter("a/d.git", 0)
+	assert.False(t, ok)
+}
