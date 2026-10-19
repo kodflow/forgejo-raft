@@ -100,7 +100,7 @@ func (r *Replicator) Handle(ctx context.Context, req *clusterhook.Request) *clus
 		if err != nil {
 			return fail(err)
 		}
-		if err := r.registry.register(req.Nonce, repo, nil, req.PID); err != nil {
+		if err := r.registry.reserve(req.Nonce, repo, req.PID); err != nil {
 			return fail(err)
 		}
 		return &clusterhook.Response{OK: true}

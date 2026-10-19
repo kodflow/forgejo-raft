@@ -719,10 +719,10 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		// out again. Its branch rows, webhooks and CI must not land there.
 		return fmt.Errorf("repository ID %d is %s/%s, which the event's %s does not lead to: the ID was reused; run `forgejo cluster reconcile`", first.RepoID, repo.OwnerName, repo.Name, first.Repo)
 	}
-	if u, err := user_model.GetUserByID(ctx, first.PusherID); err == nil && pusherReissued(u, first) {
-		// The same loss reissues user IDs: an account created after the
-		// push cannot have made it, and must not be credited with it.
-		return fmt.Errorf("pusher ID %d is %s, created after the push at %d: the ID was reused; run `forgejo cluster reconcile`", first.PusherID, u.Name, first.Token.Index)
+	if u, err := user_model.GetUserByID(ctx, first.PusherID); err == nil && pusherReissued(ctx, u, first) {
+		// The same loss reissues user IDs: another account now holds the
+		// pusher's ID, and must not be credited with the push.
+		return fmt.Errorf("pusher ID %d is %s, not the account that pushed at %d: the ID was reused; run `forgejo cluster reconcile`", first.PusherID, u.Name, first.Token.Index)
 	}
 	var updates []*repo_module.PushUpdateOptions
 	var branches []string
@@ -781,9 +781,23 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 // proposed a push and the one that created its pusher's account.
 const pusherClockSkew = 5 * time.Minute
 
-// pusherReissued reports whether u was created after the event, beyond the
-// clock skew between nodes: its ID was handed out again.
-func pusherReissued(u *user_model.User, ev reftable.Event) bool {
+// pusherReissued reports whether u, the account holding the event's pusher
+// ID now, is not the one that pushed: its ID was handed out again.
+//
+// From payload version 4 the event names the pusher, and the name decides,
+// with no clock: the same name, or a name that redirects to u (a rename
+// since), is the pusher; any other name is not. An event written before
+// carries no name and falls back to the account's creation time against
+// the push's, two nodes' clocks: a skew beyond pusherClockSkew between
+// them can still park a legitimate push.
+func pusherReissued(ctx context.Context, u *user_model.User, ev reftable.Event) bool {
+	if ev.PusherName != "" {
+		if strings.EqualFold(u.Name, ev.PusherName) {
+			return false
+		}
+		r, err := user_model.GetUserRedirect(ctx, ev.PusherName)
+		return err != nil || r.RedirectUserID != u.ID
+	}
 	if ev.Time <= 0 || u.CreatedUnix <= 0 {
 		return false
 	}

@@ -208,6 +208,15 @@ version (the autopilot raises the version; in the manual mode, the
 operator raises it from the administration page). A JOIN grant is bound to the key it first admits:
 that node may retry, another key does not join under it.
 
+**Payload version 4** carries the pusher's name in each push entry. The
+log consumer uses it to tell a pusher ID handed out again after a database
+loss (another name, and no redirect from the old name to the account) from
+the pusher itself, with no clock involved; before, it compared the push
+node's clock with the account's creation time, and a skew of more than
+five minutes parked a legitimate push. A binary of this version raises the
+cluster straight to version 4, the revocation of version 3 included, once
+every member runs it; entries written before keep the clock rule.
+
 **A compromised CA** is replaced, never revoked in place. Sign new
 certificates under a new CA, add the new CA to `TLS_CA_FILE` beside the old
 one and roll the certificates; then remove the old CA from the file and
@@ -443,9 +452,22 @@ Watch, Custom, Releases on GitHub, or the tags of
 - A push is committed whole or not at all. With git 2.54 and later, a
   non-atomic push of several refs is one git transaction that may reject
   some refs; the cluster cannot commit only the others, so when git would
-  reject one ref (another writer's lock, a ref that moved on this node) the
-  whole push is refused and the client reads every ref rejected. Pushing
-  again succeeds once the other writer is done.
+  reject one ref (another writer's lock, a lock left behind for more than
+  two minutes, a ref that moved on this node, a name that conflicts with
+  one of this node's refs as a directory and a file) the whole push is
+  refused and the client reads every ref rejected. Pushing again succeeds
+  once the other writer is done; a lock left behind by a crashed git is
+  removed by hand. An empty lock younger than two minutes, on a ref the
+  push deletes, cannot be told from git's own.
+- A deleted or renamed repository leaves its key in the replicated table
+  for good: tombstoned refs, a deletion mark, a rename mark. Each costs a
+  few hundred bytes in every snapshot, and the projector's first pass
+  after a restart visits every key. Purging them changes the state machine
+  (a new command and payload version, every node purging at the same
+  index, the push-into-a-deleted-key refusal and the consumer's rename
+  tracking kept intact for events still queued), so it is not done yet:
+  an instance that deletes repositories by the hundred thousand should
+  watch the snapshot size.
 - A ref name must be valid UTF-8. git accepts other bytes, which the
   replicated table, in JSON, cannot carry unchanged.
 - The object channel accepts what Forgejo accepts on a push: the fsck
