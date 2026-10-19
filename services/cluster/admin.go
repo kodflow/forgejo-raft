@@ -602,12 +602,12 @@ func (r *Replicator) SaveSnapshot(ctx context.Context, op consensus.Operator, pa
 	sum := hex.EncodeToString(h.Sum(nil))
 	// The digest names the file by its base name, so `sha256sum -c` works
 	// wherever the pair is copied.
-	if err := os.WriteFile(path+".sha256.partial", []byte(sum+"  "+filepath.Base(path)+"\n"), 0o600); err != nil {
+	if err := writeFileSynced(path+".sha256.partial", []byte(sum+"  "+filepath.Base(path)+"\n")); err != nil {
 		return meta, err
 	}
 	// The engine's metadata travels with the snapshot: a restore needs it.
 	if len(meta.Raw) > 0 {
-		if err := os.WriteFile(path+".meta.partial", meta.Raw, 0o600); err != nil {
+		if err := writeFileSynced(path+".meta.partial", meta.Raw); err != nil {
 			return meta, err
 		}
 	}
@@ -625,8 +625,29 @@ func (r *Replicator) SaveSnapshot(ctx context.Context, op consensus.Operator, pa
 	if err := os.Rename(path+".sha256.partial", path+".sha256"); err != nil {
 		return meta, err
 	}
+	// The renames are durable before the operator is told the snapshot is
+	// saved.
+	if err := syncDirFn(filepath.Dir(path)); err != nil {
+		return meta, err
+	}
 	log.Warn("cluster: operator %s saved the ref snapshot at %d to %s (sha256 %s)", op, meta.Position.Index, path, sum)
 	return meta, nil
+}
+
+// writeFileSynced writes b to path and syncs it before closing.
+func writeFileSynced(path string, b []byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(b)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // The refusals of the operator management, which the administration

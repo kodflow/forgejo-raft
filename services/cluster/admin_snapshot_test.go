@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -39,6 +40,26 @@ func TestSaveSnapshotLandsDigestLast(t *testing.T) {
 	for _, e := range entries {
 		assert.False(t, strings.HasSuffix(e.Name(), ".partial"), e.Name())
 	}
+}
+
+// The operator is told the snapshot is saved only once the file, its
+// digest and its metadata are durable: the directory holding their names is
+// synced after the last rename, or a power loss right after the answer can
+// take the digest or the metadata a restore needs.
+func TestSaveSnapshotSyncsItsDirectory(t *testing.T) {
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "table.snap")
+	var synced []string
+	defer func(prev func(string) error) { syncDirFn = prev }(syncDirFn)
+	syncDirFn = func(d string) error {
+		_, err := os.Stat(path + ".sha256")
+		synced = append(synced, fmt.Sprintf("%s digest=%t", d, err == nil))
+		return nil
+	}
+	_, err := tc.nodes[0].r.SaveSnapshot(context.Background(), OperatorFor(1), path)
+	require.NoError(t, err)
+	assert.Contains(t, synced, dir+" digest=true", "the directory is synced once the digest has its name")
 }
 
 // A peer's object format is checked before git sees it.
