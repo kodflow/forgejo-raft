@@ -12,13 +12,18 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"forgejo.org/modules/json"
 )
@@ -42,6 +47,68 @@ type Line struct {
 	Old string `json:"old"`
 	New string `json:"new"`
 	Ref string `json:"ref"`
+}
+
+// ParseLines reads the reference-transaction hook's input: one
+// "<old> SP <new> SP <ref> LF" per ref, split on the first two ASCII spaces
+// exactly as git writes them. The ref name is the rest of the line, byte for
+// byte: git accepts Unicode spaces in a ref name (U+00A0, U+3000), which a
+// split on any white space would cut or drop. A line that does not split in
+// three, or a name that is not valid UTF-8 (JSON would carry another name
+// than git's), is an error: the caller fails closed instead of skipping a
+// ref git is about to write.
+func ParseLines(r io.Reader) ([]Line, error) {
+	var lines []Line
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		text := sc.Text()
+		if text == "" {
+			continue
+		}
+		parts := strings.SplitN(text, " ", 3)
+		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+			return nil, fmt.Errorf("malformed reference-transaction line %q", text)
+		}
+		for _, p := range parts {
+			if !utf8.ValidString(p) {
+				return nil, fmt.Errorf("the ref name %q is not valid UTF-8, which the cluster cannot carry", text)
+			}
+		}
+		lines = append(lines, Line{Old: parts[0], New: parts[1], Ref: parts[2]})
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("reading the reference-transaction lines: %w", err)
+	}
+	return lines, nil
+}
+
+// TxnDigest names one git ref transaction among those of a git process: its
+// lines, sorted, hashed. An older git (before 2.54) runs one transaction per
+// ref of a non-atomic push under the same process nonce; the replicated
+// table must tell them apart (TxnNonce).
+func TxnDigest(lines []Line) string {
+	keys := make([]string, 0, len(lines))
+	for _, l := range lines {
+		keys = append(keys, l.Old+" "+l.New+" "+l.Ref)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	for _, k := range keys {
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// TxnNonce is the nonce a ref transaction carries in the replicated table:
+// the process nonce, which correlates the request's read-after-write cookie,
+// narrowed to the transaction by its digest.
+func TxnNonce(nonce string, lines []Line) string {
+	if nonce == "" {
+		return ""
+	}
+	return nonce + "." + TxnDigest(lines)
 }
 
 // Ops of the socket protocol.
@@ -204,13 +271,35 @@ func TxnEnv(ctx context.Context) []string {
 // ErrRefused is a transaction the replicator refused.
 var ErrRefused = errors.New("refused by the cluster")
 
-// DefaultTimeout bounds one hook call: a proposal, its objects and its commit.
+// DefaultTimeout is the default of [cluster] HOOK_TIMEOUT, which bounds one
+// hook call: a proposal, its objects and its commit.
 const DefaultTimeout = 60 * time.Second
 
-// ServerBudget is what the replicator allows itself for one call: less than
-// the hook waits, so the answer reaches the hook before it gives up. A hook
-// that gives up anyway cannot tell whether the write committed.
-const ServerBudget = DefaultTimeout - 10*time.Second
+// hookMargin is how much less than the hook the replicator allows itself,
+// so its answer reaches the hook before the hook gives up. A hook that gives
+// up anyway cannot tell whether the write committed.
+const hookMargin = 10 * time.Second
+
+var hookTimeout atomic.Int64
+
+// SetHookTimeout sets the hook's budget, [cluster] HOOK_TIMEOUT, for this
+// process; the replicator calls it at start, with the value the hook reads.
+func SetHookTimeout(d time.Duration) {
+	hookTimeout.Store(int64(d))
+}
+
+// HookTimeout is the hook's budget: DefaultTimeout unless set.
+func HookTimeout() time.Duration {
+	if d := time.Duration(hookTimeout.Load()); d > hookMargin {
+		return d
+	}
+	return DefaultTimeout
+}
+
+// ServerBudget is what the replicator allows itself for one hook call.
+func ServerBudget() time.Duration {
+	return HookTimeout() - hookMargin
+}
 
 // AdminTimeout bounds an operator's command on the socket (import,
 // reconcile, objects backfill, snapshot, reproject): it moves whole
@@ -222,7 +311,7 @@ const AdminTimeout = 30 * time.Minute
 func Budget(op string) time.Duration {
 	switch op {
 	case OpPrepared, OpCommitted, OpAborted, OpRegister, OpStatus, OpFresh:
-		return ServerBudget
+		return ServerBudget()
 	default:
 		return AdminTimeout - 10*time.Second
 	}

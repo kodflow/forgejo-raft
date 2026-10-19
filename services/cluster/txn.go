@@ -23,11 +23,15 @@ type txn struct {
 
 // registry tracks native git transactions so the projector never certifies
 // a repository's watermark while git may still publish a ref behind it.
-// Registration and certification take the same lock.
+// A registration waits while its repository is being certified.
 type registry struct {
 	mu      sync.Mutex
 	byNonce map[string]*txn
 	byRepo  map[string]map[string]*txn
+	// certifying holds the repositories being certified, each with the
+	// channel closed when its certification ends. The certification runs
+	// git outside mu: only a transaction of THAT repository waits for it.
+	certifying map[string]chan struct{}
 	ttl     time.Duration
 	perRepo int
 	total   int
@@ -37,7 +41,7 @@ type registry struct {
 
 func newRegistry(ttl time.Duration, perRepo, total int) *registry {
 	return &registry{
-		byNonce: map[string]*txn{}, byRepo: map[string]map[string]*txn{},
+		byNonce: map[string]*txn{}, byRepo: map[string]map[string]*txn{}, certifying: map[string]chan struct{}{},
 		ttl: ttl, perRepo: perRepo, total: total, alive: pidAlive, now: time.Now,
 	}
 }
@@ -56,6 +60,32 @@ func (r *registry) register(nonce, repo string, refs []string, pid int) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// A certification of this repository reads git now: registering would
+	// let git publish behind the watermark it is about to set. It runs two
+	// git commands; past the registration TTL the push is turned away.
+	var expired *time.Timer
+	defer func() {
+		if expired != nil {
+			expired.Stop()
+		}
+	}()
+	for {
+		done, busy := r.certifying[repo]
+		if !busy {
+			break
+		}
+		if expired == nil {
+			expired = time.NewTimer(r.ttl)
+		}
+		r.mu.Unlock()
+		select {
+		case <-done:
+			r.mu.Lock()
+		case <-expired.C:
+			r.mu.Lock()
+			return errTooManyTxn
+		}
+	}
 	if t, ok := r.byNonce[nonce]; ok {
 		// "register" from serv, then "prepared" from the hook, share a
 		// nonce: the second call completes the first.
@@ -131,16 +161,27 @@ func (r *registry) inFlight(repo string) bool {
 }
 
 // certify runs f while no transaction can register for repo, and only when
-// none is in flight; it reports whether f ran.
+// none is in flight; it reports whether f ran. f runs git outside the
+// registry's lock, so a slow disk under one repository holds no other
+// repository's push.
 func (r *registry) certify(repo string, f func()) bool {
 	if r.inFlight(repo) {
 		return false
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.byRepo[repo]) > 0 {
+	if _, busy := r.certifying[repo]; busy || len(r.byRepo[repo]) > 0 {
+		r.mu.Unlock()
 		return false
 	}
+	done := make(chan struct{})
+	r.certifying[repo] = done
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.certifying, repo)
+		r.mu.Unlock()
+		close(done)
+	}()
 	f()
 	return true
 }

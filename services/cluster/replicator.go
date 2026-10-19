@@ -163,6 +163,8 @@ func Init(ctx context.Context) error {
 		return fmt.Errorf("[cluster] repository root: %w", err)
 	}
 	r := newReplicator(setting.RepoRootPath, newRegistry(setting.Cluster.TxnTTL, setting.Cluster.MaxTxnPerRepo, setting.Cluster.MaxTxnTotal))
+	// The socket's budget follows the hook's, read from the same setting.
+	clusterhook.SetHookTimeout(setting.Cluster.HookTimeout)
 	r.ctx = graceful.GetManager().ShutdownContext()
 
 	id, err := newIdentity(setting.Cluster.TLSCertFile, setting.Cluster.TLSKeyFile, setting.Cluster.TLSCAFile)
@@ -464,6 +466,12 @@ func (r *Replicator) WaitReadAfterWrite(ctx context.Context, tok consensus.Token
 func (r *Replicator) WaitFresh(ctx context.Context, repo string) bool {
 	eng := r.Engine()
 	if eng == nil || reftable.ValidRepoKey(repo) != nil {
+		return false
+	}
+	// Without a known leader no barrier completes within the bound: every
+	// git request would wait READ_AFTER_WRITE_TIMEOUT to be served as the
+	// node has it anyway. It is served at once, reported possibly behind.
+	if !eng.Health().LeaderKnown {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(ctx, setting.Cluster.ReadAfterWriteTimeout)

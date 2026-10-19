@@ -72,7 +72,7 @@ func (r *Replicator) serveHookConn(conn net.Conn) {
 	}
 	// The request is read within the hook's deadline; the work then gets
 	// the budget of its operation, and the answer a little more.
-	_ = conn.SetDeadline(time.Now().Add(clusterhook.DefaultTimeout))
+	_ = conn.SetDeadline(time.Now().Add(clusterhook.HookTimeout()))
 	var req clusterhook.Request
 	if err := json.NewDecoder(bufio.NewReader(io.LimitReader(conn, 32<<20))).Decode(&req); err != nil {
 		return

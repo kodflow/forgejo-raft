@@ -268,10 +268,10 @@ func TestEventQueueCap(t *testing.T) {
 }
 
 func TestRefNames(t *testing.T) {
-	for _, ok := range []string{"HEAD", "refs/heads/main", "refs/tags/v1.0", "refs/pull/1/head", "refs/heads/feat/x-y_z"} {
+	for _, ok := range []string{"HEAD", "refs/heads/main", "refs/tags/v1.0", "refs/pull/1/head", "refs/heads/feat/x-y_z", "refs/heads/main\u00a0x", "refs/heads/\u3000"} {
 		require.NoError(t, ValidRefName(ok), ok)
 	}
-	for _, bad := range []string{"", "refs/", "refs/heads/", "refs//x", "refs/heads/.x", "refs/heads/x.", "refs/heads/a@{b", "refs/heads/a b", "refs/heads/a:b", "refs/heads/a\\b", "refs/heads/a*", "refs/heads/a\x01", "FETCH_HEAD"} {
+	for _, bad := range []string{"", "refs/", "refs/heads/", "refs//x", "refs/heads/.x", "refs/heads/x.", "refs/heads/a@{b", "refs/heads/a b", "refs/heads/a:b", "refs/heads/a\\b", "refs/heads/a*", "refs/heads/a\x01", "FETCH_HEAD", "refs/heads/a\xffb"} {
 		assert.Error(t, ValidRefName(bad), bad)
 	}
 }

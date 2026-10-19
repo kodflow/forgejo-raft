@@ -4,7 +4,6 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -76,20 +75,21 @@ func runHookReferenceTransaction(ctx context.Context, c *cli.Command) error {
 		req.PushOptions = pushoptions.New().ReadEnv().Map()
 	}
 
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) != 3 {
-			continue
+	lines, err := clusterhook.ParseLines(os.Stdin)
+	if err != nil {
+		if state != clusterhook.OpPrepared {
+			// Nothing to refuse any more: the registration expires.
+			return nil
 		}
-		req.Lines = append(req.Lines, clusterhook.Line{Old: fields[0], New: fields[1], Ref: fields[2]})
+		fmt.Fprintln(os.Stderr, "Forgejo: the cluster cannot replicate this ref transaction, nothing was written:", err)
+		return cli.Exit("", 1)
 	}
+	req.Lines = lines
 	if len(req.Lines) == 0 {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, clusterhook.DefaultTimeout)
+	ctx, cancel := context.WithTimeout(ctx, setting.Cluster.HookTimeout)
 	defer cancel()
 	resp, err := clusterhook.Call(ctx, setting.Cluster.HookSocket, req)
 	if state != clusterhook.OpPrepared {

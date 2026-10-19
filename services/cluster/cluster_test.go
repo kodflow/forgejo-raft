@@ -297,7 +297,10 @@ func (tc *testCluster) pushViaWithin(budget time.Duration, n *testNode, work, re
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
+	// In "prepared" git holds the ref's lock, written with the new value.
+	unlock := holdRefLock(t, dir, ref, sha)
 	resp := n.r.Handle(ctx, req)
+	unlock()
 	if resp.OK {
 		run(t, dir, "update-ref", ref, sha)
 		req.Op = clusterhook.OpCommitted
@@ -306,6 +309,16 @@ func (tc *testCluster) pushViaWithin(budget time.Duration, n *testNode, work, re
 	}
 	n.r.Handle(ctx, req)
 	return resp
+}
+
+// holdRefLock writes the lock git holds on ref during "prepared", and
+// returns its removal.
+func holdRefLock(t *testing.T, dir, ref, value string) func() {
+	t.Helper()
+	lock := filepath.Join(dir, filepath.FromSlash(ref)) + ".lock"
+	require.NoError(t, os.MkdirAll(filepath.Dir(lock), 0o755))
+	require.NoError(t, os.WriteFile(lock, []byte(value+"\n"), 0o644))
+	return func() { _ = os.Remove(lock) }
 }
 
 func gitRef(t *testing.T, n *testNode, repo, ref string) string {

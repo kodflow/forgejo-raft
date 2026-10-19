@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -38,6 +39,11 @@ func (r *Replicator) prepared(ctx context.Context, req *clusterhook.Request) *cl
 	if len(tx.Updates) == 0 {
 		// Only pseudo-refs outside refs/, which the table does not hold.
 		return &clusterhook.Response{OK: true}
+	}
+	if req.PusherID != 0 {
+		if err := gitWillApply(ctx, req.GitDir, req.Lines); err != nil {
+			return fail(err)
+		}
 	}
 	if err := r.registry.register(req.Nonce, repo, refs, req.PID); err != nil {
 		return fail(err)
@@ -75,6 +81,75 @@ func (r *Replicator) pushTargetGone(repo string, req *clusterhook.Request) error
 	return nil
 }
 
+// gitWillApply refuses a push transaction git is about to reject in part.
+// From git 2.54, receive-pack runs a non-atomic push as ONE transaction that
+// tolerates a failure per ref, and the hook reads the rejected refs too, in
+// "prepared" and in "committed" (measured with git 2.54.0 and 2.56.0): a ref
+// the client reads "[remote rejected]" would still be committed by the
+// cluster, then projected on every member and announced to webhooks. In
+// "prepared" git holds the lock of every ref it updates, written with the
+// new value, and has not moved the ref yet. A line whose ref does not hold
+// its old value, or whose lock is missing or holds another value (another
+// writer's, or a lock left behind), is one git rejects: the whole
+// transaction is refused then, nothing written, and the client reads every
+// ref refused. Only pushes are checked: receive-pack always names the old
+// value, Forgejo's own writes do not. A deletion's lock is empty, so a
+// stranger's empty lock cannot be told from git's own, and the reftable
+// backend keeps no lock per ref: both keep the old value check alone.
+// receive-pack also runs a nested transaction on packed-refs for a deletion,
+// whose lines carry two null ids: it is not checked.
+func gitWillApply(ctx context.Context, dir string, lines []clusterhook.Line) error {
+	var checked []clusterhook.Line
+	for _, l := range lines {
+		if !strings.HasPrefix(l.Ref, "refs/") || strings.HasPrefix(l.Old, "ref:") || strings.HasPrefix(l.New, "ref:") ||
+			(reftable.IsZeroSHA(l.Old) && reftable.IsZeroSHA(l.New)) {
+			continue
+		}
+		if err := reftable.ValidRefName(l.Ref); err != nil {
+			return fmt.Errorf("%s: %w; nothing was written", l.Ref, err)
+		}
+		checked = append(checked, l)
+	}
+	if len(checked) == 0 {
+		return nil
+	}
+	cur, err := readGitRefs(ctx, dir)
+	if err != nil {
+		return fmt.Errorf("reading the refs git is about to update: %w; nothing was written", err)
+	}
+	_, statErr := os.Stat(filepath.Join(dir, "reftable"))
+	perRefLocks := errors.Is(statErr, os.ErrNotExist)
+	for _, l := range checked {
+		v, exists := cur[l.Ref]
+		switch {
+		case reftable.IsZeroSHA(l.Old) && exists:
+			return errGitRejects{ref: l.Ref, why: "it already exists on this node"}
+		case !reftable.IsZeroSHA(l.Old) && (!exists || v.SHA != l.Old):
+			return errGitRejects{ref: l.Ref, why: "it does not hold the value the push expects on this node"}
+		}
+		if !perRefLocks {
+			continue
+		}
+		lock := filepath.Join(dir, filepath.FromSlash(l.Ref)) + ".lock"
+		b, err := os.ReadFile(lock)
+		switch {
+		case err != nil:
+			return errGitRejects{ref: l.Ref, why: "git holds no lock on it"}
+		case !reftable.IsZeroSHA(l.New) && strings.TrimSuffix(string(b), "\n") != l.New:
+			return errGitRejects{ref: l.Ref, why: "another writer holds its lock"}
+		}
+	}
+	return nil
+}
+
+// errGitRejects is a push git would reject in part: the cluster refuses
+// all of it rather than commit a ref the client reads as rejected.
+type errGitRejects struct{ ref, why string }
+
+func (e errGitRejects) Error() string {
+	return fmt.Sprintf("the push is refused: git on this node rejects %s (%s), and the cluster commits a push whole or not at all; nothing was written, push again", e.ref, e.why)
+}
+
 // errStaleCreate refuses a push that creates a ref the table already holds:
 // git on this node had not projected it yet, and the cluster must not take
 // a creation for an overwrite.
@@ -86,6 +161,12 @@ func (e errStaleCreate) Error() string {
 
 // buildTxn turns the hook's lines into a proposal, reading each ref's
 // revision from the table.
+//
+// The entry's nonce names this transaction, not the git process: a git
+// before 2.54 runs one transaction per ref of a non-atomic push under one
+// process nonce, and committed() would take a sister transaction's commit
+// for this one's (TxnNonce). The registry and the read-after-write cookie
+// keep the process nonce.
 //
 // A push (a pusher is named) that creates a ref gives git a zero old value,
 // which receive-pack reads as "must not exist" and checks against THIS
@@ -99,13 +180,18 @@ func (e errStaleCreate) Error() string {
 func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook.Request) (*reftable.RefTxn, []string, error) {
 	tx := &reftable.RefTxn{
 		Repo: repo, RepoID: req.RepoID, PusherID: req.PusherID, Time: time.Now().UnixNano(),
-		Nonce: req.Nonce, Trigger: req.Trigger, PRID: req.PRID, IsWiki: req.IsWiki, PushOptions: req.PushOptions,
+		Nonce: clusterhook.TxnNonce(req.Nonce, req.Lines), Trigger: req.Trigger, PRID: req.PRID, IsWiki: req.IsWiki, PushOptions: req.PushOptions,
 		Push: req.PusherID != 0,
 	}
 	var refs []string
 	for _, l := range req.Lines {
 		if l.Ref != "HEAD" && !strings.HasPrefix(l.Ref, "refs/") {
 			continue
+		}
+		// Apply refuses an invalid name too; a name that is not valid
+		// UTF-8 would reach it already changed by JSON, under another name.
+		if err := reftable.ValidRefName(l.Ref); err != nil {
+			return nil, nil, fmt.Errorf("%q: %w; nothing was written", l.Ref, err)
 		}
 		u := reftable.RefUpdate{Ref: l.Ref}
 		switch {

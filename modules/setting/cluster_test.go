@@ -92,6 +92,16 @@ func TestClusterExpectedNodes(t *testing.T) {
 	loadClusterSection(t, "EXPECTED_NODES = 3\nDEAD_MEMBER_TIMEOUT = 30s\nPEERS = "+peers(3)+autonomousNode)
 	require.ErrorContains(t, Cluster.ConfigError, "DEAD_MEMBER_TIMEOUT")
 
+	// HOOK_TIMEOUT: a minute by default, between 20 seconds and an hour.
+	assert.Equal(t, time.Minute, Cluster.HookTimeout)
+	loadClusterSection(t, "EXPECTED_NODES = 3\nHOOK_TIMEOUT = 5m\nPEERS = "+peers(3)+autonomousNode)
+	require.NoError(t, Cluster.ConfigError)
+	assert.Equal(t, 5*time.Minute, Cluster.HookTimeout)
+	for _, bad := range []string{"10s", "2h"} {
+		loadClusterSection(t, "EXPECTED_NODES = 3\nHOOK_TIMEOUT = "+bad+"\nPEERS = "+peers(3)+autonomousNode)
+		require.ErrorContains(t, Cluster.ConfigError, "HOOK_TIMEOUT", bad)
+	}
+
 	// 2 is refused, plainly: no safe failover without a third vote.
 	loadClusterSection(t, "EXPECTED_NODES = 2\nPEERS = "+peers(2)+autonomousNode)
 	assert.True(t, Cluster.Enabled, "refused, and nothing starts alone")
