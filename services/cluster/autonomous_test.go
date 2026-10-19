@@ -265,3 +265,24 @@ func TestAGrantIsBoundToTheKeyItAdmits(t *testing.T) {
 	_, err = r.authorizeJoin(ctx, consensus.JoinRequest{Slot: "node-d", SPKI: sha256.Sum256([]byte("another"))})
 	require.ErrorContains(t, err, "another key")
 }
+
+// The object channel refuses a revoked key at once, even while the member
+// holding it has not been removed yet.
+func TestObjectChannelRefusesARevokedKey(t *testing.T) {
+	mem, rs := NewForTesting(t.TempDir(), "node-a")
+	r := rs[0]
+	keyB := sha256.Sum256([]byte("node-b"))
+	mem.Add("node-b", keyB, reftable.New())
+	oc := &objectChannel{engine: r.Engine, revoked: r.table.KeyRevoked}
+	_, err := oc.admit(peer{Slot: "node-b", SPKI: keyB})
+	require.NoError(t, err)
+	var idB consensus.NodeID
+	for _, m := range r.Engine().Membership().Members {
+		if m.Slot == "node-b" {
+			idB = m.ID
+		}
+	}
+	require.NoError(t, r.revokeMember(context.Background(), r.Engine(), OperatorFor(1), idB))
+	_, err = oc.admit(peer{Slot: "node-b", SPKI: keyB})
+	require.ErrorContains(t, err, "revoked")
+}

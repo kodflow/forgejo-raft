@@ -186,7 +186,7 @@ func Init(ctx context.Context) error {
 	}
 	r.objects = &objectChannel{
 		root: r.root, port: setting.Cluster.ObjectPort, cluster: clusterHex, id: id,
-		engine: r.Engine, self: r.selfID, repoKnown: r.repoKnown,
+		engine: r.Engine, self: r.selfID, repoKnown: r.repoKnown, revoked: r.table.KeyRevoked,
 	}
 	if setting.Cluster.ExpectedNodes >= 3 {
 		r.auto = newAutoMode(r.objects)
