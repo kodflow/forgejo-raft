@@ -76,3 +76,29 @@ func TestALongSSHUploadDoesNotHoldTheConsumer(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, rows)
 }
+
+// SSH sessions left hanging on a repository hold reservations only: they
+// count against a total cap of their own, never against the repository's,
+// so a later push of that repository still registers.
+func TestHangingSSHSessionsDoNotTurnARepositoryAway(t *testing.T) {
+	reg := newRegistry(time.Minute, 2, 4)
+	for _, n := range []string{"r1", "r2", "r3"} {
+		require.NoError(t, reg.reserve(n, "alice/a.git", os.Getpid()))
+	}
+	require.NoError(t, reg.register("p1", "alice/a.git", []string{"refs/heads/main"}, os.Getpid()))
+	require.NoError(t, reg.register("r1", "alice/a.git", []string{"refs/heads/b"}, os.Getpid()), "a reservation completes")
+	require.ErrorIs(t, reg.register("r2", "alice/a.git", []string{"refs/heads/c"}, os.Getpid()), errTooManyTxn,
+		"the per-repository cap holds for prepared transactions")
+	require.ErrorIs(t, reg.register("p2", "alice/a.git", []string{"refs/heads/d"}, os.Getpid()), errTooManyTxn)
+
+	// Reservations have their own total cap.
+	require.NoError(t, reg.reserve("r4", "bob/b.git", os.Getpid()))
+	require.NoError(t, reg.reserve("r5", "bob/b.git", os.Getpid()))
+	require.ErrorIs(t, reg.reserve("r6", "bob/b.git", os.Getpid()), errTooManyTxn)
+
+	// A reservation whose process is gone past the TTL is swept at the cap.
+	now := time.Now()
+	reg.now = func() time.Time { return now.Add(time.Hour) }
+	reg.alive = func(int) bool { return false }
+	require.NoError(t, reg.reserve("r6", "bob/b.git", 1))
+}

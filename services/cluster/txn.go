@@ -118,6 +118,10 @@ func (r *registry) register(nonce, repo string, refs []string, pid int) error {
 		if t.repo != repo {
 			return errNonceReused
 		}
+		if !t.prepared && r.fullLocked(repo, true) {
+			// The reservation counted against no prepared cap.
+			return errTooManyTxn
+		}
 		t.refs, t.deadline, t.prepared = refs, r.now().Add(r.ttl), true
 		if pid > 0 {
 			t.pid = pid
@@ -128,7 +132,7 @@ func (r *registry) register(nonce, repo string, refs []string, pid int) error {
 }
 
 func (r *registry) addLocked(t *txn) error {
-	if len(r.byNonce) >= r.total || len(r.byRepo[t.repo]) >= r.perRepo {
+	if r.fullLocked(t.repo, t.prepared) {
 		return errTooManyTxn
 	}
 	r.byNonce[t.nonce] = t
@@ -137,6 +141,42 @@ func (r *registry) addLocked(t *txn) error {
 	}
 	r.byRepo[t.repo][t.nonce] = t
 	return nil
+}
+
+// fullLocked reports whether one more transaction of its kind exceeds the
+// caps. Prepared transactions count against the per-repository and the
+// total caps; reservations against a total cap of their own, never the
+// per-repository one: a few SSH sessions left hanging on a repository
+// (a dropped client, a half-open connection: the built-in SSH server has
+// no idle timeout) must not turn every later push of it away. Registrations
+// whose process is gone past their TTL are swept first.
+func (r *registry) fullLocked(repo string, prepared bool) bool {
+	count := func() (inRepo, total int) {
+		for _, t := range r.byNonce {
+			if t.prepared != prepared {
+				continue
+			}
+			total++
+			if t.repo == repo {
+				inRepo++
+			}
+		}
+		return inRepo, total
+	}
+	full := func() bool {
+		inRepo, total := count()
+		return total >= r.total || (prepared && inRepo >= r.perRepo)
+	}
+	if !full() {
+		return false
+	}
+	now := r.now()
+	for nonce, t := range r.byNonce {
+		if !now.Before(t.deadline) && (t.pid <= 0 || !r.alive(t.pid)) {
+			r.releaseLocked(nonce)
+		}
+	}
+	return full()
 }
 
 // release removes a transaction, explicitly (committed, aborted, a hook
