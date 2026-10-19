@@ -5,9 +5,11 @@ package observer
 
 import (
 	"context"
+	"crypto/rand"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/nacl/box"
 )
 
 // An observer is never a member: it does not link the consensus node nor
@@ -422,4 +425,87 @@ func TestObserverTakesANewBaseAfterAGap(t *testing.T) {
 	c.checkpoint()
 	require.NoError(t, o.Step(ctx))
 	assert.Len(t, o.State().Checkpoints, 2)
+}
+
+// stalledSource accepts every call and never answers.
+type stalledSource struct{}
+
+func (stalledSource) Export(ctx context.Context, _ *clusterhook.ExportRequest) (*clusterhook.ExportAnswer, io.ReadCloser, error) {
+	<-ctx.Done()
+	return nil, nil, ctx.Err()
+}
+
+// A pass that stalls on a member is bounded, and STATUS.json carries a
+// heartbeat written before each pass: monitoring sees a pass that hangs.
+func TestRunBoundsAPassAndWritesAHeartbeat(t *testing.T) {
+	_, priv, err := box.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	o, err := New(Config{
+		Name: "nas-test", Dir: t.TempDir(), Endpoints: map[string]Source{"node-a": stalledSource{}}, SecretsKey: priv,
+		StagingQuota: 1 << 30, StepTimeout: 300 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		o.Run(ctx, time.Hour)
+		close(stopped)
+	}()
+	defer func() {
+		cancel()
+		<-stopped
+	}()
+
+	read := func() Status {
+		var s Status
+		b, err := os.ReadFile(o.store.path("STATUS.json"))
+		if err == nil {
+			_ = json.Unmarshal(b, &s)
+		}
+		return s
+	}
+	require.Eventually(t, func() bool { return read().StepStarted != nil }, 5*time.Second, 10*time.Millisecond, "no heartbeat before the pass")
+	require.Eventually(t, func() bool {
+		s := read()
+		return s.StepStarted == nil && s.LastError != ""
+	}, 10*time.Second, 20*time.Millisecond, "the pass never ended")
+	assert.Contains(t, read().LastError, "deadline exceeded")
+}
+
+// A timeline history the cluster lists with other bytes than the archive
+// holds is a timeline number reused by another history: its segments are
+// not the archive's, and the observer stops for a human.
+func TestObserverQuarantinesAReusedTimeline(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	c.pg.failover()
+	c.push("alice/demo.git", "refs/heads/main", c.commit("on timeline 2"))
+	c.checkpoint()
+	require.NoError(t, o.Step(ctx))
+
+	// A recover from an older checkpoint promoted onto timeline 2 again.
+	c.pg.archive[HistoryName(2)] = []byte("1\t0/2000000\tanother switch point\n")
+	c.push("alice/demo.git", "refs/heads/main", c.commit("on the reused timeline"))
+	c.checkpoint()
+	require.ErrorIs(t, o.Step(ctx), ErrQuarantined)
+	assert.Contains(t, o.State().Quarantine.Reason, "00000002.history")
+}
+
+// A WAL name from a member becomes a path only once it is a WAL file's
+// name: a compromised member cannot write outside the archive.
+func TestObserverRefusesAnInvalidWALName(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	seed(t, c, o)
+	c.pg.archive["../../../escape.history"] = []byte("1\t0/0\tx\n")
+	c.push("alice/demo.git", "refs/heads/main", c.commit("next"))
+	c.checkpoint()
+	err := o.Step(ctx)
+	require.ErrorContains(t, err, "invalid WAL name")
+	_, serr := os.Stat(filepath.Join(o.cfg.Dir, "..", "escape.history"))
+	assert.True(t, os.IsNotExist(serr))
 }

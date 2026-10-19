@@ -60,6 +60,9 @@ type Manifest struct {
 	Loss     string      `json:"loss"`
 	Previous string      `json:"previous,omitempty"`
 	Sizes    ManifestSum `json:"sizes"`
+	// Voters are the node ids of the old cluster's voters, as the leader
+	// listed them when the checkpoint was taken; older manifests have none.
+	Voters []string `json:"voters,omitempty"`
 }
 
 // ManifestSum totals what a checkpoint references.
@@ -349,6 +352,24 @@ func (s *store) walPath(name string) string {
 		return s.path("pg", "wal", name)
 	}
 	return s.path("pg", "wal", name+".gz")
+}
+
+// histories lists every timeline history the archive holds.
+func (s *store) histories() ([]string, error) {
+	entries, err := os.ReadDir(s.path("pg", "wal"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if e.Type().IsRegular() && strings.HasSuffix(e.Name(), ".history") && ValidWALName(e.Name()) {
+			out = append(out, e.Name())
+		}
+	}
+	return out, nil
 }
 
 func (s *store) haveWAL(name string) bool {

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -211,6 +212,9 @@ func (r *Replicator) exportView(ctx context.Context, eng consensus.Engine, from 
 	}
 	for _, m := range eng.Membership().Members {
 		v.Members = append(v.Members, m.Slot)
+		if m.Voter {
+			v.Voters = append(v.Voters, m.ID.String())
+		}
 	}
 	for _, cp := range r.table.Checkpoints() {
 		if cp.Index <= from || cp.Identity != v.Lineage {
@@ -422,7 +426,13 @@ func (x exportSide) walList(after string) ([]clusterhook.WALFile, error) {
 		if err != nil {
 			continue
 		}
-		out = append(out, clusterhook.WALFile{Name: e.Name(), Size: info.Size()})
+		wf := clusterhook.WALFile{Name: e.Name(), Size: info.Size()}
+		if strings.HasSuffix(e.Name(), ".history") {
+			if wf.SHA256, err = fileDigest(filepath.Join(x.archiveDir, e.Name())); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, wf)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	if len(out) > walListMax {
@@ -505,4 +515,18 @@ func (x exportSide) secrets(observer string) (streamFunc, error) {
 		_, err := w.Write(sealed)
 		return err
 	}, nil
+}
+
+// fileDigest is the hex SHA-256 of a file.
+func fileDigest(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

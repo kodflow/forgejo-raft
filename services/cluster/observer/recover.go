@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -382,7 +383,20 @@ func (a *Archive) RestorePG(name, pgdata string, opt PGOptions) error {
 			return err
 		}
 	}
-	for _, w := range append(append([]string(nil), m.PG.History...), m.PG.Segments...) {
+	// Every timeline history the archive holds, not only those on the
+	// checkpoint's path: the promotion takes the newest timeline it finds
+	// plus one, and a number the old system used after the checkpoint is
+	// never taken again, so its segments are never mistaken for ours.
+	wals, err := a.store.histories()
+	if err != nil {
+		return err
+	}
+	for _, h := range m.PG.History {
+		if !slices.Contains(wals, h) {
+			wals = append(wals, h)
+		}
+	}
+	for _, w := range append(wals, m.PG.Segments...) {
 		r, err := a.store.OpenWAL(w)
 		if err != nil {
 			return fmt.Errorf("WAL %s: %w", w, err)

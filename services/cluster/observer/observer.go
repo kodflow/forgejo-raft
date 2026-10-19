@@ -68,8 +68,11 @@ type Config struct {
 	LiveKeep time.Duration
 	// BaseEvery is how old the newest base backup may grow before another.
 	BaseEvery time.Duration
-	Git       string
-	Now       func() time.Time
+	// StepTimeout bounds one pass, a base backup included: a member that
+	// stalls ends the pass, never the observer.
+	StepTimeout time.Duration
+	Git         string
+	Now         func() time.Time
 }
 
 // Observer is one observer node.
@@ -83,7 +86,12 @@ type Observer struct {
 	// uncovered counts the passes whose checkpoint the newest base did not
 	// reach: past gapPasses, the WAL has a gap, not a lag.
 	uncovered int
+	// stepStarted is when the running pass began, zero between passes.
+	stepStarted time.Time
 }
+
+// viewTimeout bounds one member's answer to the view request.
+const viewTimeout = time.Minute
 
 // gapPasses is how many passes a base backup may fail to cover before the
 // observer takes a new one: any gap in the archive forces a new base.
@@ -109,6 +117,9 @@ func New(cfg Config) (*Observer, error) {
 	}
 	if cfg.BaseEvery == 0 {
 		cfg.BaseEvery = 7 * 24 * time.Hour
+	}
+	if cfg.StepTimeout == 0 {
+		cfg.StepTimeout = 6 * time.Hour
 	}
 	if len(cfg.Endpoints) == 0 {
 		return nil, errors.New("no endpoint")
@@ -140,8 +151,16 @@ func (o *Observer) State() State {
 // and never stops on an error but a quarantine, which waits for a human.
 func (o *Observer) Run(ctx context.Context, interval time.Duration) {
 	backoff := interval
+	var err error
 	for {
-		err := o.Step(ctx)
+		// The heartbeat: STATUS.json says a pass started before it runs,
+		// so a pass that hangs shows as an old step_started.
+		o.stepStarted = o.cfg.Now()
+		o.writeStatus(err)
+		sctx, cancel := context.WithTimeout(ctx, o.cfg.StepTimeout)
+		err = o.Step(sctx)
+		cancel()
+		o.stepStarted = time.Time{}
 		o.writeStatus(err)
 		switch {
 		case err == nil:
@@ -188,7 +207,7 @@ func (o *Observer) Step(ctx context.Context) error {
 	if !ok {
 		return o.prune(ctx)
 	}
-	if err := o.ingest(ctx, slot, cp); err != nil {
+	if err := o.ingest(ctx, slot, cp, view.Voters); err != nil {
 		if errors.Is(err, ErrImmutable) {
 			return o.quarantineFor(fmt.Sprintf("checkpoint %s: %v", cp.Name, err), "")
 		}
@@ -280,7 +299,12 @@ func (o *Observer) leaderView(ctx context.Context) (*clusterhook.ExportView, str
 	var seen uint64
 	for _, slot := range o.order() {
 		var v clusterhook.ExportView
-		body, err := call(ctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportCheckpoints, Observer: o.cfg.Name, FromIndex: o.lastIndex()}, &v)
+		vctx, cancel := context.WithTimeout(ctx, viewTimeout)
+		body, err := call(vctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportCheckpoints, Observer: o.cfg.Name, FromIndex: o.lastIndex()}, &v)
+		if err == nil {
+			body.Close()
+		}
+		cancel()
 		if err != nil {
 			if e, ok := errors.AsType[*clusterhook.ExportError](err); ok && e.Code == clusterhook.CodeNotLeader {
 				seen = max(seen, e.Term)
@@ -288,7 +312,6 @@ func (o *Observer) leaderView(ctx context.Context) (*clusterhook.ExportView, str
 			errs = append(errs, fmt.Errorf("%s: %w", slot, err))
 			continue
 		}
-		body.Close()
 		if v.Leader != slot {
 			errs = append(errs, fmt.Errorf("%s answered as %s", slot, v.Leader))
 			continue
@@ -492,7 +515,7 @@ func (o *Observer) nextCheckpoint(v *clusterhook.ExportView) (clusterhook.Export
 
 // ingest verifies one checkpoint into staging, then publishes it. What a
 // checkpoint that fails leaves in staging goes with it.
-func (o *Observer) ingest(ctx context.Context, leader string, cp clusterhook.ExportCheckpoint) (err error) {
+func (o *Observer) ingest(ctx context.Context, leader string, cp clusterhook.ExportCheckpoint, voters []string) (err error) {
 	defer func() {
 		if err != nil {
 			_ = os.RemoveAll(o.store.path("staging", cp.Name))
@@ -519,7 +542,7 @@ func (o *Observer) ingest(ctx context.Context, leader string, cp clusterhook.Exp
 		return err
 	}
 	src := o.cfg.Endpoints[leader]
-	m := &Manifest{Format: 1, Checkpoint: cp, Repos: map[string]RepoManifest{}, Source: leader}
+	m := &Manifest{Format: 1, Checkpoint: cp, Repos: map[string]RepoManifest{}, Source: leader, Voters: voters}
 	if prev, ok := o.state.newest(); ok {
 		m.Previous = prev.Name
 	}
@@ -881,14 +904,35 @@ func (o *Observer) fetchWAL(ctx context.Context, leader string) error {
 		return err
 	}
 	for _, f := range files {
-		if o.store.haveWAL(f.Name) || f.Size > o.cfg.MaxArtifact {
+		// The name comes from a member: it becomes a path under the
+		// archive only once it is a WAL file's name.
+		if !ValidWALName(f.Name) {
+			return fmt.Errorf("a member listed an invalid WAL name %q", f.Name)
+		}
+		if o.store.haveWAL(f.Name) {
+			// A timeline history held with other bytes is a timeline
+			// number another history reused: segments under that number
+			// are not the ones this archive holds, and a restore would
+			// replay the wrong history.
+			if f.SHA256 != "" && strings.HasSuffix(f.Name, ".history") {
+				held, err := fileSHA256(o.store.walPath(f.Name))
+				if err != nil {
+					return fmt.Errorf("WAL %s: %w", f.Name, err)
+				}
+				if held != f.SHA256 {
+					return o.quarantineFor(fmt.Sprintf("timeline history %s is held with other bytes than the cluster's: a timeline was reused", f.Name), o.state.Lineage)
+				}
+			}
+			continue
+		}
+		if f.Size > o.cfg.MaxArtifact {
 			continue
 		}
 		body, err := call(ctx, o.cfg.Endpoints[leader], &clusterhook.ExportRequest{Op: clusterhook.OpExportWAL, Observer: o.cfg.Name, Name: f.Name}, nil)
 		if err != nil {
 			return err
 		}
-		n, _, err := writeStream(o.store.walPath(f.Name), body, f.Size, !strings.HasSuffix(f.Name, ".history"))
+		n, sum, err := writeStream(o.store.walPath(f.Name), body, f.Size, !strings.HasSuffix(f.Name, ".history"))
 		body.Close()
 		if err != nil {
 			return fmt.Errorf("WAL %s: %w", f.Name, err)
@@ -896,6 +940,10 @@ func (o *Observer) fetchWAL(ctx context.Context, leader string) error {
 		if n != f.Size {
 			os.Remove(o.store.walPath(f.Name))
 			return fmt.Errorf("WAL %s: %d bytes, not %d", f.Name, n, f.Size)
+		}
+		if f.SHA256 != "" && sum != f.SHA256 {
+			os.Remove(o.store.walPath(f.Name))
+			return fmt.Errorf("WAL %s: the bytes do not match the listed digest", f.Name)
 		}
 	}
 	return nil

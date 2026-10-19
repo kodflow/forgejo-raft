@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"forgejo.org/modules/clusterhook"
@@ -31,7 +32,14 @@ import (
 type SSHSource struct {
 	addr string
 	cfg  *ssh.ClientConfig
+	// idle is how long the connection may stay silent once the handshake
+	// is done: a member that accepts and then stops talking is dropped,
+	// never waited for.
+	idle time.Duration
 }
+
+// sshIdleTimeout is how long an export may send nothing.
+const sshIdleTimeout = 2 * time.Minute
 
 // NewSSHSource builds the source of target, user@host:port.
 func NewSSHSource(target, keyFile, knownHostsFile string) (*SSHSource, error) {
@@ -54,7 +62,7 @@ func NewSSHSource(target, keyFile, knownHostsFile string) (*SSHSource, error) {
 	return &SSHSource{addr: addr, cfg: &ssh.ClientConfig{
 		User: user, Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		HostKeyCallback: hostKeys, Timeout: 15 * time.Second,
-	}}, nil
+	}, idle: sshIdleTimeout}, nil
 }
 
 // Export runs one export call.
@@ -64,16 +72,21 @@ func (s *SSHSource) Export(ctx context.Context, req *clusterhook.ExportRequest) 
 	if err != nil {
 		return nil, nil, err
 	}
+	// ClientConfig.Timeout covers the dial only: the handshake gets a
+	// deadline of its own, then every read or write pushes a rolling idle
+	// deadline, so a member that stops talking is dropped.
+	ic := newIdleConn(conn, 2*s.cfg.Timeout)
 	if dl, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(dl)
+		ic.hard = dl
 	}
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
-	sc, chans, reqs, err := ssh.NewClientConn(conn, s.addr, s.cfg)
+	sc, chans, reqs, err := ssh.NewClientConn(ic, s.addr, s.cfg)
 	if err != nil {
 		stop()
 		conn.Close()
 		return nil, nil, err
 	}
+	ic.setIdle(s.idle)
 	client := ssh.NewClient(sc, chans, reqs)
 	closeAll := func() {
 		stop()
@@ -151,4 +164,38 @@ func (b *sessionBody) Read(p []byte) (int, error) {
 func (b *sessionBody) Close() error {
 	b.done()
 	return nil
+}
+
+// idleConn bounds every read and write: each one moves the deadline idle
+// ahead, never past hard when the caller's context has a deadline.
+type idleConn struct {
+	net.Conn
+	idle atomic.Int64
+	hard time.Time
+}
+
+func newIdleConn(c net.Conn, idle time.Duration) *idleConn {
+	ic := &idleConn{Conn: c}
+	ic.idle.Store(int64(idle))
+	return ic
+}
+
+func (c *idleConn) setIdle(d time.Duration) { c.idle.Store(int64(d)) }
+
+func (c *idleConn) push() {
+	dl := time.Now().Add(time.Duration(c.idle.Load()))
+	if !c.hard.IsZero() && c.hard.Before(dl) {
+		dl = c.hard
+	}
+	_ = c.SetDeadline(dl)
+}
+
+func (c *idleConn) Read(p []byte) (int, error) {
+	c.push()
+	return c.Conn.Read(p)
+}
+
+func (c *idleConn) Write(p []byte) (int, error) {
+	c.push()
+	return c.Conn.Write(p)
 }
