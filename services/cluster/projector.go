@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -230,12 +231,21 @@ func (p *projector) pass(ctx context.Context) {
 	}
 	p.mu.Unlock()
 	// A rename's target goes first, so its directory moves before the old
-	// key, whose refs are all tombstones, is projected.
+	// key, whose refs are all tombstones, is projected. Targets go in the
+	// order of their renames: in a chain (a to z, then b to a), a's
+	// directory reaches z before b's takes its place.
+	renIdx := make(map[string]uint64, len(work))
+	renamed := make(map[string]bool, len(work))
+	for _, r := range work {
+		_, renIdx[r], renamed[r] = p.table.RenamedFrom(r)
+	}
 	sort.Slice(work, func(i, j int) bool {
-		_, _, ri := p.table.RenamedFrom(work[i])
-		_, _, rj := p.table.RenamedFrom(work[j])
+		ri, rj := renamed[work[i]], renamed[work[j]]
 		if ri != rj {
 			return ri
+		}
+		if ri && renIdx[work[i]] != renIdx[work[j]] {
+			return renIdx[work[i]] < renIdx[work[j]]
 		}
 		return work[i] < work[j]
 	})
@@ -271,12 +281,15 @@ func (p *projector) project(ctx context.Context, repo string) error {
 		p.certify(repo, at, nil)
 		return nil
 	}
-	if err := p.setAsideDeleted(repo, dir); err != nil {
+	if p.movesOn(repo, dir) {
+		return nil // the projection of the rename's target moves it first
+	}
+	if err := p.setAsideStale(repo, dir); err != nil {
 		return err
 	}
 	want := tableProjection(refs)
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
-		if from, _, ok := p.table.RenamedFrom(repo); ok {
+		if from, renIdx, ok := p.table.RenamedFrom(repo); ok {
 			src := filepath.Join(p.root, filepath.FromSlash(from))
 			if p.registry.inFlight(from) {
 				// A git process still writes under the old key: moving its
@@ -284,7 +297,7 @@ func (p *projector) project(ctx context.Context, repo string) error {
 				// outside the table. The move waits for the next pass.
 				return nil
 			}
-			if _, err := os.Stat(src); err == nil {
+			if p.holdsRenamed(src, from, repo, renIdx) {
 				if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 					return err
 				}
@@ -371,7 +384,7 @@ func (p *projector) project(ctx context.Context, repo string) error {
 			verr = errors.New("git does not match the table after projection")
 			return
 		}
-		p.certify(repo, at, writeStamp(dir, at, reftable.ProjectionDigest(want)))
+		p.certify(repo, at, writeStamp(dir, repo, at, reftable.ProjectionDigest(want)))
 	})
 	return verr
 }
@@ -407,26 +420,47 @@ func (p *projector) certify(repo string, at uint64, stampErr error) {
 	p.mu.Unlock()
 }
 
-// stamp is the per-repository projection record (D19): the watermark and
-// the projected digest. A repository restored from a backup carries a stale
-// stamp, which the start-up reconciliation reprojects anyway.
+// stamp is the per-repository projection record (D19): the key, the
+// watermark and the projected digest. A repository restored from a backup
+// carries a stale stamp, which the start-up reconciliation reprojects anyway.
+// A directory moves with its stamp, so the key it names is what the
+// directory holds: the repository certified under that key at that
+// watermark. Stamps written before the key was recorded name none.
 type stamp struct {
+	Repo      string `json:"repo,omitempty"`
 	Watermark uint64 `json:"watermark"`
 	Digest    string `json:"digest"`
 	Written   int64  `json:"written"`
 }
 
+const stampName = "forgejo-cluster-stamp"
+
 // writeStamp records the projection AFTER the refs, through a rename.
-func writeStamp(dir string, at uint64, digest reftable.Sum) error {
-	b, err := json.Marshal(stamp{Watermark: at, Digest: digest.String(), Written: time.Now().Unix()})
+func writeStamp(dir, repo string, at uint64, digest reftable.Sum) error {
+	b, err := json.Marshal(stamp{Repo: repo, Watermark: at, Digest: digest.String(), Written: time.Now().Unix()})
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(dir, "forgejo-cluster-stamp.tmp")
+	tmp := filepath.Join(dir, stampName+".tmp")
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(dir, "forgejo-cluster-stamp"))
+	return os.Rename(tmp, filepath.Join(dir, stampName))
+}
+
+// heldBefore reports, from its stamp, whether dir holds key's repository as
+// this node certified it before index. known is false when the stamp names
+// no key: absent, unreadable, or written by an older binary.
+func heldBefore(dir, key string, index uint64) (held, known bool) {
+	b, err := os.ReadFile(filepath.Join(dir, stampName))
+	if err != nil {
+		return false, false
+	}
+	var s stamp
+	if json.Unmarshal(b, &s) != nil || s.Repo == "" {
+		return false, false
+	}
+	return s.Repo == key && s.Watermark < index, true
 }
 
 // Verify compares a repository's git state with the table under the
@@ -463,43 +497,99 @@ func (p *projector) MayCollectGarbage(repo string) bool {
 // repository key.
 const staleDirName = ".cluster-stale"
 
-// setAsideDeleted handles a key deleted and then taken by a rename before
-// this node removed the deleted repository's directory: that directory is
-// the old repository's, and the renamed one must move in instead of being
-// projected into it (other objects, maybe another object format). It is
-// moved under staleDirName, never removed. Only when the rename's source
-// directory is still here: on the node that served the rename, Forgejo
-// already moved the source in, and the directory is the right one. A key
-// revived otherwise (Forgejo creating a repository again) keeps its
-// directory.
-func (p *projector) setAsideDeleted(repo, dir string) error {
+// holdsRenamed reports whether src, the directory of a rename's old key, is
+// the repository the rename at renIdx moved to to: the one certified under
+// from before the rename. The old key may have been taken again since (a
+// repository created anew under the freed name), and moving that one would
+// take a live repository away from its name. Without a keyed stamp, the
+// directory moves only while from was not taken again and its newest
+// rename is this one.
+func (p *projector) holdsRenamed(src, from, to string, renIdx uint64) bool {
+	if _, err := os.Stat(src); err != nil {
+		return false
+	}
+	if held, known := heldBefore(src, from, renIdx); known {
+		return held
+	}
+	moved, ok := p.table.MovedAway(from)
+	return ok && moved == to
+}
+
+// movesOn reports whether dir still holds the repository a rename moved
+// from repo to another key, which this node has not moved yet: in a chain
+// (repo to Z, then another key to repo) or a rename projected before its
+// target's (the old key goes first by name). Projecting repo now would
+// rewrite that directory as repo; it waits, and Z is scheduled to move it.
+func (p *projector) movesOn(repo, dir string) bool {
+	if _, err := os.Stat(dir); err != nil {
+		return false
+	}
+	z, zIdx, ok := p.table.RenamedInto(repo, math.MaxUint64)
+	if !ok {
+		return false
+	}
+	if _, deleted := p.table.Deleted(z); deleted {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(p.root, filepath.FromSlash(z))); !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if !p.holdsRenamed(dir, repo, z, zIdx) {
+		return false
+	}
+	p.markDirty(z)
+	return true
+}
+
+// setAsideStale handles a key taken by a rename while this node still holds
+// the key's previous repository under it, one deleted and not yet removed
+// here: the renamed repository must move in instead of being projected into
+// that directory (other objects, maybe another object format, refs the
+// table never held there). The directory is moved under staleDirName, never
+// removed.
+//
+// The directory's stamp says which repository it holds, and survives a
+// restart and a snapshot. Without a keyed stamp, only a deletion this
+// process saw applied (deletedAt) marks the directory, and only when the
+// rename's source directory is still here: on the node that served the
+// rename, Forgejo already moved the source in, and the directory is the
+// right one.
+func (p *projector) setAsideStale(repo, dir string) error {
 	p.mu.Lock()
 	delIdx, pending := p.deletedAt[repo]
 	delete(p.deletedAt, repo)
 	p.mu.Unlock()
-	if !pending {
-		return nil
-	}
 	from, renIdx, renamed := p.table.RenamedFrom(repo)
-	if !renamed || renIdx <= delIdx {
+	if !renamed {
 		return nil
 	}
 	if _, err := os.Stat(dir); err != nil {
 		return nil
 	}
-	if _, err := os.Stat(filepath.Join(p.root, filepath.FromSlash(from))); err != nil {
+	stale, known := heldBefore(dir, repo, renIdx)
+	if !known {
+		_, err := os.Stat(filepath.Join(p.root, filepath.FromSlash(from)))
+		stale = pending && renIdx > delIdx && err == nil
+	}
+	if !stale {
 		return nil
 	}
-	aside := filepath.Join(p.root, staleDirName, fmt.Sprintf("%s-%d", strings.ReplaceAll(repo, "/", "_"), delIdx))
+	mark := delIdx
+	if known || !pending {
+		mark = renIdx
+	}
+	aside := filepath.Join(p.root, staleDirName, fmt.Sprintf("%s-%d", strings.ReplaceAll(repo, "/", "_"), mark))
 	if err := os.MkdirAll(filepath.Dir(aside), 0o700); err != nil {
 		return err
 	}
 	if err := os.Rename(dir, aside); err != nil {
-		p.mu.Lock()
-		p.deletedAt[repo] = delIdx
-		p.mu.Unlock()
+		if pending {
+			p.mu.Lock()
+			p.deletedAt[repo] = delIdx
+			p.mu.Unlock()
+		}
 		return err
 	}
-	log.Warn("cluster: %s was deleted, then taken by a rename of %s: the deleted repository's directory is set aside in %s", repo, from, aside)
+	log.Warn("cluster: %s was taken by a rename of %s while this node still held its previous repository: that directory is set aside in %s", repo, from, aside)
 	return nil
 }
