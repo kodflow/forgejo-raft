@@ -215,9 +215,41 @@ rexec() {
     [ -s /data/recover/rotated.env ] && { set -a; . /data/recover/rotated.env; set +a; }
     cd /etc/s6/gitea && . ./setup >/dev/null && exec su-exec git /usr/local/bin/gitea "$@"' -- "$@"
 }
+# The old cluster is fenced by two witnesses before anything is restored:
+# each records the supersession of every voter the checkpoint names, and
+# signs a receipt per voter. The recovery refuses without them, and probes
+# the old members' consensus addresses (stopped above, so silent).
+read -r OLD_CLUSTER VOTERS < <(dco exec -T forgejo-r python3 -c '
+import json
+m = json.load(open("/snapshots/'"$CLEAN"'/checkpoints/'"$CLEAN"'/manifest.json"))
+print(m["checkpoint"]["lineage"].split("/")[0], ",".join(m.get("voters") or []))' | tr -d '\r')
+[ -n "$VOTERS" ] || fail "the checkpoint names no voter of the old cluster"
+FENCED=()
+WITNESS_KEYS=()
+WKEY=()
+for w in 1 2; do
+  KEY="$(rexec cluster witness init --dir "/data/witness-$w" | tail -n 1 | tr -d '\r')"
+  WITNESS_KEYS+=(--witness-key "$KEY")
+  rexec cluster witness supersede --dir "/data/witness-$w" --old "$OLD_CLUSTER" --new "$NEW" --voters "$VOTERS" --method stopped >/dev/null
+  dco exec -d -u 0 forgejo-r sh -c 'cd /etc/s6/gitea && . ./setup >/dev/null && exec su-exec git /usr/local/bin/gitea cluster witness serve --dir "$1" --listen "$2"' -- "/data/witness-$w" "127.0.0.1:748$((w + 1))"
+  WKEY[w]="$KEY"
+done
+sleep 1
+dco exec -T -u 0 forgejo-r sh -c 'mkdir -p /data/receipts && chown git:git /data/receipts'
+echo "$VOTERS" | tr ',' '\n' | while IFS= read -r v; do
+  for w in 1 2; do
+    rexec cluster witness receipt --url "http://127.0.0.1:748$((w + 1))" --key "${WKEY[w]}" --old "$OLD_CLUSTER" --new "$NEW" --voter "$v" --out "/data/receipts/$v.$w" </dev/null
+  done
+done
+while IFS= read -r v; do
+  FENCED+=(--fenced "$v:stopped:/data/receipts/$v.1+/data/receipts/$v.2")
+done < <(echo "$VOTERS" | tr ',' '\n')
+ok "the old cluster $OLD_CLUSTER fenced by two witnesses, voters $VOTERS"
 RECOVER=(cluster recover --from-observer "$CLEAN" --new-cluster "$NEW" --observer-dir "/snapshots/$CLEAN"
   --secrets-key /keys/secrets.key --new-observer-recipient "$NEW_RECIPIENT" --out /data/recover
-  --pgdata /data/pg --pg-socket-dir /data/pgsock --pg-hba-file /data/lab-hba.conf --wal-archive-dir /data/wal-archive)
+  --pgdata /data/pg --pg-socket-dir /data/pgsock --pg-hba-file /data/lab-hba.conf --wal-archive-dir /data/wal-archive
+  "${WITNESS_KEYS[@]}" "${FENCED[@]}"
+  --old-peer node-a=10.89.0.41:7480 --old-peer node-b=10.89.0.42:7480 --old-peer node-c=10.89.0.43:7480)
 rexec cluster observe list --dir "/snapshots/$CLEAN" >"$WORK/list.txt" 2>&1 || true
 # In its own snapshot a checkpoint reads VERIFIED: the hook takes the
 # snapshot, then the observer writes the PROTECTED record (the live

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/json"
+	"forgejo.org/modules/log"
 	"forgejo.org/modules/setting"
 	"forgejo.org/services/cluster"
 	"forgejo.org/services/cluster/consensus"
@@ -76,6 +78,8 @@ func cmdCluster() *cli.Command {
 					&cli.StringSliceFlag{Name: "fenced", Usage: "old voter fence: id:method:receipt-file[+receipt-file], one per old voter; required unless --from-observer"},
 					&cli.StringSliceFlag{Name: "witness-key", Usage: "hex Ed25519 public key of a witness"},
 					&cli.StringSliceFlag{Name: "joining", Usage: "member lines of nodes stamped joining under the new cluster id"},
+					&cli.StringSliceFlag{Name: "old-peer", Usage: "slot=host:port of an old member's consensus address, probed with PEERS before recovering"},
+					&cli.BoolFlag{Name: "force-old-members-answer", Usage: "recover although an old member answers the probe; logged and kept in the output"},
 				}, recoverFromObserverFlags()...),
 				Action: runClusterRecover,
 			},
@@ -331,51 +335,26 @@ func runClusterRecover(ctx context.Context, c *cli.Command) error {
 		return err
 	}
 	opt := consensus.RecoverOptions{Operator: localOperator()}
-	for _, f := range c.StringSlice("fenced") {
-		parts := strings.SplitN(f, ":", 3)
-		if len(parts) != 3 {
-			return fmt.Errorf("--fenced %q: want id:method:receipt-file[+receipt-file]", f)
-		}
-		id, err := cluster.ParseNodeID(parts[0])
-		if err != nil {
-			return err
-		}
-		fv := consensus.FencedVoter{Voter: id, Method: parts[1]}
-		for file := range strings.SplitSeq(parts[2], "+") {
-			b, err := os.ReadFile(file)
-			if err != nil {
-				return err
-			}
-			// A receipt file holds the signature, raw or in hex as
-			// `cluster witness receipt` writes it.
-			if raw, err := hex.DecodeString(strings.TrimSpace(string(b))); err == nil && len(raw) == ed25519.SignatureSize {
-				b = raw
-			}
-			fv.Receipts = append(fv.Receipts, b)
-		}
-		opt.Fenced = append(opt.Fenced, fv)
+	if opt.Fenced, err = parseFenced(c.StringSlice("fenced")); err != nil {
+		return err
 	}
 	rep, err := d.Inspect(setting.Cluster.DataDir)
 	if err != nil {
 		return err
 	}
-	old := rep.Cluster
-	keys := c.StringSlice("witness-key")
-	if len(keys) == 0 {
-		keys = setting.Cluster.WitnessKeys
+	if err := checkRecoverVoters(members, rep); err != nil {
+		return err
 	}
-	// Both witnesses must have recorded the fence before the survivor
-	// serves (R9-09): a receipt from every key, for every old voter, and
-	// every key the nodes ask at boot among them.
-	pubs, err := witness.RecoverKeys(keys, setting.Cluster.WitnessKeys)
+	old := rep.Cluster
+	pubs, err := verifyWitnessFence(c, old, cid, opt.Fenced)
 	if err != nil {
-		return fmt.Errorf("RECOVER_REFUSED: %w", err)
+		return err
 	}
 	for _, pub := range pubs {
 		opt.WitnessKeys = append(opt.WitnessKeys, pub)
 	}
-	if err := witness.VerifyReceipts(pubs, old, cid, opt.Fenced); err != nil {
-		return fmt.Errorf("RECOVER_REFUSED: %w", err)
+	if err := checkOldMembersSilent(ctx, c, old, cid); err != nil {
+		return err
 	}
 	if j := c.StringSlice("joining"); len(j) > 0 {
 		if opt.Joining, err = parseMembers(strings.Join(j, ",")); err != nil {
@@ -387,6 +366,130 @@ func runClusterRecover(ctx context.Context, c *cli.Command) error {
 	}
 	opt.Confirm = cid.String()
 	return d.Recover(setting.Cluster.DataDir, cid, members, opt)
+}
+
+// parseFenced reads the --fenced attestations, id:method:receipt-file
+// [+receipt-file], one per old voter.
+func parseFenced(flags []string) ([]consensus.FencedVoter, error) {
+	var out []consensus.FencedVoter
+	for _, f := range flags {
+		parts := strings.SplitN(f, ":", 3)
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("--fenced %q: want id:method:receipt-file[+receipt-file]", f)
+		}
+		id, err := cluster.ParseNodeID(parts[0])
+		if err != nil {
+			return nil, err
+		}
+		fv := consensus.FencedVoter{Voter: id, Method: parts[1]}
+		for file := range strings.SplitSeq(parts[2], "+") {
+			b, err := os.ReadFile(file)
+			if err != nil {
+				return nil, err
+			}
+			// A receipt file holds the signature, raw or in hex as
+			// `cluster witness receipt` writes it.
+			if raw, err := hex.DecodeString(strings.TrimSpace(string(b))); err == nil && len(raw) == ed25519.SignatureSize {
+				b = raw
+			}
+			fv.Receipts = append(fv.Receipts, b)
+		}
+		out = append(out, fv)
+	}
+	return out, nil
+}
+
+// verifyWitnessFence checks that both witnesses recorded the fence before
+// the survivor serves (R9-09): a receipt from every key, for every old
+// voter, and every key the nodes ask at boot among them.
+func verifyWitnessFence(c *cli.Command, old, cid consensus.ClusterID, fenced []consensus.FencedVoter) ([]ed25519.PublicKey, error) {
+	keys := c.StringSlice("witness-key")
+	if len(keys) == 0 {
+		keys = setting.Cluster.WitnessKeys
+	}
+	pubs, err := witness.RecoverKeys(keys, setting.Cluster.WitnessKeys)
+	if err != nil {
+		return nil, fmt.Errorf("RECOVER_REFUSED: %w", err)
+	}
+	if err := witness.VerifyReceipts(pubs, old, cid, fenced); err != nil {
+		return nil, fmt.Errorf("RECOVER_REFUSED: %w", err)
+	}
+	return pubs, nil
+}
+
+// checkRecoverVoters refuses a Recover whose new configuration names
+// another voter than this node: another survivor listed as a voter would
+// either never vote (a majority nobody reaches) or run its own Recover into
+// the same cluster id, two histories under one id. The others enter as
+// learners, with --joining.
+func checkRecoverVoters(members []consensus.Member, rep consensus.Report) error {
+	for _, m := range members {
+		if m.ID != rep.Node || m.Slot != rep.Slot {
+			return fmt.Errorf("RECOVER_REFUSED: --members names %s (slot %s): only this node (%s, slot %s) is a voter after a Recover; the others join with --joining", m.ID, m.Slot, rep.Node, rep.Slot)
+		}
+	}
+	return nil
+}
+
+// oldPeerAddrs is what the probe asks: PEERS and every --old-peer, this
+// node's slot excepted.
+func oldPeerAddrs(c *cli.Command) (map[string]string, error) {
+	addrs := map[string]string{}
+	for slot, addr := range setting.Cluster.Peers {
+		if slot != setting.Cluster.Slot {
+			addrs[slot] = addr
+		}
+	}
+	for _, f := range c.StringSlice("old-peer") {
+		slot, addr, ok := strings.Cut(f, "=")
+		if !ok || slot == "" || addr == "" {
+			return nil, fmt.Errorf("--old-peer %q: want slot=host:port", f)
+		}
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			return nil, fmt.Errorf("--old-peer %q: %w", f, err)
+		}
+		if slot != setting.Cluster.Slot {
+			addrs[slot] = addr
+		}
+	}
+	return addrs, nil
+}
+
+// checkOldMembersSilent refuses while an old member answers (ADR 0152
+// R3-27): the witnesses' receipts fence the old cluster at its next boot,
+// they do not stop a member that is running and may still hold a
+// majority. With no address to probe, the operator names them, or forces.
+// A forced Recover is logged and printed.
+func checkOldMembersSilent(ctx context.Context, c *cli.Command, old, cid consensus.ClusterID) error {
+	w := c.Root().Writer
+	force := c.Bool("force-old-members-answer")
+	addrs, err := oldPeerAddrs(c)
+	if err != nil {
+		return err
+	}
+	if len(addrs) == 0 {
+		if !force {
+			return errors.New("RECOVER_REFUSED: no old member to probe: give --old-peer slot=host:port for each old member, or --force-old-members-answer once you know they are all stopped")
+		}
+		log.Warn("cluster recover into %s: no old member of %s probed, forced by the operator", cid, old)
+		fmt.Fprintf(w, "WARNING: no old member of %s was probed; the operator forced the recovery.\n", old)
+		return nil
+	}
+	var blocking []string
+	for _, a := range cluster.ProbeOldMembers(ctx, old.String(), addrs, setting.Cluster.TLSCAFile) {
+		if a.Blocks() {
+			blocking = append(blocking, fmt.Sprintf("%s at %s: %s", a.Slot, a.Addr, a.Detail))
+		}
+	}
+	if len(blocking) == 0 {
+		return nil
+	}
+	if !force {
+		return fmt.Errorf("RECOVER_REFUSED: old member answers: %s; stop it (or cut it off), or pass --force-old-members-answer", strings.Join(blocking, "; "))
+	}
+	log.Warn("cluster recover into %s: old members of %s answer and the operator forced the recovery: %s", cid, old, strings.Join(blocking, "; "))
+	fmt.Fprintf(w, "WARNING: old members answer and the recovery is forced: %s\n", strings.Join(blocking, "; "))
+	return nil
 }
 
 func runClusterRestore(ctx context.Context, c *cli.Command) error {
