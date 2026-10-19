@@ -67,6 +67,13 @@ func parseSegment(name string, segSize int64) (uint32, uint64, bool) {
 	return uint32(tli), hi*perID + lo, true
 }
 
+// walNamePattern accepts what a member's archive holds: segments,
+// timeline histories and backup history files.
+var walNamePattern = regexp.MustCompile(`^[0-9A-F]{24}(\.[0-9A-F]{8}\.backup)?$|^[0-9A-F]{8}\.history$`)
+
+// ValidWALName reports whether name is a file of the WAL archive.
+func ValidWALName(name string) bool { return walNamePattern.MatchString(name) }
+
 // HistoryName names a timeline's history file.
 func HistoryName(tli uint32) string { return fmt.Sprintf("%08X.history", tli) }
 

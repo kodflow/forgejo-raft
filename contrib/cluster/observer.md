@@ -25,9 +25,12 @@ Every `CHECKPOINT_INTERVAL`, the leader takes a checkpoint, a causal cut:
 4. Under that fence, the leader reads PostgreSQL's flushed WAL position L,
    its timeline and system identifier, and creates a restore point named
    after the checkpoint.
-5. The fence is released, the WAL segment switched so L is archived at once,
-   the artifacts written (the table at B, the list of stored files present),
-   and a position entry carrying L and the artifacts' digests is committed.
+5. The fence is released, the stored files listed (outside the fence, so a
+   large storage never freezes the writers; uploads still in a storage's
+   temporary directory are left out), the WAL segment switched so L is
+   archived at once, the artifacts written (the table at B, the list of
+   stored files), and a position entry carrying L and the artifacts'
+   digests is committed.
 
 A checkpoint is then (lineage, B, refs root, L, timeline, system id). The SQL
 committed after step 4 is past L, whatever entry it derives from. The pushes
@@ -255,21 +258,35 @@ A human act, on a new node, every member of the old cluster off:
    record is written once it exists. Mount the chosen snapshot read-only.
 2. Make the observers' new keys (`observe keygen`): every key the old
    cluster saw is rotated.
-3. On the new node, Forgejo stopped, its certificate issued for a new cluster
+3. Fence the old cluster on both witnesses, as for `recover`: `forgejo
+   cluster witness supersede --old <old id> --new <new id> --voters ...` on
+   each witness host, for every voter the checkpoint names (its manifest
+   lists them, `voters`), then `forgejo cluster witness receipt` for each
+   voter from each witness. An old member that comes back stops at its
+   boot.
+4. On the new node, Forgejo stopped, its certificate issued for a new cluster
    id:
 
 ```sh
 forgejo cluster recover --from-observer <checkpoint> --new-cluster <new id> \
   --observer-dir /mnt/snapshot --secrets-key /run/observer/secrets.key \
   --new-observer-recipient nas-paris=<new hex> --out /srv/recover \
-  --pgdata /srv/pg/data [--pg-ctl /usr/lib/postgresql/18/bin/pg_ctl]
+  --pgdata /srv/pg/data [--pg-ctl /usr/lib/postgresql/18/bin/pg_ctl] \
+  --witness-key <hex> --witness-key <hex> \
+  --fenced <voter id>:stopped:<receipt 1>+<receipt 2> ... \
+  [--old-peer node-a=10.0.0.1:7480 ...]
 ```
 
 It follows this order, and stops for the operator where a step is theirs;
 running the same command again resumes from `<out>/progress.json`:
 
 1. Forgejo stays fenced and offline: the command refuses while the node
-   answers on its socket.
+   answers on its socket. The old cluster is fenced and silent: both
+   witnesses' receipts for every voter the checkpoint names, and no old
+   member answering at its consensus address (`PEERS` and `--old-peer`;
+   `--force-old-members-answer` overrides that probe, logged). A checkpoint
+   taken before the voters were recorded names none: at least one
+   `--fenced` is then required, and the operator answers for the others.
 2. Rotation first: `<out>/rotated.ini` holds the checkpoint's `SECRET_KEY`
    (the database's encrypted columns need it), new JWT secrets and the
    observers' new key. The command stops until `app.ini` carries them.
@@ -289,7 +306,9 @@ running the same command again resumes from `<out>/progress.json`:
 6. Verification: the refs against the SQL branch rows, every LFS object
    present, every 2FA secret opening with the restored `SECRET_KEY`; then
    every access token, OAuth2 grant, session and runner token is revoked.
-7. The identifiers move past the checkpoint, once: every sequence of the
+7. The schema is migrated to this binary's first, so the sequences of the
+   tables a migration creates are moved too. Then the identifiers move past
+   the checkpoint, once: every sequence of the
    database by 1,000,000,000 (`setval`; a sequence whose type leaves less
    room moves half of what it has left, one at its end stops the recovery),
    and every repository's numbering (`issue_index`, for issues and pull

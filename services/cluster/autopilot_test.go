@@ -834,3 +834,33 @@ func TestWriterHookGatesTheWriter(t *testing.T) {
 		assert.Equal(t, 1, d, "%s is demoted once", slot)
 	}
 }
+
+// statusEngine answers Status alone, for the writer hook's steps.
+type statusEngine struct {
+	consensus.Engine
+	st consensus.Status
+}
+
+func (e *statusEngine) Status() consensus.Status { return e.st }
+
+// A leadership lost and won back between two passes of the autopilot is
+// another term: the node refuses writes and is promoted again, since
+// another node may have been promoted in between.
+func TestWriterHookPromotesAgainInANewTerm(t *testing.T) {
+	h := &fakeWriterHook{}
+	r := &Replicator{writerHook: h}
+	eng := &statusEngine{st: consensus.Status{Slot: "node-a", Role: consensus.RoleLeader, Term: 1}}
+	require.ErrorIs(t, r.writerGate(eng), errBecomingWriter)
+	r.stepWriter(context.Background(), eng)
+	require.NoError(t, r.writerGate(eng))
+	r.stepWriter(context.Background(), eng)
+	p, _ := h.counts()
+	assert.Equal(t, 1, p, "the same term is promoted once")
+
+	eng.st.Term = 3
+	require.ErrorIs(t, r.writerGate(eng), errBecomingWriter, "a promotion of term 1 does not cover term 3")
+	r.stepWriter(context.Background(), eng)
+	require.NoError(t, r.writerGate(eng))
+	p, _ = h.counts()
+	assert.Equal(t, 2, p)
+}

@@ -130,11 +130,15 @@ type ExportCheckpoint struct {
 // ExportView answers export-checkpoints: the leader's commit, confirmed by
 // a quorum, and the checkpoints closed after FromIndex.
 type ExportView struct {
-	Lineage      string             `json:"lineage"`
-	Term         uint64             `json:"term"`
-	Commit       uint64             `json:"commit"`
-	Leader       string             `json:"leader"`
-	Members      []string           `json:"members"`
+	Lineage string   `json:"lineage"`
+	Term    uint64   `json:"term"`
+	Commit  uint64   `json:"commit"`
+	Leader  string   `json:"leader"`
+	Members []string `json:"members"`
+	// Voters are the node ids of the voting members, as ParseNodeID reads
+	// them: a recovery from an observer's checkpoint needs the witnesses'
+	// receipts fencing each of them.
+	Voters       []string           `json:"voters,omitempty"`
 	LogSupported bool               `json:"log_supported"`
 	Checkpoints  []ExportCheckpoint `json:"checkpoints"`
 }
@@ -150,6 +154,11 @@ type ExportEntry struct {
 type WALFile struct {
 	Name string `json:"name"`
 	Size int64  `json:"size"`
+	// SHA256 is a timeline history's digest: a history name held with
+	// other bytes is a timeline reused by another history, which the
+	// observer refuses. Segments do not carry it, hashing them on every
+	// list would read the whole archive.
+	SHA256 string `json:"sha256,omitempty"`
 }
 
 // FileEntry is one stored file a checkpoint needs: an LFS object, an

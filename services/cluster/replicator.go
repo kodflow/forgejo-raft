@@ -63,6 +63,7 @@ type Replicator struct {
 	// writerHook follows the right to write (writer.go); nil without one.
 	writerHook WriterHook
 	writer     atomic.Uint32
+	writerAt   atomic.Pointer[writerMark]
 	// dead is when the leader found each member out of reach; seen is
 	// what this node saw of each member, for the status (autopilot.go,
 	// retire.go).
@@ -185,7 +186,7 @@ func Init(ctx context.Context) error {
 	}
 	r.objects = &objectChannel{
 		root: r.root, port: setting.Cluster.ObjectPort, cluster: clusterHex, id: id,
-		engine: r.Engine, self: r.selfID, repoKnown: r.repoKnown,
+		engine: r.Engine, self: r.selfID, repoKnown: r.repoKnown, revoked: r.table.KeyRevoked,
 	}
 	if setting.Cluster.ExpectedNodes >= 3 {
 		r.auto = newAutoMode(r.objects)

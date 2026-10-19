@@ -24,22 +24,25 @@ const StatePruned = "PRUNED"
 // Freshness follows the newest PROTECTED checkpoint alone: a verified one
 // whose snapshot failed restores nothing yet.
 type Status struct {
-	Name            string    `json:"name"`
-	At              time.Time `json:"at"`
-	Lineage         string    `json:"lineage"`
-	Leader          string    `json:"leader"`
-	Term            uint64    `json:"term"`
-	Commit          uint64    `json:"commit"`
-	LastProtected   string    `json:"last_protected,omitempty"`
-	FreshnessSecond int64     `json:"freshness_seconds"`
-	LastVerified    string    `json:"last_verified,omitempty"`
-	HookFailing     string    `json:"hook_failing,omitempty"`
-	Quarantine      string    `json:"quarantine,omitempty"`
-	Rebootstrap     string    `json:"rebootstrap,omitempty"`
-	StagingBytes    int64     `json:"staging_bytes"`
-	FreeBytes       uint64    `json:"free_bytes"`
-	LastError       string    `json:"last_error,omitempty"`
-	Alerts          []string  `json:"alerts"`
+	Name string    `json:"name"`
+	At   time.Time `json:"at"`
+	// StepStarted is when the running pass began; set, it is a heartbeat
+	// written before the pass, and its age shows a pass that hangs.
+	StepStarted     *time.Time `json:"step_started,omitempty"`
+	Lineage         string     `json:"lineage"`
+	Leader          string     `json:"leader"`
+	Term            uint64     `json:"term"`
+	Commit          uint64     `json:"commit"`
+	LastProtected   string     `json:"last_protected,omitempty"`
+	FreshnessSecond int64      `json:"freshness_seconds"`
+	LastVerified    string     `json:"last_verified,omitempty"`
+	HookFailing     string     `json:"hook_failing,omitempty"`
+	Quarantine      string     `json:"quarantine,omitempty"`
+	Rebootstrap     string     `json:"rebootstrap,omitempty"`
+	StagingBytes    int64      `json:"staging_bytes"`
+	FreeBytes       uint64     `json:"free_bytes"`
+	LastError       string     `json:"last_error,omitempty"`
+	Alerts          []string   `json:"alerts"`
 }
 
 // FreshnessAlert is the age of the newest protected checkpoint past which
@@ -56,6 +59,10 @@ func (o *Observer) Status(err error) Status {
 	}
 	if err != nil {
 		s.LastError = err.Error()
+	}
+	if !o.stepStarted.IsZero() {
+		t := o.stepStarted.UTC()
+		s.StepStarted = &t
 	}
 	if a, ok := st.LastProtected(); ok {
 		s.LastProtected = a.Name

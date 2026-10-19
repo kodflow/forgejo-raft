@@ -104,10 +104,15 @@ type Table struct {
 	// refs are written under its key again.
 	deleted map[string]uint64
 	// renamed maps a new key to the old one and the index of the rename.
-	renamed  map[string]renameMark
-	grants   map[string]JoinGrant
-	applied  consensus.Position
-	identity consensus.LogIdentity
+	renamed map[string]renameMark
+	grants  map[string]JoinGrant
+	// revoked maps a revoked key, 64 hex digits, to its revocation;
+	// pendingRevoke the revocations an operator asked for before the
+	// cluster could write them (AuditRevokeKey), by key.
+	revoked       map[string]RevokeKey
+	pendingRevoke map[string]RevokeKey
+	applied       consensus.Position
+	identity      consensus.LogIdentity
 	// pending is the open checkpoint barrier; checkpoints the closed ones.
 	pending     *pendingCheckpoint
 	checkpoints []CheckpointRecord
@@ -134,11 +139,13 @@ type renameMark struct {
 // New returns an empty table.
 func New() *Table {
 	return &Table{
-		repos:   map[string]*repoState{},
-		deleted: map[string]uint64{},
-		renamed: map[string]renameMark{},
-		grants:  map[string]JoinGrant{},
-		byNonce: map[string]uint64{},
+		repos:         map[string]*repoState{},
+		deleted:       map[string]uint64{},
+		renamed:       map[string]renameMark{},
+		grants:        map[string]JoinGrant{},
+		revoked:       map[string]RevokeKey{},
+		pendingRevoke: map[string]RevokeKey{},
+		byNonce:       map[string]uint64{},
 	}
 }
 
@@ -228,6 +235,12 @@ func (t *Table) Apply(e consensus.Entry) any {
 			res = t.applyCheckpointBarrier(e, body.(*CheckpointBarrier))
 		case KindCheckpointPosition:
 			res = t.applyCheckpointPosition(e, body.(*CheckpointPosition))
+		case KindRevokeKey:
+			if version < RevokeVersion {
+				res = refuse("a key revocation is written at payload version %d", RevokeVersion)
+				break
+			}
+			res = t.applyRevokeKey(body.(*RevokeKey))
 		}
 	}
 	t.applied = e.Position
@@ -494,6 +507,11 @@ func (t *Table) applyAudit(e consensus.Entry, a *Audit) Result {
 	}
 	t.audit = append(t.audit, AuditRecord{Audit: *a, Token: e.Token})
 	t.payload = max(t.payload, raisedVersion(a))
+	if k, ok := pendingRevocation(a); ok {
+		if _, done := t.revoked[k.SPKI]; !done {
+			t.pendingRevoke[k.SPKI] = k
+		}
+	}
 	if len(t.audit) > AuditKeep {
 		t.audit = append([]AuditRecord(nil), t.audit[len(t.audit)-AuditKeep:]...)
 	}
@@ -606,6 +624,55 @@ func validSlot(s string) bool {
 		}
 	}
 	return true
+}
+
+func (t *Table) applyRevokeKey(k *RevokeKey) Result {
+	if !validSlot(k.Slot) || consensus.Operator(k.Operator).Validate() != nil || !(len(k.SPKI) == 64 && validSHA(k.SPKI, "sha256")) {
+		return refuse("malformed key revocation")
+	}
+	if _, ok := t.revoked[k.SPKI]; !ok {
+		t.revoked[k.SPKI] = *k
+	}
+	delete(t.pendingRevoke, k.SPKI)
+	// A grant bound to the revoked key admits nothing any more.
+	if g, ok := t.grants[k.Slot]; ok && g.SPKI == k.SPKI {
+		delete(t.grants, k.Slot)
+	}
+	return Result{OK: true}
+}
+
+// pendingRevocation reads an AuditRevokeKey record; ok is false for any
+// other record.
+func pendingRevocation(a *Audit) (RevokeKey, bool) {
+	if a.Action != AuditRevokeKey || a.Outcome != AuditPending {
+		return RevokeKey{}, false
+	}
+	slot, spki, _ := strings.Cut(a.Target, ":")
+	if !validSlot(slot) || !(len(spki) == 64 && validSHA(spki, "sha256")) {
+		return RevokeKey{}, false
+	}
+	return RevokeKey{SPKI: spki, Slot: slot, Operator: a.Operator, Time: a.Time}, true
+}
+
+// PendingRevocations lists the revocations asked for and not yet written,
+// by key.
+func (t *Table) PendingRevocations() []RevokeKey {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]RevokeKey, 0, len(t.pendingRevoke))
+	for _, k := range t.pendingRevoke {
+		out = append(out, k)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SPKI < out[j].SPKI })
+	return out
+}
+
+// KeyRevoked reports whether an operator revoked spki, 64 hex digits.
+func (t *Table) KeyRevoked(spki string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	_, ok := t.revoked[spki]
+	return ok
 }
 
 // JoinGrant returns the latest grant for a slot.
@@ -846,6 +913,10 @@ type persisted struct {
 	Deleted  map[string]uint64               `json:"deleted"`
 	Renamed  map[string]renameMark           `json:"renamed"`
 	Grants   map[string]JoinGrant            `json:"grants,omitempty"`
+	Revoked  map[string]RevokeKey            `json:"revoked,omitempty"`
+	// PendingRevoke is absent from a snapshot an older member cut: it is
+	// then read back from the audit records kept.
+	PendingRevoke map[string]RevokeKey `json:"pending_revoke,omitempty"`
 	// Pending and Checkpoints are absent from snapshots older than the
 	// checkpoints, which then restore with none.
 	Pending     *pendingCheckpoint `json:"pending,omitempty"`
@@ -882,7 +953,7 @@ func (t *Table) persistedLocked() *persisted {
 	p := &persisted{
 		Format: SnapshotFormat, Applied: t.applied, Identity: t.identity,
 		Repos: make(map[string]map[string]*RefValue, len(t.repos)), Last: map[string]uint64{},
-		Events: t.events, Audit: t.audit, Deleted: t.deleted, Renamed: t.renamed, Grants: t.grants,
+		Events: t.events, Audit: t.audit, Deleted: t.deleted, Renamed: t.renamed, Grants: t.grants, Revoked: t.revoked, PendingRevoke: t.pendingRevoke,
 		Pending: t.pending, Checkpoints: t.checkpoints, Payload: t.payload, Nonces: t.nonces,
 	}
 	for k, r := range t.repos {
@@ -937,9 +1008,24 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	if p.Grants != nil {
 		nt.grants = p.Grants
 	}
+	if p.Revoked != nil {
+		nt.revoked = p.Revoked
+	}
+	if p.PendingRevoke != nil {
+		nt.pendingRevoke = p.PendingRevoke
+	} else {
+		for i := range nt.audit {
+			if k, ok := pendingRevocation(&nt.audit[i].Audit); ok {
+				if _, done := nt.revoked[k.SPKI]; !done {
+					nt.pendingRevoke[k.SPKI] = k
+				}
+			}
+		}
+	}
 	t.mu.Lock()
 	t.repos, t.root, t.events, t.eventBytes = nt.repos, nt.root, nt.events, nt.eventBytes
-	t.audit, t.deleted, t.renamed, t.grants = nt.audit, nt.deleted, nt.renamed, nt.grants
+	t.audit, t.deleted, t.renamed, t.grants, t.revoked = nt.audit, nt.deleted, nt.renamed, nt.grants, nt.revoked
+	t.pendingRevoke = nt.pendingRevoke
 	t.applied, t.identity = p.Applied, p.Identity
 	t.pending, t.checkpoints = p.Pending, p.Checkpoints
 	t.payload, t.nonces, t.byNonce = nt.payload, nt.nonces, nt.byNonce

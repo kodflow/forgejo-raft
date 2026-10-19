@@ -1374,6 +1374,7 @@
 	"admin.cluster.op.step_up_no_password": "Your account has no local password, so it cannot re-authenticate here: nothing was done.",
 	"admin.cluster.op.failed": "The operation %s failed: %s",
 	"admin.cluster.op.done": "The operation %s on %s is done.",
+	"admin.cluster.op.revocation_pending": "The operation %s on %s is done, but its key is not revoked yet: some members run an older binary. The revocation is written by itself once every member runs this version.",
 	"admin.cluster.op.add-learner": "Add a learner",
 	"admin.cluster.op.promote": "Promote",
 	"admin.cluster.op.remove": "Remove",

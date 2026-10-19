@@ -33,14 +33,15 @@ import (
 // mutual TLS, and then:
 //
 //   - if any of them is already a member, it joins the cluster;
-//   - otherwise the node of the lowest slot founds the cluster alone, as
-//     soon as it reaches a majority of the expected nodes, and every other
-//     node joins it.
+//   - otherwise the node of the lowest slot founds the cluster alone, once
+//     every expected node answers as joining, and every other node joins
+//     it. A majority is not enough: the silent node may hold the log.
 //
 // Only one slot is ever the lowest of the same list, so two nodes never
 // found two clusters, provided every node is given the same PEERS.
 // A node that already holds a cluster's log never founds again: a wiped
-// founder finds a member among the others and joins instead.
+// founder finds a member among the others and joins instead, and waits
+// while any of them is silent.
 //
 // Admission without an operator's grant rests on the cluster's CA: a node
 // presenting a CA-signed certificate for an empty slot of this cluster is
@@ -279,10 +280,18 @@ func decide(self string, expected int, peerSlots []string, seen []hello) (format
 	if founder != self {
 		return formJoin, fmt.Sprintf("slot %s founds the cluster", founder)
 	}
-	if reached := 1 + len(seen); reached < expected/2+1 {
-		return formWait, fmt.Sprintf("this node founds the cluster once it reaches a majority: %d of %d", reached, expected)
+	// Every expected slot must answer, not a majority: a slot that stays
+	// silent may be the one node still holding the cluster's log (the
+	// others wiped), and founding without it would found a second cluster
+	// under the same id, which its log can never rejoin.
+	answered := map[string]bool{self: true}
+	for _, h := range seen {
+		answered[h.Slot] = true
 	}
-	return formFound, "this node has the lowest slot and reaches a majority"
+	if reached := len(answered); reached < expected {
+		return formWait, fmt.Sprintf("this node founds the cluster once every expected node answers: %d of %d", reached, expected)
+	}
+	return formFound, "this node has the lowest slot and every expected node answers"
 }
 
 // form prepares the data directory of the autonomous mode before the node

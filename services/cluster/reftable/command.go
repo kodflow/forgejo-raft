@@ -20,7 +20,17 @@ import (
 // member running an older binary applies as a plain audit record, so a
 // rolling upgrade never hands an older member an entry it cannot read
 // before every member runs this code.
-const PayloadVersion = 2
+//
+// Version 3 adds one kind, KindRevokeKey, written at version 3 only: an
+// older binary stops on any entry above the version it applies, so a key
+// revocation is never written before every member applies it. Until then
+// an operator's revocation waits as a version 1 audit record (AuditRevokeKey),
+// which an older member keeps as a plain record, and is written once the
+// cluster raised its version.
+const PayloadVersion = 3
+
+// RevokeVersion is the payload version that carries KindRevokeKey.
+const RevokeVersion = 3
 
 // BaseVersion is the version written until the cluster raised it.
 const BaseVersion = 1
@@ -30,6 +40,11 @@ const BaseVersion = 1
 const (
 	AuditPayloadVersion = "payload-version"
 	AuditRaised         = "raised"
+	// AuditRevokeKey with Outcome AuditPending and Target "slot:spki" is a
+	// revocation an operator asked for while the cluster wrote a version
+	// below RevokeVersion: it is written as KindRevokeKey once it may be.
+	AuditRevokeKey = "revoke-key"
+	AuditPending   = "pending"
 )
 
 // Kind is the command's discriminant, the second byte of the envelope.
@@ -47,6 +62,9 @@ const (
 	// first: an older one stops on them (D18).
 	KindCheckpointBarrier  Kind = 7
 	KindCheckpointPosition Kind = 8
+	// KindRevokeKey is written at payload version 3 only (RevokeVersion),
+	// once every member applies it: an older binary stops on it (D18).
+	KindRevokeKey Kind = 9
 )
 
 // Limits pinned to the payload version: they are part of Apply's verdict, so
@@ -148,6 +166,17 @@ type JoinGrant struct {
 	Operator string `json:"op"`
 }
 
+// RevokeKey refuses a node key for good: a JOIN presenting it is refused
+// whatever the grant or the CA says, and the object channel admits no
+// member holding it. An operator's Remove and DenyPin write it; the
+// autopilot's removal of a dead member does not, so that member returns.
+type RevokeKey struct {
+	SPKI     string `json:"spki"`
+	Slot     string `json:"slot"`
+	Operator string `json:"op"`
+	Time     int64  `json:"t"`
+}
+
 // Encode writes the envelope at BaseVersion: payload version, kind, JSON
 // body.
 func Encode(kind Kind, body any) ([]byte, error) {
@@ -182,9 +211,10 @@ func decode(data []byte) (Kind, any, error) {
 	if data[0] == 0 || data[0] > PayloadVersion {
 		return 0, nil, fmt.Errorf("%w: payload version %d", ErrVersion, data[0])
 	}
-	if data[0] > BaseVersion && Kind(data[1]) != KindRefTxn {
-		// Version 2 changes the ref transaction only: any other kind at
-		// it was written by no version of this code.
+	if data[0] > BaseVersion && Kind(data[1]) != KindRefTxn && (Kind(data[1]) != KindRevokeKey || data[0] < RevokeVersion) {
+		// Version 2 changes the ref transaction only, version 3 adds the
+		// key revocation: any other kind above version 1 was written by no
+		// version of this code.
 		return 0, nil, fmt.Errorf("%w: command kind %d at payload version %d", ErrVersion, data[1], data[0])
 	}
 	kind := Kind(data[1])
@@ -206,6 +236,8 @@ func decode(data []byte) (Kind, any, error) {
 		v = &CheckpointBarrier{}
 	case KindCheckpointPosition:
 		v = &CheckpointPosition{}
+	case KindRevokeKey:
+		v = &RevokeKey{}
 	default:
 		return 0, nil, fmt.Errorf("%w: command kind %d", ErrVersion, kind)
 	}

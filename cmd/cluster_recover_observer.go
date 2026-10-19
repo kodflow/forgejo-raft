@@ -21,6 +21,7 @@ import (
 	auth_model "forgejo.org/models/auth"
 	cluster_model "forgejo.org/models/cluster"
 	"forgejo.org/models/db"
+	gitea_migrations_model "forgejo.org/models/gitea_migrations"
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/generate"
 	"forgejo.org/modules/json"
@@ -142,6 +143,13 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 	// the cluster's data directory is new.
 	if _, err := clusterhook.Call(ctx, setting.Cluster.HookSocket, &clusterhook.Request{Op: clusterhook.OpStatus}); err == nil {
 		return errors.New("Forgejo is running on this node: stop it; it stays offline until the recovery ends")
+	}
+	// The old cluster is fenced and silent, as for `recover`: both
+	// witnesses recorded the supersession for every voter the checkpoint
+	// names, so an old member that comes back stops at its boot; and no
+	// old member answers now.
+	if err := checkObserverFence(ctx, c, m, cid); err != nil {
+		return err
 	}
 
 	// 2. Rotation first: new JWT secrets, the SECRET_KEY the database needs,
@@ -294,10 +302,17 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 	// checkpoint are held elsewhere (mails, webhooks, runners, other
 	// forges): the sequences and the numbering move past them, once.
 	if !prog.done(stepAdvance) {
-		if _, err := cluster_model.AdvanceIdentifiers(ctx, recoveryMarker(name, cid.String()), func(f string, a ...any) {
-			fmt.Fprintf(w, f+"\n", a...)
+		// The schema first: a binary newer than the checkpoint's schema
+		// creates tables, and their sequences, on its first start; advanced
+		// before they exist, they would hand out again IDs the old cluster
+		// handed out after the checkpoint.
+		if err := migrateThenAdvance(ctx, migrateRecovered, func(ctx context.Context) error {
+			_, err := cluster_model.AdvanceIdentifiers(ctx, recoveryMarker(name, cid.String()), func(f string, a ...any) {
+				fmt.Fprintf(w, f+"\n", a...)
+			})
+			return err
 		}); err != nil {
-			return fmt.Errorf("advancing the identifiers past the checkpoint: %w", err)
+			return err
 		}
 		if err := save(stepAdvance); err != nil {
 			return err
@@ -327,6 +342,77 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 
 	// 8. The loss, stated.
 	fmt.Fprintf(w, "\n%s\n\nNext: start Forgejo on this node with the rotated secrets; run `forgejo cluster import` to put the restored refs in the new table, `forgejo doctor check --all --fix` and `forgejo cluster reconcile --apply` (pull request heads, branches); then add the other members, and re-key the observers with their new key.\n", m.Loss)
+	return nil
+}
+
+// checkObserverFence refuses a recovery from an observer while the old
+// cluster is not fenced by both witnesses for every voter the checkpoint
+// names, or while an old member answers.
+func checkObserverFence(ctx context.Context, c *cli.Command, m *observer.Manifest, cid consensus.ClusterID) error {
+	lineage, _, _ := strings.Cut(m.Checkpoint.Lineage, "/")
+	old, err := consensus.ParseClusterID(lineage)
+	if err != nil {
+		return fmt.Errorf("the checkpoint's lineage %q: %w", m.Checkpoint.Lineage, err)
+	}
+	if old == cid {
+		return errors.New("RECOVER_REFUSED: --new-cluster is the checkpoint's own cluster id")
+	}
+	fenced, err := parseFenced(c.StringSlice("fenced"))
+	if err != nil {
+		return err
+	}
+	if err := fenceCovers(m.Voters, fenced); err != nil {
+		return err
+	}
+	if _, err := verifyWitnessFence(c, old, cid, fenced); err != nil {
+		return err
+	}
+	return checkOldMembersSilent(ctx, c, old, cid)
+}
+
+// fenceCovers checks that every voter the checkpoint names has a fence. A
+// checkpoint taken before the voters were recorded names none: at least
+// one fence is then required, and the operator answers for the others.
+func fenceCovers(voters []string, fenced []consensus.FencedVoter) error {
+	if len(fenced) == 0 {
+		return errors.New("RECOVER_REFUSED: --fenced id:method:receipt-file[+receipt-file] is required for every voter of the old cluster")
+	}
+	have := map[consensus.NodeID]bool{}
+	for _, f := range fenced {
+		have[f.Voter] = true
+	}
+	for _, v := range voters {
+		id, err := cluster.ParseNodeID(v)
+		if err != nil {
+			return fmt.Errorf("the checkpoint's voter %q: %w", v, err)
+		}
+		if !have[id] {
+			return fmt.Errorf("RECOVER_REFUSED: voter %s of the old cluster has no --fenced receipt", id)
+		}
+	}
+	return nil
+}
+
+// migrateRecovered brings the restored schema to this binary's.
+var migrateRecovered = func(ctx context.Context) error {
+	return db.InitEngineWithMigration(ctx, func(e db.Engine) error {
+		master, err := db.GetMasterEngine(e)
+		if err != nil {
+			return err
+		}
+		return gitea_migrations_model.Migrate(master)
+	})
+}
+
+// migrateThenAdvance migrates the schema, then advances the identifiers:
+// the sequences a migration creates are advanced with the others.
+func migrateThenAdvance(ctx context.Context, migrate, advance func(context.Context) error) error {
+	if err := migrate(ctx); err != nil {
+		return fmt.Errorf("migrating the restored schema before advancing the identifiers: %w", err)
+	}
+	if err := advance(ctx); err != nil {
+		return fmt.Errorf("advancing the identifiers past the checkpoint: %w", err)
+	}
 	return nil
 }
 

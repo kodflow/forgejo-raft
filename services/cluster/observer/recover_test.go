@@ -177,3 +177,33 @@ func TestWriteFileDurableReplacesAndSyncs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 }
+
+// The restore directory holds every timeline history the archive holds,
+// not only those on the checkpoint's path: the promotion takes the newest
+// plus one, never a number the old system used after the checkpoint.
+func TestRecoverCopiesEveryTimelineHistory(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	cp := seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	c.pg.failover()
+	c.pg.failover()
+	c.push("alice/demo.git", "refs/heads/main", c.commit("on timeline 3"))
+	c.checkpoint()
+	require.NoError(t, o.Step(ctx))
+
+	a, err := OpenArchive(o.cfg.Dir, "")
+	require.NoError(t, err)
+	m, err := a.Manifest(cp.Name())
+	require.NoError(t, err)
+	require.EqualValues(t, 1, m.Checkpoint.Timeline)
+	assert.Equal(t, []string{"000000000000000a", "000000000000000b", "000000000000000c"}, m.Voters, "the old voters a recovery must fence")
+	pgdata, restore := filepath.Join(t.TempDir(), "pgdata"), filepath.Join(t.TempDir(), "restore")
+	require.NoError(t, a.RestorePG(cp.Name(), pgdata, PGOptions{Port: 5433, SocketDir: pgdata, RestoreDir: restore}))
+	for _, h := range []string{HistoryName(2), HistoryName(3)} {
+		b, err := os.ReadFile(filepath.Join(restore, h))
+		require.NoError(t, err, "the restore directory holds %s", h)
+		assert.Equal(t, c.pg.archive[h], b)
+	}
+}

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/json"
@@ -33,6 +34,8 @@ type sshMember struct {
 	mu       sync.Mutex
 	requests []string
 	got      clusterhook.ExportRequest
+	// mute makes the session read the request and never answer.
+	mute bool
 }
 
 func newSSHMember(t *testing.T, clientKey ssh.PublicKey) *sshMember {
@@ -95,7 +98,11 @@ func (m *sshMember) serve(conn net.Conn, cfg *ssh.ServerConfig) {
 				line, _ := bufio.NewReader(ch).ReadBytes('\n')
 				m.mu.Lock()
 				_ = json.Unmarshal(line, &m.got)
+				mute := m.mute
 				m.mu.Unlock()
+				if mute {
+					select {} // the member stops talking
+				}
 				b, _ := json.Marshal(clusterhook.ExportAnswer{OK: true, Stream: true})
 				_, _ = ch.Write(append(b, '\n'))
 				_, _ = ch.Write([]byte("the stream"))
@@ -152,4 +159,88 @@ func TestSSHSourcePinsTheHostAndAsksForNothingElse(t *testing.T) {
 	require.NoError(t, err)
 	_, _, err = src.Export(context.Background(), &clusterhook.ExportRequest{Op: clusterhook.OpExportWAL})
 	require.Error(t, err)
+}
+
+func observerKey(t *testing.T) (string, ssh.Signer) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	block, err := ssh.MarshalPrivateKey(priv, "")
+	require.NoError(t, err)
+	keyFile := filepath.Join(t.TempDir(), "id_ed25519")
+	require.NoError(t, os.WriteFile(keyFile, pem.EncodeToMemory(block), 0o600))
+	signer, err := ssh.NewSignerFromKey(priv)
+	require.NoError(t, err)
+	return keyFile, signer
+}
+
+func exportWithin(t *testing.T, src *SSHSource, bound time.Duration) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, body, err := src.Export(context.Background(), &clusterhook.ExportRequest{Op: clusterhook.OpExportCheckpoints})
+		if body != nil {
+			body.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(bound):
+		t.Fatalf("Export still blocked after %s", bound)
+		return nil
+	}
+}
+
+// A member whose sshd accepts the TCP connection and never speaks does not
+// hold the observer: the handshake has a deadline of its own, the context
+// none.
+func TestSSHSourceDropsASilentMember(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { ln.Close() })
+	var held []net.Conn
+	var mu sync.Mutex
+	t.Cleanup(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range held {
+			c.Close()
+		}
+	})
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, c) // accepted, never read, never written
+			mu.Unlock()
+		}
+	}()
+	keyFile, _ := observerKey(t)
+	known := filepath.Join(t.TempDir(), "known_hosts")
+	require.NoError(t, os.WriteFile(known, nil, 0o600))
+	src, err := NewSSHSource("obs@"+ln.Addr().String(), keyFile, known)
+	require.NoError(t, err)
+	src.cfg.Timeout = 200 * time.Millisecond
+	require.Error(t, exportWithin(t, src, 10*time.Second))
+}
+
+// A member that completes the handshake, takes the request and stops
+// talking is dropped after the idle deadline.
+func TestSSHSourceDropsAMemberThatStopsTalking(t *testing.T) {
+	keyFile, signer := observerKey(t)
+	member := newSSHMember(t, signer.PublicKey())
+	member.mu.Lock()
+	member.mute = true
+	member.mu.Unlock()
+	known := filepath.Join(t.TempDir(), "known_hosts")
+	require.NoError(t, os.WriteFile(known, []byte(knownhosts.Line([]string{knownhosts.Normalize(member.addr)}, member.hostKey)+"\n"), 0o600))
+	src, err := NewSSHSource("obs@"+member.addr, keyFile, known)
+	require.NoError(t, err)
+	src.idle = 300 * time.Millisecond
+	require.Error(t, exportWithin(t, src, 10*time.Second))
 }

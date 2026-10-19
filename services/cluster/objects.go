@@ -47,6 +47,9 @@ type objectChannel struct {
 	engine    func() consensus.Engine
 	self      func() consensus.NodeID
 	repoKnown func(ctx context.Context, repo string) (bool, error)
+	// revoked reports a key an operator revoked (hex SPKI): a member
+	// holding it is not admitted, even before its removal commits.
+	revoked func(spki string) bool
 	// resolve maps a member to its object channel address; nil uses the
 	// host of its consensus address and the configured port.
 	resolve func(m consensus.Member) string
@@ -78,6 +81,9 @@ func (oc *objectChannel) admit(p peer) (consensus.Member, error) {
 		}
 		if oc.pin(m) != p.SPKI {
 			continue
+		}
+		if oc.revoked != nil && (oc.revoked(hex.EncodeToString(p.SPKI[:])) || oc.revoked(hex.EncodeToString(m.SPKI[:]))) {
+			return consensus.Member{}, fmt.Errorf("PEER_REJECTED: the key of slot %s was revoked", p.Slot)
 		}
 		return m, nil
 	}

@@ -218,6 +218,7 @@ func (c *fakeCluster) viewLocked(slot string, from uint64) clusterhook.ExportVie
 	v := clusterhook.ExportView{
 		Lineage: c.lineage().String(), Term: c.term, Commit: uint64(len(c.log)), Leader: slot,
 		Members: append([]string(nil), c.members...), LogSupported: true, Checkpoints: []clusterhook.ExportCheckpoint{},
+		Voters: []string{"000000000000000a", "000000000000000b", "000000000000000c"},
 	}
 	for _, cp := range c.table.Checkpoints() {
 		if cp.Index > from && cp.Identity == v.Lineage {
@@ -348,7 +349,11 @@ func (c *fakeCluster) serve(slot string, req *clusterhook.ExportRequest) ([]byte
 		var out []clusterhook.WALFile
 		for name, b := range c.pg.archive {
 			if name > req.Name || strings.HasSuffix(name, ".history") {
-				out = append(out, clusterhook.WALFile{Name: name, Size: int64(len(b))})
+				wf := clusterhook.WALFile{Name: name, Size: int64(len(b))}
+				if strings.HasSuffix(name, ".history") {
+					wf.SHA256 = digest(b)
+				}
+				out = append(out, wf)
 			}
 		}
 		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })

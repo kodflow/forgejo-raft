@@ -61,6 +61,14 @@ func TestExportIsLeaderOnlyWithAHint(t *testing.T) {
 	assert.True(t, v.LogSupported)
 	require.Len(t, v.Checkpoints, 1)
 	assert.Equal(t, []string{"node-a", "node-b", "node-c"}, v.Members, "the observer is never among them")
+	var voters []string
+	for _, m := range tc.nodes[0].r.Engine().Membership().Members {
+		if m.Voter {
+			voters = append(voters, m.ID.String())
+		}
+	}
+	assert.Len(t, voters, 3)
+	assert.Equal(t, voters, v.Voters, "the voters a recovery from this checkpoint must fence")
 
 	// The artifact the leader serves is the one the position names.
 	_, refs, err := exportOf(t, tc.nodes[0], &clusterhook.ExportRequest{Op: clusterhook.OpExportRefs, Checkpoint: v.Checkpoints[0].Name})
@@ -191,7 +199,10 @@ func TestExportArchiveFilesAndSecrets(t *testing.T) {
 	require.NoError(t, err)
 	var files []clusterhook.WALFile
 	require.NoError(t, json.Unmarshal(data, &files))
-	assert.Equal(t, []clusterhook.WALFile{{Name: "000000010000000000000002", Size: 24}, {Name: "00000002.history", Size: 16}}, files, "after the name given, and every history")
+	assert.Equal(t, []clusterhook.WALFile{
+		{Name: "000000010000000000000002", Size: 24},
+		{Name: "00000002.history", Size: 16, SHA256: sha256Hex([]byte("00000002.history"))},
+	}, files, "after the name given, and every history with its digest")
 	_, seg, err := exportOf(t, n, &clusterhook.ExportRequest{Op: clusterhook.OpExportWAL, Name: "00000002.history"})
 	require.NoError(t, err)
 	assert.Equal(t, "00000002.history", string(seg))

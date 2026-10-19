@@ -155,9 +155,10 @@ grants a join.
 - **Forming.** Each node stamps its data directory and asks the others who
   they are, over the object channel with mutual TLS. If one is already a
   member, it joins. Otherwise the node with the lowest slot founds the
-  cluster alone, as soon as it reaches a majority of the expected nodes, and
-  the others join it. Every node must be given the same size and the same
-  `PEERS`.
+  cluster alone, once every expected node answers, and the others join it.
+  A majority is not enough: a silent node may be the last one holding the
+  log, and founding without it would start a second cluster under the same
+  id. Every node must be given the same size and the same `PEERS`.
 - **Voters.** `EXPECTED_NODES` sizes the founding and `PEERS`; afterwards
   every live member votes: three, four or five. The leader promotes a
   learner (the eldest first) as soon as it caught up. `forgejo cluster
@@ -189,8 +190,31 @@ grants a join.
 **What the CA is trusted with.** In this mode, possessing a certificate the
 cluster's CA signed for a slot is enough to join an empty slot, and a joining
 node trusts every member presenting such a certificate (set `PEER_PINS` to
-trust given keys only). Keep the CA offline or in Vault, sign one certificate
-per expected slot, and revoke by removing the member.
+trust given keys only). Keep the CA offline or in Vault, and sign one
+certificate per expected slot.
+
+**Revoking a node.** An operator's Remove or Deny pin of a member first
+revokes its key: the revocation is a replicated entry, so every member
+refuses that key at the JOIN, under any id and whatever grant the slot has,
+and the object channel no longer admits it. The node comes back only with a
+new key, which the CA signs. The autopilot's removal of a dead member revokes
+nothing, so a node that was only out of reach returns by itself. The
+revocation is a command of payload version 3, which an older binary cannot
+read: while a member still runs one, the cluster writes an older version,
+the Remove or Deny pin goes through without the revocation, and the
+administration says the key is not revoked yet. The request is kept in the
+log, and the revocation is written by itself once every member runs this
+version (the autopilot raises the version; in the manual mode, the
+operator raises it from the administration page). A JOIN grant is bound to the key it first admits:
+that node may retry, another key does not join under it.
+
+**A compromised CA** is replaced, never revoked in place. Sign new
+certificates under a new CA, add the new CA to `TLS_CA_FILE` beside the old
+one and roll the certificates; then remove the old CA from the file and
+restart every node, one after the other. The consensus transport adds the
+roots it reloads to the ones it holds and drops none until it restarts, so
+until the last node restarted, a certificate of the old CA is still accepted
+at the JOIN.
 
 ## Founding the cluster
 
@@ -273,7 +297,13 @@ These commands run with the server stopped, on the data directory.
 - `forgejo cluster recover --new-cluster <id> --members ... --fenced id:method:receipt`
   forces a new configuration after the majority is lost. Every old voter left
   out must be fenced, and every fence carries a receipt signed by each
-  witness. The command asks to type the new id again.
+  witness. `--members` names this node alone: it is the only voter of the
+  new cluster, the other survivors enter as learners (`--joining`). Before
+  anything, the command probes each old member at its consensus address
+  (`PEERS`, and `--old-peer slot=host:port`) and refuses while one answers:
+  the witnesses fence the old cluster at its next boot, they do not stop a
+  member that still runs. `--force-old-members-answer` overrides it and is
+  logged. The command asks to type the new id again.
 - `forgejo cluster snapshot save --out <file>`, server running, writes the
   table snapshot with its SHA-256 and its metadata beside it.
 - `forgejo cluster restore --file <file> --sha256 <digest> --new-cluster <id> --members ...`
@@ -303,7 +333,9 @@ These commands run with the server stopped, on the data directory.
   audit.
 - `forgejo cluster recover --from-observer <checkpoint> ...` rebuilds a
   cluster from an observer's protected checkpoint, every member lost
-  ([observer.md](observer.md)).
+  ([observer.md](observer.md)). It needs the same `--fenced` receipts of
+  both witnesses for every voter the checkpoint names, and the same probe
+  of the old members.
 
 ## Observers
 
