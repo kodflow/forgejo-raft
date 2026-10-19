@@ -492,7 +492,7 @@ func (p *projector) Verify(ctx context.Context, repo string) (bool, error) {
 // MayCollectGarbage is the projector's gate for git gc: projected, no native
 // transaction in flight, and no unconsumed event pinning objects of it.
 func (p *projector) MayCollectGarbage(repo string) bool {
-	if p.registry.inFlight(repo) || len(p.table.PinnedObjects(repo)) > 0 {
+	if p.registry.busy(repo) || len(p.table.PinnedObjects(repo)) > 0 {
 		return false
 	}
 	p.mu.Lock()
