@@ -84,21 +84,30 @@ func GitGcRepos(ctx context.Context, timeout time.Duration, args git.TrustedCmdA
 	return nil
 }
 
-// clusterGCArgs drops a --prune that expires unreachable objects at once
-// (now, all, never mind the age): in a cluster, objects arrive on a member
-// before the ref that names them commits, shipped to a majority that this
-// node counts in. Pruned then, the committed ref would name objects this
-// node told the proposer it holds. git's default expiry is kept.
-func clusterGCArgs(args git.TrustedCmdArgs) git.TrustedCmdArgs {
+// clusterGCArgs keeps unreachable objects for git's default expiry at least:
+// in a cluster, objects arrive on a member before the ref that names them
+// commits, shipped to a majority that this node counts in, and the gc gate
+// is read once before a gc that may run for minutes. Pruned meanwhile, the
+// committed ref would name objects this node told the proposer it holds.
+// A --prune with any other value than never is dropped (now, all, or an
+// age as short as one second), and gc.pruneExpire, which [git.config] may
+// set, is passed explicitly: git's default, or never when configured so.
+func clusterGCArgs(args git.TrustedCmdArgs) (config, gc git.TrustedCmdArgs) {
 	out := make(git.TrustedCmdArgs, 0, len(args))
 	for _, a := range args {
-		if v, ok := strings.CutPrefix(string(a), "--prune="); ok && (v == "now" || v == "all") {
+		if v, ok := strings.CutPrefix(string(a), "--prune="); ok && v != "never" {
 			log.Warn("git gc: %s is ignored in a cluster: objects shipped for a write not yet committed would be pruned", a)
 			continue
 		}
 		out = append(out, a)
 	}
-	return out
+	config = git.TrustedCmdArgs{"-c", "gc.pruneExpire=2.weeks.ago"}
+	for k, v := range setting.GitConfig.Options {
+		if strings.EqualFold(k, "gc.pruneExpire") && v == "never" {
+			config = git.TrustedCmdArgs{"-c", "gc.pruneExpire=never"}
+		}
+	}
+	return config, out
 }
 
 // GitGcRepo calls 'git gc' to remove unnecessary files and optimize the local repository
@@ -110,11 +119,14 @@ func GitGcRepo(ctx context.Context, repo *repo_model.Repository, timeout time.Du
 		log.Info("Skipping git gc on %-v: the cluster has work pending on it", repo)
 		return nil
 	}
+	command := git.NewCommand(ctx)
 	if setting.Cluster.Enabled {
-		args = clusterGCArgs(args)
+		var config git.TrustedCmdArgs
+		config, args = clusterGCArgs(args)
+		command.AddArguments(config...)
 	}
 	log.Trace("Running git gc on %-v", repo)
-	command := git.NewCommand(ctx, "gc").AddArguments(args...).
+	command.AddArguments("gc").AddArguments(args...).
 		SetDescription(fmt.Sprintf("Repository Garbage Collection: %s", repo.FullName()))
 	var stdout string
 	var err error
