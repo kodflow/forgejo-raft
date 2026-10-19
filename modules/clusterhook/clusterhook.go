@@ -59,6 +59,9 @@ const (
 	OpObjectsFill   = "objects-backfill"
 	OpParkedList    = "parked-list"
 	OpParkedResolve = "parked-resolve"
+	// OpFresh waits until this node serves a repository at the commit
+	// index the cluster confirms now, before `forgejo serv` runs git.
+	OpFresh = "fresh"
 )
 
 // Request is one call on the socket: one JSON object per connection.
@@ -218,7 +221,7 @@ const AdminTimeout = 30 * time.Minute
 // budget for the push path, the operator's for the rest.
 func Budget(op string) time.Duration {
 	switch op {
-	case OpPrepared, OpCommitted, OpAborted, OpRegister, OpStatus:
+	case OpPrepared, OpCommitted, OpAborted, OpRegister, OpStatus, OpFresh:
 		return ServerBudget
 	default:
 		return AdminTimeout - 10*time.Second
@@ -361,6 +364,32 @@ func WaitWrites(ctx context.Context, c *Collector) bool {
 		return true
 	}
 	return f(ctx, c.Nonces())
+}
+
+var waitFresh func(ctx context.Context, key string) bool
+
+// SetFreshWaiter registers the replicator's wait for a repository to be
+// served at the cluster's current commit index.
+func SetFreshWaiter(f func(ctx context.Context, key string) bool) {
+	lifecycleMu.Lock()
+	waitFresh = f
+	lifecycleMu.Unlock()
+}
+
+// WaitFresh waits, within the read-after-write bound, until this node
+// serves the repository at least at the commit index the cluster confirms
+// at the call: a write any node acknowledged before is then visible here.
+// git clients carry no read-after-write cookie, so git's reads ask this
+// before git runs. It reports false on a timeout or without a leader, when
+// the node may be behind; without a cluster it returns true at once.
+func WaitFresh(ctx context.Context, key string) bool {
+	lifecycleMu.RLock()
+	f := waitFresh
+	lifecycleMu.RUnlock()
+	if f == nil {
+		return true
+	}
+	return f(ctx, key)
 }
 
 type afterCommitKey struct{}

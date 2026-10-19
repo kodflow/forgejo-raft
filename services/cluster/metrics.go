@@ -66,7 +66,8 @@ var (
 
 type collector struct {
 	role, term, commit, applied, tolerance, hasLeader, ready, fenced *prometheus.Desc
-	reposPending, eventsPending, eventBytes, consumerLag, txns       *prometheus.Desc
+	reposPending, reposFailing, eventsPending, eventBytes            *prometheus.Desc
+	consumerLag, txns                                                *prometheus.Desc
 	certExpiry, applyLag                                             *prometheus.Desc
 	peerLag, peerUnreachable, peerLastContact                        *prometheus.Desc
 	refused, fsFree                                                  *prometheus.Desc
@@ -90,6 +91,7 @@ func NewCollector() prometheus.Collector {
 		ready:           d("ready", "1 when the replicator is ready: engine ready, projection caught up once."),
 		fenced:          d("projection_fenced", "1 while the projector waits for the start-up barrier."),
 		reposPending:    d("projection_pending_repositories", "Repositories not yet projected at their last change."),
+		reposFailing:    d("projection_failing_repositories", "Repositories whose last projection failed: they stay behind the table until it succeeds (a lag that does not drain)."),
 		eventsPending:   d("events_pending", "Events in the table not yet trimmed."),
 		eventBytes:      d("event_queue_bytes", "Accounted size of the event queue."),
 		consumerLag:     d("consumer_lag_events", "Events waiting for the dispatcher, as of its last pass."),
@@ -110,7 +112,7 @@ func NewCollector() prometheus.Collector {
 func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{
 		c.role, c.term, c.commit, c.applied, c.tolerance, c.hasLeader, c.ready, c.fenced,
-		c.reposPending, c.eventsPending, c.eventBytes, c.consumerLag, c.txns, c.certExpiry, c.applyLag,
+		c.reposPending, c.reposFailing, c.eventsPending, c.eventBytes, c.consumerLag, c.txns, c.certExpiry, c.applyLag,
 		c.peerLag, c.peerUnreachable, c.peerLastContact, c.refused, c.fsFree, c.consumerStalled,
 		c.expected, c.voters,
 	} {
@@ -157,7 +159,15 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	}
 	g(c.ready, b2f(r.Ready()))
 	g(c.fenced, b2f(r.projector.Fenced()))
-	g(c.reposPending, float64(len(r.projector.Lag())))
+	lag := r.projector.Lag()
+	failing := 0
+	for _, l := range lag {
+		if l.Error != "" {
+			failing++
+		}
+	}
+	g(c.reposPending, float64(len(lag)))
+	g(c.reposFailing, float64(failing))
 	g(c.eventsPending, float64(r.table.EventCount()))
 	g(c.eventBytes, float64(r.table.EventBytes()))
 	g(c.txns, float64(r.registry.count()))

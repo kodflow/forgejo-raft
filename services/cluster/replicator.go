@@ -261,6 +261,7 @@ func Init(ctx context.Context) error {
 	clusterhook.SetOwnerLifecycle(r.proposeOwnerRename)
 	clusterhook.SetGarbageCollectionGate(r.projector.MayCollectGarbage)
 	clusterhook.SetWriteWaiter(r.waitWrites)
+	clusterhook.SetFreshWaiter(r.WaitFresh)
 
 	go r.projector.run(r.ctx)
 	go r.startupBarrier(r.ctx)
@@ -440,7 +441,10 @@ func (r *Replicator) sweepRaw(ctx context.Context) {
 func (r *Replicator) WaitReadAfterWrite(ctx context.Context, tok consensus.Token, repo string) bool {
 	_, ident := r.table.Applied()
 	if ident != (consensus.LogIdentity{}) && tok.Identity() != ident {
-		return true // another lineage: nothing to wait for, and nothing to trust
+		// Another lineage: nothing to wait for, and nothing to trust. A
+		// Recover cut the history the write was in, which may have lost
+		// it: the page is never presented as current.
+		return false
 	}
 	ctx, cancel := context.WithTimeout(ctx, setting.Cluster.ReadAfterWriteTimeout)
 	defer cancel()
@@ -448,6 +452,27 @@ func (r *Replicator) WaitReadAfterWrite(ctx context.Context, tok consensus.Token
 		return false
 	}
 	return r.consumer.waitCursor(ctx, tok) == nil
+}
+
+// WaitFresh waits until this node serves repo at least at the commit index
+// a quorum confirms now, within READ_AFTER_WRITE_TIMEOUT: every write
+// acknowledged before the call, on whichever node, is then in git here. A
+// git fetch carries no read-after-write cookie: without this, a fetch that
+// follows a push, from the pusher or from a CI job its webhook started,
+// may read the refs from before the push on a node the load balancer
+// picked. It reports false when the node may be behind.
+func (r *Replicator) WaitFresh(ctx context.Context, repo string) bool {
+	eng := r.Engine()
+	if eng == nil || reftable.ValidRepoKey(repo) != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, setting.Cluster.ReadAfterWriteTimeout)
+	defer cancel()
+	tok, err := eng.Barrier(ctx)
+	if err != nil {
+		return false
+	}
+	return r.projector.Wait(ctx, repo, tok.Index) == nil
 }
 
 // WaitProjected waits until the local projection of repo reaches index.

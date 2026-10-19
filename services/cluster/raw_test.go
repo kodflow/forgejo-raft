@@ -60,3 +60,16 @@ func TestReadAfterWriteCookieIsSignedAndBounded(t *testing.T) {
 	assert.False(t, r.waitBounded(httptest.NewRequest("GET", "/", nil), near, "o/r.git"))
 	assert.Less(t, time.Since(start), 100*time.Millisecond)
 }
+
+// A write from another lineage (a Recover started a new history, which may
+// not hold it) is not waited for, and the page is not presented as current.
+func TestReadAfterWriteFromAnotherLineageMayBeBehind(t *testing.T) {
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	r := tc.nodes[0].r
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	require.True(t, tc.pushVia(tc.nodes[0], work, "o/r.git", "refs/heads/main", strings.Repeat("0", 40), commit(t, work, "one")).OK)
+	_, id := r.table.Applied()
+	old := consensus.Token{Cluster: id.Cluster, Epoch: id.Epoch + 1, Term: 1, Index: 1}
+	assert.False(t, r.WaitReadAfterWrite(t.Context(), old, "o/r.git"))
+}
