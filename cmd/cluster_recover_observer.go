@@ -116,11 +116,14 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 			return fmt.Errorf("%s holds the recovery of %s into %s; use another --out", out, prog.Checkpoint, prog.NewCluster)
 		}
 	}
+	// A step is recorded only after what it restored is durable, and the
+	// record itself replaces the previous one durably: a run resumed after
+	// a power loss skips exactly the steps whose output survived.
 	save := func(step string) error {
 		prog.Done = append(prog.Done, step)
 		b, _ := json.MarshalIndent(prog, "", "  ")
 		fmt.Fprintf(w, "done: %s\n", step)
-		return os.WriteFile(filepath.Join(out, progressFile), b, 0o600)
+		return observer.WriteFileDurable(filepath.Join(out, progressFile), b)
 	}
 
 	archive, err := observer.OpenArchive(c.String("observer-dir"), setting.Git.Path)
@@ -258,11 +261,11 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(filepath.Join(out, "postgresql.recovered.conf"), []byte(conf), 0o600); err != nil {
+		if err := observer.WriteFileDurable(filepath.Join(out, "postgresql.recovered.conf"), []byte(conf)); err != nil {
 			return err
 		}
 		if ctl := c.String("pg-ctl"); ctl != "" {
-			if err := os.WriteFile(filepath.Join(c.String("pgdata"), "postgresql.conf"), []byte(conf), 0o600); err != nil {
+			if err := observer.WriteFileDurable(filepath.Join(c.String("pgdata"), "postgresql.conf"), []byte(conf)); err != nil {
 				return err
 			}
 			if err := runPGCtl(ctx, ctl, c.String("pgdata"), "restart"); err != nil {
@@ -362,7 +365,7 @@ JWT_SECRET = %s
 [cluster]
 OBSERVER_RECIPIENTS = %s
 `, secretKey, lfs, oauth, recipient)
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+	if err := observer.WriteFileDurable(path, []byte(body)); err != nil {
 		return nil, err
 	}
 	return map[string]string{"SECRET_KEY": secretKey, "JWT_SECRET": oauth}, nil

@@ -250,8 +250,48 @@ func writeAtomic(path string, b []byte, replace bool) error {
 	return syncDir(filepath.Dir(path))
 }
 
-func syncDir(dir string) error {
-	f, err := os.Open(dir)
+func syncDir(dir string) error { return syncPath(dir) }
+
+// SyncTree makes everything under root durable, as pg_basebackup does
+// before it returns: every regular file and directory, then the directory
+// holding root. A recovery records a step done only after it.
+func SyncTree(root string) error {
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || d.Type().IsRegular() {
+			return syncPath(p)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return syncPath(filepath.Dir(root))
+}
+
+// syncParents syncs the directories from path's parent up to root, root
+// included: the names a restore created on the way to path.
+func syncParents(path, root string) error {
+	root = filepath.Clean(root)
+	for d := filepath.Dir(path); ; d = filepath.Dir(d) {
+		if err := syncPath(d); err != nil {
+			return err
+		}
+		if d == root || d == filepath.Dir(d) {
+			return nil
+		}
+	}
+}
+
+// WriteFileDurable replaces path with b, synced, through a rename whose
+// directory is synced.
+func WriteFileDurable(path string, b []byte) error { return writeAtomic(path, b, true) }
+
+// syncPath syncs one file or directory; tests replace it.
+var syncPath = func(path string) error {
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
