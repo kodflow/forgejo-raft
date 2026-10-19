@@ -529,6 +529,14 @@ func (r *Replicator) proposeLifecycle(ctx context.Context, kind reftable.Kind, b
 	if err != nil {
 		return err
 	}
+	// As a push: while the autonomous cluster forms, a deletion or a
+	// rename committed on the founder's disk alone, already done in SQL,
+	// would be lost with that disk.
+	if eng := r.Engine(); eng != nil {
+		if err := r.waitFormed(ctx, eng); err != nil {
+			return fmt.Errorf("the cluster did not record it: %w", err)
+		}
+	}
 	r.fence.RLock()
 	_, result, err := r.proposeCommand(ctx, data, landed)
 	r.fence.RUnlock()
