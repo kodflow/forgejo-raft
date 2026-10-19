@@ -260,6 +260,24 @@ func TestArchiveWALIsIdempotent(t *testing.T) {
 	require.Error(t, ArchiveWAL(src, "000000010000000000000002.nope", dir))
 }
 
+// archive_command killed between the link and the directory's sync leaves
+// the name in the page cache only; PostgreSQL retries, and the retry that
+// finds the same bytes must sync the directory before it answers success,
+// or PostgreSQL recycles a segment a power loss then takes from the archive.
+func TestArchiveWALRetrySyncsTheDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "archive")
+	src := filepath.Join(t.TempDir(), "seg")
+	require.NoError(t, os.WriteFile(src, []byte("segment one"), 0o600))
+	seg := "000000010000000000000003"
+	require.NoError(t, ArchiveWAL(src, seg, dir))
+
+	var synced []string
+	defer func(prev func(string) error) { syncDirFn = prev }(syncDirFn)
+	syncDirFn = func(d string) error { synced = append(synced, d); return nil }
+	require.NoError(t, ArchiveWAL(src, seg, dir), "a retry of the same file succeeds")
+	assert.Contains(t, synced, dir, "the retry syncs the archive directory")
+}
+
 // After a promotion PostgreSQL archives the old timeline's last segment as
 // <segment>.partial, and retries a refused file forever without archiving
 // anything after it: a refusal stopped the archive at the first failover,

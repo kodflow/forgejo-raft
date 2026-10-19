@@ -40,7 +40,10 @@ func ArchiveWAL(src, name, dir string) error {
 	}
 	if have, err := os.ReadFile(dst); err == nil {
 		if sha256.Sum256(have) == sha256.Sum256(in) {
-			return nil
+			// A first attempt killed between its link and the sync left
+			// the name in the page cache: success is answered only once
+			// it is durable, PostgreSQL recycles the segment then.
+			return syncDirFn(dir)
 		}
 		return fmt.Errorf("%s is already archived with other bytes; refusing to overwrite it", name)
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -72,7 +75,7 @@ func ArchiveWAL(src, name, dir string) error {
 		}
 		return err
 	}
-	return syncDir(dir)
+	return syncDirFn(dir)
 }
 
 // partialWALPattern is the old timeline's last segment after a promotion.

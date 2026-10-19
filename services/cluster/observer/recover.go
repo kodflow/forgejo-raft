@@ -184,7 +184,15 @@ func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, err
 		if len(rm.Refs) == 0 {
 			continue
 		}
-		if err := a.store.git.Materialize(ctx, repo, name, filepath.Join(root, filepath.FromSlash(repo)), rm.Format, rm.Symbolic); err != nil {
+		target := filepath.Join(root, filepath.FromSlash(repo))
+		if err := a.store.git.Materialize(ctx, repo, name, target, rm.Format, rm.Symbolic); err != nil {
+			return n, fmt.Errorf("%s: %w", repo, err)
+		}
+		// git syncs its packs, not its refs nor its directories.
+		if err := SyncTree(target); err != nil {
+			return n, fmt.Errorf("%s: %w", repo, err)
+		}
+		if err := syncParents(target, root); err != nil {
 			return n, fmt.Errorf("%s: %w", repo, err)
 		}
 		n++
@@ -230,6 +238,11 @@ func (a *Archive) RestoreFiles(name string, roots map[string]string) (int, error
 		if sum != f.SHA256 {
 			os.Remove(dst)
 			return i, fmt.Errorf("%s/%s does not match its digest", f.Storage, f.Path)
+		}
+		// writeStream synced the file and its directory; the directories
+		// created on the way to it are synced too.
+		if err := syncParents(dst, root); err != nil {
+			return i, err
 		}
 	}
 	return len(m.Files), nil
@@ -380,7 +393,12 @@ func (a *Archive) RestorePG(name, pgdata string, opt PGOptions) error {
 			return fmt.Errorf("WAL %s: %w", w, err)
 		}
 	}
-	return nil
+	// The extracted base and its configuration are durable before the
+	// recovery records this step: it never extracts them again.
+	if err := SyncTree(pgdata); err != nil {
+		return err
+	}
+	return SyncTree(opt.RestoreDir)
 }
 
 // extractBase extracts the regular files and directories of a base tar,

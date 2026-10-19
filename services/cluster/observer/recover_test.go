@@ -98,3 +98,82 @@ func TestPrimaryConfigArchivesAfresh(t *testing.T) {
 	_, err = PrimaryConfig(PGOptions{ArchiveCommand: "x' ; y"})
 	require.Error(t, err)
 }
+
+// A recovery resumes from its progress file, which skips the steps it
+// records: a step is recorded only once what it restored is durable, or a
+// power loss after the record leaves PostgreSQL's data directory, the
+// repositories or the stored files truncated and never restored again.
+// Every file and directory each restore writes is synced before it returns.
+func TestRecoverSyncsWhatItRestores(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	cp := seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	a, err := OpenArchive(o.cfg.Dir, "")
+	require.NoError(t, err)
+
+	synced := map[string]bool{}
+	prev := syncPath
+	defer func() { syncPath = prev }()
+	syncPath = func(p string) error {
+		synced[p] = true
+		return prev(p)
+	}
+	// Every regular file and directory under root, and root's parent.
+	assertSynced := func(t *testing.T, root string) {
+		t.Helper()
+		assert.True(t, synced[filepath.Dir(root)], "the directory holding %s", root)
+		require.NoError(t, filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+			require.NoError(t, err)
+			if d.IsDir() || d.Type().IsRegular() {
+				assert.True(t, synced[p], "%s is synced", p)
+			}
+			return nil
+		}))
+	}
+
+	pgdata, restore := filepath.Join(t.TempDir(), "pgdata"), filepath.Join(t.TempDir(), "restore")
+	require.NoError(t, a.RestorePG(cp.Name(), pgdata, PGOptions{Port: 5433, SocketDir: pgdata, RestoreDir: restore}))
+	assertSynced(t, pgdata)
+	assertSynced(t, restore)
+
+	root := t.TempDir()
+	_, err = a.RestoreRepos(ctx, cp.Name(), root)
+	require.NoError(t, err)
+	assertSynced(t, filepath.Join(root, "alice"))
+
+	// A stored file is synced under its temporary name before it is
+	// linked: the directories leading to it are what remains.
+	lfs := t.TempDir()
+	_, err = a.RestoreFiles(cp.Name(), map[string]string{"lfs": lfs})
+	require.NoError(t, err)
+	require.NoError(t, filepath.WalkDir(lfs, func(p string, d os.DirEntry, err error) error {
+		require.NoError(t, err)
+		if d.IsDir() {
+			assert.True(t, synced[p], "%s is synced", p)
+		}
+		return nil
+	}))
+}
+
+// The recovery's progress file is replaced durably: the new record is
+// synced, then renamed, and its directory synced.
+func TestWriteFileDurableReplacesAndSyncs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "progress.json")
+	require.NoError(t, os.WriteFile(path, []byte("old"), 0o600))
+	var synced []string
+	prev := syncPath
+	defer func() { syncPath = prev }()
+	syncPath = func(p string) error { synced = append(synced, p); return prev(p) }
+
+	require.NoError(t, WriteFileDurable(path, []byte("new")))
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "new", string(b))
+	assert.Equal(t, []string{dir}, synced, "the directory is synced after the rename")
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+}
