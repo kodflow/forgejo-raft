@@ -517,9 +517,10 @@ func (p *projector) holdsRenamed(src, from, to string, renIdx uint64) bool {
 
 // movesOn reports whether dir still holds the repository a rename moved
 // from repo to another key, which this node has not moved yet: in a chain
-// (repo to Z, then another key to repo) or a rename projected before its
-// target's (the old key goes first by name). Projecting repo now would
-// rewrite that directory as repo; it waits, and Z is scheduled to move it.
+// (repo to Z, then another key to repo), or while Z's projection waits (a
+// transaction in flight, a failure). Projecting repo now would rewrite that
+// directory as repo, certified past the rename, and Z would no longer take
+// it; repo waits, and Z is scheduled to move it.
 func (p *projector) movesOn(repo, dir string) bool {
 	if _, err := os.Stat(dir); err != nil {
 		return false
@@ -532,7 +533,15 @@ func (p *projector) movesOn(repo, dir string) bool {
 		return false
 	}
 	if _, err := os.Stat(filepath.Join(p.root, filepath.FromSlash(z))); !errors.Is(err, os.ErrNotExist) {
-		return false
+		// Z's directory may be the previous repository under that name,
+		// which Z's projection sets aside before this one moves in: only a
+		// Z certified since its rename no longer wants this directory.
+		p.mu.Lock()
+		done := p.watermark[z] >= zIdx
+		p.mu.Unlock()
+		if done {
+			return false
+		}
 	}
 	if !p.holdsRenamed(dir, repo, z, zIdx) {
 		return false
