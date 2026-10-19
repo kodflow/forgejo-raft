@@ -443,9 +443,13 @@ Watch, Custom, Releases on GitHub, or the tags of
 - A push is committed whole or not at all. With git 2.54 and later, a
   non-atomic push of several refs is one git transaction that may reject
   some refs; the cluster cannot commit only the others, so when git would
-  reject one ref (another writer's lock, a ref that moved on this node) the
-  whole push is refused and the client reads every ref rejected. Pushing
-  again succeeds once the other writer is done.
+  reject one ref (another writer's lock, a lock left behind for more than
+  two minutes, a ref that moved on this node, a name that conflicts with
+  one of this node's refs as a directory and a file) the whole push is
+  refused and the client reads every ref rejected. Pushing again succeeds
+  once the other writer is done; a lock left behind by a crashed git is
+  removed by hand. An empty lock younger than two minutes, on a ref the
+  push deletes, cannot be told from git's own.
 - A ref name must be valid UTF-8. git accepts other bytes, which the
   replicated table, in JSON, cannot carry unchanged.
 - The object channel accepts what Forgejo accepts on a push: the fsck

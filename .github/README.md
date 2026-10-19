@@ -718,8 +718,9 @@ official release would give (clean, carried, or the conflicted files).
 - **Git hooks are disabled** cluster-wide (server-side hooks in the
   repository settings). Webhooks and Forgejo Actions work as usual.
 - **A push is committed whole or not at all.** When git would reject one
-  ref of a push (a lock held by another writer, a ref that moved on this
-  node), the cluster refuses the whole push, nothing written, and the
+  ref of a push (a lock held by another writer or left behind, a ref that
+  moved on this node, a directory and file name conflict), the cluster
+  refuses the whole push, nothing written, and the
   client reads every ref rejected: push again. A ref name must be valid
   UTF-8 (git also accepts other bytes).
 - **Large pushes** must reach a majority within `HOOK_TIMEOUT` (one minute

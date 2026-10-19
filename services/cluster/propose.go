@@ -93,9 +93,10 @@ func (r *Replicator) pushTargetGone(repo string, req *clusterhook.Request) error
 // writer's, or a lock left behind), is one git rejects: the whole
 // transaction is refused then, nothing written, and the client reads every
 // ref refused. Only pushes are checked: receive-pack always names the old
-// value, Forgejo's own writes do not. A deletion's lock is empty, so a
-// stranger's empty lock cannot be told from git's own, and the reftable
-// backend keeps no lock per ref: both keep the old value check alone.
+// value, Forgejo's own writes do not. A deletion's lock is empty, so a lock
+// holding a value is another writer's; a lock older than staleLockAge was
+// left behind. The reftable backend keeps no lock per ref: the old value
+// and the directory and file conflicts with this node's refs are checked.
 // receive-pack also runs a nested transaction on packed-refs for a deletion,
 // whose lines carry two null ids: it is not checked.
 func gitWillApply(ctx context.Context, dir string, lines []clusterhook.Line) error {
@@ -127,19 +128,76 @@ func gitWillApply(ctx context.Context, dir string, lines []clusterhook.Line) err
 		case !reftable.IsZeroSHA(l.Old) && (!exists || v.SHA != l.Old):
 			return errGitRejects{ref: l.Ref, why: "it does not hold the value the push expects on this node"}
 		}
+		if conflict := gitNameConflict(cur, checked, l); conflict != "" {
+			return errGitRejects{ref: l.Ref, why: "it conflicts with " + conflict + " on this node"}
+		}
 		if !perRefLocks {
 			continue
 		}
 		lock := filepath.Join(dir, filepath.FromSlash(l.Ref)) + ".lock"
 		b, err := os.ReadFile(lock)
-		switch {
-		case err != nil:
+		if err != nil {
 			return errGitRejects{ref: l.Ref, why: "git holds no lock on it"}
-		case !reftable.IsZeroSHA(l.New) && strings.TrimSuffix(string(b), "\n") != l.New:
+		}
+		held := strings.TrimSuffix(string(b), "\n")
+		switch {
+		case reftable.IsZeroSHA(l.New) && held != "":
+			// git's lock for a deletion is empty: a value is another
+			// writer's update.
 			return errGitRejects{ref: l.Ref, why: "another writer holds its lock"}
+		case !reftable.IsZeroSHA(l.New) && held != l.New:
+			return errGitRejects{ref: l.Ref, why: "another writer holds its lock"}
+		}
+		if st, err := os.Stat(lock); err != nil || time.Since(st.ModTime()) > staleLockAge {
+			// git took its locks moments before calling the hook: an older
+			// lock was left behind, and git, which could not take it,
+			// rejects the ref, an empty one for a deletion included.
+			return errGitRejects{ref: l.Ref, why: "a lock left behind blocks it"}
 		}
 	}
 	return nil
+}
+
+// staleLockAge is how old a ref lock may be and still be git's own: git
+// locks every ref of the transaction, then runs the hook. A stranger's lock
+// younger than that, empty for a deletion, cannot be told apart.
+var staleLockAge = 2 * time.Minute
+
+// gitNameConflict names a ref of this node's git that a created or updated
+// ref of the push conflicts with as a directory and a file
+// (refs/heads/a against refs/heads/a/b), once the push's own deletions are
+// gone. git rejects such a ref in part, the reftable backend included,
+// which keeps no lock per ref; the table checks its own state, which a
+// node behind on its projection does not share.
+func gitNameConflict(cur map[string]reftable.ProjectedRef, lines []clusterhook.Line, l clusterhook.Line) string {
+	if reftable.IsZeroSHA(l.New) {
+		return ""
+	}
+	deleted := map[string]bool{}
+	for _, x := range lines {
+		if reftable.IsZeroSHA(x.New) {
+			deleted[x.Ref] = true
+		}
+	}
+	for i := strings.IndexByte(l.Ref, '/'); i > 0; {
+		if p := l.Ref[:i]; !deleted[p] {
+			if _, ok := cur[p]; ok {
+				return p
+			}
+		}
+		j := strings.IndexByte(l.Ref[i+1:], '/')
+		if j < 0 {
+			break
+		}
+		i += 1 + j
+	}
+	conflict := ""
+	for name := range cur {
+		if strings.HasPrefix(name, l.Ref+"/") && !deleted[name] && (conflict == "" || name < conflict) {
+			conflict = name
+		}
+	}
+	return conflict
 }
 
 // errGitRejects is a push git would reject in part: the cluster refuses
