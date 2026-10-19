@@ -87,7 +87,7 @@ type coordinator struct {
 	interval time.Duration
 	dir      string
 	wal      walSource
-	// files lists the stored files at the fence; tests replace it.
+	// files lists the stored files after the fence; tests replace it.
 	files func() ([]clusterhook.FileEntry, error)
 	now   func() time.Time
 	// backup records the backup cursor; tests replace it.
@@ -227,20 +227,27 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 		}
 	}
 
-	// 4. PostgreSQL's position under the fence, and the files present.
+	// 4. PostgreSQL's position under the fence.
 	name := reftable.CheckpointName(tok.Identity().String(), tok.Index)
 	mark, err := c.wal.Mark(bctx, name)
 	if err != nil {
 		return reftable.CheckpointRecord{}, fmt.Errorf("reading PostgreSQL's position: %w", err)
 	}
 	readAt := c.now()
+
+	// 5. Released: the rest is bounded, and waits on nobody. The stored
+	// files are listed here, outside the fence: a walk of a large storage
+	// would otherwise freeze the leader's writers for its whole length. A
+	// list taken after L holds every file the SQL at L names, plus files
+	// added since, which a restore ignores.
+	release()
 	files, err := c.files()
 	if err != nil {
 		return reftable.CheckpointRecord{}, fmt.Errorf("listing the stored files: %w", err)
 	}
-
-	// 5. Released: the rest is bounded, and waits on nobody.
-	release()
+	// The bound counts from the end of the walk: its length depends on the
+	// storage, not on the cluster, and must not discard every checkpoint.
+	listedAt := c.now()
 	if err := c.wal.SwitchWAL(ctx); err != nil {
 		log.Warn("cluster checkpoint: switching the WAL segment: %v", err)
 	}
@@ -264,7 +271,7 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 	if data, err = reftable.Encode(reftable.KindCheckpointPosition, pos); err != nil {
 		return reftable.CheckpointRecord{}, err
 	}
-	left := readToCommitBound - c.now().Sub(readAt)
+	left := readToCommitBound - c.now().Sub(listedAt)
 	if left <= 0 {
 		return reftable.CheckpointRecord{}, fmt.Errorf("checkpoint %s discarded: %s between the read and the proposal", name, readToCommitBound)
 	}
@@ -531,7 +538,20 @@ const (
 // storageRoots returns the local roots of the stored files; a storage that
 // is not local is refused, since the export cannot copy it.
 func storageRoots() (map[string]string, error) {
+	sts, err := storageConfigs()
+	if err != nil {
+		return nil, err
+	}
 	out := map[string]string{}
+	for name, st := range sts {
+		out[name] = st.Path
+	}
+	return out, nil
+}
+
+// storageConfigs returns the local storages a checkpoint covers.
+func storageConfigs() (map[string]*setting.Storage, error) {
+	out := map[string]*setting.Storage{}
 	for name, st := range map[string]*setting.Storage{
 		StorageLFS: setting.LFS.Storage, StorageAttachments: setting.Attachment.Storage, StoragePackages: setting.Packages.Storage,
 	} {
@@ -541,25 +561,46 @@ func storageRoots() (map[string]string, error) {
 		if st.Type != setting.LocalStorageType {
 			return nil, fmt.Errorf("the %s storage is %q: observers support local storage only", name, st.Type)
 		}
-		out[name] = st.Path
+		out[name] = st
 	}
 	return out, nil
 }
 
+// storageTemporaryPath is where a local storage writes an upload before
+// renaming it into place: <root>/tmp unless TEMPORARY_PATH says otherwise.
+func storageTemporaryPath(st *setting.Storage) string {
+	if st.TemporaryPath != "" {
+		return filepath.Clean(st.TemporaryPath)
+	}
+	return filepath.Join(st.Path, "tmp")
+}
+
 // storedFiles lists every stored file, by storage and relative path.
 func storedFiles() ([]clusterhook.FileEntry, error) {
-	roots, err := storageRoots()
+	sts, err := storageConfigs()
 	if err != nil {
 		return nil, err
 	}
+	return listStoredFiles(sts)
+}
+
+// listStoredFiles walks each storage root. An upload in flight lives in
+// the storage's temporary directory until it is renamed: listing it would
+// name a file that is gone, or partial, when an observer asks for it, and
+// fail the whole checkpoint.
+func listStoredFiles(roots map[string]*setting.Storage) ([]clusterhook.FileEntry, error) {
 	var out []clusterhook.FileEntry
-	for name, root := range roots {
+	for name, st := range roots {
+		root, tmp := st.Path, storageTemporaryPath(st)
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				if errors.Is(err, fs.ErrNotExist) {
 					return nil
 				}
 				return err
+			}
+			if d.IsDir() && path != root && filepath.Clean(path) == tmp {
+				return filepath.SkipDir
 			}
 			if !d.Type().IsRegular() {
 				return nil

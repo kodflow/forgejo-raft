@@ -16,6 +16,7 @@ import (
 
 	cluster_model "forgejo.org/models/cluster"
 	"forgejo.org/modules/clusterhook"
+	"forgejo.org/modules/setting"
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/reftable"
 
@@ -315,4 +316,59 @@ func TestCheckpointRefusesATableCapturedAtAnotherBarrier(t *testing.T) {
 	b, err := tableAtBarrier(context.Background(), got, 9)
 	require.NoError(t, err)
 	assert.Equal(t, "at 9", string(b))
+}
+
+// The stored files are listed outside the fence, and a walk longer than
+// readToCommitBound does not discard the checkpoint: the bound counts from
+// the end of the walk.
+func TestCheckpointListsTheFilesOutsideTheFence(t *testing.T) {
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	pg := newFakePG()
+	coord := withCheckpoints(t, tc, pg)
+	leader := tc.nodes[0].r
+	var mu sync.Mutex
+	skew := time.Duration(0)
+	coord.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return time.Now().Add(skew)
+	}
+	fenceFree := false
+	coord.files = func() ([]clusterhook.FileEntry, error) {
+		if leader.fence.TryLock() {
+			fenceFree = true
+			leader.fence.Unlock()
+		}
+		mu.Lock()
+		skew += 2 * readToCommitBound // a large storage on a slow disk
+		mu.Unlock()
+		return nil, nil
+	}
+	_, err := coord.take(context.Background())
+	require.NoError(t, err)
+	assert.True(t, fenceFree, "the walk ran while the leader's writers were fenced")
+}
+
+// An upload in flight sits in the storage's temporary directory; it is not
+// a stored file, and listing it fails the observer's ingest.
+func TestStoredFilesSkipTheTemporaryDirectory(t *testing.T) {
+	root := t.TempDir()
+	other := t.TempDir()
+	for _, f := range []string{"ab/cd/obj", "tmp/upload-123", "x/tmp/kept"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(root, filepath.Dir(f)), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(root, f), []byte("1234567"), 0o644))
+	}
+	require.NoError(t, os.MkdirAll(filepath.Join(other, "elsewhere"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(other, "kept"), []byte("1"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(other, "elsewhere", "upload"), []byte("1"), 0o644))
+	files, err := listStoredFiles(map[string]*setting.Storage{
+		StorageLFS:         {Type: setting.LocalStorageType, Path: root},
+		StorageAttachments: {Type: setting.LocalStorageType, Path: other, TemporaryPath: filepath.Join(other, "elsewhere")},
+	})
+	require.NoError(t, err)
+	var got []string
+	for _, f := range files {
+		got = append(got, f.Storage+":"+f.Path)
+	}
+	assert.Equal(t, []string{"attachments:kept", "lfs:ab/cd/obj", "lfs:x/tmp/kept"}, got)
 }
