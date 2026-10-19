@@ -129,6 +129,17 @@ func (r *Replicator) Handle(ctx context.Context, req *clusterhook.Request) *clus
 		}
 		return withData(rep)
 	case clusterhook.OpReconcile:
+		if req.Repo != "" {
+			// `reconcile --delete-orphan`: one repository, explicitly.
+			if req.Index <= 0 {
+				return fail(errors.New("--expect-index is required: the index reconcile reported"))
+			}
+			res, err := r.DeleteOrphan(ctx, operatorOrLocal(req.Operator), req.Repo, uint64(req.Index), req.Reason)
+			if err != nil {
+				return fail(err)
+			}
+			return withData(res)
+		}
 		ms, err := r.Reconcile(ctx, !req.DryRun)
 		if err != nil {
 			return fail(err)

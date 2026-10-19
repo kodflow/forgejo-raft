@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -151,6 +152,9 @@ func cmdCluster() *cli.Command {
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "dry-run", Usage: "report only (the default)"},
 					&cli.BoolFlag{Name: "apply", Usage: "rebuild regenerable rows from the table"},
+					&cli.StringFlag{Name: "delete-orphan", Usage: "delete from the cluster one repository (owner/repo) the table holds and SQL does not know; restore it by adoption instead when SQL lost it"},
+					&cli.Uint64Flag{Name: "expect-index", Usage: "with --delete-orphan: the index reconcile reported; refused if the repository changed since"},
+					&cli.StringFlag{Name: "reason", Usage: "with --delete-orphan: why it is deleted (required, kept in the audit)"},
 				},
 				Action: runClusterReconcile,
 			},
@@ -566,11 +570,36 @@ func runClusterObjects(op string) cli.ActionFunc {
 	}
 }
 
-func runClusterReconcile(ctx context.Context, c *cli.Command) error {
+// reconcileRequest checks the arguments of `reconcile`: a report, a
+// rebuild, or the explicit deletion of one orphaned repository.
+func reconcileRequest(c *cli.Command) (*clusterhook.Request, error) {
 	if c.Bool("apply") && c.Bool("dry-run") {
-		return errors.New("--apply and --dry-run exclude each other")
+		return nil, errors.New("--apply and --dry-run exclude each other")
 	}
-	resp, err := callReplicator(ctx, &clusterhook.Request{Op: clusterhook.OpReconcile, DryRun: !c.Bool("apply")})
+	repo := strings.TrimSpace(c.String("delete-orphan"))
+	if repo == "" {
+		return &clusterhook.Request{Op: clusterhook.OpReconcile, DryRun: !c.Bool("apply")}, nil
+	}
+	if c.Bool("apply") || c.Bool("dry-run") {
+		return nil, errors.New("--delete-orphan is its own operation: no --apply nor --dry-run")
+	}
+	index := c.Uint64("expect-index")
+	if index == 0 || index > math.MaxInt64 {
+		return nil, errors.New("--expect-index is required: the index `forgejo cluster reconcile` reported for the repository")
+	}
+	reason := strings.TrimSpace(c.String("reason"))
+	if reason == "" {
+		return nil, errors.New("--reason is required: it is kept in the audit")
+	}
+	return &clusterhook.Request{Op: clusterhook.OpReconcile, Repo: repo, Index: int64(index), Reason: reason, Operator: string(localOperator())}, nil
+}
+
+func runClusterReconcile(ctx context.Context, c *cli.Command) error {
+	req, err := reconcileRequest(c)
+	if err != nil {
+		return err
+	}
+	resp, err := callReplicator(ctx, req)
 	if err != nil {
 		return err
 	}

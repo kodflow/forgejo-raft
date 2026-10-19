@@ -331,13 +331,13 @@ func CreateRepositoryDirectly(ctx context.Context, doer, u *user_model.User, opt
 // key is deleted from the table first, so no member keeps the name taken
 // or hands its refs to the next repository created under it. When the
 // cluster does not record it, the files stay, matching the table, until
-// `forgejo cluster reconcile --apply` deletes a key SQL does not have. It
+// `forgejo cluster reconcile --delete-orphan` deletes it. It
 // runs on a context detached from the failed request.
 func removeAbandonedRepo(ctx context.Context, owner, name string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clusterhook.DefaultTimeout)
 	defer cancel()
 	if err := clusterhook.RepoDeleted(ctx, owner, name, 0); err != nil {
-		return fmt.Errorf("the cluster did not record the removal of %s/%s, its files are kept until `forgejo cluster reconcile --apply`: %w", owner, name, err)
+		return fmt.Errorf("the cluster did not record the removal of %s/%s, its files are kept until `forgejo cluster reconcile --delete-orphan`: %w", owner, name, err)
 	}
 	return util.RemoveAll(repo_model.RepoPath(owner, name))
 }

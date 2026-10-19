@@ -14,8 +14,8 @@ import (
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unittest"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/setting"
-	"forgejo.org/modules/test"
 	"forgejo.org/services/cluster/reftable"
 	repo_service "forgejo.org/services/repository"
 
@@ -55,8 +55,8 @@ func requireLiveEverywhere(t *testing.T, tc *testCluster, key string) {
 // does not record it, the deletion is refused with the files kept on every
 // member, matching the table: removed here only, they came back from the
 // other members, and a repository created again under the name inherited
-// their refs (R-D4). `reconcile --apply` then deletes the key SQL no
-// longer has, once it stayed unchanged for the grace period.
+// their refs (R-D4). reconcile reports the key SQL no longer has, and
+// only `reconcile --delete-orphan` deletes it.
 func TestRepositoryDeletionTheClusterDoesNotRecord(t *testing.T) {
 	require.NoError(t, unittest.PrepareTestDatabase())
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
@@ -84,7 +84,7 @@ func TestRepositoryDeletionTheClusterDoesNotRecord(t *testing.T) {
 	err = repo_service.DeleteRepositoryDirectly(dctx, doomed.ID, repo_service.DeleteRepositoryOpts{})
 	cancel()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "reconcile --apply")
+	assert.Contains(t, err.Error(), "--delete-orphan")
 	unittest.AssertNotExistsBean(t, &repo_model.Repository{ID: doomed.ID})
 	tc.mem.SetDown(tc.nodes[1].node, false)
 	tc.mem.SetDown(tc.nodes[2].node, false)
@@ -92,34 +92,106 @@ func TestRepositoryDeletionTheClusterDoesNotRecord(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	requireLiveEverywhere(t, tc, key)
 
-	// Within the grace period, reconcile only reports it.
-	ms, err := origin.r.Reconcile(ctx, true)
-	require.NoError(t, err)
-	found := false
-	for _, m := range ms {
-		if m.Repo == key {
-			found = true
-			assert.Equal(t, RepoLifecycle, m.Category)
-			assert.False(t, m.Applied, "within the grace period")
-			assert.Contains(t, m.Action, "SQL has no row")
+	// reconcile only reports it, even with apply: after a loss on the SQL
+	// side the table is the repository's only copy.
+	orphan := func() Mismatch {
+		ms, err := origin.r.Reconcile(ctx, true)
+		require.NoError(t, err)
+		for _, m := range ms {
+			if m.Repo == key {
+				return m
+			}
 		}
+		require.Fail(t, "not reported", "%v", ms)
+		return Mismatch{}
 	}
-	require.True(t, found, "%v", ms)
+	m := orphan()
+	assert.Equal(t, RepoLifecycle, m.Category)
+	assert.False(t, m.Applied)
+	assert.Contains(t, m.Action, "adopting it")
+	assert.Contains(t, m.Action, "--delete-orphan")
+	assert.NotZero(t, m.Index)
+	assert.NotEmpty(t, m.Since)
+	assert.Equal(t, m.Since, orphan().Since, "unchanged since")
 	requireLiveEverywhere(t, tc, key)
 
-	// Unchanged past the grace period, it is deleted on every member.
-	defer test.MockVariableValue(&orphanGrace, 0)()
-	ms, err = origin.r.Reconcile(ctx, true)
-	require.NoError(t, err)
-	found = false
-	for _, m := range ms {
-		if m.Repo == key {
+	// The explicit deletion: refused at another index, without a reason,
+	// then done on every member and kept in the audit.
+	del := func(index int64, reason string) *clusterhook.Response {
+		return origin.r.Handle(ctx, &clusterhook.Request{Op: clusterhook.OpReconcile, Repo: "user4/doomed", Index: index, Reason: reason, Operator: "tester"})
+	}
+	resp := del(int64(m.Index)-1, "deletion not recorded")
+	require.False(t, resp.OK)
+	assert.Contains(t, resp.Message, "changed at index")
+	resp = del(int64(m.Index), " ")
+	require.False(t, resp.OK)
+	assert.Contains(t, resp.Message, "reason is required")
+	requireLiveEverywhere(t, tc, key)
+	resp = del(int64(m.Index), "deletion not recorded")
+	require.True(t, resp.OK, resp.Message)
+	requireGoneEverywhere(t, tc, key)
+	found := false
+	for _, a := range origin.r.table.Audit() {
+		if a.Action == string(ActionDeleteOrphan) && a.Target == key && a.Operator == "tester" {
 			found = true
-			assert.True(t, m.Applied, "%+v", m)
+			assert.Equal(t, "deleted", a.Outcome)
+			assert.Contains(t, a.Detail, "deletion not recorded")
 		}
 	}
-	require.True(t, found, "%v", ms)
-	requireGoneEverywhere(t, tc, key)
+	assert.True(t, found, "audited")
+}
+
+// A repository SQL lost (a PostgreSQL failover, a restore) looks like an
+// orphan: it is restored by adoption, from the files every member kept,
+// and reconcile no longer reports it. DeleteOrphan refuses a repository
+// SQL knows.
+func TestOrphanIsRestoredByAdoption(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	origin := tc.nodes[0]
+	withGitThroughReplicator(t, origin)
+	ctx := db.DefaultContext
+	owner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 4})
+	admin := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 1})
+
+	repo, err := repo_service.CreateRepositoryDirectly(ctx, owner, owner, repo_service.CreateRepoOptions{Name: "lost", AutoInit: true, Readme: "Default", DefaultBranch: "main"})
+	require.NoError(t, err)
+	key := "user4/lost.git"
+	requireLiveEverywhere(t, tc, key)
+	main, ok := origin.r.table.Get(key, "refs/heads/main")
+	require.True(t, ok)
+
+	// SQL loses the row, the files stay.
+	_, err = db.GetEngine(ctx).ID(repo.ID).Delete(new(repo_model.Repository))
+	require.NoError(t, err)
+	ms, err := origin.r.Reconcile(ctx, true)
+	require.NoError(t, err)
+	var index uint64
+	for _, m := range ms {
+		if m.Repo == key {
+			index = m.Index
+		}
+	}
+	require.NotZero(t, index, "reported: %v", ms)
+	requireLiveEverywhere(t, tc, key)
+
+	adopted, err := repo_service.AdoptRepository(ctx, admin, owner, repo_service.CreateRepoOptions{Name: "lost"})
+	require.NoError(t, err)
+	ms, err = origin.r.Reconcile(ctx, true)
+	require.NoError(t, err)
+	for _, m := range ms {
+		assert.NotEqual(t, RepoLifecycle, m.Category, "%+v", m)
+	}
+	for _, n := range tc.nodes {
+		v, ok := n.r.table.Get(key, "refs/heads/main")
+		require.True(t, ok, n.slot)
+		assert.Equal(t, main.SHA, v.SHA, n.slot)
+	}
+	assert.Equal(t, "main", adopted.DefaultBranch)
+
+	resp := origin.r.Handle(ctx, &clusterhook.Request{Op: clusterhook.OpReconcile, Repo: "user4/lost", Index: int64(index), Reason: "x", Operator: "tester"})
+	require.False(t, resp.OK)
+	requireLiveEverywhere(t, tc, key)
 }
 
 // A creation that fails after `git init` takes its key out of the table:

@@ -364,11 +364,11 @@ func DeleteRepositoryDirectly(ctx context.Context, repoID int64, opts DeleteRepo
 	// removed here without it would come back from the other members, and
 	// a repository created again under the name would inherit its refs.
 	// When the cluster does not record it, the files stay everywhere,
-	// matching the table, until `forgejo cluster reconcile --apply`
+	// matching the table, until `forgejo cluster reconcile --delete-orphan`
 	// records the deletion of a repository SQL no longer has.
 	clusterErr := clusterhook.RepoDeleted(ctx, repo.OwnerName, repo.Name, repo.ID)
 	if clusterErr != nil {
-		log.Error("cluster: the deletion of %s/%s was not recorded, its files are kept on every node until `forgejo cluster reconcile --apply`: %v", repo.OwnerName, repo.Name, clusterErr)
+		log.Error("cluster: the deletion of %s/%s was not recorded, its files are kept on every node until `forgejo cluster reconcile --delete-orphan`: %v", repo.OwnerName, repo.Name, clusterErr)
 	} else {
 		// Remove repository files.
 		repoPath := repo.RepoPath()
@@ -433,7 +433,7 @@ func DeleteRepositoryDirectly(ctx context.Context, repoID int64, opts DeleteRepo
 	}
 
 	if clusterErr != nil {
-		return fmt.Errorf("the repository's rows are deleted, but the cluster did not record the deletion of its files (run `forgejo cluster reconcile --apply`): %w", clusterErr)
+		return fmt.Errorf("the repository's rows are deleted, but the cluster did not record the deletion of its files (see `forgejo cluster reconcile`, then `--delete-orphan`): %w", clusterErr)
 	}
 	return nil
 }

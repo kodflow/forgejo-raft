@@ -21,6 +21,7 @@ import (
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/optional"
 	repo_module "forgejo.org/modules/repository"
+	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/reftable"
 	repo_service "forgejo.org/services/repository"
 )
@@ -90,6 +91,11 @@ type Mismatch struct {
 	Regenerable bool   `json:"regenerable"`
 	Action      string `json:"action,omitempty"`
 	Applied     bool   `json:"applied,omitempty"`
+	// Index and Since are, for a repository the table holds and SQL does
+	// not know, the index of its last change and since when this node saw
+	// it unchanged: what `reconcile --delete-orphan` checks.
+	Index uint64 `json:"index,omitempty"`
+	Since string `json:"since,omitempty"`
 }
 
 // Mismatch categories (ADR 0152 D17, R4-26, R5-08).
@@ -147,7 +153,7 @@ func (r *Replicator) Reconcile(ctx context.Context, apply bool) ([]Mismatch, err
 			// table holds no repository key for it.
 			if main := wiki + ".git"; !inTable[main] {
 				if known, err := repoKnownInDB(ctx, main); err == nil && !known {
-					if m, ok := r.reconcileOrphan(ctx, main, apply, orphans); ok {
+					if m, ok := r.reconcileOrphan(main, orphans); ok {
 						out = append(out, m)
 					}
 				}
@@ -160,7 +166,7 @@ func (r *Replicator) Reconcile(ctx context.Context, apply bool) ([]Mismatch, err
 			if !deleted {
 				m := Mismatch{Repo: key, Category: RepoLifecycle}
 				if repo_model.IsErrRepoNotExist(err) {
-					if o, ok := r.reconcileOrphan(ctx, key, apply, orphans); ok {
+					if o, ok := r.reconcileOrphan(key, orphans); ok {
 						m = o
 					}
 				}
@@ -226,41 +232,30 @@ func (r *Replicator) Reconcile(ctx context.Context, apply bool) ([]Mismatch, err
 	return out, nil
 }
 
-// orphanGrace is how long a repository the table holds alive, and SQL
-// does not know, must stay unchanged in the table before `reconcile
-// --apply` deletes it from the cluster. A creation or a fork writes its
-// refs before its row commits, a fork's copy taking up to ten minutes.
-var orphanGrace = 30 * time.Minute
-
-// orphanMark is when reconcile first saw an orphaned key at an index.
+// orphanMark is when this node's reconcile first saw an orphaned
+// repository unchanged at an index.
 type orphanMark struct {
 	last  uint64
 	since time.Time
 }
 
-// reconcileOrphan handles a repository the table holds alive and SQL does
+// ActionDeleteOrphan is the audit action of `reconcile --delete-orphan`.
+const ActionDeleteOrphan Action = "delete-orphan"
+
+// actionOrphan is what the operator does with a repository the table holds
+// alive and SQL does not know.
+const actionOrphan = "the table holds this repository alive, SQL has no row for it. After a loss on the SQL side (a PostgreSQL failover, a point-in-time or backup restore) the table is its only copy: restore it, by adopting it (Site administration > Repositories > Unadopted, or POST /api/v1/admin/unadopted/{owner}/{repo}) once its owner exists. Only a deletion or a failed creation the cluster did not record is deleted, explicitly: `forgejo cluster reconcile --delete-orphan <owner>/<repo> --expect-index <index> --reason \"...\"`"
+
+// reconcileOrphan reports a repository the table holds alive and SQL does
 // not know, with its wiki: the files of a deletion or of a failed creation
-// the cluster did not record (R-D4, R-D5). Every member keeps them, and a
-// repository created again under the name would inherit their refs. With
-// apply, once the keys stayed unchanged for orphanGrace since this node's
-// reconcile first saw them, and SQL still has no row, their deletion is
-// proposed and every member removes the files. It reports false when the
-// table holds no live ref under either key: nothing is left to delete.
-func (r *Replicator) reconcileOrphan(ctx context.Context, key string, apply bool, seen map[string]bool) (Mismatch, bool) {
-	wiki := strings.TrimSuffix(key, ".git") + ".wiki.git"
-	var live []string
-	var last uint64
-	for _, k := range []string{key, wiki} {
-		refs, _ := r.table.Refs(k)
-		for _, v := range refs {
-			if v.Live() {
-				live = append(live, k)
-				_, at := r.table.RepoHash(k)
-				last = max(last, at)
-				break
-			}
-		}
-	}
+// the cluster did not record (R-D4, R-D5), or a repository SQL lost. They
+// look the same, and the second is only in the table: reconcile never
+// deletes it, even with apply. The report carries the index of the keys'
+// last change and since when this node saw them unchanged, for
+// DeleteOrphan. It reports false when the table holds no live ref under
+// either key.
+func (r *Replicator) reconcileOrphan(key string, seen map[string]bool) (Mismatch, bool) {
+	live, last := r.orphanKeys(key)
 	if len(live) == 0 {
 		return Mismatch{}, false
 	}
@@ -275,30 +270,86 @@ func (r *Replicator) reconcileOrphan(ctx context.Context, key string, apply bool
 		r.orphans[key] = mark
 	}
 	r.orphansMu.Unlock()
+	return Mismatch{
+		Repo: key, Category: RepoLifecycle, Action: actionOrphan,
+		Index: last, Since: mark.since.UTC().Format(time.RFC3339),
+	}, true
+}
 
-	m := Mismatch{Repo: key, Category: RepoLifecycle}
-	if wait := orphanGrace - time.Since(mark.since); wait > 0 {
-		m.Action = fmt.Sprintf("the table holds this repository, SQL has no row for it: `forgejo cluster reconcile --apply` deletes it from the cluster once it stayed unchanged for %s, from %s on", orphanGrace, mark.since.Add(orphanGrace).UTC().Format(time.RFC3339))
-		return m, true
-	}
-	m.Action = "the table holds this repository, SQL has no row for it: `forgejo cluster reconcile --apply` deletes it from the cluster"
-	if !apply {
-		return m, true
-	}
-	// SQL is read again last: a creation that committed meanwhile keeps
-	// its repository.
-	if known, err := repoKnownInDB(ctx, key); err != nil || known {
-		return m, true
-	}
-	for _, k := range live {
-		if err := r.proposeRepoDelete(ctx, k, 0); err != nil {
-			log.Error("cluster reconcile: deleting %s, which SQL does not know: %v", k, err)
-			return m, true
+// orphanKeys returns the keys of a repository and its wiki that hold a
+// live ref, and the index of their last change.
+func (r *Replicator) orphanKeys(key string) ([]string, uint64) {
+	var live []string
+	var last uint64
+	for _, k := range []string{key, strings.TrimSuffix(key, ".git") + ".wiki.git"} {
+		refs, _ := r.table.Refs(k)
+		for _, v := range refs {
+			if v.Live() {
+				live = append(live, k)
+				_, at := r.table.RepoHash(k)
+				last = max(last, at)
+				break
+			}
 		}
 	}
-	log.Warn("cluster reconcile: deleted %s from the cluster: the table held it alive, unchanged since %s, and SQL has no row for it", strings.Join(live, ", "), mark.since.UTC().Format(time.RFC3339))
-	m.Applied = true
-	return m, true
+	return live, last
+}
+
+// OrphanDeletion is what `reconcile --delete-orphan` deleted.
+type OrphanDeletion struct {
+	Deleted []string `json:"deleted"`
+	Index   uint64   `json:"index"`
+}
+
+// DeleteOrphan deletes from the cluster a repository the table holds alive
+// and SQL does not know, wiki included: an operator's explicit decision,
+// for one repository, never implied by reconcile. It refuses unless this
+// node's table is confirmed current, the keys did not change since the
+// index the operator read in reconcile's report, and SQL, read last, still
+// has no row for the repository. The decision is in the audit with its
+// reason.
+func (r *Replicator) DeleteOrphan(ctx context.Context, op consensus.Operator, repo string, expect uint64, reason string) (*OrphanDeletion, error) {
+	if db.DefaultContext == nil {
+		return nil, errors.New("database not ready")
+	}
+	if strings.TrimSpace(reason) == "" {
+		return nil, errors.New("a reason is required: it is kept in the audit")
+	}
+	key := strings.ToLower(strings.TrimSuffix(strings.TrimSuffix(repo, ".git"), ".wiki")) + ".git"
+	if err := reftable.ValidRepoKey(key); err != nil {
+		return nil, fmt.Errorf("repository %q: %w", repo, err)
+	}
+	if r.Engine() == nil {
+		return nil, errors.New("the cluster is not running: nothing is deleted")
+	}
+	if _, err := r.confirm(ctx); err != nil {
+		return nil, fmt.Errorf("this node's table could not be confirmed current (%w): nothing is deleted", err)
+	}
+	live, last := r.orphanKeys(key)
+	if len(live) == 0 {
+		return nil, fmt.Errorf("the table holds nothing alive under %s: nothing is deleted", key)
+	}
+	if last != expect {
+		return nil, fmt.Errorf("%s changed at index %d, after the index %d given: run `forgejo cluster reconcile` again; nothing is deleted", key, last, expect)
+	}
+	known, err := repoKnownInDB(ctx, key)
+	if err != nil {
+		return nil, fmt.Errorf("reading SQL: %w; nothing is deleted", err)
+	}
+	if known {
+		return nil, fmt.Errorf("SQL has a row for %s: it is no orphan; nothing is deleted", key)
+	}
+	res := &OrphanDeletion{Index: last}
+	for _, k := range live {
+		if err := r.proposeRepoDelete(ctx, k, 0); err != nil {
+			r.audit(ctx, op, Operation{Action: ActionDeleteOrphan, Target: key}, "failed", fmt.Sprintf("%s (index %d, deleted %v): %v", reason, last, res.Deleted, err))
+			return res, fmt.Errorf("deleting %s: %w", k, err)
+		}
+		res.Deleted = append(res.Deleted, k)
+	}
+	log.Warn("cluster: %s deleted %s, which SQL does not know, at index %d: %s", op, strings.Join(live, ", "), last, reason)
+	r.audit(ctx, op, Operation{Action: ActionDeleteOrphan, Target: key}, "deleted", fmt.Sprintf("%s (index %d)", reason, last))
+	return res, nil
 }
 
 // forgetOrphans drops, after a whole pass, the marks of the keys it did
