@@ -53,6 +53,10 @@ type Event struct {
 	IsWiki      bool              `json:"wiki,omitempty"`
 	PushOptions map[string]string `json:"opts,omitempty"`
 	RenamedFrom string            `json:"from,omitempty"`
+	// PusherName is the pusher's name when it pushed, from payload
+	// version 4 (PusherVersion); empty before. It is not counted in the
+	// queue's size, which stays what an older binary computes.
+	PusherName string `json:"pn,omitempty"`
 }
 
 // Event kinds.
@@ -298,6 +302,13 @@ func (t *Table) applyRefTxn(e consensus.Entry, version uint8, tx *RefTxn) (Resul
 			return refuse("the repository %s was renamed to %s", tx.Repo, to), Change{}
 		}
 	}
+	pusherName := ""
+	if version >= PusherVersion {
+		if len(tx.PusherName) > MaxPusherName {
+			return refuse("a pusher's name holds at most %d bytes", MaxPusherName), Change{}
+		}
+		pusherName = tx.PusherName
+	}
 	if tx.Format != "sha1" && tx.Format != "sha256" {
 		return refuse("unknown object format %q", tx.Format), Change{}
 	}
@@ -404,6 +415,7 @@ func (t *Table) applyRefTxn(e consensus.Entry, version uint8, tx *RefTxn) (Resul
 			Token: e.Token, Kind: EventRef, Repo: tx.Repo, RepoID: tx.RepoID, Ref: u.Ref,
 			Old: old, New: v.SHA, Rev: v.Rev, PusherID: tx.PusherID, Time: tx.Time,
 			Trigger: tx.Trigger, PRID: tx.PRID, IsWiki: tx.IsWiki, PushOptions: tx.PushOptions,
+			PusherName: pusherName,
 		}
 		if u.Symbolic != "" {
 			ev.New = "ref:" + u.Symbolic

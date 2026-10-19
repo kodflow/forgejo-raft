@@ -27,10 +27,24 @@ import (
 // an operator's revocation waits as a version 1 audit record (AuditRevokeKey),
 // which an older member keeps as a plain record, and is written once the
 // cluster raised its version.
-const PayloadVersion = 3
+//
+// Version 4 carries the pusher's name in a ref transaction (PusherName),
+// copied into its events: the log consumer tells a pusher ID handed out
+// again after a database loss by the name, not by comparing two nodes'
+// clocks. Below version 4 Apply ignores the field, as an older binary
+// does, so a log written before the upgrade replays to the same table.
+const PayloadVersion = 4
 
 // RevokeVersion is the payload version that carries KindRevokeKey.
 const RevokeVersion = 3
+
+// PusherVersion is the payload version from which a ref transaction's
+// PusherName is applied.
+const PusherVersion = 4
+
+// MaxPusherName bounds a pusher's name, from PusherVersion: a longer one
+// is refused, on every node alike.
+const MaxPusherName = 255
 
 // BaseVersion is the version written until the cluster raised it.
 const BaseVersion = 1
@@ -110,6 +124,10 @@ type RefTxn struct {
 	// version 2, Apply refuses it on a deleted or renamed-away key; a
 	// version 1 entry ignores it.
 	Push bool `json:"push,omitempty"`
+	// PusherName is the pusher's account name when it pushed. Written and
+	// applied from PusherVersion only: an older binary drops it, and so
+	// does Apply below that version.
+	PusherName string `json:"pn,omitempty"`
 }
 
 // Ack trims the events of a lineage up to an index, once the dispatcher read
@@ -212,9 +230,9 @@ func decode(data []byte) (Kind, any, error) {
 		return 0, nil, fmt.Errorf("%w: payload version %d", ErrVersion, data[0])
 	}
 	if data[0] > BaseVersion && Kind(data[1]) != KindRefTxn && (Kind(data[1]) != KindRevokeKey || data[0] < RevokeVersion) {
-		// Version 2 changes the ref transaction only, version 3 adds the
-		// key revocation: any other kind above version 1 was written by no
-		// version of this code.
+		// Versions 2 and 4 change the ref transaction only, version 3 adds
+		// the key revocation: any other kind above version 1 was written by
+		// no version of this code.
 		return 0, nil, fmt.Errorf("%w: command kind %d at payload version %d", ErrVersion, data[1], data[0])
 	}
 	kind := Kind(data[1])

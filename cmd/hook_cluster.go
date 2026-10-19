@@ -67,6 +67,7 @@ func runHookReferenceTransaction(ctx context.Context, c *cli.Command) error {
 		PID:    os.Getppid(),
 	}
 	req.PusherID, _ = strconv.ParseInt(os.Getenv(repo_module.EnvPusherID), 10, 64)
+	req.PusherName = os.Getenv(repo_module.EnvPusherName)
 	req.RepoID, _ = strconv.ParseInt(os.Getenv(repo_module.EnvRepoID), 10, 64)
 	req.PRID, _ = strconv.ParseInt(os.Getenv(repo_module.EnvPRID), 10, 64)
 	req.IsWiki, _ = strconv.ParseBool(os.Getenv(repo_module.EnvRepoIsWiki))

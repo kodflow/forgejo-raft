@@ -157,8 +157,43 @@ func TestPushWorkRefusesAReusedPusherID(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pusher ID 2")
 
-	assert.False(t, pusherReissued(u, reftable.Event{Time: time.Unix(int64(u.CreatedUnix), 0).Add(-time.Minute).UnixNano()}), "within the clock skew")
-	assert.False(t, pusherReissued(u, reftable.Event{Time: time.Unix(int64(u.CreatedUnix), 0).Add(time.Hour).UnixNano()}))
+	assert.False(t, pusherReissued(ctx, u, reftable.Event{Time: time.Unix(int64(u.CreatedUnix), 0).Add(-time.Minute).UnixNano()}), "within the clock skew")
+	assert.False(t, pusherReissued(ctx, u, reftable.Event{Time: time.Unix(int64(u.CreatedUnix), 0).Add(time.Hour).UnixNano()}))
+}
+
+// From payload version 4 the event names its pusher, and the name decides,
+// whatever the clocks: a node whose clock ran an hour behind the one that
+// created the account no longer parks that account's push, and an ID now
+// held by another account is caught even with the clocks agreeing.
+func TestPushWorkTellsAReusedPusherIDByName(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ctx := db.DefaultContext
+	u := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	behind := time.Unix(int64(u.CreatedUnix), 0).Add(-time.Hour).UnixNano()
+	ev := reftable.Event{
+		Token: consensus.Token{Index: 9}, Kind: reftable.EventRef, Repo: "user2/repo1.git", RepoID: 1, PusherID: 2,
+		Ref: "refs/tags/v-name", New: "65f1bf27bc3bf70f64657658635e66094edbcb4d", Time: behind, PusherName: "user2",
+	}
+	assert.False(t, pusherReissued(ctx, u, ev), "the same name, a clock an hour behind")
+	ev.PusherName = "USER2"
+	assert.False(t, pusherReissued(ctx, u, ev), "names compare without case")
+	if err := pushWork(ctx, []reftable.Event{ev}); err != nil {
+		// The fixture repository lacks the tag: the work fails further on,
+		// past the pusher check.
+		assert.NotContains(t, err.Error(), "pusher ID")
+	}
+
+	ev.PusherName = "someone-else"
+	ev.Time = time.Unix(int64(u.CreatedUnix), 0).Add(time.Hour).UnixNano()
+	assert.True(t, pusherReissued(ctx, u, ev), "another account's name, the clocks agreeing")
+	err := pushWork(ctx, []reftable.Event{ev})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "pusher ID 2")
+
+	// A rename since the push: the old name redirects to the account.
+	u1 := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 1})
+	assert.False(t, pusherReissued(ctx, u1, reftable.Event{PusherName: "olduser1", Time: behind}))
+	assert.True(t, pusherReissued(ctx, u, reftable.Event{PusherName: "olduser1", Time: behind}), "a redirect to another account")
 }
 
 // A parked event's row commits with the cursor that moves past it, or not

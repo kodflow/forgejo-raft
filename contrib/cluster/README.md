@@ -208,6 +208,15 @@ version (the autopilot raises the version; in the manual mode, the
 operator raises it from the administration page). A JOIN grant is bound to the key it first admits:
 that node may retry, another key does not join under it.
 
+**Payload version 4** carries the pusher's name in each push entry. The
+log consumer uses it to tell a pusher ID handed out again after a database
+loss (another name, and no redirect from the old name to the account) from
+the pusher itself, with no clock involved; before, it compared the push
+node's clock with the account's creation time, and a skew of more than
+five minutes parked a legitimate push. A binary of this version raises the
+cluster straight to version 4, the revocation of version 3 included, once
+every member runs it; entries written before keep the clock rule.
+
 **A compromised CA** is replaced, never revoked in place. Sign new
 certificates under a new CA, add the new CA to `TLS_CA_FILE` beside the old
 one and roll the certificates; then remove the old CA from the file and

@@ -237,7 +237,7 @@ func (e errStaleCreate) Error() string {
 // rewrite) carry no pusher and keep their meaning.
 func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook.Request) (*reftable.RefTxn, []string, error) {
 	tx := &reftable.RefTxn{
-		Repo: repo, RepoID: req.RepoID, PusherID: req.PusherID, Time: time.Now().UnixNano(),
+		Repo: repo, RepoID: req.RepoID, PusherID: req.PusherID, PusherName: req.PusherName, Time: time.Now().UnixNano(),
 		Nonce: clusterhook.TxnNonce(req.Nonce, req.Lines), Trigger: req.Trigger, PRID: req.PRID, IsWiki: req.IsWiki, PushOptions: req.PushOptions,
 		Push: req.PusherID != 0,
 	}
@@ -399,7 +399,14 @@ func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.
 	// From payload version 2, Apply itself refuses a push into a key
 	// deleted or renamed away by an entry this node had not applied yet
 	// when pushTargetGone looked.
-	data, err := reftable.EncodeVersion(r.table.WriteVersion(), reftable.KindRefTxn, tx)
+	// The pusher's name is written from payload version 4 only, once every
+	// member applies it: an older one drops it, and its table would hold
+	// other events than the others'.
+	v := r.table.WriteVersion()
+	if v < reftable.PusherVersion || tx.PusherID == 0 || len(tx.PusherName) > reftable.MaxPusherName {
+		tx.PusherName = ""
+	}
+	data, err := reftable.EncodeVersion(v, reftable.KindRefTxn, tx)
 	if err != nil {
 		return fail(err)
 	}

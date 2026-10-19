@@ -138,6 +138,7 @@ type Request struct {
 	GitDir      string            `json:"git_dir,omitempty"`
 	Lines       []Line            `json:"lines,omitempty"`
 	PusherID    int64             `json:"pusher_id,omitempty"`
+	PusherName  string            `json:"pusher_name,omitempty"`
 	RepoID      int64             `json:"repo_id,omitempty"`
 	IsWiki      bool              `json:"is_wiki,omitempty"`
 	PRID        int64             `json:"pr_id,omitempty"`
