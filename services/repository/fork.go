@@ -6,6 +6,8 @@ package repository
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	git_model "forgejo.org/models/git"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/log"
@@ -106,9 +109,9 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 		}
 
 		// As the transaction will be failed and hence database changes will be destroyed we only need
-		// to delete the related repository on the filesystem
-		if errDelete := util.RemoveAll(repoPath); errDelete != nil {
-			log.Error("Failed to remove fork repo")
+		// to delete the related repository on the filesystem, and from the cluster's table
+		if errDelete := removeAbandonedRepo(ctx, owner.Name, repo.Name); errDelete != nil {
+			log.Error("Failed to remove fork repo: %v", errDelete)
 		}
 	}
 
@@ -141,16 +144,23 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 
 		needsRollback = true
 
-		cloneCmd := git.NewCommand(txCtx, "clone", "--bare")
-		if opts.SingleBranch != "" {
-			cloneCmd.AddArguments("--single-branch", "--branch").AddDynamicArguments(opts.SingleBranch)
-		}
 		repoPath := repo_model.RepoPath(owner.Name, repo.Name)
-		if stdout, _, err := cloneCmd.AddDynamicArguments(oldRepoPath, repoPath).
-			SetDescription(fmt.Sprintf("ForkRepositoryIfNotExists(git clone): %s to %s", opts.BaseRepo.FullName(), repo.FullName())).
-			RunStdBytes(&git.RunOpts{Timeout: 10 * time.Minute}); err != nil {
-			log.Error("Fork Repository (git clone) Failed for %v (from %v):\nStdout: %s\nError: %v", repo, opts.BaseRepo, stdout, err)
-			return fmt.Errorf("git clone: %w", err)
+		if clusterhook.Enabled() {
+			if err := copyForkInCluster(txCtx, opts, oldRepoPath, repoPath, defaultBranch, repo.ObjectFormatName); err != nil {
+				log.Error("Fork Repository (git init and fetch) Failed for %v (from %v): %v", repo, opts.BaseRepo, err)
+				return err
+			}
+		} else {
+			cloneCmd := git.NewCommand(txCtx, "clone", "--bare")
+			if opts.SingleBranch != "" {
+				cloneCmd.AddArguments("--single-branch", "--branch").AddDynamicArguments(opts.SingleBranch)
+			}
+			if stdout, _, err := cloneCmd.AddDynamicArguments(oldRepoPath, repoPath).
+				SetDescription(fmt.Sprintf("ForkRepositoryIfNotExists(git clone): %s to %s", opts.BaseRepo.FullName(), repo.FullName())).
+				RunStdBytes(&git.RunOpts{Timeout: 10 * time.Minute}); err != nil {
+				log.Error("Fork Repository (git clone) Failed for %v (from %v):\nStdout: %s\nError: %v", repo, opts.BaseRepo, stdout, err)
+				return fmt.Errorf("git clone: %w", err)
+			}
 		}
 
 		if err := repo_module.CheckDaemonExportOK(txCtx, repo); err != nil {
@@ -180,6 +190,47 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 	}
 
 	return repo, nil
+}
+
+// copyForkInCluster takes into the fork the refs `git clone --bare` would:
+// the branches, or the one branch asked, and the tags, with HEAD on the
+// default branch. In a cluster a clone cannot do it: its first ref
+// transaction carries every ref, whose objects go to the other members for
+// a key they know neither from the replicated table nor from SQL, where
+// the fork's row is not committed yet, and they refuse them. `git init`
+// writes HEAD alone first, which ships no object and makes the key known
+// to the table; the refs then follow with `git fetch`.
+func copyForkInCluster(ctx context.Context, opts ForkRepoOptions, from, to, defaultBranch, objectFormat string) error {
+	if strings.ContainsAny(opts.SingleBranch, "*:") {
+		return fmt.Errorf("invalid branch name %q", opts.SingleBranch)
+	}
+	if err := os.MkdirAll(to, os.ModePerm); err != nil {
+		return err
+	}
+	initCmd := git.NewCommand(ctx, "init", "--bare", "--template", "").AddOptionValues("--initial-branch", defaultBranch)
+	if git.SupportHashSha256 && objectFormat != "" {
+		initCmd.AddOptionValues("--object-format", objectFormat)
+	}
+	if stdout, _, err := initCmd.SetDescription(fmt.Sprintf("ForkRepositoryIfNotExists(git init): %s", to)).
+		RunStdString(&git.RunOpts{Dir: to}); err != nil {
+		return fmt.Errorf("git init: %w: %s", err, stdout)
+	}
+
+	refspecs := []string{"+refs/heads/*:refs/heads/*"}
+	if opts.SingleBranch != "" {
+		refspecs = []string{"+refs/heads/" + opts.SingleBranch + ":refs/heads/" + opts.SingleBranch}
+	}
+	refspecs = append(refspecs, "+refs/tags/*:refs/tags/*")
+	if stdout, _, err := git.NewCommand(ctx, "fetch", "--quiet", "--no-tags").AddDynamicArguments(from).AddDynamicArguments(refspecs...).
+		SetDescription(fmt.Sprintf("ForkRepositoryIfNotExists(git fetch): %s to %s", from, to)).
+		RunStdString(&git.RunOpts{Dir: to, Timeout: 10 * time.Minute}); err != nil {
+		return fmt.Errorf("git fetch: %w: %s", err, stdout)
+	}
+	// A clone leaves no FETCH_HEAD; nothing reads this one.
+	if err := os.Remove(filepath.Join(to, "FETCH_HEAD")); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // ForkRepositoryAndUpdates forks a repository. On success it updates metadata (size, stats, etc.) and send a notification.

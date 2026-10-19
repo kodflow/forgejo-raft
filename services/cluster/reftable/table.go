@@ -721,6 +721,20 @@ func (t *Table) RenamedInto(from string, before uint64) (string, uint64, bool) {
 	return to, at, found
 }
 
+// RenamedAfter reports the oldest rename after index that moved from's refs
+// to another key: the way forward from an event written under from.
+func (t *Table) RenamedAfter(from string, after uint64) (string, uint64, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	to, at, found := "", uint64(0), false
+	for k, m := range t.renamed {
+		if m.From == from && m.Index > after && (!found || m.Index < at || m.Index == at && k < to) {
+			to, at, found = k, m.Index, true
+		}
+	}
+	return to, at, found
+}
+
 // raisedVersion is the payload version an audit record raises the cluster
 // to, 0 when it raises none. A version this code cannot apply is not
 // adopted: its entries would stop this node anyway.

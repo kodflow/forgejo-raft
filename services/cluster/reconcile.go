@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	cluster_model "forgejo.org/models/cluster"
 	"forgejo.org/models/db"
@@ -17,8 +18,10 @@ import (
 	issues_model "forgejo.org/models/issues"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/modules/gitrepo"
+	"forgejo.org/modules/log"
 	"forgejo.org/modules/optional"
 	repo_module "forgejo.org/modules/repository"
+	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/reftable"
 	repo_service "forgejo.org/services/repository"
 )
@@ -88,6 +91,11 @@ type Mismatch struct {
 	Regenerable bool   `json:"regenerable"`
 	Action      string `json:"action,omitempty"`
 	Applied     bool   `json:"applied,omitempty"`
+	// Index and Since are, for a repository the table holds and SQL does
+	// not know, the index of its last change and since when this node saw
+	// it unchanged: what `reconcile --delete-orphan` checks.
+	Index uint64 `json:"index,omitempty"`
+	Since string `json:"since,omitempty"`
 }
 
 // Mismatch categories (ADR 0152 D17, R4-26, R5-08).
@@ -130,18 +138,39 @@ func (r *Replicator) Reconcile(ctx context.Context, apply bool) ([]Mismatch, err
 	if err != nil {
 		return out, err
 	}
-	for _, key := range r.table.Repos() {
+	keys := r.table.Repos()
+	inTable := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		inTable[key] = true
+	}
+	orphans := map[string]bool{}
+	for _, key := range keys {
 		if ctx.Err() != nil {
 			return out, ctx.Err()
 		}
-		if strings.HasSuffix(key, ".wiki.git") {
+		if wiki, ok := strings.CutSuffix(key, ".wiki.git"); ok {
+			// A wiki is reconciled with its repository, or alone when the
+			// table holds no repository key for it.
+			if main := wiki + ".git"; !inTable[main] {
+				if known, err := repoKnownInDB(ctx, main); err == nil && !known {
+					if m, ok := r.reconcileOrphan(main, orphans); ok {
+						out = append(out, m)
+					}
+				}
+			}
 			continue
 		}
 		_, deleted := r.table.Deleted(key)
 		repo, err := lookupRepo(ctx, reftable.Event{Repo: key})
 		if err != nil {
 			if !deleted {
-				out = append(out, Mismatch{Repo: key, Category: RepoLifecycle})
+				m := Mismatch{Repo: key, Category: RepoLifecycle}
+				if repo_model.IsErrRepoNotExist(err) {
+					if o, ok := r.reconcileOrphan(key, orphans); ok {
+						m = o
+					}
+				}
+				out = append(out, m)
 			}
 			continue
 		}
@@ -199,7 +228,140 @@ func (r *Replicator) Reconcile(ctx context.Context, apply bool) ([]Mismatch, err
 		}
 		out = append(out, more...)
 	}
+	r.forgetOrphans(orphans)
 	return out, nil
+}
+
+// orphanMark is when this node's reconcile first saw an orphaned
+// repository unchanged at an index.
+type orphanMark struct {
+	last  uint64
+	since time.Time
+}
+
+// ActionDeleteOrphan is the audit action of `reconcile --delete-orphan`.
+const ActionDeleteOrphan Action = "delete-orphan"
+
+// actionOrphan is what the operator does with a repository the table holds
+// alive and SQL does not know.
+const actionOrphan = "the table holds this repository alive, SQL has no row for it. After a loss on the SQL side (a PostgreSQL failover, a point-in-time or backup restore) the table is its only copy: restore it, by adopting it (Site administration > Repositories > Unadopted, or POST /api/v1/admin/unadopted/{owner}/{repo}) once its owner exists. Only a deletion or a failed creation the cluster did not record is deleted, explicitly: `forgejo cluster reconcile --delete-orphan <owner>/<repo> --expect-index <index> --reason \"...\"`"
+
+// reconcileOrphan reports a repository the table holds alive and SQL does
+// not know, with its wiki: the files of a deletion or of a failed creation
+// the cluster did not record (R-D4, R-D5), or a repository SQL lost. They
+// look the same, and the second is only in the table: reconcile never
+// deletes it, even with apply. The report carries the index of the keys'
+// last change and since when this node saw them unchanged, for
+// DeleteOrphan. It reports false when the table holds no live ref under
+// either key.
+func (r *Replicator) reconcileOrphan(key string, seen map[string]bool) (Mismatch, bool) {
+	live, last := r.orphanKeys(key)
+	if len(live) == 0 {
+		return Mismatch{}, false
+	}
+	seen[key] = true
+	r.orphansMu.Lock()
+	if r.orphans == nil {
+		r.orphans = map[string]orphanMark{}
+	}
+	mark, ok := r.orphans[key]
+	if !ok || mark.last != last {
+		mark = orphanMark{last: last, since: time.Now()}
+		r.orphans[key] = mark
+	}
+	r.orphansMu.Unlock()
+	return Mismatch{
+		Repo: key, Category: RepoLifecycle, Action: actionOrphan,
+		Index: last, Since: mark.since.UTC().Format(time.RFC3339),
+	}, true
+}
+
+// orphanKeys returns the keys of a repository and its wiki that hold a
+// live ref, and the index of their last change.
+func (r *Replicator) orphanKeys(key string) ([]string, uint64) {
+	var live []string
+	var last uint64
+	for _, k := range []string{key, strings.TrimSuffix(key, ".git") + ".wiki.git"} {
+		refs, _ := r.table.Refs(k)
+		for _, v := range refs {
+			if v.Live() {
+				live = append(live, k)
+				_, at := r.table.RepoHash(k)
+				last = max(last, at)
+				break
+			}
+		}
+	}
+	return live, last
+}
+
+// OrphanDeletion is what `reconcile --delete-orphan` deleted.
+type OrphanDeletion struct {
+	Deleted []string `json:"deleted"`
+	Index   uint64   `json:"index"`
+}
+
+// DeleteOrphan deletes from the cluster a repository the table holds alive
+// and SQL does not know, wiki included: an operator's explicit decision,
+// for one repository, never implied by reconcile. It refuses unless this
+// node's table is confirmed current, the keys did not change since the
+// index the operator read in reconcile's report, and SQL, read last, still
+// has no row for the repository. The decision is in the audit with its
+// reason.
+func (r *Replicator) DeleteOrphan(ctx context.Context, op consensus.Operator, repo string, expect uint64, reason string) (*OrphanDeletion, error) {
+	if db.DefaultContext == nil {
+		return nil, errors.New("database not ready")
+	}
+	if strings.TrimSpace(reason) == "" {
+		return nil, errors.New("a reason is required: it is kept in the audit")
+	}
+	key := strings.ToLower(strings.TrimSuffix(strings.TrimSuffix(repo, ".git"), ".wiki")) + ".git"
+	if err := reftable.ValidRepoKey(key); err != nil {
+		return nil, fmt.Errorf("repository %q: %w", repo, err)
+	}
+	if r.Engine() == nil {
+		return nil, errors.New("the cluster is not running: nothing is deleted")
+	}
+	if _, err := r.confirm(ctx); err != nil {
+		return nil, fmt.Errorf("this node's table could not be confirmed current (%w): nothing is deleted", err)
+	}
+	live, last := r.orphanKeys(key)
+	if len(live) == 0 {
+		return nil, fmt.Errorf("the table holds nothing alive under %s: nothing is deleted", key)
+	}
+	if last != expect {
+		return nil, fmt.Errorf("%s changed at index %d, after the index %d given: run `forgejo cluster reconcile` again; nothing is deleted", key, last, expect)
+	}
+	known, err := repoKnownInDB(ctx, key)
+	if err != nil {
+		return nil, fmt.Errorf("reading SQL: %w; nothing is deleted", err)
+	}
+	if known {
+		return nil, fmt.Errorf("SQL has a row for %s: it is no orphan; nothing is deleted", key)
+	}
+	res := &OrphanDeletion{Index: last}
+	for _, k := range live {
+		if err := r.proposeRepoDelete(ctx, k, 0); err != nil {
+			r.audit(ctx, op, Operation{Action: ActionDeleteOrphan, Target: key}, "failed", fmt.Sprintf("%s (index %d, deleted %v): %v", reason, last, res.Deleted, err))
+			return res, fmt.Errorf("deleting %s: %w", k, err)
+		}
+		res.Deleted = append(res.Deleted, k)
+	}
+	log.Warn("cluster: %s deleted %s, which SQL does not know, at index %d: %s", op, strings.Join(live, ", "), last, reason)
+	r.audit(ctx, op, Operation{Action: ActionDeleteOrphan, Target: key}, "deleted", fmt.Sprintf("%s (index %d)", reason, last))
+	return res, nil
+}
+
+// forgetOrphans drops, after a whole pass, the marks of the keys it did
+// not find orphaned.
+func (r *Replicator) forgetOrphans(seen map[string]bool) {
+	r.orphansMu.Lock()
+	defer r.orphansMu.Unlock()
+	for k := range r.orphans {
+		if !seen[k] {
+			delete(r.orphans, k)
+		}
+	}
 }
 
 // reconcileParked lists the parked events and, with apply, retries them

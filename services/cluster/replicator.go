@@ -80,6 +80,10 @@ type Replicator struct {
 	// export is the PostgreSQL and archive side of the observers' export
 	// (export.go).
 	export exportSide
+	// orphans are the keys reconcile found alive in the table and unknown
+	// to SQL, with when it first saw each unchanged (reconcile.go).
+	orphansMu sync.Mutex
+	orphans   map[string]orphanMark
 }
 
 type rawWrite struct {

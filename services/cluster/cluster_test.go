@@ -38,6 +38,11 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	// The test binary is also the reference-transaction hook of the tests
+	// that run real git commands through the replicator (fork_test.go).
+	if sock := os.Getenv(testHookSocketEnv); sock != "" {
+		os.Exit(runTestHook(sock))
+	}
 	// The full test environment: git with its home, and a fixture database
 	// for the consumer's transactions.
 	unittest.MainTest(m)

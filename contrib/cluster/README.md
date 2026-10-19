@@ -284,6 +284,23 @@ These commands run with the server stopped, on the data directory.
   can be regenerated (branches, tags); the others are reported with what to
   do, such as a pull request marked merged whose commit is missing from its
   base branch.
+- A repository the table holds alive and SQL does not know is reported by
+  `reconcile` with the index of its last change and since when it is
+  unchanged. `reconcile`, `--apply` included, never deletes it. After a loss
+  on the SQL side (an asynchronous PostgreSQL failover, a point-in-time
+  recovery, `pg_rewind`, a backup restore) the table and the files every
+  member kept are the repository's ONLY copy: restore it. Recreate its owner
+  if SQL lost it too, then adopt the repository (Site administration >
+  Repositories > Unadopted, or `POST /api/v1/admin/unadopted/{owner}/{repo}`).
+  Never use "delete unadopted" in a cluster: it removes one node's files and
+  the projector brings them back.
+- Only a deletion or a failed creation the cluster did not record is
+  deleted, explicitly, one repository at a time:
+  `forgejo cluster reconcile --delete-orphan <owner>/<repo> --expect-index <index> --reason "..."`.
+  It is refused unless this node's table is confirmed current, the
+  repository did not change since the index given, and SQL, read last, still
+  has no row for it. The decision, its operator and its reason are in the
+  audit.
 - `forgejo cluster recover --from-observer <checkpoint> ...` rebuilds a
   cluster from an observer's protected checkpoint, every member lost
   ([observer.md](observer.md)).
