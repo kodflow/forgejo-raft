@@ -171,6 +171,11 @@ func renameUser(ctx context.Context, u *user_model.User, newUserName string, doe
 	if err = clusterhook.OwnerRenamed(ctx, oldUserName, newUserName); err != nil {
 		u.Name = oldUserName
 		u.LowerName = strings.ToLower(oldUserName)
+		if clusterhook.IsOutcomeUnresolved(err) {
+			// The members may follow the rename: the directory stays.
+			log.Critical("Renaming user %s to %s: %v; the directory stays under the new name, run `forgejo cluster reconcile`", oldUserName, newUserName, err)
+			return fmt.Errorf("rename user in the cluster: %w", err)
+		}
 		if err2 := util.Rename(user_model.UserPath(newUserName), user_model.UserPath(oldUserName)); err2 != nil && !os.IsNotExist(err2) {
 			log.Critical("Unable to rollback directory change during a refused cluster rename from %s to %s: %v", oldUserName, newUserName, err2)
 		}

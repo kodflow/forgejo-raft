@@ -377,10 +377,21 @@ func WikiDeleted(ctx context.Context, owner, name string, repoID int64) error {
 	return f(ctx, RepoKey(owner, name, true), repoID)
 }
 
+// ErrOutcomeUnresolved is a lifecycle command the cluster may or may not
+// have recorded: the proposal's outcome was unknown, and no commit
+// boundary could tell within the budget. The caller keeps what it did
+// locally, never undoes it: if the command committed, every member,
+// itself included, follows the table, and an undo would leave the
+// database naming what the table moved away (#46).
+var ErrOutcomeUnresolved = errors.New("the cluster may or may not have recorded it")
+
+// IsOutcomeUnresolved reports whether err is ErrOutcomeUnresolved.
+func IsOutcomeUnresolved(err error) bool { return errors.Is(err, ErrOutcomeUnresolved) }
+
 // RepoRenamed records a repository and its wiki moving, after Forgejo moved
 // them locally. Both moves are one replicated command, applied together or
 // not at all. An error means the other members did not follow: the caller
-// moves them back.
+// moves them back, unless it is ErrOutcomeUnresolved.
 func RepoRenamed(ctx context.Context, oldOwner, oldName, newOwner, newName string) error {
 	lifecycleMu.RLock()
 	f := onRenamed
