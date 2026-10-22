@@ -816,6 +816,21 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		// pusher's ID, and must not be credited with the push.
 		return fmt.Errorf("pusher ID %d is %s, not the account that pushed at %d: the ID was reused; run `forgejo cluster reconcile`", first.PusherID, u.Name, first.Token.Index)
 	}
+	var gitRepo *git.Repository
+	openGit := func() (*git.Repository, error) {
+		if gitRepo == nil {
+			var err error
+			if gitRepo, err = gitrepo.OpenRepository(ctx, repo); err != nil {
+				return nil, err
+			}
+		}
+		return gitRepo, nil
+	}
+	defer func() {
+		if gitRepo != nil {
+			gitRepo.Close()
+		}
+	}()
 	var updates []*repo_module.PushUpdateOptions
 	var branches []string
 	for _, ev := range evs {
@@ -841,10 +856,26 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		if opt.IsNewRef() && opt.IsDelRef() {
 			continue
 		}
+		if ref.IsTag() {
+			gone, err := tagGone(ctx, repo, opt, openGit)
+			if err != nil {
+				return err
+			}
+			if gone {
+				// Created then deleted before this work ran: there is no
+				// tag to describe, or no release row to remove, and the
+				// work would fail at every retry, parked for good (#44).
+				log.Info("cluster consumer: the tag %s of %s at %d is gone; its post-receive work is dropped", ref.TagName(), first.Repo, ev.Token.Index)
+				continue
+			}
+		}
 		updates = append(updates, opt)
 		if ref.IsBranch() {
 			if opt.IsDelRef() {
-				if err := git_model.AddDeletedBranch(ctx, repo.ID, ref.BranchName(), ev.PusherID); err != nil {
+				// A branch whose creation was never written in SQL (created
+				// and deleted before its work ran) has nothing to mark
+				// deleted (#44).
+				if err := git_model.AddDeletedBranch(ctx, repo.ID, ref.BranchName(), ev.PusherID); err != nil && !git_model.IsErrBranchNotExist(err) {
 					return err
 				}
 			} else if !slices.Contains(branches, ref.BranchName()) {
@@ -853,13 +884,11 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		}
 	}
 	if len(branches) > 0 {
-		gitRepo, err := gitrepo.OpenRepository(ctx, repo)
+		gitRepo, err := openGit()
 		if err != nil {
 			return err
 		}
-		err = repo_service.SyncBranchesToDB(ctx, repo.ID, first.PusherID, branches, gitRepo.GetBranchCommit)
-		gitRepo.Close()
-		if err != nil {
+		if err := repo_service.SyncBranchesToDB(ctx, repo.ID, first.PusherID, branches, gitRepo.GetBranchCommit); err != nil {
 			return err
 		}
 	}
@@ -867,6 +896,24 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		return nil
 	}
 	return repo_service.PushUpdatesNow(clusterhook.WithCommand(ctx, first.Token.String()), updates)
+}
+
+// tagGone reports whether a tag update has nothing left to land on: a new
+// tag git no longer holds, or a deleted tag without a release row.
+func tagGone(ctx context.Context, repo *repo_model.Repository, opt *repo_module.PushUpdateOptions, openGit func() (*git.Repository, error)) (bool, error) {
+	name := opt.RefFullName.TagName()
+	if opt.IsDelRef() {
+		_, err := repo_model.GetRelease(ctx, repo.ID, name)
+		if repo_model.IsErrReleaseNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	gitRepo, err := openGit()
+	if err != nil {
+		return false, err
+	}
+	return !gitRepo.IsTagExist(name), nil
 }
 
 // pusherClockSkew bounds the clock difference between the node that

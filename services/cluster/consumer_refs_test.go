@@ -39,6 +39,30 @@ func repo1Git(t *testing.T, args ...string) {
 	require.NoError(t, err, string(out))
 }
 
+// A branch or a tag created then deleted before the consumer derived it
+// has no row to mark deleted and nothing to describe: the work is done,
+// never failed, so it is not parked for good behind the trim (#44,
+// TestHuntR1ProveCrDel).
+func TestCreateThenDeleteOfAnUnsyncedBranch(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ctx := db.DefaultContext
+	create := repo1Event(10, "refs/heads/tmp", "", repo1Base)
+	del := repo1Event(11, "refs/heads/tmp", repo1Base, "")
+	// What an older dispatch grouped, then each entry on its own, as
+	// retryParked replays them.
+	require.NoError(t, pushWork(ctx, []reftable.Event{create, del}))
+	require.NoError(t, pushWork(ctx, []reftable.Event{create}))
+	require.NoError(t, pushWork(ctx, []reftable.Event{del}))
+	_, err := git_model.GetBranch(ctx, 1, "tmp")
+	assert.True(t, git_model.IsErrBranchNotExist(err))
+
+	tagCreate := repo1Event(12, "refs/tags/tmp-tag", "", repo1Base)
+	tagDel := repo1Event(13, "refs/tags/tmp-tag", repo1Base, "")
+	require.NoError(t, pushWork(ctx, []reftable.Event{tagCreate}))
+	require.NoError(t, pushWork(ctx, []reftable.Event{tagDel}))
+	require.NoError(t, pushWork(ctx, []reftable.Event{tagCreate, tagDel}))
+}
+
 // Two entries of one repository and one pusher, the creation of a branch
 // or a tag and its update, are derived each on its own: the new branch and
 // the tag's release are inserted once (#76, TestHuntR4ProveDupRefGroupedEntries).
