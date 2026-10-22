@@ -16,6 +16,7 @@ import (
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unittest"
 	"forgejo.org/modules/clusterhook"
+	"forgejo.org/modules/git"
 	"forgejo.org/modules/setting"
 	repo_service "forgejo.org/services/repository"
 
@@ -150,6 +151,47 @@ func TestAPackedDeletionOnALaggingNode(t *testing.T) {
 	assert.Equal(t, c2, v.SHA)
 }
 
+// Forgejo's DeleteBranch (`git branch -D`) and RenameBranch on a packed
+// branch succeed, and every member holds the result (#37, #38).
+func TestBranchDeleteAndRenameOfPackedBranches(t *testing.T) {
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	n := tc.nodes[0]
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	c1 := commit(t, work, "one")
+	zero := strings.Repeat("0", 40)
+	repo := "alice/brd.git"
+	for _, b := range []string{"main", "del", "ren"} {
+		require.True(t, tc.pushVia(n, work, repo, "refs/heads/"+b, zero, c1).OK)
+	}
+	dir := filepath.Join(n.r.root, filepath.FromSlash(repo))
+	run(t, dir, "pack-refs", "--all")
+	for _, m := range tc.nodes {
+		require.Eventually(t, func() bool { return gitRef(t, m, repo, "refs/heads/ren") == c1 }, 10*time.Second, 20*time.Millisecond)
+	}
+	withGitThroughReplicator(t, n)
+	g, err := git.OpenRepository(context.Background(), dir)
+	require.NoError(t, err)
+	defer g.Close()
+	errDel := g.DeleteBranch("del", git.DeleteBranchOptions{Force: true})
+	t.Logf("DeleteBranch(del) packed: %v", errDel)
+	errRen := g.RenameBranch("ren", "ren-new")
+	t.Logf("RenameBranch(ren, ren-new) packed: %v", errRen)
+	time.Sleep(3 * time.Second)
+	logRefState(t, tc, repo, "refs/heads/del", "refs/heads/ren", "refs/heads/ren-new")
+	require.NoError(t, errDel)
+	require.NoError(t, errRen)
+	vd, _ := n.r.table.Get(repo, "refs/heads/del")
+	assert.True(t, vd.Tombstone, "del deleted")
+	vr, _ := n.r.table.Get(repo, "refs/heads/ren")
+	assert.True(t, vr.Tombstone, "ren renamed away")
+	for _, m := range tc.nodes {
+		require.Eventually(t, func() bool {
+			return gitRef(t, m, repo, "refs/heads/ren-new") == c1 && gitRef(t, m, repo, "refs/heads/ren") == "" && gitRef(t, m, repo, "refs/heads/del") == ""
+		}, 10*time.Second, 20*time.Millisecond, "%s: ren-new held, ren and del gone", m.slot)
+	}
+}
+
 // The same order with a pusher named (production receive-pack), driven
 // through Handle with the lines and order real git 2.54/2.56 emit: the
 // nested 0->0 is answered without a proposal, the deletion is proposed with
@@ -250,5 +292,107 @@ func TestGitGcKeepsTheRefs(t *testing.T) {
 			t.Logf("git on %s after gc: %s = %q", m.slot, ref, got)
 			assert.Equal(t, c1, got, "%s: %s must survive a git gc on %s", m.slot, ref, n.slot)
 		}
+	}
+}
+
+// Forgejo's RenameBranch through the cluster's reference-transaction hook:
+// `git branch -m` wrote the new name without a transaction, which no other
+// member ever saw (#38). Both a loose and a packed ref are renamed.
+func TestRenameBranchReachesEveryMember(t *testing.T) {
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	n := tc.nodes[0]
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	c1 := commit(t, work, "one")
+	zero := strings.Repeat("0", 40)
+	repo := "alice/r1rename.git"
+	for _, b := range []string{"main", "packed"} {
+		require.True(t, tc.pushVia(n, work, repo, "refs/heads/"+b, zero, c1).OK)
+	}
+	dir := filepath.Join(n.r.root, filepath.FromSlash(repo))
+	run(t, dir, "pack-refs", "--all")
+	require.True(t, tc.pushVia(n, work, repo, "refs/heads/loose", zero, c1).OK)
+	for _, m := range tc.nodes {
+		require.Eventually(t, func() bool {
+			return gitRef(t, m, repo, "refs/heads/loose") == c1 && gitRef(t, m, repo, "refs/heads/packed") == c1
+		}, 15*time.Second, 20*time.Millisecond, "%s: precondition, the branches are on every member", m.slot)
+	}
+
+	withGitThroughReplicator(t, n)
+	g, err := git.OpenRepository(context.Background(), dir)
+	require.NoError(t, err)
+	defer g.Close()
+	errLoose := g.RenameBranch("loose", "loose-new")
+	errPacked := g.RenameBranch("packed", "packed-new")
+	t.Logf("RenameBranch loose -> loose-new: err=%v", errLoose)
+	t.Logf("RenameBranch packed -> packed-new: err=%v", errPacked)
+	require.NoError(t, errLoose)
+	require.NoError(t, errPacked)
+
+	// Let the projectors run: the old names must be gone everywhere first.
+	for _, m := range tc.nodes {
+		require.Eventually(t, func() bool { return gitRef(t, m, repo, "refs/heads/loose") == "" }, 15*time.Second, 20*time.Millisecond, "%s: old name gone", m.slot)
+	}
+	time.Sleep(3 * time.Second)
+	for _, m := range tc.nodes {
+		for _, b := range []string{"loose", "loose-new", "packed", "packed-new"} {
+			v, ok := m.r.table.Get(repo, "refs/heads/"+b)
+			t.Logf("%s %-10s table(ok=%v tombstone=%v live=%v) git=%q", m.slot, b, ok, ok && v.Tombstone, ok && v.Live(), gitRef(t, m, repo, "refs/heads/"+b))
+		}
+	}
+	_, inTable := n.r.table.Get(repo, "refs/heads/loose-new")
+	assert.True(t, inTable, "the renamed branch loose-new is not in the replicated table")
+	for _, m := range tc.nodes {
+		assert.Equal(t, c1, gitRef(t, m, repo, "refs/heads/loose-new"), "%s does not hold the renamed branch loose-new", m.slot)
+		assert.Equal(t, c1, gitRef(t, m, repo, "refs/heads/packed-new"), "%s does not hold the renamed branch packed-new", m.slot)
+		assert.Empty(t, gitRef(t, m, repo, "refs/heads/packed"), "%s still holds packed", m.slot)
+	}
+}
+
+// Renaming the default branch, as services/repository.RenameBranch does:
+// RenameBranch, then `git symbolic-ref HEAD refs/heads/<to>`
+// (gitrepo.SetDefaultBranch). Every member serves the renamed branch (#38).
+func TestRenameTheDefaultBranch(t *testing.T) {
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	n := tc.nodes[0]
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	c1 := commit(t, work, "one")
+	zero := strings.Repeat("0", 40)
+	repo := "alice/r1default.git"
+	require.True(t, tc.pushVia(n, work, repo, "refs/heads/main", zero, c1).OK)
+	for _, m := range tc.nodes {
+		require.Eventually(t, func() bool { return gitRef(t, m, repo, "refs/heads/main") == c1 }, 15*time.Second, 20*time.Millisecond)
+	}
+	dir := filepath.Join(n.r.root, filepath.FromSlash(repo))
+
+	withGitThroughReplicator(t, n)
+	ctx := context.Background()
+	g, err := git.OpenRepository(ctx, dir)
+	require.NoError(t, err)
+	defer g.Close()
+	require.NoError(t, g.RenameBranch("main", "trunk"))
+	_, _, err = git.NewCommand(ctx, "symbolic-ref", "HEAD").AddDynamicArguments(git.BranchPrefix + "trunk").RunStdString(&git.RunOpts{Dir: dir})
+	require.NoError(t, err)
+
+	for _, m := range tc.nodes {
+		require.Eventually(t, func() bool {
+			v, ok := m.r.table.Get(repo, "HEAD")
+			return ok && v.Symbolic == "refs/heads/trunk"
+		}, 15*time.Second, 20*time.Millisecond, "%s: HEAD -> trunk in the table", m.slot)
+	}
+	time.Sleep(3 * time.Second)
+	for _, m := range tc.nodes {
+		mdir := filepath.Join(m.r.root, filepath.FromSlash(repo))
+		cmd := exec.Command("git", "rev-parse", "--verify", "-q", "HEAD")
+		cmd.Dir = mdir
+		out, rerr := cmd.CombinedOutput()
+		head := exec.Command("git", "symbolic-ref", "-q", "HEAD")
+		head.Dir = mdir
+		hout, _ := head.CombinedOutput()
+		t.Logf("%s HEAD->%s rev-parse HEAD=%q err=%v main=%q trunk=%q", m.slot, strings.TrimSpace(string(hout)), strings.TrimSpace(string(out)), rerr, gitRef(t, m, repo, "refs/heads/main"), gitRef(t, m, repo, "refs/heads/trunk"))
+	}
+	for _, m := range tc.nodes {
+		assert.Equal(t, c1, gitRef(t, m, repo, "refs/heads/trunk"), "%s: HEAD names trunk, which this member does not hold (the repository looks empty)", m.slot)
 	}
 }

@@ -13,7 +13,9 @@ import (
 	"io"
 	"strings"
 
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/log"
+	"forgejo.org/modules/setting"
 )
 
 // BranchPrefix base dir of the branch information file store on git
@@ -153,7 +155,40 @@ func (branch *Branch) GetCommit() (*Commit, error) {
 
 // RenameBranch rename a branch
 func (repo *Repository) RenameBranch(from, to string) error {
+	if setting.Cluster.Enabled || clusterhook.Enabled() {
+		return repo.renameBranchInOneTransaction(from, to)
+	}
 	_, _, err := NewCommand(repo.Ctx, "branch", "-m").AddDynamicArguments(from, to).RunStdString(&RunOpts{Dir: repo.Path})
+	return err
+}
+
+// renameBranchInOneTransaction renames a branch as one ref transaction:
+// the new name created and the old one deleted, each checked against the
+// branch's value. A node of a cluster learns a ref only from the
+// reference-transaction hook, and `git branch -m` writes the new name
+// outside any transaction: the cluster saw the old branch deleted and never
+// the new one, which then lived on this node alone (#38). HEAD, when it
+// named the old branch, follows as with `git branch -m`, in a transaction
+// of its own: git refuses HEAD and its referent in one.
+func (repo *Repository) renameBranchInOneTransaction(from, to string) error {
+	// A ref name holds no whitespace nor control character: none may reach
+	// update-ref's command stream either.
+	if strings.ContainsFunc(from+to, func(r rune) bool { return r <= ' ' || r == 0x7f }) {
+		return fmt.Errorf("invalid branch name %q or %q", from, to)
+	}
+	sha, _, err := NewCommand(repo.Ctx, "rev-parse", "--verify", "--end-of-options").AddDynamicArguments(BranchPrefix + from).RunStdString(&RunOpts{Dir: repo.Path})
+	if err != nil {
+		return err
+	}
+	sha = strings.TrimSpace(sha)
+	head, _, headErr := NewCommand(repo.Ctx, "symbolic-ref", "-q", "HEAD").RunStdString(&RunOpts{Dir: repo.Path})
+	stdin := fmt.Sprintf("create %s%s %s\ndelete %s%s %s\n", BranchPrefix, to, sha, BranchPrefix, from, sha)
+	if _, _, err := NewCommand(repo.Ctx, "update-ref", "--stdin").RunStdString(&RunOpts{Dir: repo.Path, Stdin: strings.NewReader(stdin)}); err != nil {
+		return err
+	}
+	if headErr == nil && strings.TrimSpace(head) == BranchPrefix+from {
+		_, _, err = NewCommand(repo.Ctx, "symbolic-ref", "HEAD").AddDynamicArguments(BranchPrefix + to).RunStdString(&RunOpts{Dir: repo.Path})
+	}
 	return err
 }
 
