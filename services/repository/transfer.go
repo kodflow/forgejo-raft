@@ -81,6 +81,11 @@ func transferOwnership(ctx context.Context, doer *user_model.User, newOwnerName 
 		if err == nil && recoverErr == nil {
 			return
 		}
+		if recoverErr == nil && !clusterRenamed && clusterhook.IsOutcomeUnresolved(err) {
+			// The members may follow the transfer: the directories stay.
+			log.Critical("Transferring repository %s/%s to %s: %v; the directories stay under the new owner, run `forgejo cluster reconcile`", oldOwnerName, repo.Name, newOwnerName, err)
+			return
+		}
 
 		// The cluster already moved the keys: move them back first, or
 		// every member would keep the repository under its new owner while
@@ -344,6 +349,11 @@ func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newR
 	// In a cluster, the move is replicated before it is committed, and undone
 	// here when the other members cannot follow.
 	if err := clusterhook.RepoRenamed(ctx, repo.Owner.Name, oldRepoName, repo.Owner.Name, newRepoName); err != nil {
+		if clusterhook.IsOutcomeUnresolved(err) {
+			// The members may follow the rename: the directories stay.
+			log.Critical("Renaming repository %s to %s: %v; the directories stay under the new name, run `forgejo cluster reconcile`", repo.RepoPath(), newRepoPath, err)
+			return fmt.Errorf("rename repository in the cluster: %w", err)
+		}
 		if rerr := util.Rename(newRepoPath, repo.RepoPath()); rerr != nil {
 			log.Critical("Unable to move repository %s back after a refused cluster rename: %v", newRepoPath, rerr)
 		}

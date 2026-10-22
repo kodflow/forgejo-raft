@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -50,8 +51,10 @@ type consumer struct {
 	// cursor and advance are the SQL side; tests replace them.
 	cursor  func(ctx context.Context, name string) (*cluster_model.Cursor, error)
 	advance func(ctx context.Context, name string, prev, next cluster_model.Cursor) error
-	// tx runs f in one SQL transaction; tests replace it.
-	tx func(ctx context.Context, f func(ctx context.Context) error) error
+	// tx runs f in one SQL transaction; tests replace it. inTx reports
+	// whether that transaction is still open, nil when tx is not SQL's.
+	tx   func(ctx context.Context, f func(ctx context.Context) error) error
+	inTx func(ctx context.Context) bool
 	// events, projectedAt and lineageNow read the table and the projector;
 	// ack proposes a trim. Tests replace them.
 	events      func() []reftable.Event
@@ -93,6 +96,9 @@ type consumer struct {
 	// backupLag is how far the backup cursor lags the dispatch cursor when
 	// that lag is beyond backupMaxLag and holds the trim; 0 otherwise.
 	backupLag uint64
+	// stalledOut holds the repositories whose event was parked for want of
+	// projection, until one of their events is projected.
+	stalledOut map[string]bool
 	// stall is the head event waiting for its repository's projection.
 	stall struct {
 		index uint64
@@ -128,7 +134,7 @@ func newConsumer(r *Replicator) *consumer {
 			return pushWorkWith(ctx, evs, r.table)
 		},
 		dbReady: func() bool { return db.DefaultContext != nil },
-		cursor:  cluster_model.GetCursor, advance: cluster_model.AdvanceCursor, tx: db.WithTx,
+		cursor:  cluster_model.GetCursor, advance: cluster_model.AdvanceCursor, tx: batchTx, inTx: db.InTransaction,
 		events:      r.table.Events,
 		projectedAt: r.projector.Projected,
 		lineageNow: func() string {
@@ -139,6 +145,7 @@ func newConsumer(r *Replicator) *consumer {
 		park:    cluster_model.ParkEvents, hasParked: cluster_model.RepoHasParked, minParked: cluster_model.MinParkedIndex,
 		listParked: cluster_model.ListParked, unpark: cluster_model.UnparkEntry, noteParked: cluster_model.NoteParkedFailure,
 		lastAck: map[string]uint64{}, failures: map[uint64]int{}, reasons: map[uint64]string{}, seen: map[string]int64{},
+		stalledOut: map[string]bool{},
 	}
 	c.ack = func(ctx context.Context, lineage string, index uint64) error {
 		data, err := reftable.Encode(reftable.KindAck, &reftable.Ack{Identity: lineage, Index: index})
@@ -153,6 +160,40 @@ func newConsumer(r *Replicator) *consumer {
 
 func cursorName(lineage string) string { return "dispatch@" + lineage }
 
+// batchTx is the transaction of a batch: a transaction nested in its work
+// runs in a savepoint, so a nested failure the work logs and swallows
+// rolls back that statement alone, never the batch before it nor the
+// cursor after it (#104).
+func batchTx(ctx context.Context, f func(ctx context.Context) error) error {
+	return db.WithTx(db.WithNestedSavepoints(ctx), f)
+}
+
+// errBatchTxEnded is the work of a batch that ended its transaction: what
+// it wrote before is rolled back, what follows would commit statement by
+// statement, so nothing may advance past it.
+var errBatchTxEnded = errors.New("the batch transaction ended inside the work")
+
+// stillInTx refuses to go on once the work ended the batch's transaction.
+func (c *consumer) stillInTx(ctx context.Context) error {
+	if c.inTx != nil && !c.inTx(ctx) {
+		return errBatchTxEnded
+	}
+	return nil
+}
+
+// forget drops what the consumer remembers of the table's events, for a
+// node whose table is emptied to rejoin under a new id (#41).
+func (c *consumer) forget() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastAck = map[string]uint64{}
+	c.seen = map[string]int64{}
+	c.failures = map[uint64]int{}
+	c.reasons = map[uint64]string{}
+	c.stalledOut = map[string]bool{}
+	c.stall.index, c.stall.repo = 0, ""
+}
+
 // projected reports whether the events of one entry are projected on this
 // node. When the head entry has waited longer than projectionStallBound,
 // its events are let through marked as failed, so dispatch parks them and
@@ -165,12 +206,23 @@ func (c *consumer) projected(evs []reftable.Event) bool {
 			break
 		}
 	}
-	if waiting == "" {
-		return true
-	}
 	idx := evs[0].Token.Index
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if waiting == "" {
+		for _, ev := range evs {
+			delete(c.stalledOut, ev.Repo)
+		}
+		return true
+	}
+	if c.stalledOut[waiting] {
+		// The bound is the repository's, not each event's: the later
+		// events of a repository whose head event was parked unprojected
+		// are parked at once, not after a bound each (#45).
+		c.failures[idx] = maxAttempts
+		c.reasons[idx] = fmt.Sprintf("%s is still not projected; parked behind its stalled event", waiting)
+		return true
+	}
 	if c.stall.index != idx || c.stall.repo != waiting {
 		c.stall.index, c.stall.repo, c.stall.since = idx, waiting, time.Now()
 		return false
@@ -181,6 +233,10 @@ func (c *consumer) projected(evs []reftable.Event) bool {
 	log.Error("cluster consumer: %s is still not projected at %d after %s; parking its event", waiting, idx, projectionStallBound)
 	c.failures[idx] = maxAttempts
 	c.reasons[idx] = fmt.Sprintf("not projected after %s", projectionStallBound)
+	if c.stalledOut == nil {
+		c.stalledOut = map[string]bool{}
+	}
+	c.stalledOut[waiting] = true
 	return true
 }
 
@@ -342,7 +398,9 @@ func (c *consumer) pass(ctx context.Context) error {
 			n = end
 		}
 		if n == 0 {
-			return nil // the projector has not caught up; the next pass retries
+			// The projector has not caught up; the next pass retries. The
+			// parked events and the trim do not wait for it (#45).
+			break
 		}
 		c.clearStall()
 		batch := pending[:n]
@@ -396,7 +454,10 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 			// One group per pusher too: the work attributes its branch rows to
 			// the group's first pusher, and a group parked after maxAttempts
 			// must not take another user's push down with it.
-			if i < len(batch) && batch[i].Repo == batch[start].Repo && batch[i].Kind == batch[start].Kind &&
+			// And one group per entry: two pushes of a ref grouped together
+			// insert its new branch or tag twice, and a creation and its
+			// deletion fail on the row the creation never wrote (#76, #44).
+			if i < len(batch) && batch[i].Token == batch[start].Token && batch[i].Repo == batch[start].Repo && batch[i].Kind == batch[start].Kind &&
 				batch[i].Trigger == batch[start].Trigger && batch[i].PusherID == batch[start].PusherID {
 				continue
 			}
@@ -430,7 +491,11 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 				parked += len(group)
 				continue
 			}
-			if err := c.work(ctx, group); err != nil {
+			err := c.work(ctx, group)
+			if err == nil {
+				err = c.stillInTx(ctx)
+			}
+			if err != nil {
 				c.mu.Lock()
 				c.failures[idx]++
 				attempts = c.failures[idx]
@@ -439,14 +504,19 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 				return fmt.Errorf("event %s at %d: %w (attempt %d)", group[0].Repo, idx, err, attempts)
 			}
 		}
+		if err := c.stillInTx(ctx); err != nil {
+			return err
+		}
 		return c.advance(ctx, cursorName(lineage), *cur, next)
 	})
 	if err != nil {
 		if errors.Is(err, cluster_model.ErrCursorMoved) {
 			return nil // another dispatcher moved it; its work stands, ours rolled back
 		}
-		dispatchFailuresTotal.Inc()
-		return err
+		if !c.committedAnyway(ctx, lineage, next, err) {
+			dispatchFailuresTotal.Inc()
+			return err
+		}
 	}
 	effects.Run()
 	dispatchedTotal.Add(float64(len(batch) - parked))
@@ -462,6 +532,44 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 	}
 	c.mu.Unlock()
 	return nil
+}
+
+// committedAnyway tells a batch whose COMMIT failed with an unknown
+// outcome (the connection cut after the database committed it, a
+// synchronous standby's wait ended by a failover) from one that rolled
+// back: the cursor is read again on a new connection, and a cursor at
+// next means the work committed, so its effects run once, here, since no
+// replay will collect them again (#103).
+func (c *consumer) committedAnyway(ctx context.Context, lineage string, next cluster_model.Cursor, cause error) bool {
+	if c.cursor == nil {
+		return false
+	}
+	cur, err := c.cursor(ctx, cursorName(lineage))
+	if err != nil || cur.Lineage != next.Lineage || cur.Position != next.Position {
+		return false
+	}
+	log.Warn("cluster consumer: the commit of the batch up to %d of %s returned %v, but the cursor reads %d: it committed, its effects run", next.Position, lineage, cause, next.Position)
+	return true
+}
+
+// parkedGone tells a retried parked entry whose COMMIT failed with an
+// unknown outcome from one that rolled back: its rows are gone only if the
+// transaction that removed them, with the work, committed (#103).
+func (c *consumer) parkedGone(ctx context.Context, lineage string, index int64, cause error) bool {
+	if c.listParked == nil {
+		return false
+	}
+	rows, err := c.listParked(ctx)
+	if err != nil {
+		return false
+	}
+	for _, row := range rows {
+		if row.Lineage == lineage && row.LogIndex == index {
+			return false
+		}
+	}
+	log.Warn("cluster consumer: the commit of the parked entry %d of %s returned %v, but its rows are gone: it committed, its effects run", index, lineage, cause)
+	return true
 }
 
 // parkGroup writes the parked rows of a group, in the dispatch's
@@ -536,12 +644,18 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 			if err := c.work(ctx, evs); err != nil {
 				return err
 			}
+			if err := c.stillInTx(ctx); err != nil {
+				return err
+			}
 			// Another retrier that applied the entry first removed its
 			// rows: this transaction, work included, rolls back.
 			return c.unpark(ctx, lineage, index, len(entry))
 		})
 		if errors.Is(err, cluster_model.ErrParkedGone) {
 			continue
+		}
+		if err != nil && c.parkedGone(ctx, lineage, index, err) {
+			err = nil
 		}
 		if err != nil {
 			blocked[repo] = true
@@ -702,7 +816,7 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 	}
 	repo, err := lookupRepo(ctx, first)
 	if err != nil {
-		if repo_model.IsErrRepoNotExist(err) && deletedAfter(tbl, first) {
+		if repo_model.IsErrRepoNotExist(err) && (deletedAfter(tbl, first) || idSuperseded(ctx, tbl, first)) {
 			// The repository was deleted after the push: its rows are gone
 			// with it, and the work has nothing left to land on. Kept, it
 			// would fail at every retry, parked for good, and hold back
@@ -719,11 +833,32 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		// out again. Its branch rows, webhooks and CI must not land there.
 		return fmt.Errorf("repository ID %d is %s/%s, which the event's %s does not lead to: the ID was reused; run `forgejo cluster reconcile`", first.RepoID, repo.OwnerName, repo.Name, first.Repo)
 	}
-	if u, err := user_model.GetUserByID(ctx, first.PusherID); err == nil && pusherReissued(ctx, u, first) {
+	u, err := user_model.GetUserByID(ctx, first.PusherID)
+	if err == nil && pusherReissued(ctx, u, first) {
 		// The same loss reissues user IDs: another account now holds the
 		// pusher's ID, and must not be credited with the push.
 		return fmt.Errorf("pusher ID %d is %s, not the account that pushed at %d: the ID was reused; run `forgejo cluster reconcile`", first.PusherID, u.Name, first.Token.Index)
 	}
+	// A pusher whose account was deleted since: the branch rows are still
+	// written, but the notifications that need the account are not, as
+	// upstream Forgejo drops that work. Retried, it would fail for good,
+	// parked, and hold back the trim of the whole queue (#95).
+	pusherGone := first.PusherID > 0 && user_model.IsErrUserNotExist(err)
+	var gitRepo *git.Repository
+	openGit := func() (*git.Repository, error) {
+		if gitRepo == nil {
+			var err error
+			if gitRepo, err = gitrepo.OpenRepository(ctx, repo); err != nil {
+				return nil, err
+			}
+		}
+		return gitRepo, nil
+	}
+	defer func() {
+		if gitRepo != nil {
+			gitRepo.Close()
+		}
+	}()
 	var updates []*repo_module.PushUpdateOptions
 	var branches []string
 	for _, ev := range evs {
@@ -749,32 +884,68 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		if opt.IsNewRef() && opt.IsDelRef() {
 			continue
 		}
+		if ref.IsTag() {
+			gone, err := tagGone(ctx, repo, opt, openGit)
+			if err != nil {
+				return err
+			}
+			if gone {
+				// Created then deleted before this work ran: there is no
+				// tag to describe, or no release row to remove, and the
+				// work would fail at every retry, parked for good (#44).
+				log.Info("cluster consumer: the tag %s of %s at %d is gone; its post-receive work is dropped", ref.TagName(), first.Repo, ev.Token.Index)
+				continue
+			}
+		}
 		updates = append(updates, opt)
 		if ref.IsBranch() {
 			if opt.IsDelRef() {
-				if err := git_model.AddDeletedBranch(ctx, repo.ID, ref.BranchName(), ev.PusherID); err != nil {
+				// A branch whose creation was never written in SQL (created
+				// and deleted before its work ran) has nothing to mark
+				// deleted (#44).
+				if err := git_model.AddDeletedBranch(ctx, repo.ID, ref.BranchName(), ev.PusherID); err != nil && !git_model.IsErrBranchNotExist(err) {
 					return err
 				}
-			} else {
+			} else if !slices.Contains(branches, ref.BranchName()) {
 				branches = append(branches, ref.BranchName())
 			}
 		}
 	}
 	if len(branches) > 0 {
-		gitRepo, err := gitrepo.OpenRepository(ctx, repo)
+		gitRepo, err := openGit()
 		if err != nil {
 			return err
 		}
-		err = repo_service.SyncBranchesToDB(ctx, repo.ID, first.PusherID, branches, gitRepo.GetBranchCommit)
-		gitRepo.Close()
-		if err != nil {
+		if err := repo_service.SyncBranchesToDB(ctx, repo.ID, first.PusherID, branches, gitRepo.GetBranchCommit); err != nil {
 			return err
 		}
 	}
 	if len(updates) == 0 {
 		return nil
 	}
+	if pusherGone {
+		log.Warn("cluster consumer: the pusher %d of %s at %d is gone; the notifications of its push are dropped", first.PusherID, first.Repo, first.Token.Index)
+		return nil
+	}
 	return repo_service.PushUpdatesNow(clusterhook.WithCommand(ctx, first.Token.String()), updates)
+}
+
+// tagGone reports whether a tag update has nothing left to land on: a new
+// tag git no longer holds, or a deleted tag without a release row.
+func tagGone(ctx context.Context, repo *repo_model.Repository, opt *repo_module.PushUpdateOptions, openGit func() (*git.Repository, error)) (bool, error) {
+	name := opt.RefFullName.TagName()
+	if opt.IsDelRef() {
+		_, err := repo_model.GetRelease(ctx, repo.ID, name)
+		if repo_model.IsErrReleaseNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	gitRepo, err := openGit()
+	if err != nil {
+		return false, err
+	}
+	return !gitRepo.IsTagExist(name), nil
 }
 
 // pusherClockSkew bounds the clock difference between the node that
@@ -844,6 +1015,32 @@ func deletedAfter(tbl lifecycleTable, ev reftable.Event) bool {
 		key, at = to, idx
 	}
 	return false
+}
+
+// idSuperseded reports whether the repository an event's ID names is gone
+// for good: the key it leads to, following the table's renames forward,
+// is now held by a row with another ID. A repository deleted and created
+// again under its name clears the table's deletion mark at its first
+// write, so deletedAfter no longer sees it (#78). IDs are not handed out
+// again short of a database loss, which eventLeadsTo reports.
+func idSuperseded(ctx context.Context, tbl lifecycleTable, ev reftable.Event) bool {
+	if ev.RepoID <= 0 {
+		return false
+	}
+	key, at := ev.Repo, ev.Token.Index
+	for range 64 {
+		if tbl == nil {
+			break
+		}
+		to, idx, ok := tbl.RenamedAfter(key, at)
+		if !ok {
+			break
+		}
+		key, at = to, idx
+	}
+	owner, name, _ := strings.Cut(strings.TrimSuffix(key, ".git"), "/")
+	r, err := repo_model.GetRepositoryByOwnerAndName(ctx, owner, name)
+	return err == nil && r.ID != ev.RepoID
 }
 
 func lookupRepo(ctx context.Context, ev reftable.Event) (*repo_model.Repository, error) {

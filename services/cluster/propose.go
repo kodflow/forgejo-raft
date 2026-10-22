@@ -665,9 +665,27 @@ func (r *Replicator) proposeLifecycle(ctx context.Context, kind reftable.Kind, b
 			return fmt.Errorf("the cluster did not record it: %w", err)
 		}
 	}
+	// The caller already moved or removed the directories: a request that
+	// ends, its client gone, must not leave the outcome open (#46).
+	// Its deadline still bounds the proposal.
+	detached := context.WithoutCancel(ctx)
+	pctx := detached
+	if dl, ok := ctx.Deadline(); ok {
+		var cancel context.CancelFunc
+		pctx, cancel = context.WithDeadline(detached, dl)
+		defer cancel()
+	}
 	r.fence.RLock()
-	_, result, err := r.proposeCommand(ctx, data, landed)
+	_, result, err := r.proposeCommand(pctx, data, landed)
 	r.fence.RUnlock()
+	if clusterhook.IsOutcomeUnresolved(err) && landed != nil {
+		if ok, rerr := r.resolveLanded(detached, landed); rerr == nil {
+			if !ok {
+				return fmt.Errorf("the cluster did not record it: not applied at a commit boundary after %w", err)
+			}
+			result, err = reftable.Result{OK: true}, nil
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("the cluster did not record it: %w", err)
 	}
@@ -676,6 +694,22 @@ func (r *Replicator) proposeLifecycle(ctx context.Context, kind reftable.Kind, b
 	}
 	r.signalConsumer()
 	return nil
+}
+
+// lifecycleResolveBudget bounds how long a lifecycle command whose outcome
+// stayed unknown is resolved, a commit boundary at a time, before its
+// caller is told ErrOutcomeUnresolved.
+var lifecycleResolveBudget = clusterhook.DefaultTimeout
+
+// resolveLanded applies a commit boundary confirmed by a quorum and then
+// asks landed, within lifecycleResolveBudget.
+func (r *Replicator) resolveLanded(ctx context.Context, landed func() bool) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, lifecycleResolveBudget)
+	defer cancel()
+	if _, err := r.confirm(ctx); err != nil {
+		return false, err
+	}
+	return landed(), nil
 }
 
 // proposeOwnerRename moves every repository the table holds under an owner
@@ -760,7 +794,7 @@ func (r *Replicator) proposeCommand(ctx context.Context, data []byte, landed fun
 			maybeCommitted = true
 			ctok, cerr := r.confirm(ctx)
 			if cerr != nil {
-				return tok, reftable.Result{}, fmt.Errorf("%w (unresolved: %v)", err, cerr)
+				return tok, reftable.Result{}, fmt.Errorf("%w: %w (unresolved: %v)", clusterhook.ErrOutcomeUnresolved, err, cerr)
 			}
 			if landed != nil && landed() {
 				return ctok, reftable.Result{OK: true}, nil

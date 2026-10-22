@@ -208,6 +208,12 @@ func (t *Table) OnChange(f func(Change)) {
 // Result; a payload this code does not know stops the node by panicking,
 // because skipping an entry forks the replica (D18).
 func (t *Table) Apply(e consensus.Entry) any {
+	if t.replayed(e) {
+		// An entry of this lineage at or below the applied index is a
+		// replay: applying it again on the table that already holds it
+		// diverges, a deletion or a rename being unconditional (#41).
+		return refuse("entry %d is already applied", e.Index)
+	}
 	kind, body, err := decode(e.Data)
 	var version uint8
 	if len(e.Data) > 0 {
@@ -263,6 +269,32 @@ func (t *Table) Apply(e consensus.Entry) any {
 	}
 	t.mu.Unlock()
 	return res
+}
+
+// replayed reports whether e belongs to the lineage the table applied and
+// lies at or below its applied index.
+func (t *Table) replayed(e consensus.Entry) bool {
+	if e.Token.IsZero() {
+		return false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.applied.Index > 0 && e.Index <= t.applied.Index && e.Token.Identity() == t.identity
+}
+
+// Reset empties the table, before a node that rejoins under a new id opens
+// an engine that replays the log from its start (#41). The projector is
+// not told: it is fenced until the new engine applied a barrier.
+func (t *Table) Reset() {
+	nt := New()
+	t.mu.Lock()
+	t.repos, t.root, t.events, t.eventBytes = nt.repos, nt.root, nil, 0
+	t.audit, t.deleted, t.renamed, t.grants, t.revoked = nil, nt.deleted, nt.renamed, nt.grants, nt.revoked
+	t.pendingRevoke = nt.pendingRevoke
+	t.applied, t.identity = consensus.Position{}, consensus.LogIdentity{}
+	t.pending, t.checkpoints = nil, nil
+	t.payload, t.nonces, t.byNonce = 0, nil, nt.byNonce
+	t.mu.Unlock()
 }
 
 func (t *Table) repo(key string) *repoState {

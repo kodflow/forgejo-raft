@@ -69,6 +69,17 @@ func TestPushWorkOfADeletedRepositoryIsDone(t *testing.T) {
 	applyAt(t, tbl, 8, reftable.KindRefTxn, &reftable.RefTxn{Repo: "new/d.git", RepoID: 99999, Format: "sha1", PusherID: 2, Updates: []reftable.RefUpdate{{Ref: "refs/heads/main", New: sha, ExpectRev: 2}}})
 	require.Error(t, pushWorkWith(ctx, []reftable.Event{ev("new/d.git", 8)}, tbl))
 
+	// Deleted, then created again under the same name, a new ID whose row
+	// committed: the new repository's first write cleared the deletion
+	// mark, and the event's ID is gone for good (#78,
+	// TestHuntR4ProveRecreateDropsDeadEvent). user2/repo1 is the new row.
+	applyAt(t, tbl, 9, reftable.KindRefTxn, push("user2/repo1.git"))
+	applyAt(t, tbl, 10, reftable.KindRepoDelete, &reftable.RepoDelete{Repo: "user2/repo1.git", RepoID: 99999})
+	applyAt(t, tbl, 11, reftable.KindRefTxn, &reftable.RefTxn{Repo: "user2/repo1.git", RepoID: 1, Format: "sha1", PusherID: 2, Updates: []reftable.RefUpdate{{Ref: "refs/heads/main", New: sha, ExpectRev: 2}}})
+	_, deleted := tbl.Deleted("user2/repo1.git")
+	require.False(t, deleted, "the recreation cleared the mark")
+	require.NoError(t, pushWorkWith(ctx, []reftable.Event{ev("user2/repo1.git", 9)}, tbl))
+
 	// Without the table nothing is known: the work keeps failing.
 	require.Error(t, pushWork(ctx, []reftable.Event{ev("gone/a.git", 1)}))
 }

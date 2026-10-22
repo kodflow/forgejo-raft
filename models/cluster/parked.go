@@ -58,10 +58,12 @@ func RepoHasParked(ctx context.Context, repo string) (bool, error) {
 	return db.GetEngine(ctx).Where("repo = ?", repo).Exist(new(ParkedEvent))
 }
 
-// ListParked returns every parked event, by lineage, index and place.
+// ListParked returns every parked event, oldest first: in the order they
+// were parked, which is the log's, across lineages too. A lineage is a
+// random cluster id and an epoch in text, whose order says nothing (#101).
 func ListParked(ctx context.Context) ([]*ParkedEvent, error) {
 	var out []*ParkedEvent
-	err := db.GetEngine(ctx).OrderBy("lineage, log_index, seq").Find(&out)
+	err := db.GetEngine(ctx).OrderBy("id").Find(&out)
 	return out, err
 }
 

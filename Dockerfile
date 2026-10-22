@@ -97,8 +97,9 @@ RUN addgroup \
   echo "git:*" | chpasswd -e
 
 RUN mkdir \
-  -p /run/forgejo && \
-  chown git:git /run/forgejo
+  -p /run/forgejo /run/kitsunium-consensus && \
+  chown git:git /run/forgejo /run/kitsunium-consensus && \
+  chmod 0700 /run/kitsunium-consensus
 
 ENV USER=git
 ENV GITEA_CUSTOM=/data/gitea

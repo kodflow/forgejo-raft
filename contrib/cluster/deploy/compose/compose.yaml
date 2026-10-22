@@ -27,6 +27,10 @@ x-node: &node
   build:
     context: ../../../..
     target: forgejo
+  # Each node also mounts the host's /run/kitsunium-consensus, a tmpfs
+  # emptied at boot, where a consensus node that stopped on a storage
+  # failure leaves the marker that refuses its restart in the same boot.
+  # After a STORAGE_FAILED, reboot the machine, never only the container.
   restart: unless-stopped
   depends_on:
     postgres:
@@ -125,7 +129,7 @@ services:
       FORGEJO__cluster__LISTEN_ADDR: node-a:7480
       FORGEJO__server__ROOT_URL: http://localhost:${NODE_A_PORT:-3001}/
     ports: ["127.0.0.1:${NODE_A_PORT:-3001}:3000"]
-    volumes: [node-a:/data]
+    volumes: [node-a:/data, /run/kitsunium-consensus:/run/kitsunium-consensus]
 
   node-b:
     <<: *node
@@ -140,7 +144,7 @@ services:
       FORGEJO__cluster__LISTEN_ADDR: node-b:7480
       FORGEJO__server__ROOT_URL: http://localhost:${NODE_B_PORT:-3002}/
     ports: ["127.0.0.1:${NODE_B_PORT:-3002}:3000"]
-    volumes: [node-b:/data]
+    volumes: [node-b:/data, /run/kitsunium-consensus:/run/kitsunium-consensus]
 
   node-c:
     <<: *node
@@ -154,7 +158,7 @@ services:
       FORGEJO__cluster__LISTEN_ADDR: node-c:7480
       FORGEJO__server__ROOT_URL: http://localhost:${NODE_C_PORT:-3003}/
     ports: ["127.0.0.1:${NODE_C_PORT:-3003}:3000"]
-    volumes: [node-c:/data]
+    volumes: [node-c:/data, /run/kitsunium-consensus:/run/kitsunium-consensus]
 
 volumes:
   postgres:

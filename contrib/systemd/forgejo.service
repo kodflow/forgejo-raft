@@ -56,9 +56,16 @@ Type=notify
 User=git
 Group=git
 WorkingDirectory=/var/lib/forgejo/
-RuntimeDirectory=forgejo
+RuntimeDirectory=forgejo kitsunium-consensus
+# In a cluster ([cluster] ENABLED), /run/kitsunium-consensus holds the
+# boot-scoped STORAGE_FAILED marker of the consensus node: it outlives a
+# restart of the service and goes with a reboot.
+RuntimeDirectoryPreserve=yes
 ExecStart=/usr/local/bin/forgejo web --config /etc/forgejo/app.ini
 Restart=always
+# The exit codes of a consensus node that stopped itself: an operator
+# clears the stop, and after a STORAGE_FAILED reboots the machine.
+RestartPreventExitStatus=65 69 73 74 76
 Environment=USER=git HOME=/home/git FORGEJO_WORK_DIR=/var/lib/forgejo
 # If you install Git to directory prefix other than default PATH (which happens
 # for example if you install other versions of Git side-to-side with

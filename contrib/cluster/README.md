@@ -29,6 +29,18 @@ derive in it is written by a single consumer, on the leader.
   a HEAD line for a push to the default branch, which the cluster refuses.
   The standalone release binaries run with the distribution's git (2.39 on
   Debian 12, 2.43 on Ubuntu 24.04): upgrade it first.
+- `/run/kitsunium-consensus`, a directory on the machine's tmpfs, emptied at
+  each boot, writable by the user Forgejo runs as, and kept across restarts
+  of Forgejo: the consensus node writes its boot-scoped `STORAGE_FAILED`
+  marker there, the second line of defence when the marker in `DATA_DIR`
+  cannot be written. The systemd unit (`RuntimeDirectory=` with
+  `RuntimeDirectoryPreserve=yes`), the Nomad job (a host volume), the
+  Kubernetes StatefulSet (a `hostPath`) and the Compose file (a bind mount)
+  provide it. A consensus node that stops itself ends Forgejo with its exit
+  code (65, 69, 73, 74 or 76): do not restart Forgejo on those codes
+  (`RestartPreventExitStatus=`), an operator clears the stop. After a
+  `STORAGE_FAILED`, reboot the MACHINE, never only the service: a restart in
+  the same boot can read back pages a failed `fsync` left behind.
 
 ## PostgreSQL durability (REQUIRED)
 
@@ -117,7 +129,7 @@ entries": take a checkpoint.
 | `TLS_CERT_FILE` | none, required | The node's certificate. It may hold the key too. |
 | `TLS_KEY_FILE` | `TLS_CERT_FILE` | The node's key. |
 | `TLS_CA_FILE` | none, required | The cluster's CA. |
-| `DATA_DIR` | `<APP_DATA_PATH>/cluster` | The log and snapshots, never on a tmpfs. |
+| `DATA_DIR` | `<APP_DATA_PATH>/cluster` | The log and snapshots, never on a tmpfs, and never restored from a backup: a restored directory comes back under the same id and incarnation with a log that went back, and an acknowledged write is lost. A lost directory is replaced by an empty one, which joins under a new id, or by `forgejo cluster restore`. `forgejo dump` leaves it out. |
 | `HOOK_SOCKET` | `<APP_DATA_PATH>/cluster-run/hook.sock` | The private socket of the git hooks and of `forgejo cluster`. 103 bytes at most. |
 | `OPERATORS` | empty | Bootstrap only: these site administrators get the operator permission while nobody holds it. |
 | `STEP_UP_MAX_AGE` | `5m` | How long a re-authentication allows further operations. |

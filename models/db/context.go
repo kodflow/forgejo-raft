@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync/atomic"
 
 	"code.forgejo.org/xorm/xorm"
 	"xorm.io/builder"
@@ -195,6 +196,9 @@ func WithTxOpts(parentCtx context.Context, config *TransactionConfig, f func(ctx
 			return errors.New("unsupported operation: attempted to use WithTxOpts with a non-nil config in a transaction")
 		}
 
+		if parentCtx.Value(savepointsContextKey) != nil {
+			return withSavepoint(parentCtx, sess, f)
+		}
 		txCtx := newContext(parentCtx, sess, true)
 		err := f(txCtx)
 		if err != nil {
@@ -235,6 +239,53 @@ func WithTxOpts(parentCtx context.Context, config *TransactionConfig, f func(ctx
 		hook()
 	}
 
+	return nil
+}
+
+type savepointsKey struct{}
+
+var (
+	savepointsContextKey = savepointsKey{}
+	savepointSeq         atomic.Uint64
+)
+
+// WithNestedSavepoints marks ctx so that a WithTx nested in the transaction
+// opened under it runs in a SAVEPOINT: its failure rolls back to the
+// savepoint and leaves the outer transaction open, instead of closing the
+// session, which rolls back everything before it and runs every later
+// statement in autocommit. A caller that swallows the nested error then
+// still commits its own work atomically.
+func WithNestedSavepoints(ctx context.Context) context.Context {
+	return context.WithValue(ctx, savepointsContextKey, true)
+}
+
+// withSavepoint runs f in a savepoint of the transaction sess holds.
+func withSavepoint(parentCtx context.Context, sess *xorm.Session, f func(ctx context.Context) error) error {
+	name := fmt.Sprintf("forgejo_nested_%d", savepointSeq.Add(1))
+	if _, err := sess.Exec("SAVEPOINT " + name); err != nil {
+		_ = sess.Close()
+		return fmt.Errorf("opening a savepoint: %w", err)
+	}
+	txCtx := newContext(parentCtx, sess, true)
+	if err := f(txCtx); err != nil {
+		// The hooks of the rolled-back work are discarded with it.
+		if _, rerr := sess.Exec("ROLLBACK TO SAVEPOINT " + name); rerr != nil {
+			_ = sess.Close()
+			return errors.Join(err, fmt.Errorf("rolling back to a savepoint: %w", rerr))
+		}
+		if _, rerr := sess.Exec("RELEASE SAVEPOINT " + name); rerr != nil {
+			_ = sess.Close()
+			return errors.Join(err, fmt.Errorf("releasing a savepoint: %w", rerr))
+		}
+		return err
+	}
+	if _, err := sess.Exec("RELEASE SAVEPOINT " + name); err != nil {
+		_ = sess.Close()
+		return fmt.Errorf("releasing a savepoint: %w", err)
+	}
+	for _, hook := range txCtx.afterCommitHooks {
+		AfterTx(parentCtx, hook)
+	}
 	return nil
 }
 

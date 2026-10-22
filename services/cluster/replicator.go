@@ -272,6 +272,7 @@ func Init(ctx context.Context) error {
 
 	go r.projector.run(r.ctx)
 	go r.startupBarrier(r.ctx)
+	go r.exitOnStop(r.ctx)
 	go r.consumer.run(r.ctx)
 	go r.sweepRaw(r.ctx)
 	if r.checkpoints != nil {
@@ -323,6 +324,9 @@ func (r *Replicator) rejoinUnderNewID(ctx context.Context, driver consensus.Driv
 	if err := fenceClusterOrExit(ctx, cluster); err != nil {
 		return err
 	}
+	if err := refuseStoppedDir(driver, cfg.DataDir); err != nil {
+		return err
+	}
 	moved, err := retireDataDir(cfg.DataDir, time.Now())
 	if err != nil {
 		return err
@@ -333,13 +337,69 @@ func (r *Replicator) rejoinUnderNewID(ctx context.Context, driver consensus.Driv
 		return fmt.Errorf("stamping a new id: %w", err)
 	}
 	r.auto.noteDisk(false)
+	r.resetForRejoin()
 	eng, err := driver.Open(r.ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("opening under the new id %s: %w", id, err)
 	}
 	r.setEngine(eng)
+	go r.startupBarrier(r.ctx)
 	log.Warn("cluster: rejoining under the new id %s", id)
 	return nil
+}
+
+// resetForRejoin forgets what this node derived from the log before the
+// engine of its new id opens: that engine applies the log from its start,
+// and the table that already holds it would apply a deletion or a rename
+// twice (#41). The projector stays fenced until the new engine applied a
+// barrier; startupBarrier lifts it again.
+func (r *Replicator) resetForRejoin() {
+	r.projector.refence()
+	r.table.Reset()
+	r.consumer.forget()
+}
+
+// stopPoll paces exitOnStop.
+var stopPoll = time.Second
+
+// exitProcess ends the process; tests replace it.
+var exitProcess = func(code int) {
+	log.GetManager().Close()
+	os.Exit(code)
+}
+
+// exitOnStop ends the process once the engine stopped itself, with the
+// stop's exit code (ADR 0152 D4, R9-05): a supervisor that does not
+// restart on it keeps the node down in the same boot, where a restart
+// could read back a page cache a failed fsync left behind and acknowledge
+// what the disk does not hold (#116). An engine closed, by a shutdown or
+// a rejoin, has no exit code.
+func (r *Replicator) exitOnStop(ctx context.Context) {
+	t := time.NewTicker(stopPoll)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		eng := r.Engine()
+		if eng == nil {
+			continue
+		}
+		h := eng.Health()
+		if !h.Stopped || h.StopExitCode == 0 {
+			continue
+		}
+		log.Critical("cluster: the consensus node stopped (%s); Forgejo exits %d, and an operator clears the stop: after a STORAGE_FAILED, reboot the machine, never only the service", h.StopReason, h.StopExitCode)
+		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := eng.Close(cctx); err != nil {
+			log.Error("cluster: closing the stopped consensus node: %v", err)
+		}
+		cancel()
+		exitProcess(h.StopExitCode)
+		return
+	}
 }
 
 func (r *Replicator) selfID() consensus.NodeID {

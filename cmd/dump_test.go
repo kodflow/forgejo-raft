@@ -5,7 +5,11 @@ package cmd
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
+
+	"forgejo.org/modules/setting"
+	"forgejo.org/modules/test"
 
 	"github.com/mholt/archives"
 	"github.com/stretchr/testify/assert"
@@ -123,4 +127,12 @@ func TestAddRecursiveExclude(t *testing.T) {
 			assert.Contains(t, files, "deep/nested/folder/another-file")
 		})
 	})
+}
+
+// A dump never holds the cluster's consensus data directory: restored, it
+// would bring a node back under its id with a log that went back (#65).
+func TestDumpLeavesOutTheClusterDataDirectory(t *testing.T) {
+	dir := t.TempDir()
+	defer test.MockVariableValue(&setting.Cluster.DataDir, filepath.Join(dir, "cluster"))()
+	assert.Contains(t, dataExcludes(filepath.Join(dir, "dump.zip")), filepath.Join(dir, "cluster"))
 }

@@ -127,6 +127,16 @@ func (r *Replicator) checkRetired(ctx context.Context, eng consensus.Engine) {
 	if self == 0 || r.auto.rejoin == nil {
 		return
 	}
+	if h := eng.Health(); h.Stopped && h.StopReason != "" {
+		// A stopped engine lists no membership, which reads as retired;
+		// its stop belongs to the operator, and a rejoin would move its
+		// marker aside with the data directory (#67). An engine closed
+		// without a reason, by a rejoin that failed, may rejoin again.
+		if r.auto.stopNoted.CompareAndSwap(false, true) {
+			log.Error("cluster: the consensus node stopped (%s): it does not rejoin under a new id; an operator clears the stop", h.StopReason)
+		}
+		return
+	}
 	if Rank(eng.Membership(), self) > 0 && probeLeader(ctx, eng) {
 		return
 	}
@@ -137,6 +147,20 @@ func (r *Replicator) checkRetired(ctx context.Context, eng consensus.Engine) {
 	if err := r.auto.rejoin(ctx); err != nil {
 		log.Error("cluster: rejoining under a new id: %v; retried", err)
 	}
+}
+
+// refuseStoppedDir refuses to move aside a data directory that holds a
+// stop marker or a quarantine: only an operator clears them, and a rejoin
+// would reopen the node past them (#67).
+func refuseStoppedDir(driver consensus.Driver, dir string) error {
+	rep, err := driver.Inspect(dir)
+	if err != nil {
+		return fmt.Errorf("inspecting the data directory before a rejoin: %w", err)
+	}
+	if len(rep.Markers) > 0 || rep.Quarantined {
+		return fmt.Errorf("the data directory %s holds the stop markers %v (quarantined: %t): an operator clears them before the node rejoins", dir, rep.Markers, rep.Quarantined)
+	}
+	return nil
 }
 
 // retireDataDir moves a retired node's consensus data directory aside,

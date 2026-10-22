@@ -252,10 +252,15 @@ type Health struct {
 	CertExpiry       time.Time
 	Stopped          bool
 	StopReason       string
-	Peers            []PeerHealth
-	Identity         LogIdentity
-	ContractGen      uint64
-	ClusterVersion   uint32
+	// StopExitCode is the code the process exits with once the node
+	// stopped itself, so its supervisor does not start it again in the
+	// same boot: 73 for a STORAGE_FAILED whose marker could be written
+	// nowhere (ADR 0152 D4, R9-05). 0 for a node closed, or running.
+	StopExitCode   int
+	Peers          []PeerHealth
+	Identity       LogIdentity
+	ContractGen    uint64
+	ClusterVersion uint32
 }
 
 // Precondition names what a clearing or raising operation acts on, scoped by
@@ -380,7 +385,10 @@ type Report struct {
 	LastIndex   uint64
 	Snapshot    *SnapshotMeta
 	Quarantined bool
-	Detail      []string
+	// Markers names the stop markers of the directory, which only an
+	// operator clears.
+	Markers []string
+	Detail  []string
 }
 
 // QuarantineExit is the way out of a LOG_CORRUPT quarantine (R3-09).
