@@ -15,6 +15,7 @@ import (
 	system_model "forgejo.org/models/system"
 	"forgejo.org/models/unit"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/log"
@@ -395,7 +396,14 @@ func DeleteWikiPage(ctx context.Context, doer *user_model.User, repo *repo_model
 }
 
 // DeleteWiki removes the actual and local copy of repository wiki.
+//
+// In a cluster the wiki's key is deleted in the replicated table first:
+// every member's projector then removes the wiki. A refusal, or an outcome
+// the cluster could not confirm, leaves the unit and the files as they are.
 func DeleteWiki(ctx context.Context, repo *repo_model.Repository) error {
+	if err := clusterhook.WikiDeleted(ctx, repo.OwnerName, repo.Name, repo.ID); err != nil {
+		return fmt.Errorf("the cluster did not delete the wiki: %w", err)
+	}
 	if err := repo_service.UpdateRepositoryUnits(ctx, repo, nil, []unit.Type{unit.TypeWiki}); err != nil {
 		return err
 	}

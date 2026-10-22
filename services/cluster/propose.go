@@ -29,6 +29,13 @@ func (r *Replicator) prepared(ctx context.Context, req *clusterhook.Request) *cl
 	if err != nil {
 		return fail(err)
 	}
+	nested := r.registry.takeNested(req.Nonce)
+	if !nested && req.Nonce != "" && packedRefsTxn(req.GitDir, req.Lines) {
+		// The files backend's own transaction on packed-refs: the one that
+		// follows carries the deletion.
+		r.registry.markNested(req.Nonce)
+		return &clusterhook.Response{OK: true}
+	}
 	if err := r.pushTargetGone(repo, req); err != nil {
 		return fail(err)
 	}
@@ -45,7 +52,7 @@ func (r *Replicator) prepared(ctx context.Context, req *clusterhook.Request) *cl
 			return fail(err)
 		}
 	}
-	if err := r.registry.register(req.Nonce, repo, refs, req.PID); err != nil {
+	if err := r.registry.register(req.Nonce, repo, refs, req.PID, nested); err != nil {
 		return fail(err)
 	}
 	// A checkpoint reading PostgreSQL's position holds this briefly.
@@ -57,6 +64,57 @@ func (r *Replicator) prepared(ctx context.Context, req *clusterhook.Request) *cl
 		r.registry.release(req.Nonce)
 	}
 	return resp
+}
+
+// packedRefsTxn reports whether the hook's lines are the nested transaction
+// git's files backend runs on packed-refs when it deletes a packed ref:
+// every line with two null ids, each ref in packed-refs. git runs it inside
+// the transaction that deletes the refs, and calls the hook for it first:
+// preparing(X->0), preparing(0->0), prepared(0->0), prepared(X->0),
+// committed(0->0), committed(X->0) (git 2.48 to 2.56, update-ref -d,
+// branch -D, branch -m and a push alike). It carries no value: proposed,
+// its 0->0 would tombstone the ref with no check of its old value, before
+// the deletion git itself checks (#37). A deletion without an old value
+// (update-ref -d, branch -D) shows the same lines in its own transaction,
+// which comes right after the nested one: the registry tells them apart by
+// their order under the nonce (markNested, takeNested). One of a ref only
+// loose, which packed-refs does not hold, is aborted by git before it is
+// prepared.
+func packedRefsTxn(gitDir string, lines []clusterhook.Line) bool {
+	if len(lines) == 0 {
+		return false
+	}
+	for _, l := range lines {
+		if !reftable.IsZeroSHA(l.Old) || !reftable.IsZeroSHA(l.New) || !strings.HasPrefix(l.Ref, "refs/") {
+			return false
+		}
+	}
+	b, err := os.ReadFile(filepath.Join(gitDir, "packed-refs"))
+	if err != nil {
+		return false
+	}
+	packed := map[string]bool{}
+	for line := range strings.SplitSeq(string(b), "\n") {
+		if _, name, ok := strings.Cut(line, " "); ok && line[0] != '#' && line[0] != '^' {
+			packed[name] = true
+		}
+	}
+	for _, l := range lines {
+		if !packed[l.Ref] {
+			return false
+		}
+	}
+	return true
+}
+
+// allZeroLines reports whether every line carries two null ids.
+func allZeroLines(lines []clusterhook.Line) bool {
+	for _, l := range lines {
+		if !reftable.IsZeroSHA(l.Old) || !reftable.IsZeroSHA(l.New) {
+			return false
+		}
+	}
+	return len(lines) > 0
 }
 
 // pushTargetGone refuses a push into a key the table deleted or renamed
@@ -547,6 +605,11 @@ func (r *Replicator) proposed(repo, nonce string, tok consensus.Token) *clusterh
 // finished releases a transaction after git committed or aborted it, and
 // has the projector check git against the table.
 func (r *Replicator) finished(req *clusterhook.Request) {
+	if allZeroLines(req.Lines) && r.registry.nestedFinished(req.Nonce) {
+		// The nested packed-refs transaction ends before the one that
+		// deletes the refs, which stays registered until git publishes.
+		return
+	}
 	t := r.registry.release(req.Nonce)
 	repo := ""
 	if t != nil {

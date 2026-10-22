@@ -31,7 +31,7 @@ func TestAStalledProjectionDoesNotHoldBackOtherRepositories(t *testing.T) {
 	leader := tc.nodes[0]
 	// A native git transaction that does not end keeps the leader from
 	// projecting o/stall.git.
-	require.NoError(t, leader.r.registry.register("held", "o/stall.git", nil, os.Getpid()))
+	require.NoError(t, leader.r.registry.register("held", "o/stall.git", nil, os.Getpid(), false))
 
 	// The stall is reported while it lasts.
 	var seen atomic.Value

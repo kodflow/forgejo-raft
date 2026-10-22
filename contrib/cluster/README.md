@@ -23,6 +23,12 @@ derive in it is written by a single consumer, on the leader.
   `serverAuth` and `clientAuth` usages. The key stays on the node.
 - `[security] DISABLE_GIT_HOOKS = true`. Start-up fails without it, since a
   user hook would run inside the replication path.
+- git 2.48 or later. Start-up fails with an older git: the cluster learns
+  HEAD only from the reference-transaction hook, which git before 2.46
+  bypasses for `git init` and `git symbolic-ref`, and git up to 2.47 reports
+  a HEAD line for a push to the default branch, which the cluster refuses.
+  The standalone release binaries run with the distribution's git (2.39 on
+  Debian 12, 2.43 on Ubuntu 24.04): upgrade it first.
 
 ## PostgreSQL durability (REQUIRED)
 
@@ -332,7 +338,11 @@ These commands run with the server stopped, on the data directory.
   if SQL lost it too, then adopt the repository (Site administration >
   Repositories > Unadopted, or `POST /api/v1/admin/unadopted/{owner}/{repo}`).
   Never use "delete unadopted" in a cluster: it removes one node's files and
-  the projector brings them back.
+  the projector brings them back. "Delete all repositories missing their Git
+  files" and "Reinitialize all missing Git repositories" are not offered in
+  a cluster, and refused: they judge a repository missing from one node's
+  disk, which a node behind on its projection is, and would delete it, or
+  rewrite its HEAD, on every member.
 - Only a deletion or a failed creation the cluster did not record is
   deleted, explicitly, one repository at a time:
   `forgejo cluster reconcile --delete-orphan <owner>/<repo> --expect-index <index> --reason "..."`.

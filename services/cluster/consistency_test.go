@@ -66,7 +66,7 @@ func TestRenameWaitsForATransactionInFlightOnTheOldKey(t *testing.T) {
 
 	nodeB := tc.nodes[1]
 	nonce := clusterhook.NewNonce()
-	require.NoError(t, nodeB.r.registry.register(nonce, "o/old.git", []string{"refs/heads/main"}, os.Getpid()))
+	require.NoError(t, nodeB.r.registry.register(nonce, "o/old.git", []string{"refs/heads/main"}, os.Getpid(), false))
 
 	origin := tc.nodes[0]
 	require.NoError(t, os.Rename(filepath.Join(origin.r.root, "o", "old.git"), filepath.Join(origin.r.root, "o", "new.git")))
@@ -213,7 +213,7 @@ func TestRenameIntoAnUnprojectedDeletionSetsTheOldDirectoryAside(t *testing.T) {
 
 	// The lagging node does not project s/b.git while a transaction holds it.
 	nonce := clusterhook.NewNonce()
-	require.NoError(t, lag.r.registry.register(nonce, "s/b.git", nil, os.Getpid()))
+	require.NoError(t, lag.r.registry.register(nonce, "s/b.git", nil, os.Getpid(), false))
 	ctx := context.Background()
 	require.NoError(t, os.RemoveAll(filepath.Join(origin.r.root, "s", "b.git")))
 	require.NoError(t, origin.r.proposeRepoDelete(ctx, "s/b.git", 1))
@@ -273,8 +273,8 @@ func TestChainedRenamesOnALaggingNodeMoveInLogOrder(t *testing.T) {
 
 	// The lagging node projects neither repository while both renames apply.
 	holds := []string{clusterhook.NewNonce(), clusterhook.NewNonce()}
-	require.NoError(t, lag.r.registry.register(holds[0], "s/a.git", nil, os.Getpid()))
-	require.NoError(t, lag.r.registry.register(holds[1], "s/b.git", nil, os.Getpid()))
+	require.NoError(t, lag.r.registry.register(holds[0], "s/a.git", nil, os.Getpid(), false))
+	require.NoError(t, lag.r.registry.register(holds[1], "s/b.git", nil, os.Getpid(), false))
 	ctx := context.Background()
 	root := origin.r.root
 	require.NoError(t, os.Rename(filepath.Join(root, "s", "a.git"), filepath.Join(root, "s", "z.git")))
@@ -319,7 +319,7 @@ func TestRenameIntoAnUnprojectedDeletionAfterARestart(t *testing.T) {
 	}
 
 	nonce := clusterhook.NewNonce()
-	require.NoError(t, lag.r.registry.register(nonce, "s/b.git", nil, os.Getpid()))
+	require.NoError(t, lag.r.registry.register(nonce, "s/b.git", nil, os.Getpid(), false))
 	ctx := context.Background()
 	require.NoError(t, os.RemoveAll(filepath.Join(origin.r.root, "s", "b.git")))
 	require.NoError(t, origin.r.proposeRepoDelete(ctx, "s/b.git", 1))
@@ -424,7 +424,7 @@ func TestFreshWaitServesAnAcknowledgedPush(t *testing.T) {
 	ctx := context.Background()
 	fresh := &clusterhook.Request{Op: clusterhook.OpFresh, Repo: "s/f.git"}
 	hold := clusterhook.NewNonce()
-	require.NoError(t, lag.r.registry.register(hold, "s/f.git", nil, os.Getpid()))
+	require.NoError(t, lag.r.registry.register(hold, "s/f.git", nil, os.Getpid(), false))
 	require.True(t, tc.pushVia(origin, work, "s/f.git", "refs/heads/main", c1, c2).OK)
 	go func() {
 		time.Sleep(300 * time.Millisecond)
@@ -436,7 +436,7 @@ func TestFreshWaitServesAnAcknowledgedPush(t *testing.T) {
 	assert.Equal(t, c2, gitRef(t, lag, "s/f.git", "refs/heads/main"), "the fetch would read the ref from before the acknowledged push")
 
 	defer test.MockVariableValue(&setting.Cluster.ReadAfterWriteTimeout, 300*time.Millisecond)()
-	require.NoError(t, lag.r.registry.register(hold, "s/f.git", nil, os.Getpid()))
+	require.NoError(t, lag.r.registry.register(hold, "s/f.git", nil, os.Getpid(), false))
 	require.True(t, tc.pushVia(origin, work, "s/f.git", "refs/heads/main", c2, c3).OK)
 	assert.False(t, lag.r.Handle(ctx, fresh).OK, "a node that cannot catch up says it may be behind")
 	lag.r.registry.release(hold)

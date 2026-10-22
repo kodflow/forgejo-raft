@@ -33,7 +33,7 @@ func TestAReservationFencesNothingUntilPrepared(t *testing.T) {
 	assert.True(t, reg.certify("alice/a.git", func() { ran = true }))
 	assert.True(t, ran)
 
-	require.NoError(t, reg.register("n1", "alice/a.git", []string{"refs/heads/main"}, os.Getpid()))
+	require.NoError(t, reg.register("n1", "alice/a.git", []string{"refs/heads/main"}, os.Getpid(), false))
 	assert.Equal(t, 1, reg.count(), "prepared completes the reservation")
 	assert.True(t, reg.inFlight("alice/a.git"))
 	assert.False(t, reg.certify("alice/a.git", func() { t.Error("certified behind a prepared transaction") }))
@@ -85,11 +85,11 @@ func TestHangingSSHSessionsDoNotTurnARepositoryAway(t *testing.T) {
 	for _, n := range []string{"r1", "r2", "r3"} {
 		require.NoError(t, reg.reserve(n, "alice/a.git", os.Getpid()))
 	}
-	require.NoError(t, reg.register("p1", "alice/a.git", []string{"refs/heads/main"}, os.Getpid()))
-	require.NoError(t, reg.register("r1", "alice/a.git", []string{"refs/heads/b"}, os.Getpid()), "a reservation completes")
-	require.ErrorIs(t, reg.register("r2", "alice/a.git", []string{"refs/heads/c"}, os.Getpid()), errTooManyTxn,
+	require.NoError(t, reg.register("p1", "alice/a.git", []string{"refs/heads/main"}, os.Getpid(), false))
+	require.NoError(t, reg.register("r1", "alice/a.git", []string{"refs/heads/b"}, os.Getpid(), false), "a reservation completes")
+	require.ErrorIs(t, reg.register("r2", "alice/a.git", []string{"refs/heads/c"}, os.Getpid(), false), errTooManyTxn,
 		"the per-repository cap holds for prepared transactions")
-	require.ErrorIs(t, reg.register("p2", "alice/a.git", []string{"refs/heads/d"}, os.Getpid()), errTooManyTxn)
+	require.ErrorIs(t, reg.register("p2", "alice/a.git", []string{"refs/heads/d"}, os.Getpid(), false), errTooManyTxn)
 
 	// Reservations have their own total cap.
 	require.NoError(t, reg.reserve("r4", "bob/b.git", os.Getpid()))
@@ -101,4 +101,24 @@ func TestHangingSSHSessionsDoNotTurnARepositoryAway(t *testing.T) {
 	reg.now = func() time.Time { return now.Add(time.Hour) }
 	reg.alive = func(int) bool { return false }
 	require.NoError(t, reg.reserve("r6", "bob/b.git", 1))
+}
+
+// A proposal that outlasts the registration's TTL leaves it fencing the
+// repository: git publishes only after "prepared" answers, and the process
+// the registration names may be gone by then (R6-06, #108). The deadline
+// counts from the proposal's commit, not from the registration.
+func TestAProposalRearmsItsRegistration(t *testing.T) {
+	reg := newRegistry(30*time.Second, 8, 64)
+	now := time.Now()
+	reg.now = func() time.Time { return now }
+	reg.alive = func(int) bool { return false }
+	require.NoError(t, reg.register("n1", "alice/a.git", []string{"refs/heads/main"}, 12345, false))
+
+	now = now.Add(45 * time.Second) // a slow majority: the proposal took 45 s
+	reg.markProposed("n1")
+	assert.True(t, reg.inFlight("alice/a.git"), "the registration expired between the commit and git's publication")
+	assert.False(t, reg.certify("alice/a.git", func() { t.Error("certified while git may still publish") }))
+
+	now = now.Add(31 * time.Second) // git died without a "committed"
+	assert.False(t, reg.inFlight("alice/a.git"))
 }

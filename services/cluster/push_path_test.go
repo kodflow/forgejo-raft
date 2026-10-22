@@ -227,7 +227,7 @@ func TestCertificationHoldsOnlyItsRepository(t *testing.T) {
 	<-started
 
 	other := make(chan error, 1)
-	go func() { other <- reg.register("n1", "bob/b.git", nil, 1) }()
+	go func() { other <- reg.register("n1", "bob/b.git", nil, 1, false) }()
 	select {
 	case err := <-other:
 		require.NoError(t, err)
@@ -238,7 +238,7 @@ func TestCertificationHoldsOnlyItsRepository(t *testing.T) {
 	assert.False(t, reg.certify("alice/a.git", func() { t.Error("a second certification of the same repository ran") }))
 
 	registered := make(chan error, 1)
-	go func() { registered <- reg.register("n2", "alice/a.git", nil, 1) }()
+	go func() { registered <- reg.register("n2", "alice/a.git", nil, 1, false) }()
 	select {
 	case err := <-registered:
 		t.Fatalf("the same repository registered during its certification: %v", err)
@@ -259,7 +259,7 @@ func TestRegistrationGivesUpPastTheTTL(t *testing.T) {
 	<-started
 	defer close(release)
 	got := make(chan error, 1)
-	go func() { got <- reg.register("n1", "alice/a.git", nil, 1) }()
+	go func() { got <- reg.register("n1", "alice/a.git", nil, 1, false) }()
 	select {
 	case err := <-got:
 		require.ErrorIs(t, err, errTooManyTxn)
