@@ -221,7 +221,9 @@ func newTestClusterWith(t *testing.T, clusterID consensus.ClusterID, start func(
 			resolve: func(m consensus.Member) string { return addrs[m.Slot] },
 			// The engines may authenticate with other keys than the
 			// certificates (the SDK's memory network does).
-			pinOf: func(m consensus.Member) [32]byte { return pins[m.Slot] },
+			pinOf:        func(m consensus.Member) [32]byte { return pins[m.Slot] },
+			leavesKey:    r.projector.leavesKey,
+			awaitsRename: r.projector.awaitsRename,
 		}
 		r.projector.fetch = r.objects.fetchMissing
 		srv := &http.Server{Handler: r.objects.handler(), TLSConfig: id.serverConfig(), ReadHeaderTimeout: 5 * time.Second}

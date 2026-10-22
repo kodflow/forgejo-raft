@@ -47,6 +47,12 @@ type objectChannel struct {
 	engine    func() consensus.Engine
 	self      func() consensus.NodeID
 	repoKnown func(ctx context.Context, repo string) (bool, error)
+	// leavesKey reports a directory under the key the projector is about
+	// to set aside or remove: objects indexed there would leave with it.
+	leavesKey func(repo string) bool
+	// awaitsRename reports a key whose renamed repository's directory the
+	// projector has not moved in yet.
+	awaitsRename func(repo string) bool
 	// revoked reports a key an operator revoked (hex SPKI): a member
 	// holding it is not admitted, even before its removal commits.
 	revoked func(spki string) bool
@@ -178,10 +184,28 @@ func (oc *objectChannel) handlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		if oc.awaitsRename != nil && oc.awaitsRename(repo) {
+			// The renamed repository's directory is still under its old
+			// key here: created empty now, the key would never take it,
+			// and it would stay under the freed name (#100).
+			http.Error(w, fmt.Sprintf("%s waits for its rename to be projected on this node", repo), http.StatusServiceUnavailable)
+			return
+		}
 		if err := initBare(r.Context(), dir, format); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+	} else if err == nil && oc.leavesKey != nil && oc.leavesKey(repo) {
+		// Acknowledged here, the objects would leave the key with that
+		// directory, and no member would serve them once the sender is
+		// lost (#99): the sender counts another member.
+		http.Error(w, fmt.Sprintf("the directory of %s on this node is not the repository the cluster holds under that key yet", repo), http.StatusServiceUnavailable)
+		return
+	} else if err == nil && !validRepoDir(dir) {
+		// An interrupted init: the projector sets it aside and creates the
+		// repository anew; meanwhile this member does not acknowledge.
+		http.Error(w, fmt.Sprintf("%s holds no git repository on this node yet", repo), http.StatusServiceUnavailable)
+		return
 	}
 	// A sender that stalls mid-pack must not hold index-pack forever.
 	ctx, cancel := context.WithTimeout(r.Context(), objectBudget)

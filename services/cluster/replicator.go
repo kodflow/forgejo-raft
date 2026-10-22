@@ -51,6 +51,9 @@ type Replicator struct {
 	raw   map[string]rawWrite
 
 	started time.Time
+	// hookAcceptFailing is set while the hook socket's Accept fails: no
+	// git write reaches this node then.
+	hookAcceptFailing atomic.Bool
 	// wake signals the consumer that the table changed.
 	wake chan struct{}
 	ctx  context.Context
@@ -196,6 +199,7 @@ func Init(ctx context.Context) error {
 	r.objects = &objectChannel{
 		root: r.root, port: setting.Cluster.ObjectPort, cluster: clusterHex, id: id,
 		engine: r.Engine, self: r.selfID, repoKnown: r.repoKnown, revoked: r.table.KeyRevoked,
+		leavesKey: r.projector.leavesKey, awaitsRename: r.projector.awaitsRename,
 	}
 	if setting.Cluster.ExpectedNodes >= 3 {
 		r.auto = newAutoMode(r.objects)
@@ -279,6 +283,7 @@ func Init(ctx context.Context) error {
 	clusterhook.SetGarbageCollectionGate(r.projector.MayCollectGarbage)
 	clusterhook.SetWriteWaiter(r.waitWrites)
 	clusterhook.SetFreshWaiter(r.WaitFresh)
+	clusterhook.SetReadGuard(r.ReadRefusal)
 
 	go r.projector.run(r.ctx)
 	go r.startupBarrier(r.ctx)
@@ -450,7 +455,7 @@ func (r *Replicator) Ready() bool {
 		return false
 	}
 	h := eng.Health()
-	return h.Ready && !h.Stopped && r.projector.Ready()
+	return h.Ready && !h.Stopped && r.projector.Ready() && !r.hookAcceptFailing.Load()
 }
 
 // repoKey turns a git directory under the repository root into the table's
@@ -558,6 +563,21 @@ func (r *Replicator) WaitFresh(ctx context.Context, repo string) bool {
 	return r.projector.Wait(ctx, repo, tok.Index) == nil
 }
 
+// ReadRefusal refuses a read of repo while its directory here holds
+// another repository than the one the table holds under the key (#82): a
+// repository renamed away, or the previous one under a name a rename took,
+// not projected here yet. Served, its history would be read under the
+// database's permissions of the repository that now has the name.
+func (r *Replicator) ReadRefusal(repo string) error {
+	if reftable.ValidRepoKey(repo) != nil {
+		return nil
+	}
+	if r.projector.servesAnother(repo) {
+		return fmt.Errorf("this node of the cluster has not projected the last rename of %s yet; retry shortly or through another node", repo)
+	}
+	return nil
+}
+
 // WaitProjected waits until the local projection of repo reaches index.
 func (r *Replicator) WaitProjected(ctx context.Context, repo string, index uint64) error {
 	return r.projector.Wait(ctx, repo, index)
@@ -586,13 +606,24 @@ func (r *Replicator) waitWrites(ctx context.Context, nonces []string) bool {
 // the creating request's transaction, and the first push of an
 // auto-initialised repository ships its objects then. Only Forgejo's own
 // hook path proposes, so a key in the table was created by a member.
+// A key whose refs are all tombstones (renamed away) is not known by the
+// table: a shipment there would create a stray repository (#100).
 func (r *Replicator) repoKnown(ctx context.Context, key string) (bool, error) {
 	if refs, _ := r.table.Refs(key); len(refs) > 0 {
-		if _, deleted := r.table.Deleted(key); !deleted {
+		if _, deleted := r.table.Deleted(key); !deleted && anyLive(refs) {
 			return true, nil
 		}
 	}
 	return repoKnownInDB(ctx, key)
+}
+
+func anyLive(refs map[string]reftable.RefValue) bool {
+	for _, v := range refs {
+		if v.Live() {
+			return true
+		}
+	}
+	return false
 }
 
 // peerPins decodes [cluster] PEER_PINS, already validated.

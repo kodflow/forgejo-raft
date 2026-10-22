@@ -135,7 +135,7 @@ entries": take a checkpoint.
 | `STEP_UP_MAX_AGE` | `5m` | How long a re-authentication allows further operations. |
 | `STEP_UP_OIDC_SOURCE`, `STEP_UP_ACR` | empty | The OpenID Connect source every operator re-authenticates with, and the authentication class required. Without a source, password and TOTP apply. |
 | `STEP_UP_PASSWORD_OPERATORS` | empty | Break-glass logins that keep password and TOTP when `STEP_UP_OIDC_SOURCE` is set. |
-| `READ_AFTER_WRITE_TIMEOUT` | `2s` | How long a request waits for the node to catch up with the caller's last write, and a git request (fetch, clone, push over HTTP or SSH) with the cluster's commit index. Without a known leader a git request does not wait: it is served as the node has it. |
+| `READ_AFTER_WRITE_TIMEOUT` | `2s` | How long a request waits for the node to catch up with the caller's last write, and a git request (fetch, clone, push over HTTP or SSH) with the cluster's commit index. Without a known leader a git request does not wait: it is served as the node has it, except a repository whose directory on the node still holds another repository than the one the table holds under its name (a rename or a recreation of the name not projected there yet): git over HTTP and SSH answers 503 until the node projects it. |
 | `HOOK_TIMEOUT` | `1m`, between `20s` and `1h` | How long one ref transaction may take in the cluster: its objects written on a majority, then its entry committed. A push that needs longer fails with nothing written; its retry ships only the objects the peers still lack. The proxies in front of Forgejo must allow at least as long. |
 | `MAX_LOG_BYTES`, `MAX_SNAPSHOT_BYTES` | 1 GiB | Bounds of the log and of a snapshot. |
 | `ACK_MARGIN` | `1024` | How far the trimming of consumed events lags the cursor. |
@@ -426,8 +426,11 @@ reports nothing.
   `forgejo cluster witness check` through the image's setup, so it reads the
   same `[cluster]` settings as Forgejo, on the data volume mounted read-write
   (opening the data directory takes its lock file). It exits 77 when a witness
-  says the lineage was superseded, or when none answers: Forgejo does not
-  start, the allocation fails and Nomad does not reschedule it.
+  says the lineage was superseded: Forgejo does not start, the allocation
+  fails and Nomad does not reschedule it. While no witness answers, it waits
+  and asks again (5 s, doubled up to a minute), and Forgejo starts once one
+  says the lineage is clear; Forgejo's own boot check does the same. It
+  exits 78 when the witness settings are wrong.
 - **Vault through the workload identity.** The renewer logs in at
   `auth/jwt-consensus/login` with its slot's role and the JWT Nomad writes into
   the task's secrets. It keeps the token to two thirds of its TTL, then logs in
@@ -491,9 +494,15 @@ Watch, Custom, Releases on GitHub, or the tags of
   two minutes, a ref that moved on this node, a name that conflicts with
   one of this node's refs as a directory and a file) the whole push is
   refused and the client reads every ref rejected. Pushing again succeeds
-  once the other writer is done; a lock left behind by a crashed git is
-  removed by hand. An empty lock younger than two minutes, on a ref the
-  push deletes, cannot be told from git's own.
+  once the other writer is done. A lock left behind by a crashed git
+  (a ref's, `HEAD.lock`, `packed-refs.lock`, `packed-refs.new`) is
+  removed by the projector the next time it writes that ref, once no git
+  of the repository is registered and the lock is older than both
+  `TXN_TTL` and two minutes (counted in
+  `forgejo_cluster_stale_locks_removed_total`); a lock on a ref the
+  projector has nothing to write to is still removed by hand. An empty
+  lock younger than two minutes, on a ref the push deletes, cannot be told
+  from git's own.
 - A deleted or renamed repository leaves its key in the replicated table
   for good: tombstoned refs, a deletion mark, a rename mark. Each costs a
   few hundred bytes in every snapshot, and the projector's first pass

@@ -45,8 +45,15 @@ type projector struct {
 	fenced bool
 	// pendingFirst counts repositories not yet reconciled once since the
 	// start: no watermark is certified as "everything" before they are.
+	// Each one holds the writes of its own key only (#39).
 	pendingFirst map[string]bool
-	failures     map[string]string
+	// unfencedAt is when the fence was lifted: past firstPassGrace, the
+	// keys still pending no longer hold the node's readiness.
+	unfencedAt time.Time
+	// graceLogged is set once the keys holding the first pass past its
+	// grace were reported.
+	graceLogged bool
+	failures    map[string]string
 	// deletedAt holds the index of a repository's deletion until this node
 	// removed its directory: a key revived meanwhile by a rename finds the
 	// deleted repository's directory still there.
@@ -119,6 +126,8 @@ func (p *projector) unfence() {
 		}
 	}
 	p.fenced = false
+	p.unfencedAt = time.Now()
+	p.graceLogged = false
 	p.mu.Unlock()
 	p.signal()
 }
@@ -144,11 +153,51 @@ func (p *projector) Fenced() bool {
 	return p.fenced
 }
 
-// Ready reports whether projection caught up once since the start.
+// firstPassGrace bounds how long the first reconciliation of every
+// repository holds the node's readiness after a start. A repository whose
+// projection keeps failing (a damaged packed-refs, a lock left behind)
+// would otherwise keep the node out of service for good (#39): past the
+// grace it stays behind alone, refused to writes and reported in Lag and
+// in projection_failing_repositories.
+var firstPassGrace = 10 * time.Minute
+
+// Ready reports whether projection caught up once since the start, or the
+// first pass's grace ran out with only some keys behind.
 func (p *projector) Ready() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return !p.fenced && len(p.pendingFirst) == 0
+	if p.fenced {
+		return false
+	}
+	if len(p.pendingFirst) == 0 {
+		return true
+	}
+	if time.Since(p.unfencedAt) < firstPassGrace {
+		return false
+	}
+	if !p.graceLogged {
+		p.graceLogged = true
+		keys := make([]string, 0, len(p.pendingFirst))
+		for r := range p.pendingFirst {
+			keys = append(keys, r)
+		}
+		sort.Strings(keys)
+		if len(keys) > 20 {
+			keys = append(keys[:20], "...")
+		}
+		log.Error("cluster: %d repositories are still not reconciled %s after the start, they stay refused to writes until their projection succeeds: %s", len(p.pendingFirst), firstPassGrace, strings.Join(keys, ", "))
+	}
+	return true
+}
+
+// Writable reports whether a write to repo may be proposed from this node:
+// the fence is lifted and repo itself was reconciled once since the start.
+// Another key still behind does not hold it (#39); Apply checks the old
+// values against the table, and gitWillApply the local git.
+func (p *projector) Writable(repo string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.fenced && !p.pendingFirst[repo]
 }
 
 // Projected returns the index up to which every entry touching repo is
@@ -207,6 +256,9 @@ type RepoLag struct {
 	Watermark uint64
 	Target    uint64
 	Error     string
+	// Pending is set while the repository was not reconciled once since
+	// the start: its writes are refused on this node.
+	Pending bool
 }
 
 func (p *projector) Lag() []RepoLag {
@@ -214,7 +266,7 @@ func (p *projector) Lag() []RepoLag {
 	defer p.mu.Unlock()
 	out := make([]RepoLag, 0, len(p.dirty))
 	for r, idx := range p.dirty {
-		out = append(out, RepoLag{Repo: r, Watermark: p.watermark[r], Target: idx, Error: p.failures[r]})
+		out = append(out, RepoLag{Repo: r, Watermark: p.watermark[r], Target: idx, Error: p.failures[r], Pending: p.pendingFirst[r]})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Target-out[i].Watermark > out[j].Target-out[j].Watermark })
 	return out
@@ -317,6 +369,7 @@ func (p *projector) project(ctx context.Context, repo string) error {
 	}
 	dir := filepath.Join(p.root, filepath.FromSlash(repo))
 	refs, at := p.table.Refs(repo)
+	withRenamedAway(p.table, repo, refs)
 
 	if _, deleted := p.table.Deleted(repo); deleted {
 		if err := os.RemoveAll(dir); err != nil {
@@ -334,9 +387,16 @@ func (p *projector) project(ctx context.Context, repo string) error {
 	if err := p.setAsideStale(repo, dir); err != nil {
 		return err
 	}
+	if err := p.setAsideInvalid(repo, dir, at); err != nil {
+		return err
+	}
 	want := tableProjection(refs)
-	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
-		if from, renIdx, ok := p.table.RenamedFrom(repo); ok {
+	if err := p.setAsideLeftBehind(repo, dir, want); err != nil {
+		return err
+	}
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) && !p.passesOn(repo, want) {
+		if first, firstIdx, ok := p.table.RenamedFrom(repo); ok {
+			from, to, renIdx := p.renameSource(repo, first, firstIdx)
 			src := filepath.Join(p.root, filepath.FromSlash(from))
 			if p.registry.inFlight(from) {
 				// A git process still writes under the old key: moving its
@@ -344,7 +404,7 @@ func (p *projector) project(ctx context.Context, repo string) error {
 				// outside the table. The move waits for the next pass.
 				return nil
 			}
-			if p.holdsRenamed(src, from, repo, renIdx) {
+			if p.holdsRenamed(src, from, to, renIdx) {
 				if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 					return err
 				}
@@ -412,7 +472,15 @@ func (p *projector) project(ctx context.Context, repo string) error {
 	}
 	if len(set) > 0 || len(del) > 0 {
 		if err := writeRefs(ctx, dir, set, del); err != nil {
-			return err
+			// A git killed while it held its locks (SIGKILL, OOM, a power
+			// cut) leaves them behind, and every later transaction on
+			// those refs fails for good (#48).
+			if p.clearStaleLocks(repo, dir, set, del) == 0 {
+				return err
+			}
+			if err := writeRefs(ctx, dir, set, del); err != nil {
+				return err
+			}
 		}
 	}
 	// Certification re-reads git under the registry's lock, so a native
@@ -436,13 +504,88 @@ func (p *projector) project(ctx context.Context, repo string) error {
 	return verr
 }
 
+// clearStaleLocks removes the locks a killed git left on the refs the
+// projector writes: each ref's own, HEAD's, packed-refs' and the
+// packed-refs.new a pack-refs writes before its rename. The projector is
+// the only authority over git: a lock is removed only while no native
+// transaction is registered for the repository, a reservation included,
+// and only past both the registry's TTL and staleLockAge, past which git
+// holds none of its own (git gc waits for the gate, which a repository
+// behind keeps closed). Only regular files are removed. It returns how
+// many were.
+func (p *projector) clearStaleLocks(repo, dir string, set map[string]reftable.RefValue, del []string) int {
+	if p.registry.busy(repo) {
+		return 0
+	}
+	age := max(p.registry.ttl, staleLockAge)
+	paths := []string{"HEAD.lock", "packed-refs.lock", "packed-refs.new"}
+	for name := range set {
+		paths = append(paths, name+".lock")
+	}
+	for _, name := range del {
+		paths = append(paths, name+".lock")
+	}
+	removed := 0
+	for _, rel := range paths {
+		// The names come from the table, whose Apply validated them: no
+		// ".." component, no absolute path.
+		path := filepath.Join(dir, filepath.FromSlash(rel))
+		st, err := os.Lstat(path)
+		if err != nil || !st.Mode().IsRegular() || time.Since(st.ModTime()) <= age {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			log.Warn("cluster: removing the stale lock %s of %s: %v", rel, repo, err)
+			continue
+		}
+		log.Warn("cluster: removed %s of %s, left behind by a git that died %s ago", rel, repo, time.Since(st.ModTime()).Round(time.Second))
+		staleLocksRemovedTotal.Inc()
+		removed++
+	}
+	return removed
+}
+
+// renameLineageDepth bounds the walk back through a chain of renames.
+const renameLineageDepth = 32
+
+// withRenamedAway adds to refs, as tombstones, the refs the keys renamed
+// into repo held and repo does not: a rename copies only the live refs, and
+// the directory a node behind moves in from the old key still holds the
+// refs deleted there before the rename (#96). Projected from repo's refs
+// alone, such a ref was neither deleted nor compared, and the node served
+// a deleted branch under the new name, certified. Each key of the chain is
+// followed back through the renames before the one into it.
+func withRenamedAway(t *reftable.Table, repo string, refs map[string]reftable.RefValue) {
+	key, before := repo, uint64(math.MaxUint64)
+	seen := map[string]bool{repo: true}
+	for range renameLineageDepth {
+		from, idx, ok := t.RenamedFrom(key)
+		if !ok || idx >= before || seen[from] {
+			return
+		}
+		seen[from] = true
+		old, _ := t.Refs(from)
+		for name := range old {
+			if _, known := refs[name]; !known {
+				refs[name] = reftable.RefValue{Tombstone: true}
+			}
+		}
+		key, before = from, idx
+	}
+}
+
 // filterTracked keeps the refs of git the table knows about: a ref the
 // table never held (one from before the cluster) is reported elsewhere and
 // left alone, never deleted by the projector.
+//
+// HEAD whose table entry is a tombstone is left out too: the projector never
+// deletes HEAD, and a bare repository always has one (#43). Compared, it
+// kept a key whose refs are all tombstones (renamed away, deleted) from
+// ever certifying.
 func filterTracked(git map[string]reftable.ProjectedRef, refs map[string]reftable.RefValue) map[string]reftable.ProjectedRef {
 	out := map[string]reftable.ProjectedRef{}
 	for name, r := range git {
-		if _, known := refs[name]; known {
+		if v, known := refs[name]; known && (name != "HEAD" || v.Live()) {
 			out[name] = r
 		}
 	}
@@ -515,6 +658,7 @@ func heldBefore(dir, key string, index uint64) (held, known bool) {
 func (p *projector) Verify(ctx context.Context, repo string) (bool, error) {
 	dir := filepath.Join(p.root, filepath.FromSlash(repo))
 	refs, _ := p.table.Refs(repo)
+	withRenamedAway(p.table, repo, refs)
 	want := tableProjection(refs)
 	have, err := readGitRefs(ctx, dir)
 	if err != nil {
@@ -572,8 +716,24 @@ func (p *projector) movesOn(repo, dir string) bool {
 	if _, err := os.Stat(dir); err != nil {
 		return false
 	}
-	z, zIdx, ok := p.table.RenamedInto(repo, math.MaxUint64)
+	first, firstIdx, ok := p.table.RenamedInto(repo, math.MaxUint64)
 	if !ok {
+		return false
+	}
+	// Through the waypoints of a chain of renames (#43): the directory
+	// belongs to the chain's end, and stays here when the chain comes back.
+	z, zIdx := first, firstIdx
+	for range renameLineageDepth {
+		if _, moved := p.table.MovedAway(z); !moved {
+			break
+		}
+		next, nextIdx, ok := p.table.RenamedInto(z, math.MaxUint64)
+		if !ok || nextIdx <= zIdx {
+			break
+		}
+		z, zIdx = next, nextIdx
+	}
+	if z == repo {
 		return false
 	}
 	if _, deleted := p.table.Deleted(z); deleted {
@@ -590,7 +750,7 @@ func (p *projector) movesOn(repo, dir string) bool {
 			return false
 		}
 	}
-	if !p.holdsRenamed(dir, repo, z, zIdx) {
+	if !p.holdsRenamed(dir, repo, first, firstIdx) {
 		return false
 	}
 	p.markDirty(z)
@@ -622,6 +782,13 @@ func (p *projector) setAsideStale(repo, dir string) error {
 	if _, err := os.Stat(dir); err != nil {
 		return nil
 	}
+	// A chain of renames that came back (repo to b, then b to repo): the
+	// directory is repo's own, certified before the chain started (#43).
+	if src, _, srcIdx := p.renameSource(repo, from, renIdx); src == repo {
+		if held, known := heldBefore(dir, repo, srcIdx); known && held {
+			return nil
+		}
+	}
 	stale, known := heldBefore(dir, repo, renIdx)
 	if !known {
 		_, err := os.Stat(filepath.Join(p.root, filepath.FromSlash(from)))
@@ -648,4 +815,186 @@ func (p *projector) setAsideStale(repo, dir string) error {
 	}
 	log.Warn("cluster: %s was taken by a rename of %s while this node still held its previous repository: that directory is set aside in %s", repo, from, aside)
 	return nil
+}
+
+// setAsideInvalid moves aside a directory under repo's key that is no git
+// repository, a git init killed halfway or never synced (#42): the
+// projection then creates it anew and fetches its objects from the
+// members, where it would otherwise fail at every pass. A directory a
+// native git of this key may still be writing is left alone: one with a
+// transaction registered, or one changed lately, as Forgejo's own git init
+// writes HEAD through the hook before it creates objects/. Like
+// setAsideStale, it is moved under staleDirName, never removed.
+func (p *projector) setAsideInvalid(repo, dir string, at uint64) error {
+	st, err := os.Stat(dir)
+	if err != nil || validRepoDir(dir) || p.registry.busy(repo) || time.Since(st.ModTime()) <= max(p.registry.ttl, staleLockAge) {
+		return nil
+	}
+	aside := filepath.Join(p.root, staleDirName, fmt.Sprintf("%s-invalid-%d-%d", strings.ReplaceAll(repo, "/", "_"), at, time.Now().UnixNano()))
+	if err := os.MkdirAll(filepath.Dir(aside), 0o700); err != nil {
+		return err
+	}
+	if err := os.Rename(dir, aside); err != nil {
+		return err
+	}
+	log.Warn("cluster: %s held no git repository on this node (an interrupted init): that directory is set aside in %s and the repository is projected anew", repo, aside)
+	return nil
+}
+
+// passesOn reports whether repo is a waypoint of a chain of renames: no
+// live ref, and renamed on to a key not deleted. The directory of the
+// chain's start belongs to the end of the chain, which takes it from where
+// it is (renameSource): moved here, it would be stamped under no key the
+// end recognises (#43).
+func (p *projector) passesOn(repo string, want map[string]reftable.ProjectedRef) bool {
+	if len(want) != 0 {
+		return false
+	}
+	z, _, ok := p.table.RenamedInto(repo, math.MaxUint64)
+	if !ok {
+		return false
+	}
+	_, deleted := p.table.Deleted(z)
+	return !deleted
+}
+
+// renameSource walks back from the rename into repo (from, at renIdx)
+// through keys whose directory is absent and whose refs went on, unchanged,
+// to the next key of the chain: the first key whose directory is here is
+// where a node behind still holds the repository (a to b, then b to c: c
+// takes a's directory), with the key its rename moved it to and that
+// rename's index. It returns from, repo and renIdx when the walk finds
+// nothing.
+func (p *projector) renameSource(repo, from string, renIdx uint64) (string, string, uint64) {
+	key, to, idx := from, repo, renIdx
+	for range renameLineageDepth {
+		if _, err := os.Stat(filepath.Join(p.root, filepath.FromSlash(key))); err == nil {
+			return key, to, idx
+		}
+		prev, prevIdx, ok := p.table.RenamedFrom(key)
+		if !ok || prevIdx >= idx {
+			break
+		}
+		if moved, ok := p.table.MovedAway(key); !ok || moved != to {
+			break
+		}
+		key, to, idx = prev, key, prevIdx
+	}
+	return from, repo, renIdx
+}
+
+// setAsideLeftBehind moves aside a directory left under a key a rename moved
+// away from, when no rename's target takes it any more (the target was
+// deleted, or projected anew meanwhile): kept under the freed name, it
+// would fail Forgejo's creation of a repository there (#43). Only a
+// directory whose stamp names this key is concerned, never one a native git
+// of the key may be writing; it is moved under staleDirName, never removed.
+func (p *projector) setAsideLeftBehind(repo, dir string, want map[string]reftable.ProjectedRef) error {
+	if len(want) != 0 || p.registry.busy(repo) {
+		return nil
+	}
+	if _, moved := p.table.MovedAway(repo); !moved {
+		return nil
+	}
+	if _, err := os.Stat(dir); err != nil {
+		return nil
+	}
+	if held, known := heldBefore(dir, repo, math.MaxUint64); !known || !held {
+		return nil
+	}
+	aside := filepath.Join(p.root, staleDirName, fmt.Sprintf("%s-left-%d", strings.ReplaceAll(repo, "/", "_"), time.Now().UnixNano()))
+	if err := os.MkdirAll(filepath.Dir(aside), 0o700); err != nil {
+		return err
+	}
+	if err := os.Rename(dir, aside); err != nil {
+		return err
+	}
+	log.Warn("cluster: %s was renamed away and no rename takes its directory any more: it is set aside in %s", repo, aside)
+	return nil
+}
+
+// leavesKey reports whether the directory under repo is one the projector
+// sets aside or removes before repo is projected: the key is deleted in the
+// table, or a rename took it while the directory still holds, by its stamp,
+// the repository certified under it before that rename (setAsideStale,
+// setAsideLeftBehind). The object channel refuses to index a pack there
+// (#99). Without a keyed stamp, nothing is refused.
+func (p *projector) leavesKey(repo string) bool {
+	dir := filepath.Join(p.root, filepath.FromSlash(repo))
+	if _, err := os.Stat(dir); err != nil {
+		return false
+	}
+	if _, deleted := p.table.Deleted(repo); deleted {
+		return true
+	}
+	from, renIdx, ok := p.table.RenamedFrom(repo)
+	if !ok {
+		return false
+	}
+	if src, _, srcIdx := p.renameSource(repo, from, renIdx); src == repo {
+		if held, known := heldBefore(dir, repo, srcIdx); known && held {
+			return false
+		}
+	}
+	held, known := heldBefore(dir, repo, renIdx)
+	return known && held
+}
+
+// awaitsRename reports whether repo's directory is absent here while the
+// repository a rename moved into it still sits under an older key of the
+// chain, which the projection moves in: a directory created under repo
+// meanwhile would keep it out (#100).
+func (p *projector) awaitsRename(repo string) bool {
+	if _, err := os.Stat(filepath.Join(p.root, filepath.FromSlash(repo))); err == nil {
+		return false
+	}
+	first, firstIdx, ok := p.table.RenamedFrom(repo)
+	if !ok {
+		return false
+	}
+	from, to, renIdx := p.renameSource(repo, first, firstIdx)
+	return p.holdsRenamed(filepath.Join(p.root, filepath.FromSlash(from)), from, to, renIdx)
+}
+
+// servesAnother reports whether repo's directory holds, by its stamp,
+// another repository than the one the table holds under repo: the stamp
+// names a key that is not repo nor one renamed into it before its
+// certification there, or it names repo certified before a rename that took
+// repo or moved it away, which is not a chain of renames come back. A
+// directory without a keyed stamp is not judged.
+func (p *projector) servesAnother(repo string) bool {
+	b, err := os.ReadFile(filepath.Join(p.root, filepath.FromSlash(repo), stampName))
+	if err != nil {
+		return false
+	}
+	var s stamp
+	if json.Unmarshal(b, &s) != nil || s.Repo == "" {
+		return false
+	}
+	if s.Repo != repo {
+		// The directory of a key renamed into repo, moved in and not
+		// certified yet: the same repository.
+		key, before := repo, uint64(math.MaxUint64)
+		for range renameLineageDepth {
+			from, idx, ok := p.table.RenamedFrom(key)
+			if !ok || idx >= before {
+				break
+			}
+			if from == s.Repo && s.Watermark < idx {
+				return false
+			}
+			key, before = from, idx
+		}
+		return true
+	}
+	if from, idx, ok := p.table.RenamedFrom(repo); ok && idx > s.Watermark {
+		if src, _, srcIdx := p.renameSource(repo, from, idx); src == repo && s.Watermark < srcIdx {
+			return false
+		}
+		return true
+	}
+	if _, idx, ok := p.table.RenamedInto(repo, math.MaxUint64); ok && idx > s.Watermark {
+		return true
+	}
+	return false
 }

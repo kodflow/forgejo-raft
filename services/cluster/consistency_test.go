@@ -241,11 +241,20 @@ func TestInitBareSyncsTheDirectoriesItCreates(t *testing.T) {
 	var synced []string
 	defer func(prev func(string) error) { syncDirFn = prev }(syncDirFn)
 	syncDirFn = func(d string) error { synced = append(synced, d); return nil }
+	var files []string
+	defer func(prev func(string) error) { syncFileFn = prev }(syncFileFn)
+	syncFileFn = func(f string) error { files = append(files, filepath.Base(f)); return nil }
 	dir := filepath.Join(root, "o", "r.git")
 	require.NoError(t, initBare(context.Background(), dir, "sha1"))
-	for _, d := range []string{filepath.Join(dir, "objects"), filepath.Join(dir, "refs"), dir, filepath.Join(root, "o"), root} {
-		assert.Contains(t, synced, d)
-	}
+	// The repository is made and synced in a sibling, then renamed under
+	// the key (#42): its own directories are synced under the sibling.
+	require.Len(t, synced, 5, "%v", synced)
+	tmp := synced[2]
+	assert.True(t, strings.HasPrefix(filepath.Base(tmp), ".r.git.init-"), tmp)
+	assert.Equal(t, []string{filepath.Join(tmp, "objects"), filepath.Join(tmp, "refs"), tmp, filepath.Join(root, "o"), root}, synced)
+	assert.Equal(t, []string{"HEAD", "config"}, files)
+	assert.True(t, validRepoDir(dir))
+	assert.NoDirExists(t, tmp)
 }
 
 // Two renames applied on a node before its projector ran: s/a.git renamed

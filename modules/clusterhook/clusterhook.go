@@ -134,6 +134,10 @@ const (
 	// OpFresh waits until this node serves a repository at the commit
 	// index the cluster confirms now, before `forgejo serv` runs git.
 	OpFresh = "fresh"
+	// OpReadable refuses a read of a repository whose directory on this
+	// node is not the repository the table holds under its key, before
+	// `forgejo serv` runs git.
+	OpReadable = "readable"
 )
 
 // Request is one call on the socket: one JSON object per connection.
@@ -317,7 +321,7 @@ const AdminTimeout = 30 * time.Minute
 // budget for the push path, the operator's for the rest.
 func Budget(op string) time.Duration {
 	switch op {
-	case OpPrepared, OpCommitted, OpAborted, OpRegister, OpStatus, OpFresh:
+	case OpPrepared, OpCommitted, OpAborted, OpRegister, OpStatus, OpFresh, OpReadable:
 		return ServerBudget()
 	default:
 		return AdminTimeout - 10*time.Second
@@ -486,7 +490,33 @@ func WaitWrites(ctx context.Context, c *Collector) bool {
 	return f(ctx, c.Nonces())
 }
 
-var waitFresh func(ctx context.Context, key string) bool
+var (
+	waitFresh  func(ctx context.Context, key string) bool
+	readRefuse func(key string) error
+)
+
+// SetReadGuard registers the replicator's check of a repository's
+// directory before it is read.
+func SetReadGuard(f func(key string) error) {
+	lifecycleMu.Lock()
+	readRefuse = f
+	lifecycleMu.Unlock()
+}
+
+// ReadRefusal says why this node must not serve the repository's directory
+// now, or nil: the directory still holds another repository than the one
+// the table holds under the key (a rename or a recreation of the name not
+// projected here yet), which the database's permissions do not describe.
+// Without a cluster it returns nil.
+func ReadRefusal(key string) error {
+	lifecycleMu.RLock()
+	f := readRefuse
+	lifecycleMu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	return f(key)
+}
 
 // SetFreshWaiter registers the replicator's wait for a repository to be
 // served at the cluster's current commit index.

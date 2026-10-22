@@ -377,7 +377,9 @@ func (r *Replicator) WriteRefusal(ctx context.Context) error {
 	defer cancel()
 	for {
 		eng := r.Engine()
-		if eng == nil || !r.projector.Ready() {
+		// The fence only: a repository still behind refuses its own writes,
+		// at the proposal, and holds no other one (#39).
+		if eng == nil || r.projector.Fenced() {
 			return errors.New("this node of the cluster is not ready; retry shortly")
 		}
 		if h := eng.Health(); h.Stopped {
@@ -414,8 +416,11 @@ func WriteRefusal(ctx context.Context) error {
 
 func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.Request, tx *reftable.RefTxn) *clusterhook.Response {
 	eng := r.Engine()
-	if eng == nil || !r.projector.Ready() {
+	if eng == nil || r.projector.Fenced() {
 		return fail(errors.New("this node of the cluster is not ready; retry shortly"))
+	}
+	if !r.projector.Writable(repo) {
+		return fail(fmt.Errorf("the repository %s is not reconciled on this node since its start; retry shortly or through another node", repo))
 	}
 	if r.table.EventBytes() > reftable.MaxEventBytes*9/10 {
 		return fail(errors.New("the cluster's event queue is nearly full; the push is refused before anything is written"))

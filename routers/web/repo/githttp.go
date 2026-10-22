@@ -296,6 +296,13 @@ func httpBase(ctx *context.Context) *serviceHandler {
 	if service != "" || strings.HasSuffix(ctx.Req.URL.Path, "-pack") {
 		clusterhook.WaitFresh(ctx, clusterhook.RepoKey(owner.Name, repo.Name, isWiki))
 	}
+	// A directory that still holds another repository than the one the
+	// database describes under this name is never served under its
+	// permissions.
+	if err := clusterhook.ReadRefusal(clusterhook.RepoKey(owner.Name, repo.Name, isWiki)); err != nil {
+		ctx.PlainText(http.StatusServiceUnavailable, err.Error())
+		return nil
+	}
 
 	ctx.Req.URL.Path = strings.ToLower(ctx.Req.URL.Path) // blue: In case some repo name has upper case name
 
