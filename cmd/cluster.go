@@ -15,6 +15,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -324,7 +325,7 @@ func runClusterRecover(ctx context.Context, c *cli.Command) error {
 	if c.String("from-observer") != "" {
 		return runRecoverFromObserver(ctx, c)
 	}
-	if c.String("members") == "" || len(c.StringSlice("fenced")) == 0 {
+	if c.String("members") == "" {
 		return errors.New("--members and --fenced are required, unless --from-observer")
 	}
 	d, err := clusterDriver()
@@ -339,15 +340,30 @@ func runClusterRecover(ctx context.Context, c *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	opt := consensus.RecoverOptions{Operator: localOperator()}
-	if opt.Fenced, err = parseFenced(c.StringSlice("fenced")); err != nil {
-		return err
-	}
 	rep, err := d.Inspect(setting.Cluster.DataDir)
 	if err != nil {
 		return err
 	}
 	if err := checkRecoverVoters(members, rep); err != nil {
+		return err
+	}
+	opt := consensus.RecoverOptions{Operator: localOperator()}
+	if recoverInterruptedAfterStamp(rep, cid) {
+		// The Recover to cid wrote its stamp and was cut before it removed
+		// its marker: the old cluster was fenced then, and the stamp names
+		// cid now, against which no receipt can exist. Running it again
+		// only removes the marker, confirmed and audited.
+		fmt.Fprintf(c.Root().Writer, "Completing the Recover to %s that was interrupted after its stamp.\n", cid)
+		if err := confirmTyped(c, "the new cluster id", cid.String()); err != nil {
+			return err
+		}
+		opt.Confirm = cid.String()
+		return d.Recover(setting.Cluster.DataDir, cid, members, opt)
+	}
+	if len(c.StringSlice("fenced")) == 0 {
+		return errors.New("--members and --fenced are required, unless --from-observer")
+	}
+	if opt.Fenced, err = parseFenced(c.StringSlice("fenced")); err != nil {
 		return err
 	}
 	old := rep.Cluster
@@ -371,6 +387,12 @@ func runClusterRecover(ctx context.Context, c *cli.Command) error {
 	}
 	opt.Confirm = cid.String()
 	return d.Recover(setting.Cluster.DataDir, cid, members, opt)
+}
+
+// recoverInterruptedAfterStamp tells whether the data directory holds a
+// Recover to cid that wrote its stamp and was cut before it completed.
+func recoverInterruptedAfterStamp(rep consensus.Report, cid consensus.ClusterID) bool {
+	return rep.Cluster == cid && slices.Contains(rep.Markers, consensus.MarkerRecover)
 }
 
 // parseFenced reads the --fenced attestations, id:method:receipt-file

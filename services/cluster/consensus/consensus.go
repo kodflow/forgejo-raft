@@ -386,10 +386,14 @@ type Report struct {
 	Snapshot    *SnapshotMeta
 	Quarantined bool
 	// Markers names the stop markers of the directory, which only an
-	// operator clears.
+	// operator clears: STOP-RECOVER for a Recover interrupted before it
+	// completed.
 	Markers []string
 	Detail  []string
 }
+
+// MarkerRecover is the stop marker of a Recover that did not complete.
+const MarkerRecover = "STOP-RECOVER"
 
 // QuarantineExit is the way out of a LOG_CORRUPT quarantine (R3-09).
 type QuarantineExit uint8

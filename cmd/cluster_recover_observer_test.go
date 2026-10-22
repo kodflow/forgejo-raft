@@ -22,6 +22,7 @@ import (
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/test"
 	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/reftable"
 	"forgejo.org/services/cluster/witness"
 
 	"github.com/stretchr/testify/assert"
@@ -294,4 +295,66 @@ func TestHuntR1ProveRestoreCommandHasNoFenceNorProbe(t *testing.T) {
 	require.ErrorContains(t, run(slices.Concat([]string{"--new-cluster", old.String(), "--witness-key", keys[0], "--witness-key", keys[1]}, fenced)...), "own id")
 	ln.Close()
 	require.NoError(t, run(slices.Concat(both, fenced, oldPeer)...), "fenced and silent")
+}
+
+// A Recover cut after its stamp and before it removed STOP-RECOVER is
+// completed by running it again to the same cluster: the CLI no longer
+// asks for receipts of (new, new), which no witness can sign, and the
+// engine removes the marker (#35).
+func TestHuntR1ProveRecoverInterruptedAfterStamp(t *testing.T) {
+	d, err := consensus.Lookup("kitsunium")
+	require.NoError(t, err)
+	old, cid := consensus.ClusterID{0x0a}, consensus.ClusterID{0x0b}
+	var members []consensus.Member
+	dirs := map[string]string{}
+	for i, slot := range []string{"node-a", "node-b", "node-c"} {
+		dir := t.TempDir()
+		id, inc, err := d.Init(dir, old, slot)
+		require.NoError(t, err)
+		dirs[slot] = dir
+		members = append(members, consensus.Member{ID: id, Incarnation: inc, Slot: slot, SPKI: [32]byte{byte(i + 1)}, Address: fmt.Sprintf("127.0.0.1:%d", i+1), Voter: true})
+	}
+	dir := dirs["node-b"]
+	require.NoError(t, d.Bootstrap(context.Background(), consensus.Config{DataDir: dir, Slot: "node-b", Machine: reftable.New(), MaxLogBytes: 1 << 30, MaxSnapshotBytes: 1 << 30}, members))
+
+	// Two witnesses fenced node-a and node-c for the Recover of node-b.
+	var keys [][]byte
+	var privs []ed25519.PrivateKey
+	for range 2 {
+		pub, priv, err := ed25519.GenerateKey(nil)
+		require.NoError(t, err)
+		keys, privs = append(keys, pub), append(privs, priv)
+	}
+	opt := consensus.RecoverOptions{Operator: consensus.Operator("forgejo-user:1"), Confirm: cid.String(), WitnessKeys: keys}
+	for _, m := range []consensus.Member{members[0], members[2]} {
+		fv := consensus.FencedVoter{Voter: m.ID, Method: "stopped"}
+		for _, k := range privs {
+			fv.Receipts = append(fv.Receipts, ed25519.Sign(k, witness.ReceiptMessage(old, cid, m.ID)))
+		}
+		opt.Fenced = append(opt.Fenced, fv)
+	}
+	self := []consensus.Member{members[1]}
+	require.NoError(t, d.Recover(dir, cid, self, opt))
+	rep, err := d.Inspect(dir)
+	require.NoError(t, err)
+	require.Equal(t, cid, rep.Cluster)
+	assert.False(t, recoverInterruptedAfterStamp(rep, cid), "a completed Recover")
+
+	// The crash between the stamp and the marker's removal.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, consensus.MarkerRecover), fmt.Appendf(nil, "cluster=%s\nkept=%d\nRecover to cluster %s was interrupted: run Recover again to cluster %s to complete it\n", cid, rep.LastIndex-1, cid, cid), 0o600))
+	rep, err = d.Inspect(dir)
+	require.NoError(t, err)
+	require.True(t, recoverInterruptedAfterStamp(rep, cid))
+	assert.False(t, recoverInterruptedAfterStamp(rep, consensus.ClusterID{0x0c}), "another cluster is a new Recover")
+	// The receipts the CLI used to check, against the stamp's cluster, can
+	// never verify: they sign (old, new).
+	require.Error(t, witness.VerifyReceipts([]ed25519.PublicKey{keys[0], keys[1]}, rep.Cluster, cid, opt.Fenced))
+
+	// What the CLI runs now: the same Recover, without the fence.
+	require.NoError(t, d.Recover(dir, cid, self, consensus.RecoverOptions{Operator: opt.Operator, Confirm: cid.String()}))
+	rep, err = d.Inspect(dir)
+	require.NoError(t, err)
+	assert.NotContains(t, rep.Markers, consensus.MarkerRecover)
+	_, err = os.Stat(filepath.Join(dir, consensus.MarkerRecover))
+	assert.True(t, os.IsNotExist(err))
 }
