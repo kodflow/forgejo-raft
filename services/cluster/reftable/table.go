@@ -1065,6 +1065,12 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	if p.Format != SnapshotFormat {
 		return fmt.Errorf("%w: snapshot format %d", ErrVersion, p.Format)
 	}
+	// A snapshot cut at a payload version this binary does not apply holds
+	// state it cannot keep: restoring it would drop that state and leave
+	// the node writing a version it cannot encode (#50). It stops here.
+	if p.Payload > PayloadVersion {
+		return fmt.Errorf("%w: snapshot written at payload version %d, this binary applies %d", ErrVersion, p.Payload, PayloadVersion)
+	}
 	if err := p.validNames(); err != nil {
 		return err
 	}

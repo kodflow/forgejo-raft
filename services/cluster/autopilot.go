@@ -167,16 +167,39 @@ const promoteLag = 1024
 
 // promotable says whether a learner is ready to vote: the leader heard it
 // within the autopilot's period, it receives no snapshot and is caught up
-// (#92, #94).
+// (#92, #94), and, once the cluster writes a payload version above the
+// base, its binary applies that version: an older binary made a voter would
+// stop on the first entry it cannot read, or lead and lose what it cannot
+// keep (#50). Its hello is asked once per pass, and only then.
 func (r *Replicator) promotable(ctx context.Context, eng consensus.Engine) func(consensus.Member) bool {
 	peers := map[consensus.NodeID]consensus.PeerHealth{}
 	for _, p := range eng.Health().Peers {
 		peers[p.ID] = p
 	}
+	var seen []hello
+	asked := false
 	return func(x consensus.Member) bool {
 		p, ok := peers[x.ID]
-		return ok && !p.Unreachable && !p.Snapshot && p.Lag <= promoteLag && p.LastContact <= r.auto.tick
+		if !ok || p.Unreachable || p.Snapshot || p.Lag > promoteLag || p.LastContact > r.auto.tick {
+			return false
+		}
+		v := r.table.WriteVersion()
+		if v <= reftable.BaseVersion {
+			return true
+		}
+		if !asked {
+			seen, asked = r.auto.round(ctx), true
+		}
+		return slices.ContainsFunc(seen, func(h hello) bool {
+			return h.Node == x.ID.String() && appliesVersion(h, v) && r.trustedAnswer(x, h)
+		})
 	}
+}
+
+// appliesVersion reports whether the binary that answered applies payload
+// version v; a binary older than the field applies the base version only.
+func appliesVersion(h hello, v uint8) bool {
+	return max(h.Payload, reftable.BaseVersion) >= int(v)
 }
 
 // deadClock is when the leader first found each member out of reach. Only

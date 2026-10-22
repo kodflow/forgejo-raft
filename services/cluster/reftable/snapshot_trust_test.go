@@ -5,6 +5,7 @@ package reftable
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -13,6 +14,37 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// A snapshot cut at a payload version this binary does not apply is
+// refused with ErrVersion, which stops the node, instead of being restored
+// with the state it cannot keep (#50).
+func TestNewerSnapshotIsRefused(t *testing.T) {
+	tb := New()
+	err := tb.Restore(strings.NewReader(fmt.Sprintf(`{"format":1,"payload":%d,"repos":{},"last":{},"deleted":{},"renamed":{}}`, PayloadVersion+1)), consensus.SnapshotMeta{})
+	require.ErrorIs(t, err, ErrVersion, "WriteVersion %d", tb.WriteVersion())
+	assert.Equal(t, uint8(BaseVersion), tb.WriteVersion(), "the refused snapshot left the table as it was")
+}
+
+// The snapshot this binary cuts at its own payload version still restores.
+func TestHuntR1ProveNewerSnapshotIsRefused(t *testing.T) {
+	h := newHarness(t)
+	for v := BaseVersion + 1; v <= PayloadVersion; v++ {
+		require.True(t, h.apply(KindAudit, &Audit{Operator: "op", Action: AuditPayloadVersion, Target: fmt.Sprint(v), Outcome: AuditRaised}).OK)
+	}
+	require.Equal(t, uint8(PayloadVersion), h.table.WriteVersion())
+	snap, err := h.table.Snapshot()
+	require.NoError(t, err)
+	var b strings.Builder
+	_, err = snap.WriteTo(&b)
+	require.NoError(t, err)
+	tb := New()
+	require.NoError(t, tb.Restore(strings.NewReader(b.String()), consensus.SnapshotMeta{}))
+	assert.Equal(t, uint8(PayloadVersion), tb.WriteVersion())
+
+	newer := strings.Replace(b.String(), fmt.Sprintf(`"payload":%d`, PayloadVersion), fmt.Sprintf(`"payload":%d`, PayloadVersion+1), 1)
+	require.NotEqual(t, b.String(), newer)
+	require.ErrorIs(t, New().Restore(strings.NewReader(newer), consensus.SnapshotMeta{}), ErrVersion)
+}
 
 // Every repository key and ref name a snapshot holds passes the checks
 // Apply makes: the projector, the observer and a recover turn the keys into

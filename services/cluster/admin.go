@@ -386,6 +386,14 @@ func (r *Replicator) operate(ctx context.Context, eng consensus.Engine, op conse
 		if o.Target != strconv.Itoa(reftable.PayloadVersion) {
 			return fmt.Errorf("this binary raises the payload version to %d only", reftable.PayloadVersion)
 		}
+		// In the autonomous mode every member says which version its
+		// binary applies: the raise waits for all of them, as the
+		// autopilot's does, since a member on an older binary stops on the
+		// first entry of the new version, and two of three lose the
+		// quorum (#50).
+		if r.auto != nil && !everyMemberApplies(eng.Membership(), eng.Status().ID, r.auto.round(ctx), r.trustedAnswer) {
+			return fmt.Errorf("some member did not answer, or runs a binary that does not apply payload version %d: the version is not raised", reftable.PayloadVersion)
+		}
 		if err := r.RaisePayloadVersion(ctx, op); err != nil {
 			return err
 		}
@@ -695,6 +703,10 @@ func (r *Replicator) authorizeJoin(ctx context.Context, req consensus.JoinReques
 	default:
 		return "", fmt.Errorf("JOIN_REFUSED: the grant for slot %s expired", slot)
 	}
+	if err := r.joinerApplies(ctx, req); err != nil {
+		log.Warn("cluster: a join under slot %s refused: %v", slot, err)
+		return "", err
+	}
 	if gate := r.nomadGate(); gate != nil {
 		if err := gate.CheckJoin(ctx, slot, req.Address); err != nil {
 			log.Warn("cluster: a join under slot %s refused: %v", slot, err)
@@ -710,6 +722,30 @@ func (r *Replicator) authorizeJoin(ctx context.Context, req consensus.JoinReques
 	}
 	log.Warn("cluster: a node joins under slot %s, admitted by %s", slot, operator)
 	return operator, nil
+}
+
+// joinerApplies refuses, in the autonomous mode, a joiner whose binary does
+// not apply the payload version the cluster writes: it would restore the
+// table's snapshot without what it cannot read (a revocation among them),
+// then become a voter, perhaps the leader (#50). The joiner says it in its
+// hello, under the certificate of its slot; a joiner that does not answer
+// is refused, and retries. While the cluster writes the base version, every
+// binary applies it, and nothing is asked.
+func (r *Replicator) joinerApplies(ctx context.Context, req consensus.JoinRequest) error {
+	v := r.table.WriteVersion()
+	if r.auto == nil || r.auto.probe == nil || v <= reftable.BaseVersion {
+		return nil
+	}
+	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	h, err := r.auto.probe(pctx, req.Address, req.Slot)
+	if err != nil {
+		return fmt.Errorf("JOIN_REFUSED: the joiner of slot %s does not say which payload version it applies: %w", req.Slot, err)
+	}
+	if h.Slot != req.Slot || !appliesVersion(h, v) {
+		return fmt.Errorf("JOIN_REFUSED: the joiner of slot %s runs a binary that applies payload version %d, the cluster writes %d", req.Slot, max(h.Payload, reftable.BaseVersion), v)
+	}
+	return nil
 }
 
 // SaveSnapshot writes the ref snapshot and its SHA-256 side by side (D17,

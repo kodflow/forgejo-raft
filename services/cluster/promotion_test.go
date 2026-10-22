@@ -6,11 +6,13 @@ package cluster
 import (
 	"context"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/reftable"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -168,4 +170,65 @@ func TestHuntPerfMbrSecondVoterLossLeavesFormingLeaderless(t *testing.T) {
 	r.autopilotStep(t.Context())
 	assert.Equal(t, []consensus.NodeID{0xb, 0xc}, e.promotes)
 	assert.Equal(t, 3, e.voters())
+}
+
+// raiseTo raises a table's written payload version, as the audit records
+// of the raises do.
+func raiseTo(t *testing.T, r *Replicator, v int) {
+	t.Helper()
+	for i := reftable.BaseVersion + 1; i <= v; i++ {
+		data, err := reftable.Encode(reftable.KindAudit, &reftable.Audit{Operator: "op", Action: reftable.AuditPayloadVersion, Target: strconv.Itoa(i), Outcome: reftable.AuditRaised})
+		require.NoError(t, err)
+		require.True(t, r.table.Apply(consensus.Entry{Term: 1, Index: uint64(i), Data: data}).(reftable.Result).OK)
+	}
+	require.Equal(t, uint8(v), r.table.WriteVersion())
+}
+
+// Once the cluster writes a payload version above the base, a binary that
+// does not apply it is refused at the JOIN, never promoted, and holds a
+// raise from the administration back (#50).
+func TestHuntR1ProveOlderBinaryJoinsAfterTheRaise(t *testing.T) {
+	r, e, clock := newLeaderBench(t, 3)
+	payload := map[string]int{"node-b": reftable.PayloadVersion, "node-c": reftable.PayloadVersion - 1}
+	r.auto.peers = map[string]string{"node-a": "a:1", "node-b": "b:1", "node-c": "c:1"}
+	r.auto.probe = func(_ context.Context, _, slot string) (hello, error) {
+		id := map[string]consensus.NodeID{"node-b": 0xb, "node-c": 0xc}[slot]
+		return hello{Slot: slot, State: helloJoining, Node: id.String(), Payload: payload[slot], SPKI: [32]byte{byte(id)}}, nil
+	}
+
+	// At the base version, nothing is asked.
+	require.NoError(t, r.joinerApplies(t.Context(), consensus.JoinRequest{Slot: "node-c", Address: "c:1"}))
+	raiseTo(t, r, reftable.PayloadVersion)
+	require.NoError(t, r.joinerApplies(t.Context(), consensus.JoinRequest{Slot: "node-b", Address: "b:1"}))
+	err := r.joinerApplies(t.Context(), consensus.JoinRequest{Slot: "node-c", Address: "c:1"})
+	require.ErrorContains(t, err, "JOIN_REFUSED")
+	payload["node-c"] = 0 // a binary older than the field applies version 1
+	require.ErrorContains(t, r.joinerApplies(t.Context(), consensus.JoinRequest{Slot: "node-c", Address: "c:1"}), "JOIN_REFUSED")
+
+	// Members already: the older one is never promoted, so neither is the
+	// other from one voter.
+	e.join(consensus.Member{ID: 0xb, Slot: "node-b", SPKI: [32]byte{0xb}})
+	e.join(consensus.Member{ID: 0xc, Slot: "node-c", SPKI: [32]byte{0xc}})
+	for range 5 {
+		r.autopilotStep(t.Context())
+		clock.advance(2 * time.Second)
+	}
+	assert.Empty(t, e.promotes)
+	payload["node-c"] = reftable.PayloadVersion
+	r.autopilotStep(t.Context())
+	assert.Equal(t, []consensus.NodeID{0xb, 0xc}, e.promotes)
+}
+
+// A raise from the administration, in the autonomous mode, waits for every
+// member to apply the version, as the autopilot's does (#50).
+func TestRaiseFromTheAdministrationWaitsForEveryMember(t *testing.T) {
+	r, e, _ := newLeaderBench(t, 3)
+	e.join(consensus.Member{ID: 0xb, Slot: "node-b", SPKI: [32]byte{0xb}, Voter: true})
+	r.auto.peers = map[string]string{"node-a": "a:1", "node-b": "b:1"}
+	r.auto.probe = func(_ context.Context, _, slot string) (hello, error) {
+		return hello{Slot: slot, State: helloMember, Node: consensus.NodeID(0xb).String(), Payload: reftable.PayloadVersion - 1, SPKI: [32]byte{0xb}}, nil
+	}
+	err := r.operate(t.Context(), e, "op", Operation{Action: ActionRaisePayload, Target: strconv.Itoa(reftable.PayloadVersion)})
+	require.ErrorContains(t, err, "not raised")
+	assert.Equal(t, uint8(reftable.BaseVersion), r.table.WriteVersion())
 }
