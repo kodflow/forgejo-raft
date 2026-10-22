@@ -487,8 +487,10 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 		if errors.Is(err, cluster_model.ErrCursorMoved) {
 			return nil // another dispatcher moved it; its work stands, ours rolled back
 		}
-		dispatchFailuresTotal.Inc()
-		return err
+		if !c.committedAnyway(ctx, lineage, next, err) {
+			dispatchFailuresTotal.Inc()
+			return err
+		}
 	}
 	effects.Run()
 	dispatchedTotal.Add(float64(len(batch) - parked))
@@ -504,6 +506,44 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 	}
 	c.mu.Unlock()
 	return nil
+}
+
+// committedAnyway tells a batch whose COMMIT failed with an unknown
+// outcome (the connection cut after the database committed it, a
+// synchronous standby's wait ended by a failover) from one that rolled
+// back: the cursor is read again on a new connection, and a cursor at
+// next means the work committed, so its effects run once, here, since no
+// replay will collect them again (#103).
+func (c *consumer) committedAnyway(ctx context.Context, lineage string, next cluster_model.Cursor, cause error) bool {
+	if c.cursor == nil {
+		return false
+	}
+	cur, err := c.cursor(ctx, cursorName(lineage))
+	if err != nil || cur.Lineage != next.Lineage || cur.Position != next.Position {
+		return false
+	}
+	log.Warn("cluster consumer: the commit of the batch up to %d of %s returned %v, but the cursor reads %d: it committed, its effects run", next.Position, lineage, cause, next.Position)
+	return true
+}
+
+// parkedGone tells a retried parked entry whose COMMIT failed with an
+// unknown outcome from one that rolled back: its rows are gone only if the
+// transaction that removed them, with the work, committed (#103).
+func (c *consumer) parkedGone(ctx context.Context, lineage string, index int64, cause error) bool {
+	if c.listParked == nil {
+		return false
+	}
+	rows, err := c.listParked(ctx)
+	if err != nil {
+		return false
+	}
+	for _, row := range rows {
+		if row.Lineage == lineage && row.LogIndex == index {
+			return false
+		}
+	}
+	log.Warn("cluster consumer: the commit of the parked entry %d of %s returned %v, but its rows are gone: it committed, its effects run", index, lineage, cause)
+	return true
 }
 
 // parkGroup writes the parked rows of a group, in the dispatch's
@@ -587,6 +627,9 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 		})
 		if errors.Is(err, cluster_model.ErrParkedGone) {
 			continue
+		}
+		if err != nil && c.parkedGone(ctx, lineage, index, err) {
+			err = nil
 		}
 		if err != nil {
 			blocked[repo] = true
