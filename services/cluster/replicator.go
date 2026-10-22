@@ -280,6 +280,7 @@ func Init(ctx context.Context) error {
 	clusterhook.SetGarbageCollectionGate(r.projector.MayCollectGarbage)
 	clusterhook.SetWriteWaiter(r.waitWrites)
 	clusterhook.SetFreshWaiter(r.WaitFresh)
+	clusterhook.SetReadGuard(r.ReadRefusal)
 
 	go r.projector.run(r.ctx)
 	go r.startupBarrier(r.ctx)
@@ -557,6 +558,21 @@ func (r *Replicator) WaitFresh(ctx context.Context, repo string) bool {
 		return false
 	}
 	return r.projector.Wait(ctx, repo, tok.Index) == nil
+}
+
+// ReadRefusal refuses a read of repo while its directory here holds
+// another repository than the one the table holds under the key (#82): a
+// repository renamed away, or the previous one under a name a rename took,
+// not projected here yet. Served, its history would be read under the
+// database's permissions of the repository that now has the name.
+func (r *Replicator) ReadRefusal(repo string) error {
+	if reftable.ValidRepoKey(repo) != nil {
+		return nil
+	}
+	if r.projector.servesAnother(repo) {
+		return fmt.Errorf("this node of the cluster has not projected the last rename of %s yet; retry shortly or through another node", repo)
+	}
+	return nil
 }
 
 // WaitProjected waits until the local projection of repo reaches index.

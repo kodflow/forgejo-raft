@@ -955,3 +955,46 @@ func (p *projector) awaitsRename(repo string) bool {
 	from, to, renIdx := p.renameSource(repo, first, firstIdx)
 	return p.holdsRenamed(filepath.Join(p.root, filepath.FromSlash(from)), from, to, renIdx)
 }
+
+// servesAnother reports whether repo's directory holds, by its stamp,
+// another repository than the one the table holds under repo: the stamp
+// names a key that is not repo nor one renamed into it before its
+// certification there, or it names repo certified before a rename that took
+// repo or moved it away, which is not a chain of renames come back. A
+// directory without a keyed stamp is not judged.
+func (p *projector) servesAnother(repo string) bool {
+	b, err := os.ReadFile(filepath.Join(p.root, filepath.FromSlash(repo), stampName))
+	if err != nil {
+		return false
+	}
+	var s stamp
+	if json.Unmarshal(b, &s) != nil || s.Repo == "" {
+		return false
+	}
+	if s.Repo != repo {
+		// The directory of a key renamed into repo, moved in and not
+		// certified yet: the same repository.
+		key, before := repo, uint64(math.MaxUint64)
+		for range renameLineageDepth {
+			from, idx, ok := p.table.RenamedFrom(key)
+			if !ok || idx >= before {
+				break
+			}
+			if from == s.Repo && s.Watermark < idx {
+				return false
+			}
+			key, before = from, idx
+		}
+		return true
+	}
+	if from, idx, ok := p.table.RenamedFrom(repo); ok && idx > s.Watermark {
+		if src, _, srcIdx := p.renameSource(repo, from, idx); src == repo && s.Watermark < srcIdx {
+			return false
+		}
+		return true
+	}
+	if _, idx, ok := p.table.RenamedInto(repo, math.MaxUint64); ok && idx > s.Watermark {
+		return true
+	}
+	return false
+}

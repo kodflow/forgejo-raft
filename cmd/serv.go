@@ -382,6 +382,16 @@ func runServ(ctx context.Context, c *cli.Command) error {
 		if err != nil || !resp.OK {
 			fmt.Fprintln(os.Stderr, "Forgejo: this node of the cluster may not show the cluster's last writes yet; fetch again shortly")
 		}
+		// A directory that still holds another repository than the one the
+		// database describes under this name is never served (only an
+		// explicit refusal stops git: a replicator too old to know the
+		// question answers an error).
+		rctx, rcancel := context.WithTimeout(ctx, 10*time.Second)
+		resp, err = clusterhook.Call(rctx, setting.Cluster.HookSocket, &clusterhook.Request{Op: clusterhook.OpReadable, Repo: key})
+		rcancel()
+		if err == nil && !resp.OK && !strings.Contains(resp.Message, "unknown operation") {
+			return fail(ctx, resp.Message, "")
+		}
 	}
 	if setting.Cluster.Enabled && verb == "git-receive-pack" {
 		// The SSH path registers its transaction nonce with the replicator
