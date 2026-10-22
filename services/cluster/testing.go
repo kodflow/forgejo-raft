@@ -4,10 +4,13 @@
 package cluster
 
 import (
+	"context"
 	"crypto/sha256"
+	"errors"
 	"time"
 
 	"forgejo.org/services/cluster/consensus/memraft"
+	"forgejo.org/services/cluster/reftable"
 )
 
 // NewForTesting builds replicators on an in-process log, one per slot, with
@@ -19,6 +22,16 @@ func NewForTesting(root string, slots ...string) (*memraft.Cluster, []*Replicato
 	for _, slot := range slots {
 		r := newReplicator(root, newRegistry(time.Second, 8, 64))
 		r.setEngine(mem.Add(slot, sha256.Sum256([]byte(slot)), r.table))
+		// Every member of the in-memory cluster runs this binary, and
+		// answers a member's hello as such.
+		r.memberProbe = func(_ context.Context, _, slot string) (hello, error) {
+			for _, m := range r.Engine().Membership().Members {
+				if m.Slot == slot {
+					return hello{Slot: slot, State: helloMember, Node: m.ID.String(), Payload: reftable.PayloadVersion, SPKI: m.SPKI}, nil
+				}
+			}
+			return hello{}, errors.New("no member under slot " + slot)
+		}
 		out = append(out, r)
 	}
 	return mem, out
