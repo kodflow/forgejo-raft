@@ -352,6 +352,22 @@ func (r *Replicator) form(ctx context.Context, driver consensus.Driver, cfg cons
 		log.Info("cluster: data directory stamped, node %s of cluster %s", id, cluster)
 		rep = consensus.Report{Cluster: cluster, Node: id, Incarnation: inc, Slot: cfg.Slot, Joining: true}
 	}
+	if rep.BootstrapPending {
+		// This node decided to found, and its Bootstrap stopped between the
+		// pending stamp and the member stamp (#62): it is run again with
+		// the same one-member list, which the SDK accepts only with the
+		// same digest. hello does not say "member" before it succeeds.
+		if rep.Cluster != cluster {
+			return fmt.Errorf("%w: the data directory belongs to cluster %s, the certificate to %s", consensus.ErrMisconfigured, rep.Cluster, cluster)
+		}
+		self := consensus.Member{ID: rep.Node, Incarnation: rep.Incarnation, Slot: cfg.Slot, SPKI: spki, Address: cfg.ListenAddress, Voter: true}
+		log.Warn("cluster: the founding of cluster %s was interrupted on this node; it resumes", cluster)
+		if err := driver.Bootstrap(ctx, cfg, []consensus.Member{self}); err != nil {
+			return fmt.Errorf("[cluster] resuming the founding: %w", err)
+		}
+		r.auto.noteDisk(true)
+		return nil
+	}
 	r.auto.noteDisk(!rep.Joining)
 	if !rep.Joining {
 		return nil

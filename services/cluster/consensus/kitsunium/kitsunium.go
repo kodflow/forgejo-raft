@@ -206,7 +206,8 @@ func (driver) Inspect(dir string) (consensus.Report, error) {
 		out := consensus.Report{
 			Cluster: consensus.ClusterID(r.Stamp.Log.Cluster), Node: consensus.NodeID(r.Stamp.ID),
 			Incarnation: consensus.Incarnation(r.Stamp.Incarnation), Slot: r.Stamp.Slot,
-			Joining: r.Stamp.State == sdk.StampJoining, HardTerm: r.HardState.Term, LastIndex: r.Last,
+			Joining: r.Stamp.State == sdk.StampJoining, BootstrapPending: r.Stamp.State == sdk.StampBootstrapPending,
+			HardTerm: r.HardState.Term, LastIndex: r.Last,
 			Quarantined: r.Quarantine != "", Markers: r.Markers,
 		}
 		out.Detail = append(out.Detail, fmt.Sprintf("stamp state %d, epoch %d", r.Stamp.State, r.Stamp.Log.Epoch),

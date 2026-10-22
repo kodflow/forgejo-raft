@@ -381,10 +381,13 @@ type Report struct {
 	Incarnation Incarnation
 	Slot        string
 	Joining     bool
-	HardTerm    uint64
-	LastIndex   uint64
-	Snapshot    *SnapshotMeta
-	Quarantined bool
+	// BootstrapPending is a founding Bootstrap started and did not finish
+	// (a crash, a write that failed): it resumes with the same list.
+	BootstrapPending bool
+	HardTerm         uint64
+	LastIndex        uint64
+	Snapshot         *SnapshotMeta
+	Quarantined      bool
 	// Markers names the stop markers of the directory, which only an
 	// operator clears: STOP-RECOVER for a Recover interrupted before it
 	// completed.
