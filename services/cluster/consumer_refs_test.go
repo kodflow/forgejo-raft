@@ -97,3 +97,19 @@ func TestTwoPushesOfANewRefInOneBatch(t *testing.T) {
 		repo1Event(21, "refs/heads/dup-grouped", repo1Base, repo1Next),
 	}))
 }
+
+// The pusher's account deleted before the consumer derived its push: the
+// branch rows are written, the notifications that need the account are
+// dropped, and the work is done, never parked for good (#95,
+// TestHuntR6ProveDeletedPusherParksForever, TestHuntSecpushDeletedPusherParksForever).
+func TestPushWorkOfADeletedPusherIsDone(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ctx := db.DefaultContext
+	repo1Git(t, "update-ref", "refs/heads/gone-pusher", repo1Next)
+	ev := repo1Event(30, "refs/heads/gone-pusher", "", repo1Next)
+	ev.PusherID, ev.PusherName = 424242, "gone"
+	require.NoError(t, pushWork(ctx, []reftable.Event{ev}))
+	b, err := git_model.GetBranch(ctx, 1, "gone-pusher")
+	require.NoError(t, err)
+	assert.Equal(t, repo1Next, b.CommitID)
+}

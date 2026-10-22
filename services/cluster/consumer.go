@@ -811,11 +811,17 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		// out again. Its branch rows, webhooks and CI must not land there.
 		return fmt.Errorf("repository ID %d is %s/%s, which the event's %s does not lead to: the ID was reused; run `forgejo cluster reconcile`", first.RepoID, repo.OwnerName, repo.Name, first.Repo)
 	}
-	if u, err := user_model.GetUserByID(ctx, first.PusherID); err == nil && pusherReissued(ctx, u, first) {
+	u, err := user_model.GetUserByID(ctx, first.PusherID)
+	if err == nil && pusherReissued(ctx, u, first) {
 		// The same loss reissues user IDs: another account now holds the
 		// pusher's ID, and must not be credited with the push.
 		return fmt.Errorf("pusher ID %d is %s, not the account that pushed at %d: the ID was reused; run `forgejo cluster reconcile`", first.PusherID, u.Name, first.Token.Index)
 	}
+	// A pusher whose account was deleted since: the branch rows are still
+	// written, but the notifications that need the account are not, as
+	// upstream Forgejo drops that work. Retried, it would fail for good,
+	// parked, and hold back the trim of the whole queue (#95).
+	pusherGone := first.PusherID > 0 && user_model.IsErrUserNotExist(err)
 	var gitRepo *git.Repository
 	openGit := func() (*git.Repository, error) {
 		if gitRepo == nil {
@@ -893,6 +899,10 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		}
 	}
 	if len(updates) == 0 {
+		return nil
+	}
+	if pusherGone {
+		log.Warn("cluster consumer: the pusher %d of %s at %d is gone; the notifications of its push are dropped", first.PusherID, first.Repo, first.Token.Index)
 		return nil
 	}
 	return repo_service.PushUpdatesNow(clusterhook.WithCommand(ctx, first.Token.String()), updates)
