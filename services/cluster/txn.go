@@ -253,10 +253,15 @@ func (r *registry) releaseLocked(nonce string) *txn {
 	return t
 }
 
+// markProposed records that the transaction's entry committed, and gives it
+// a whole TTL from now: git publishes only after "prepared" answers, and a
+// proposal that took longer than the TTL must not leave the registration
+// expired, whatever process it names, while git still holds its locks.
 func (r *registry) markProposed(nonce string) {
 	r.mu.Lock()
 	if t := r.byNonce[nonce]; t != nil {
 		t.proposed = true
+		t.deadline = r.now().Add(r.ttl)
 	}
 	r.mu.Unlock()
 }

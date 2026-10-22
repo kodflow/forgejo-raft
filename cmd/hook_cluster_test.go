@@ -256,6 +256,27 @@ func TestClusterHookRewriteKeepsTheGate(t *testing.T) {
 	assert.Empty(t, written, "pushes acknowledged although the cluster refuses every prepared")
 }
 
+// The hook names git's process, not its wrapper's, which exits as soon as
+// the hook returns while git still holds its locks (#108, ADR 0152 R6-06).
+// Each phase runs a wrapper of its own under the same git process: the
+// "prepared" and the "aborted" that follows name the same PID.
+func TestClusterHookNamesTheGitProcess(t *testing.T) {
+	e := newClusterHookEnv(t)
+	_, err := e.push(e.bare, "refs/heads/pid")
+	require.Error(t, err)
+	e.rep.mu.Lock()
+	defer e.rep.mu.Unlock()
+	pids := map[string]int{}
+	for _, r := range e.rep.reqs {
+		pids[r.Op] = r.PID
+	}
+	t.Logf("PIDs named per phase: %v", pids)
+	require.Contains(t, pids, clusterhook.OpPrepared)
+	require.Contains(t, pids, clusterhook.OpAborted)
+	assert.Positive(t, pids[clusterhook.OpPrepared])
+	assert.Equal(t, pids[clusterhook.OpPrepared], pids[clusterhook.OpAborted], "the PID is the hook wrapper's, one per phase")
+}
+
 // A node of a cluster refuses a git older than 2.48 (#83).
 func TestClusterGitVersionError(t *testing.T) {
 	for v, ok := range map[string]bool{"2.39.5": false, "2.45.4": false, "2.47.3": false, "2.48.0": true, "2.48.2": true, "2.54.0": true, "2.56.0": true} {

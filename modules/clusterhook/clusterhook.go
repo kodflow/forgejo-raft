@@ -33,6 +33,11 @@ import (
 // controls overrides it; it is a correlation id, not an authenticator (R7-37).
 const EnvTxn = "FORGEJO_CLUSTER_TXN"
 
+// EnvGitPID names, to the reference-transaction hook, the git process that
+// runs the transaction: the generated wrapper exports its own parent's PID
+// before it runs the hook, whose parent is that wrapper.
+const EnvGitPID = "FORGEJO_GIT_PID"
+
 // NewNonce draws a 128-bit nonce from crypto/rand.
 func NewNonce() string {
 	var b [16]byte
@@ -144,7 +149,8 @@ type Request struct {
 	PRID        int64             `json:"pr_id,omitempty"`
 	Trigger     string            `json:"trigger,omitempty"`
 	PushOptions map[string]string `json:"push_options,omitempty"`
-	// PID is the hook's parent, the git process owning the transaction.
+	// PID is the git process owning the transaction, as the hook's wrapper
+	// names it (EnvGitPID), else the hook's parent.
 	PID int `json:"pid,omitempty"`
 	// Path and Repo are arguments of the operational calls.
 	Path   string `json:"path,omitempty"`

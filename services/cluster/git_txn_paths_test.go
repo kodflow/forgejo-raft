@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -395,4 +396,108 @@ func TestRenameTheDefaultBranch(t *testing.T) {
 	for _, m := range tc.nodes {
 		assert.Equal(t, c1, gitRef(t, m, repo, "refs/heads/trunk"), "%s: HEAD names trunk, which this member does not hold (the repository looks empty)", m.slot)
 	}
+}
+
+// R6-06 / R3-12 end to end, through Handle on a three-node cluster: node-a's
+// git passed "prepared" (main locked with c1) and has not published yet.
+// The proposal outlived TXN_TTL (the registry's clock is moved past the
+// deadline). node-b then takes an acknowledged write setting main back to
+// c0 (ABA). With git's own PID, which the hook now sends (#108), alive
+// until it published, the fence holds: node-a certifies nothing behind git.
+func TestTheFenceHoldsUntilGitPublishes(t *testing.T) {
+	fenceUntilGitPublishes(t, true)
+}
+
+func fenceUntilGitPublishes(t *testing.T, gitPID bool) {
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	a, b := tc.nodes[0], tc.nodes[1]
+	var skew atomic.Int64
+	a.r.registry.mu.Lock()
+	a.r.registry.now = func() time.Time { return time.Now().Add(time.Duration(skew.Load())) }
+	ttl := a.r.registry.ttl
+	a.r.registry.mu.Unlock()
+
+	repo, ref := "h/gpf.git", "refs/heads/main"
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	c0 := commit(t, work, "zero")
+	c1 := commit(t, work, "one")
+	zero := strings.Repeat("0", 40)
+	require.True(t, tc.pushVia(a, work, repo, ref, zero, c0).OK)
+	for _, n := range []*testNode{a, b} {
+		require.Eventually(t, func() bool { return gitRef(t, n, repo, ref) == c0 }, 10*time.Second, 20*time.Millisecond)
+	}
+	dirA := filepath.Join(a.r.root, filepath.FromSlash(repo))
+	ctx := context.Background()
+
+	// node-a: receive-pack wrote the objects, locked main with c1, and runs
+	// the hook in "prepared".
+	run(t, work, "push", "-q", dirA, c1+":refs/tmp/incoming")
+	run(t, dirA, "update-ref", "-d", "refs/tmp/incoming")
+	unlock := holdRefLock(t, dirA, ref, c1)
+	defer unlock()
+	pid := os.Getpid() // git-receive-pack: alive until it published
+	if !gitPID {
+		w := exec.Command("sh", "-c", "exit 0") // the generated bash wrapper: gone once the hook returned
+		require.NoError(t, w.Run())
+		pid = w.Process.Pid
+	}
+	req := &clusterhook.Request{
+		Op: clusterhook.OpPrepared, Nonce: clusterhook.NewNonce(), GitDir: dirA, RepoID: 1, PusherID: 2, PID: pid,
+		Lines: []clusterhook.Line{{Old: c0, New: c1, Ref: ref}},
+	}
+	resp := a.r.Handle(ctx, req)
+	require.True(t, resp.OK, resp.Message)
+	// The proposal took longer than TXN_TTL (slow majority, big push).
+	skew.Store(int64(ttl + time.Second))
+
+	// node-b projects main=c1, then an acknowledged write there sets it back to c0.
+	require.Eventually(t, func() bool { return gitRef(t, b, repo, ref) == c1 }, 10*time.Second, 20*time.Millisecond)
+	require.True(t, tc.pushVia(b, work, repo, ref, c1, c0).OK)
+	require.Eventually(t, func() bool { v, _ := a.r.table.Get(repo, ref); return v.SHA == c0 }, 10*time.Second, 10*time.Millisecond)
+	pos, _ := a.r.table.Applied()
+	idx := pos.Index
+
+	certified := false
+	for end := time.Now().Add(6 * time.Second); time.Now().Before(end); time.Sleep(20 * time.Millisecond) {
+		if a.r.projector.Projected(repo) >= idx {
+			certified = true
+			break
+		}
+	}
+	t.Logf("before git published: node-a certified index %d (ABA entry) = %v; git main=%s, lock=%s, table main=%s",
+		idx, certified, shortSHA(gitRef(t, a, repo, ref)), shortSHA(c1), shortSHA(c0))
+
+	// git publishes what "prepared" allowed: the lock becomes the ref.
+	lock := filepath.Join(dirA, "refs", "heads", "main.lock")
+	require.NoError(t, os.Rename(lock, filepath.Join(dirA, "refs", "heads", "main")))
+	gitA := gitRef(t, a, repo, ref)
+	tabA, _ := a.r.table.Get(repo, ref)
+	wctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	werr := a.r.WaitProjected(wctx, repo, idx)
+	cancel()
+	fresh := a.r.Handle(ctx, &clusterhook.Request{Op: clusterhook.OpFresh, Repo: repo})
+	t.Logf("after git published: git main=%s table main=%s; WaitProjected(%d) err=%v; OpFresh ok=%v",
+		shortSHA(gitA), shortSHA(tabA.SHA), idx, werr, fresh.OK)
+
+	if !gitPID {
+		// "committed" never reaches the replicator: does anything repair it?
+		time.Sleep(5 * time.Second)
+		t.Logf("5 s later, no \"committed\": git main=%s table main=%s Projected=%d",
+			shortSHA(gitRef(t, a, repo, ref)), shortSHA(tabA.SHA), a.r.projector.Projected(repo))
+	}
+	assert.False(t, werr == nil && gitA != tabA.SHA,
+		"node-a reports index %d projected while its git serves %s and the table at that index holds %s: the fence lapsed before git published",
+		idx, shortSHA(gitA), shortSHA(tabA.SHA))
+
+	req.Op = clusterhook.OpCommitted
+	a.r.Handle(ctx, req)
+	require.Eventually(t, func() bool { return gitRef(t, a, repo, ref) == c0 }, 10*time.Second, 20*time.Millisecond, "repair after committed")
+}
+
+func shortSHA(s string) string {
+	if len(s) > 8 {
+		return s[:8]
+	}
+	return s
 }

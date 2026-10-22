@@ -102,3 +102,23 @@ func TestHangingSSHSessionsDoNotTurnARepositoryAway(t *testing.T) {
 	reg.alive = func(int) bool { return false }
 	require.NoError(t, reg.reserve("r6", "bob/b.git", 1))
 }
+
+// A proposal that outlasts the registration's TTL leaves it fencing the
+// repository: git publishes only after "prepared" answers, and the process
+// the registration names may be gone by then (R6-06, #108). The deadline
+// counts from the proposal's commit, not from the registration.
+func TestAProposalRearmsItsRegistration(t *testing.T) {
+	reg := newRegistry(30*time.Second, 8, 64)
+	now := time.Now()
+	reg.now = func() time.Time { return now }
+	reg.alive = func(int) bool { return false }
+	require.NoError(t, reg.register("n1", "alice/a.git", []string{"refs/heads/main"}, 12345, false))
+
+	now = now.Add(45 * time.Second) // a slow majority: the proposal took 45 s
+	reg.markProposed("n1")
+	assert.True(t, reg.inFlight("alice/a.git"), "the registration expired between the commit and git's publication")
+	assert.False(t, reg.certify("alice/a.git", func() { t.Error("certified while git may still publish") }))
+
+	now = now.Add(31 * time.Second) // git died without a "committed"
+	assert.False(t, reg.inFlight("alice/a.git"))
+}

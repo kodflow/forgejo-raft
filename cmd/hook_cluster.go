@@ -64,7 +64,7 @@ func runHookReferenceTransaction(ctx context.Context, c *cli.Command) error {
 		Op:     state,
 		Nonce:  os.Getenv(clusterhook.EnvTxn),
 		GitDir: gitDir,
-		PID:    os.Getppid(),
+		PID:    gitPID(),
 	}
 	req.PusherID, _ = strconv.ParseInt(os.Getenv(repo_module.EnvPusherID), 10, 64)
 	req.PusherName = os.Getenv(repo_module.EnvPusherName)
@@ -107,6 +107,18 @@ func runHookReferenceTransaction(ctx context.Context, c *cli.Command) error {
 		return cli.Exit("", 1)
 	}
 	return nil
+}
+
+// gitPID names the git process that owns the transaction, which the
+// replicator fences the repository on until it ends (ADR 0152 R6-06). The
+// generated wrapper, which git runs and which runs this hook, exports it;
+// the hook's own parent is that wrapper, gone as soon as the hook returns,
+// while git still holds its locks and has not published.
+func gitPID() int {
+	if pid, err := strconv.Atoi(os.Getenv(clusterhook.EnvGitPID)); err == nil && pid > 0 {
+		return pid
+	}
+	return os.Getppid()
 }
 
 // realPath resolves symbolic links, falling back to the cleaned path.
