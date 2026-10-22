@@ -144,8 +144,27 @@ func writeRefs(ctx context.Context, dir string, set map[string]reftable.RefValue
 	return nil
 }
 
+// validRepoDir reports whether dir holds what git needs to see a bare
+// repository: a non-empty HEAD, objects/ and refs/. A git init killed
+// halfway, or one whose files were never synced before a power cut,
+// leaves a directory git refuses as "not a git repository" (#42).
+func validRepoDir(dir string) bool {
+	st, err := os.Lstat(filepath.Join(dir, "HEAD"))
+	if err != nil || !st.Mode().IsRegular() || st.Size() == 0 {
+		return false
+	}
+	for _, d := range []string{"objects", "refs"} {
+		if st, err := os.Stat(filepath.Join(dir, d)); err != nil || !st.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
 // initBare creates an empty bare repository for a key the table names and
-// this node lacks.
+// this node lacks. It is made in a sibling directory, whose leading dot
+// keeps it outside every repository key, synced, and renamed under the
+// key: an interrupted init never leaves a partial repository there (#42).
 func initBare(ctx context.Context, dir, format string) error {
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 		return err
@@ -157,18 +176,51 @@ func initBare(ctx context.Context, dir, format string) error {
 	default:
 		return fmt.Errorf("object format %q is neither sha1 nor sha256", format)
 	}
-	if _, err := gitRun(ctx, filepath.Dir(dir), nil, "init", "--bare", "--object-format="+format, dir); err != nil {
+	tmp, err := os.MkdirTemp(filepath.Dir(dir), "."+filepath.Base(dir)+".init-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp) // gone once renamed
+	if _, err := gitRun(ctx, filepath.Dir(dir), nil, "init", "--bare", "--object-format="+format, tmp); err != nil {
+		return err
+	}
+	for _, f := range []string{"HEAD", "config"} {
+		if err := syncFileFn(filepath.Join(tmp, f)); err != nil {
+			return err
+		}
+	}
+	for _, d := range []string{filepath.Join(tmp, "objects"), filepath.Join(tmp, "refs"), tmp} {
+		if err := syncDirFn(d); err != nil {
+			return err
+		}
+	}
+	if err := os.Rename(tmp, dir); err != nil {
+		// Another init of the same key (the projector and the object
+		// channel) won the race.
+		if validRepoDir(dir) {
+			return nil
+		}
 		return err
 	}
 	// The objects about to land here are acknowledged once their pack is
-	// synced: the directories leading to them are synced first, innermost
-	// first, up to the repository root.
-	for _, d := range []string{filepath.Join(dir, "objects"), filepath.Join(dir, "refs"), dir, filepath.Dir(dir), filepath.Dir(filepath.Dir(dir))} {
+	// synced: the directories leading to them are synced first, up to the
+	// repository root.
+	for _, d := range []string{filepath.Dir(dir), filepath.Dir(filepath.Dir(dir))} {
 		if err := syncDirFn(d); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// syncFileFn syncs a file; tests replace it.
+var syncFileFn = func(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 // syncDirFn syncs a directory; tests replace it.

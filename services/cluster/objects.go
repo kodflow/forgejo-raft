@@ -182,6 +182,11 @@ func (oc *objectChannel) handlePush(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+	} else if err == nil && !validRepoDir(dir) {
+		// An interrupted init: the projector sets it aside and creates the
+		// repository anew; meanwhile this member does not acknowledge.
+		http.Error(w, fmt.Sprintf("%s holds no git repository on this node yet", repo), http.StatusServiceUnavailable)
+		return
 	}
 	// A sender that stalls mid-pack must not hold index-pack forever.
 	ctx, cancel := context.WithTimeout(r.Context(), objectBudget)

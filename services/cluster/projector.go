@@ -386,6 +386,9 @@ func (p *projector) project(ctx context.Context, repo string) error {
 	if err := p.setAsideStale(repo, dir); err != nil {
 		return err
 	}
+	if err := p.setAsideInvalid(repo, dir, at); err != nil {
+		return err
+	}
 	want := tableProjection(refs)
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
 		if from, renIdx, ok := p.table.RenamedFrom(repo); ok {
@@ -748,5 +751,29 @@ func (p *projector) setAsideStale(repo, dir string) error {
 		return err
 	}
 	log.Warn("cluster: %s was taken by a rename of %s while this node still held its previous repository: that directory is set aside in %s", repo, from, aside)
+	return nil
+}
+
+// setAsideInvalid moves aside a directory under repo's key that is no git
+// repository, a git init killed halfway or never synced (#42): the
+// projection then creates it anew and fetches its objects from the
+// members, where it would otherwise fail at every pass. A directory a
+// native git of this key may still be writing is left alone: one with a
+// transaction registered, or one changed lately, as Forgejo's own git init
+// writes HEAD through the hook before it creates objects/. Like
+// setAsideStale, it is moved under staleDirName, never removed.
+func (p *projector) setAsideInvalid(repo, dir string, at uint64) error {
+	st, err := os.Stat(dir)
+	if err != nil || validRepoDir(dir) || p.registry.busy(repo) || time.Since(st.ModTime()) <= max(p.registry.ttl, staleLockAge) {
+		return nil
+	}
+	aside := filepath.Join(p.root, staleDirName, fmt.Sprintf("%s-invalid-%d-%d", strings.ReplaceAll(repo, "/", "_"), at, time.Now().UnixNano()))
+	if err := os.MkdirAll(filepath.Dir(aside), 0o700); err != nil {
+		return err
+	}
+	if err := os.Rename(dir, aside); err != nil {
+		return err
+	}
+	log.Warn("cluster: %s held no git repository on this node (an interrupted init): that directory is set aside in %s and the repository is projected anew", repo, aside)
 	return nil
 }
