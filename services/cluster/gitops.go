@@ -104,26 +104,35 @@ func missingObjects(ctx context.Context, dir string, shas []string) ([]string, e
 	return missing, nil
 }
 
-// writeRefs makes the given refs of dir hold their table values, in one git
-// transaction for the direct refs.
+// writeRefs makes the given refs of dir hold their table values. The
+// deletions go in a first git transaction and the updates in a second: git
+// refuses to swap a file and a directory of refs in one transaction, in
+// either order of its lines (t1404, "D/F conflict prevents add long +
+// delete short"), and a node behind that projects a deleted refs/heads/a
+// and a created refs/heads/a/b, or the reverse, would fail at every pass
+// (#73). Between the two, the node serves neither ref, which the next
+// write closes; the table is what holds the refs.
 func writeRefs(ctx context.Context, dir string, set map[string]reftable.RefValue, del []string) error {
-	var stdin strings.Builder
+	var deletes, updates strings.Builder
 	var symbolic [][2]string
 	for name, v := range set {
 		if v.Symbolic != "" {
 			symbolic = append(symbolic, [2]string{name, v.Symbolic})
 			continue
 		}
-		fmt.Fprintf(&stdin, "update %s %s\n", name, v.SHA)
+		fmt.Fprintf(&updates, "update %s %s\n", name, v.SHA)
 	}
 	for _, name := range del {
 		if name == "HEAD" {
 			continue
 		}
-		fmt.Fprintf(&stdin, "delete %s\n", name)
+		fmt.Fprintf(&deletes, "delete %s\n", name)
 	}
-	if stdin.Len() > 0 {
-		if _, err := gitRun(ctx, dir, strings.NewReader(stdin.String()), "update-ref", "--stdin"); err != nil {
+	for _, stdin := range []string{deletes.String(), updates.String()} {
+		if stdin == "" {
+			continue
+		}
+		if _, err := gitRun(ctx, dir, strings.NewReader(stdin), "update-ref", "--stdin"); err != nil {
 			return err
 		}
 	}
