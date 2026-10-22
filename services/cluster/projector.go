@@ -291,10 +291,29 @@ func (p *projector) pass(ctx context.Context) {
 	p.notifyWaiters()
 }
 
+// projectedKeys refuses to turn into a path a key, or a rename's source,
+// that Apply would refuse: the table checks them on every entry and every
+// snapshot, and this check keeps a key that slipped past from removing or
+// moving a directory outside the repository root (#81).
+func projectedKeys(table *reftable.Table, repo string) error {
+	if err := reftable.ValidRepoKey(repo); err != nil {
+		return fmt.Errorf("refusing to project %q: %w", repo, err)
+	}
+	if from, _, ok := table.RenamedFrom(repo); ok {
+		if err := reftable.ValidRepoKey(from); err != nil {
+			return fmt.Errorf("refusing to move %q into %s: %w", from, repo, err)
+		}
+	}
+	return nil
+}
+
 // project makes one repository match the table, then certifies it.
 func (p *projector) project(ctx context.Context, repo string) error {
 	if p.registry.inFlight(repo) {
 		return nil // retried at the next pass, once git is done
+	}
+	if err := projectedKeys(p.table, repo); err != nil {
+		return err
 	}
 	dir := filepath.Join(p.root, filepath.FromSlash(repo))
 	refs, at := p.table.Refs(repo)
