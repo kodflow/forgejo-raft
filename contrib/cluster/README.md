@@ -340,6 +340,15 @@ These commands run with the server stopped, on the data directory.
   `snapshot save` logged it: read it from the authenticated backup store.
   The file is refused when it differs, and so is `<file>.meta` when it
   differs from its line in `<file>.sha256`.
+  Like `recover`, it founds the new cluster only once the old one cannot
+  come back: `--fenced id:method:receipt-file[+receipt-file]` for every
+  voter the snapshot's cluster had at the cut, signed by both witnesses
+  (`--witness-key` twice, or `WITNESS_KEYS`), and no old member answering
+  the probe (`PEERS`, `--old-peer slot=host:port`, or
+  `--force-old-members-answer`, logged). The old cluster is the snapshot's;
+  `--old-cluster <id>` names another one when the cluster still running
+  succeeded it. Without the fence, the old site, back up, forms its
+  cluster again and two forges write.
 - After a restore or a PostgreSQL failover, `forgejo cluster reconcile` lists
   the differences between the table and SQL. `--apply` rebuilds the rows that
   can be regenerated (branches, tags); the others are reported with what to

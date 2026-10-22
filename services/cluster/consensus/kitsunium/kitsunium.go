@@ -264,6 +264,20 @@ func (driver) Restore(dir string, r io.Reader, newCluster consensus.ClusterID, m
 	})
 }
 
+// SnapshotOrigin reads the cluster a snapshot was cut from and its voters
+// at the cut.
+func (driver) SnapshotOrigin(meta []byte) (consensus.ClusterID, []consensus.NodeID, error) {
+	var m sdk.SnapshotMetaValue
+	if err := sdk.ParseSnapshotMeta(meta, &m); err != nil {
+		return consensus.ClusterID{}, nil, fmt.Errorf("the snapshot's metadata file: %w", err)
+	}
+	var voters []consensus.NodeID
+	for _, id := range m.Membership.Voters() {
+		voters = append(voters, consensus.NodeID(id))
+	}
+	return consensus.ClusterID(m.Log.Cluster), voters, nil
+}
+
 func (driver) ClearQuarantine(dir string, exit consensus.QuarantineExit, op consensus.Operator) error {
 	e := sdk.WipeAndRejoin
 	if exit == consensus.TruncateAndStaySilent {

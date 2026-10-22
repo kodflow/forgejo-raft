@@ -439,6 +439,13 @@ type Driver interface {
 	ClearQuarantine(dir string, exit QuarantineExit, op Operator) error
 }
 
+// SnapshotOrigin is implemented by a driver that reads, in a snapshot's
+// metadata, the cluster it was cut from and that cluster's voters at the
+// cut: a restore fences them before it founds a new cluster.
+type SnapshotOrigin interface {
+	SnapshotOrigin(meta []byte) (ClusterID, []NodeID, error)
+}
+
 var drivers = map[string]Driver{}
 
 // Register makes a driver available by name; drivers register in init.

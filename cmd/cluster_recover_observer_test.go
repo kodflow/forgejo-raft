@@ -5,11 +5,16 @@ package cmd
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +22,7 @@ import (
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/test"
 	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/witness"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -201,4 +207,91 @@ func TestRecoverArchivesThePromotedHistory(t *testing.T) {
 	assert.True(t, os.IsNotExist(err), "segments are PostgreSQL's to archive")
 	// A second run, after a crash, finds the same bytes and succeeds.
 	require.NoError(t, archiveHistories(pgdata, dir, 2))
+}
+
+// originDriver is a driver that reads a snapshot's origin, and nothing else.
+type originDriver struct {
+	consensus.Driver
+	old    consensus.ClusterID
+	voters []consensus.NodeID
+}
+
+func (d originDriver) SnapshotOrigin([]byte) (consensus.ClusterID, []consensus.NodeID, error) {
+	return d.old, d.voters, nil
+}
+
+// A restore founds a new cluster only once the cluster the snapshot was cut
+// from is fenced at both witnesses, for every voter it had, and none of its
+// members answers: otherwise the old site, back up, forms its cluster
+// again and two forges write (#36).
+func TestHuntR1ProveRestoreCommandHasNoFenceNorProbe(t *testing.T) {
+	defer test.MockVariableValue(&setting.Cluster.Slot, "node-r")()
+	defer test.MockVariableValue(&setting.Cluster.Peers, map[string]string{})()
+	defer test.MockVariableValue(&setting.Cluster.TLSCAFile, "")()
+	defer test.MockVariableValue(&setting.Cluster.WitnessKeys, []string(nil))()
+	old, cid := consensus.ClusterID{0x0f, 0x07}, consensus.ClusterID{0x0e, 0x57}
+	d := originDriver{old: old, voters: []consensus.NodeID{0xa, 0xb}}
+
+	// Two witnesses, and their receipts for both old voters.
+	dir := t.TempDir()
+	var keys []string
+	var privs []ed25519.PrivateKey
+	for range 2 {
+		pub, priv, err := ed25519.GenerateKey(nil)
+		require.NoError(t, err)
+		keys, privs = append(keys, hex.EncodeToString(pub)), append(privs, priv)
+	}
+	fence := func(voter consensus.NodeID, signers ...ed25519.PrivateKey) string {
+		var files []string
+		for i, k := range signers {
+			f := filepath.Join(dir, fmt.Sprintf("%s-%d", voter, i))
+			require.NoError(t, os.WriteFile(f, []byte(hex.EncodeToString(ed25519.Sign(k, witness.ReceiptMessage(old, cid, voter)))), 0o600))
+			files = append(files, f)
+		}
+		return voter.String() + ":stopped:" + strings.Join(files, "+")
+	}
+
+	var restore *cli.Command
+	for _, c := range cmdCluster().Commands {
+		if c.Name == "restore" {
+			restore = c
+		}
+	}
+	require.NotNil(t, restore)
+	run := func(args ...string) error {
+		var got error
+		cmd := &cli.Command{Name: "restore", Flags: restore.Flags, Action: func(ctx context.Context, c *cli.Command) error {
+			nc, err := consensus.ParseClusterID(c.String("new-cluster"))
+			require.NoError(t, err)
+			got = checkRestoreFence(ctx, c, d, nil, nc)
+			return nil
+		}}
+		cmd.Writer = io.Discard
+		require.NoError(t, cmd.Run(context.Background(), append([]string{"restore", "--file", "x", "--sha256", "00", "--members", "x"}, args...)))
+		return got
+	}
+	both := []string{"--new-cluster", cid.String(), "--witness-key", keys[0], "--witness-key", keys[1]}
+	fenced := []string{"--fenced", fence(0xa, privs...), "--fenced", fence(0xb, privs...)}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	oldPeer := []string{"--old-peer", "node-a=" + ln.Addr().String()}
+
+	require.ErrorContains(t, run(append([]string{"--new-cluster", cid.String()}, oldPeer...)...), "--fenced", "no fence")
+	require.ErrorContains(t, run(slices.Concat(both, []string{"--fenced", fence(0xa, privs...)}, oldPeer)...), "000000000000000b", "a voter left unfenced")
+	require.ErrorContains(t, run(slices.Concat([]string{"--new-cluster", cid.String()}, fenced, oldPeer)...), "both witnesses", "no witness key")
+	require.ErrorContains(t, run(slices.Concat(both, []string{"--fenced", fence(0xa, privs[0]), "--fenced", fence(0xb, privs...)}, oldPeer)...), "RECOVER_REFUSED", "one witness never recorded the fence")
+	require.ErrorContains(t, run(slices.Concat(both, fenced, oldPeer)...), "old member answers", "an old member answers")
+	require.ErrorContains(t, run(slices.Concat([]string{"--new-cluster", old.String(), "--witness-key", keys[0], "--witness-key", keys[1]}, fenced)...), "own id")
+	ln.Close()
+	require.NoError(t, run(slices.Concat(both, fenced, oldPeer)...), "fenced and silent")
 }

@@ -153,3 +153,22 @@ func TestHuntR3ProveRestoreDigest(t *testing.T) {
 		require.ErrorContains(t, restore(t), "does not match its digest")
 	})
 }
+
+// A snapshot's metadata names the cluster it was cut from and its voters at
+// the cut: the ones a restore fences before founding a new cluster (#36).
+func TestSnapshotOriginNamesTheOldVoters(t *testing.T) {
+	tc := newTestClusterOn(t, true, "node-a", "node-b", "node-c")
+	path := filepath.Join(t.TempDir(), "table.snap")
+	_, err := tc.nodes[0].r.SaveSnapshot(context.Background(), OperatorFor(1), path)
+	require.NoError(t, err)
+	meta, err := os.ReadFile(path + ".meta")
+	require.NoError(t, err)
+	driver, err := consensus.Lookup("kitsunium")
+	require.NoError(t, err)
+	o, ok := driver.(consensus.SnapshotOrigin)
+	require.True(t, ok)
+	old, voters, err := o.SnapshotOrigin(meta)
+	require.NoError(t, err)
+	assert.Equal(t, consensus.ClusterID{0x0f, 0x07, 0x9e, 0x10}, old, "newTestClusterOn's cluster")
+	assert.Len(t, voters, 3)
+}

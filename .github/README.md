@@ -364,7 +364,8 @@ Notes:
   `WITNESS_OVERRIDE_SHA256`). Its use is logged.
 - Other recovery tools: `forgejo cluster snapshot save` (online) and
   `forgejo cluster restore` (offline, into an empty directory) for the ref
-  table; `forgejo cluster objects verify|backfill` for missing objects;
+  table, which, like `recover`, fences the snapshot's cluster at both
+  witnesses (`--fenced`, `--witness-key`) and probes its old members first; `forgejo cluster objects verify|backfill` for missing objects;
   `forgejo cluster reconcile [--apply]` to compare SQL with the ref table
   after a database restore or failover; `forgejo cluster quarantine clear`
   after a corrupted log; `forgejo cluster inspect` to read a data directory
