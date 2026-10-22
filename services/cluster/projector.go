@@ -912,3 +912,30 @@ func (p *projector) setAsideLeftBehind(repo, dir string, want map[string]reftabl
 	log.Warn("cluster: %s was renamed away and no rename takes its directory any more: it is set aside in %s", repo, aside)
 	return nil
 }
+
+// leavesKey reports whether the directory under repo is one the projector
+// sets aside or removes before repo is projected: the key is deleted in the
+// table, or a rename took it while the directory still holds, by its stamp,
+// the repository certified under it before that rename (setAsideStale,
+// setAsideLeftBehind). The object channel refuses to index a pack there
+// (#99). Without a keyed stamp, nothing is refused.
+func (p *projector) leavesKey(repo string) bool {
+	dir := filepath.Join(p.root, filepath.FromSlash(repo))
+	if _, err := os.Stat(dir); err != nil {
+		return false
+	}
+	if _, deleted := p.table.Deleted(repo); deleted {
+		return true
+	}
+	from, renIdx, ok := p.table.RenamedFrom(repo)
+	if !ok {
+		return false
+	}
+	if src, _, srcIdx := p.renameSource(repo, from, renIdx); src == repo {
+		if held, known := heldBefore(dir, repo, srcIdx); known && held {
+			return false
+		}
+	}
+	held, known := heldBefore(dir, repo, renIdx)
+	return known && held
+}
