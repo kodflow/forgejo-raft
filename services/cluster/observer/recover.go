@@ -185,7 +185,9 @@ func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, err
 	sort.Strings(repos)
 	for _, repo := range repos {
 		rm := m.Repos[repo]
-		if len(rm.Refs) == 0 {
+		// A repository with no ref but its symbolic HEAD (created empty, or
+		// every branch deleted) exists all the same: it is written empty.
+		if len(rm.Refs) == 0 && len(rm.Symbolic) == 0 {
 			continue
 		}
 		target := filepath.Join(root, filepath.FromSlash(repo))
@@ -199,7 +201,7 @@ func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, err
 				continue
 			}
 		}
-		if err := a.store.git.Materialize(ctx, repo, name, target, rm.Format, rm.Symbolic); err != nil {
+		if err := a.store.git.Materialize(ctx, repo, name, target, rm.Format, len(rm.Refs) > 0, rm.Symbolic); err != nil {
 			return n, fmt.Errorf("%s: %w", repo, err)
 		}
 		// git syncs its packs, not its refs nor its directories.

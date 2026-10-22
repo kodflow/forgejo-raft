@@ -22,6 +22,7 @@ import (
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/test"
 	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/observer"
 	"forgejo.org/services/cluster/reftable"
 	"forgejo.org/services/cluster/witness"
 
@@ -372,4 +373,16 @@ func TestRecoverEmptiesWhatItBegan(t *testing.T) {
 	p := recoverProgress{Begun: []string{stepPG}}
 	assert.True(t, p.begun(stepPG))
 	assert.False(t, p.done(stepPG))
+}
+
+// The recovery's verification fails when a repository of the checkpoint,
+// an empty one included, has no restored directory (#114).
+func TestRecoverVerifiesEmptyRepositories(t *testing.T) {
+	m := &observer.Manifest{Repos: map[string]observer.RepoManifest{
+		"alice/empty.git": {Format: "sha1", Symbolic: map[string]string{"HEAD": "refs/heads/trunk"}},
+		"bob/none.git":    {Format: "sha1"},
+	}}
+	err := verifyRestoredRepos(context.Background(), m, t.TempDir(), io.Discard)
+	require.ErrorContains(t, err, "alice/empty.git")
+	assert.NotContains(t, err.Error(), "bob/none.git", "a repository the checkpoint holds nothing of")
 }

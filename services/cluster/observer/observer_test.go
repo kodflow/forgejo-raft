@@ -282,7 +282,7 @@ func TestObserverPoisonKeepsOlderCheckpoint(t *testing.T) {
 
 	// The clean repository materializes from its namespace, checked again.
 	target := filepath.Join(t.TempDir(), "demo.git")
-	require.NoError(t, o.store.git.Materialize(ctx, "alice/demo.git", clean.Name(), target, "sha1", m.Repos["alice/demo.git"].Symbolic))
+	require.NoError(t, o.store.git.Materialize(ctx, "alice/demo.git", clean.Name(), target, "sha1", true, m.Repos["alice/demo.git"].Symbolic))
 	c.git(target, "fsck", "--strict")
 	assert.Equal(t, cleanMain.SHA, c.git(target, "rev-parse", "refs/heads/main"))
 	assert.Equal(t, "refs/heads/main", c.git(target, "symbolic-ref", "HEAD"))

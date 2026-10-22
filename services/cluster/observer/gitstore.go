@@ -202,9 +202,9 @@ func (g gitStore) restoredRefs(ctx context.Context, target string, refs map[stri
 }
 
 // Materialize writes a checkpoint's repository into target, an absent or
-// empty directory: its refs, their objects checked again by fetch, and its
-// symbolic refs.
-func (g gitStore) Materialize(ctx context.Context, repo, checkpoint, target, format string, symbolic map[string]string) error {
+// empty directory: its refs, their objects checked again by fetch (none
+// for a repository without refs), and its symbolic refs.
+func (g gitStore) Materialize(ctx context.Context, repo, checkpoint, target, format string, fetch bool, symbolic map[string]string) error {
 	if entries, err := os.ReadDir(target); err == nil && len(entries) > 0 {
 		return fmt.Errorf("%s is not empty", target)
 	}
@@ -226,9 +226,12 @@ func (g gitStore) Materialize(ctx context.Context, repo, checkpoint, target, for
 	if _, err := g.run(ctx, filepath.Dir(target), nil, "init", "-q", "--bare", "--object-format="+format, target); err != nil {
 		return err
 	}
-	ns := RefNamespace(checkpoint)
-	if _, err := g.run(ctx, target, nil, "-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-tags", "--no-write-fetch-head", g.dir(repo), "+"+ns+"refs/*:refs/*"); err != nil {
-		return err
+	// A repository without refs has nothing to fetch, and no store here.
+	if fetch {
+		ns := RefNamespace(checkpoint)
+		if _, err := g.run(ctx, target, nil, "-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-tags", "--no-write-fetch-head", g.dir(repo), "+"+ns+"refs/*:refs/*"); err != nil {
+			return err
+		}
 	}
 	for name, to := range symbolic {
 		if _, err := g.run(ctx, target, nil, "symbolic-ref", name, to); err != nil {

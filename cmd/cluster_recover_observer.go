@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -553,6 +554,42 @@ func emptyDirs(dirs ...string) error {
 	return nil
 }
 
+// verifyRestoredRepos checks that every repository of the checkpoint,
+// empty ones included, has its directory under root, and reports the SQL
+// repository rows that have none: the forge marks those broken.
+func verifyRestoredRepos(ctx context.Context, m *observer.Manifest, root string, w interface{ Write([]byte) (int, error) }) error {
+	var missing []string
+	for repo, rm := range m.Repos {
+		if len(rm.Refs) == 0 && len(rm.Symbolic) == 0 {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(repo), "HEAD")); err != nil {
+			missing = append(missing, repo)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("repositories of the checkpoint were not restored: %s", strings.Join(missing, ", "))
+	}
+	rows, err := db.GetEngine(ctx).Query(`SELECT owner_name AS owner, lower_name AS repo FROM repository`)
+	if err != nil {
+		return err
+	}
+	var orphans []string
+	for _, r := range rows {
+		repo := strings.ToLower(string(r["owner"])) + "/" + string(r["repo"]) + ".git"
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(repo), "HEAD")); err != nil {
+			orphans = append(orphans, repo)
+		}
+	}
+	sort.Strings(orphans)
+	for _, repo := range orphans {
+		fmt.Fprintf(w, "WARNING: %s has a repository row and no directory: the checkpoint does not hold it\n", repo)
+	}
+	fmt.Fprintf(w, "verified: %d repositories restored, empty ones included\n", len(rows)-len(orphans))
+	return nil
+}
+
 // historyName is a timeline history file in pg_wal.
 var historyName = regexp.MustCompile(`^[0-9A-F]{8}\.history$`)
 
@@ -646,6 +683,9 @@ func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Wri
 		return fmt.Errorf("the refs and the SQL rows differ at the checkpoint:\n  %s", strings.Join(mismatch, "\n  "))
 	}
 	fmt.Fprintf(w, "verified: %d branches, refs and SQL rows match\n", refs)
+	if err := verifyRestoredRepos(ctx, m, setting.RepoRootPath, w); err != nil {
+		return err
+	}
 
 	if setting.LFS.Storage != nil && setting.LFS.Storage.Type == setting.LocalStorageType {
 		objs, err := e.Query("SELECT DISTINCT oid FROM lfs_meta_object")
