@@ -239,6 +239,7 @@ func newTestClusterWith(t *testing.T, clusterID consensus.ClusterID, start func(
 		r.consumer.cursor = tc.cursors.get
 		r.consumer.advance = tc.cursors.advance
 		r.consumer.tx = func(ctx context.Context, f func(context.Context) error) error { return f(ctx) }
+		r.consumer.inTx = nil
 		r.consumer.durable = func(context.Context) (bool, string) { return true, "test" }
 		tc.parked.wire(r.consumer)
 		tc.loops.Add(3)

@@ -50,8 +50,10 @@ type consumer struct {
 	// cursor and advance are the SQL side; tests replace them.
 	cursor  func(ctx context.Context, name string) (*cluster_model.Cursor, error)
 	advance func(ctx context.Context, name string, prev, next cluster_model.Cursor) error
-	// tx runs f in one SQL transaction; tests replace it.
-	tx func(ctx context.Context, f func(ctx context.Context) error) error
+	// tx runs f in one SQL transaction; tests replace it. inTx reports
+	// whether that transaction is still open, nil when tx is not SQL's.
+	tx   func(ctx context.Context, f func(ctx context.Context) error) error
+	inTx func(ctx context.Context) bool
 	// events, projectedAt and lineageNow read the table and the projector;
 	// ack proposes a trim. Tests replace them.
 	events      func() []reftable.Event
@@ -128,7 +130,7 @@ func newConsumer(r *Replicator) *consumer {
 			return pushWorkWith(ctx, evs, r.table)
 		},
 		dbReady: func() bool { return db.DefaultContext != nil },
-		cursor:  cluster_model.GetCursor, advance: cluster_model.AdvanceCursor, tx: db.WithTx,
+		cursor:  cluster_model.GetCursor, advance: cluster_model.AdvanceCursor, tx: batchTx, inTx: db.InTransaction,
 		events:      r.table.Events,
 		projectedAt: r.projector.Projected,
 		lineageNow: func() string {
@@ -152,6 +154,27 @@ func newConsumer(r *Replicator) *consumer {
 }
 
 func cursorName(lineage string) string { return "dispatch@" + lineage }
+
+// batchTx is the transaction of a batch: a transaction nested in its work
+// runs in a savepoint, so a nested failure the work logs and swallows
+// rolls back that statement alone, never the batch before it nor the
+// cursor after it (#104).
+func batchTx(ctx context.Context, f func(ctx context.Context) error) error {
+	return db.WithTx(db.WithNestedSavepoints(ctx), f)
+}
+
+// errBatchTxEnded is the work of a batch that ended its transaction: what
+// it wrote before is rolled back, what follows would commit statement by
+// statement, so nothing may advance past it.
+var errBatchTxEnded = errors.New("the batch transaction ended inside the work")
+
+// stillInTx refuses to go on once the work ended the batch's transaction.
+func (c *consumer) stillInTx(ctx context.Context) error {
+	if c.inTx != nil && !c.inTx(ctx) {
+		return errBatchTxEnded
+	}
+	return nil
+}
 
 // forget drops what the consumer remembers of the table's events, for a
 // node whose table is emptied to rejoin under a new id (#41).
@@ -442,7 +465,11 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 				parked += len(group)
 				continue
 			}
-			if err := c.work(ctx, group); err != nil {
+			err := c.work(ctx, group)
+			if err == nil {
+				err = c.stillInTx(ctx)
+			}
+			if err != nil {
 				c.mu.Lock()
 				c.failures[idx]++
 				attempts = c.failures[idx]
@@ -450,6 +477,9 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 				c.mu.Unlock()
 				return fmt.Errorf("event %s at %d: %w (attempt %d)", group[0].Repo, idx, err, attempts)
 			}
+		}
+		if err := c.stillInTx(ctx); err != nil {
+			return err
 		}
 		return c.advance(ctx, cursorName(lineage), *cur, next)
 	})
@@ -546,6 +576,9 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 		wctx, effects := clusterhook.WithAfterCommit(ctx)
 		err := c.tx(wctx, func(ctx context.Context) error {
 			if err := c.work(ctx, evs); err != nil {
+				return err
+			}
+			if err := c.stillInTx(ctx); err != nil {
 				return err
 			}
 			// Another retrier that applied the entry first removed its
