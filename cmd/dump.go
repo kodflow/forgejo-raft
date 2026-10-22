@@ -452,15 +452,28 @@ func dumpData(ctx *cli.Command, archiveJobs chan archives.ArchiveAsyncJob, wg *s
 		excludes = append(excludes, setting.RepoArchive.Storage.Path)
 	}
 
-	excludes = append(excludes, setting.RepoRootPath)
-	excludes = append(excludes, setting.LFS.Storage.Path)
-	excludes = append(excludes, setting.Attachment.Storage.Path)
-	excludes = append(excludes, setting.Packages.Storage.Path)
-	excludes = append(excludes, setting.Log.RootPath)
-	excludes = append(excludes, absFileName)
+	excludes = append(excludes, dataExcludes(absFileName)...)
 	if err := addRecursiveExclude(archiveJobs, "data", setting.AppDataPath, excludes, verbose); err != nil {
 		fatal("Failed to include data directory: %v", err)
 	}
+}
+
+// dataExcludes are the paths under the data directory a dump never holds.
+// The cluster's consensus data directory is one: a node whose directory is
+// restored comes back under its id and incarnation with a log that went
+// back, and an acknowledged write is lost; a lost directory is replaced by
+// an empty one, which joins under a new id, or by `forgejo cluster restore`.
+func dataExcludes(absFileName string) []string {
+	excludes := []string{
+		setting.RepoRootPath, setting.LFS.Storage.Path, setting.Attachment.Storage.Path,
+		setting.Packages.Storage.Path, setting.Log.RootPath, absFileName,
+	}
+	if setting.Cluster.DataDir != "" {
+		if dir, err := filepath.Abs(setting.Cluster.DataDir); err == nil {
+			excludes = append(excludes, dir)
+		}
+	}
+	return excludes
 }
 
 func dumpCustom(archiveJobs chan archives.ArchiveAsyncJob, wg *sync.WaitGroup, absFileName string, verbose bool) {
