@@ -30,6 +30,7 @@ func leaveLock(t *testing.T, path, content string) {
 // one node. The projector must remove them once no git can own them, and
 // the node converge and be ready again after a start (#48).
 func TestALockLeftByAKilledGitDoesNotStopProjection(t *testing.T) {
+	t.Parallel()
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	work := t.TempDir()
 	run(t, work, "init", "-q")
@@ -57,6 +58,7 @@ func TestALockLeftByAKilledGitDoesNotStopProjection(t *testing.T) {
 // packed-refs.lock and packed-refs.new: every deletion of a packed ref
 // fails until both are gone (#48).
 func TestAPackedRefsLockLeftBehindDoesNotStopADeletion(t *testing.T) {
+	t.Parallel()
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	work := t.TempDir()
 	run(t, work, "init", "-q")

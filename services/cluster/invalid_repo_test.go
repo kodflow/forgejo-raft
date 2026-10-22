@@ -38,6 +38,7 @@ func TestAnInterruptedInitLeavesNoPartialRepository(t *testing.T) {
 // init killed before ours was atomic, is set aside and the repository
 // projected anew from the members (#42); the node is ready after a start.
 func TestAPartialRepositoryDirectoryIsRepaired(t *testing.T) {
+	t.Parallel()
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	work := t.TempDir()
 	run(t, work, "init", "-q")

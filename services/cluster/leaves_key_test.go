@@ -20,6 +20,7 @@ import (
 // directory, where its objects would leave the key with it (#99); node-c
 // gets them once it projects the new s/b.git.
 func TestObjectsAreNotAcknowledgedIntoADirectoryAboutToBeSetAside(t *testing.T) {
+	t.Parallel()
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	work := t.TempDir()
 	run(t, work, "init", "-q")

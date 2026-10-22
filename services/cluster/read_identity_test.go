@@ -21,6 +21,7 @@ import (
 // under the new repository's permissions must be refused there (#82),
 // never on the members that hold the right directories.
 func TestAReadOfANameARenameFreedWaitsForTheProjection(t *testing.T) {
+	t.Parallel()
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	work := t.TempDir()
 	run(t, work, "init", "-q")

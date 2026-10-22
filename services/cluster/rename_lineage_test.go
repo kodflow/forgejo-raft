@@ -21,6 +21,7 @@ import (
 // and must not serve the deleted ref under the new name, nor report it
 // matched, nor import it back (#96).
 func TestADeletedRefDoesNotSurviveARenameOnALaggingNode(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name  string
 		ref   string
@@ -31,6 +32,7 @@ func TestADeletedRefDoesNotSurviveARenameOnALaggingNode(t *testing.T) {
 		{"branch, chain of renames", "refs/heads/feature", true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tc := newTestCluster(t, "node-a", "node-b", "node-c")
 			work := t.TempDir()
 			run(t, work, "init", "-q")

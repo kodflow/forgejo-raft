@@ -22,6 +22,7 @@ import (
 // node, the repository reach its final name with its directory, the freed
 // name hold nothing, and the node be ready after a start (#43).
 func TestKeysAllTombstonesCertifyAfterRenamesOnALaggingNode(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name  string
 		steps func(t *testing.T, tc *testCluster) (final, freed string)
@@ -44,6 +45,7 @@ func TestKeysAllTombstonesCertifyAfterRenamesOnALaggingNode(t *testing.T) {
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tc := newTestCluster(t, "node-a", "node-b", "node-c")
 			work := t.TempDir()
 			run(t, work, "init", "-q")

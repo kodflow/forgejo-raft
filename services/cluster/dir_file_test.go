@@ -20,6 +20,7 @@ import (
 // refuses that swap of a file and a directory in one transaction, and the
 // node must still converge and be ready after its start (#73).
 func TestALaggingNodeConvergesOnADirectoryAndFileSwap(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name          string
 		before, after string
@@ -31,6 +32,7 @@ func TestALaggingNodeConvergesOnADirectoryAndFileSwap(t *testing.T) {
 		{"dir then file, packed", "refs/heads/a/b", "refs/heads/a", true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tc := newTestCluster(t, "node-a", "node-b", "node-c")
 			work := t.TempDir()
 			run(t, work, "init", "-q")

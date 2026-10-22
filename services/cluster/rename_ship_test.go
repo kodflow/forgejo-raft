@@ -20,6 +20,7 @@ import (
 // freed name for good (#100). node-c moves it in, and the old key is not
 // known to the object channel any more.
 func TestAPushToARenamedRepositoryWaitsForTheMove(t *testing.T) {
+	t.Parallel()
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	work := t.TempDir()
 	run(t, work, "init", "-q")
