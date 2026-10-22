@@ -9,7 +9,9 @@ import (
 
 	"forgejo.org/models/db"
 	repo_model "forgejo.org/models/repo"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/log"
+	"forgejo.org/modules/setting"
 
 	"xorm.io/builder"
 )
@@ -51,6 +53,17 @@ func FixPushMirrorsWithoutGitRemote(ctx context.Context, logger log.Logger, auto
 			} else {
 				logger.Warn("Found %d push mirrors with missing git remotes", count)
 			}
+		}
+		return nil
+	}
+
+	if setting.Cluster.Enabled || clusterhook.Enabled() {
+		// A node of a cluster holds its own git config, which the cluster
+		// does not replicate: a remote missing here may be held by the
+		// node that created the mirror, and the sync recreates it from
+		// SQL. The row is never removed on this node's word (#79).
+		if logger != nil && count > 0 {
+			logger.Warn("Keeping %d push mirrors whose git remote is missing on this node of the cluster: their sync recreates it", count)
 		}
 		return nil
 	}
