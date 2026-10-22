@@ -369,6 +369,7 @@ func (p *projector) project(ctx context.Context, repo string) error {
 	}
 	dir := filepath.Join(p.root, filepath.FromSlash(repo))
 	refs, at := p.table.Refs(repo)
+	withRenamedAway(p.table, repo, refs)
 
 	if _, deleted := p.table.Deleted(repo); deleted {
 		if err := os.RemoveAll(dir); err != nil {
@@ -540,6 +541,35 @@ func (p *projector) clearStaleLocks(repo, dir string, set map[string]reftable.Re
 	return removed
 }
 
+// renameLineageDepth bounds the walk back through a chain of renames.
+const renameLineageDepth = 32
+
+// withRenamedAway adds to refs, as tombstones, the refs the keys renamed
+// into repo held and repo does not: a rename copies only the live refs, and
+// the directory a node behind moves in from the old key still holds the
+// refs deleted there before the rename (#96). Projected from repo's refs
+// alone, such a ref was neither deleted nor compared, and the node served
+// a deleted branch under the new name, certified. Each key of the chain is
+// followed back through the renames before the one into it.
+func withRenamedAway(t *reftable.Table, repo string, refs map[string]reftable.RefValue) {
+	key, before := repo, uint64(math.MaxUint64)
+	seen := map[string]bool{repo: true}
+	for range renameLineageDepth {
+		from, idx, ok := t.RenamedFrom(key)
+		if !ok || idx >= before || seen[from] {
+			return
+		}
+		seen[from] = true
+		old, _ := t.Refs(from)
+		for name := range old {
+			if _, known := refs[name]; !known {
+				refs[name] = reftable.RefValue{Tombstone: true}
+			}
+		}
+		key, before = from, idx
+	}
+}
+
 // filterTracked keeps the refs of git the table knows about: a ref the
 // table never held (one from before the cluster) is reported elsewhere and
 // left alone, never deleted by the projector.
@@ -619,6 +649,7 @@ func heldBefore(dir, key string, index uint64) (held, known bool) {
 func (p *projector) Verify(ctx context.Context, repo string) (bool, error) {
 	dir := filepath.Join(p.root, filepath.FromSlash(repo))
 	refs, _ := p.table.Refs(repo)
+	withRenamedAway(p.table, repo, refs)
 	want := tableProjection(refs)
 	have, err := readGitRefs(ctx, dir)
 	if err != nil {

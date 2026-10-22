@@ -74,6 +74,9 @@ func (r *Replicator) importRepo(ctx context.Context, key string) (int, error) {
 		return 0, err
 	}
 	current, _ := r.table.Refs(key)
+	// A ref a key renamed into this one held, and this one does not, was
+	// deleted before the rename: never adopted again (#96).
+	withRenamedAway(r.table, key, current)
 	format := "sha1"
 	if out, err := gitRun(ctx, dir, nil, "rev-parse", "--show-object-format"); err == nil && strings.TrimSpace(out) == "sha256" {
 		format = "sha256"
