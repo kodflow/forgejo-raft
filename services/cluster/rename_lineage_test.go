@@ -72,7 +72,7 @@ func TestADeletedRefDoesNotSurviveARenameOnALaggingNode(t *testing.T) {
 			}, 10*time.Second, 20*time.Millisecond)
 
 			lag.r.projector.unfence()
-			require.Eventually(t, lag.r.projector.Ready, 15*time.Second, 20*time.Millisecond, "node-c ready: %+v", lag.r.projector.Lag())
+			require.Eventually(t, lag.r.projector.Ready, 15*time.Second, 20*time.Millisecond, "node-c ready")
 			assert.Equal(t, c1, gitRef(t, lag, final, "refs/heads/main"))
 			assert.Empty(t, gitRef(t, lag, final, tt.ref), "the deleted ref is served under %s", final)
 			same, err := lag.r.projector.Verify(t.Context(), final)

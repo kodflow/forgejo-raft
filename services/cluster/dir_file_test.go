@@ -61,7 +61,7 @@ func TestALaggingNodeConvergesOnADirectoryAndFileSwap(t *testing.T) {
 			require.Eventually(t, func() bool { return gitRef(t, peer, "dfr/r.git", tt.after) == c2 }, 10*time.Second, 20*time.Millisecond)
 
 			lag.r.projector.unfence()
-			require.Eventually(t, lag.r.projector.Ready, 15*time.Second, 20*time.Millisecond, "node-c ready: %+v", lag.r.projector.Lag())
+			require.Eventually(t, lag.r.projector.Ready, 15*time.Second, 20*time.Millisecond, "node-c ready")
 			assert.Equal(t, c2, gitRef(t, lag, "dfr/r.git", tt.after))
 			assert.Empty(t, gitRef(t, lag, "dfr/r.git", tt.before))
 			assert.Empty(t, lag.r.projector.Lag())
