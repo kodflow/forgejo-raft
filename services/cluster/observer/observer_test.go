@@ -6,6 +6,7 @@ package observer
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -391,6 +392,35 @@ func TestObserverPrunesOnlyProtectedOldCheckpoints(t *testing.T) {
 	refs, err := o.store.git.refs(ctx, o.store.git.dir("alice/demo.git"), first)
 	require.NoError(t, err)
 	assert.Empty(t, refs)
+}
+
+// Passes after a prune go on: the pruned checkpoint is never handed to the
+// hook again, and new checkpoints are ingested and protected (#109).
+func TestHuntR8ProvePassesAfterPrune(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	h := &hookLog{}
+	o := newTestObserver(t, c, h)
+	seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	first := o.State().Checkpoints[0].Name
+	o.cfg.LiveKeep = 1
+	c.push("alice/demo.git", "refs/heads/main", c.commit("z"))
+	c.checkpoint()
+	require.NoError(t, o.Step(ctx))
+	require.Equal(t, StatePruned, o.State().Checkpoints[0].State)
+	calls := len(h.calls)
+	for i := range 3 {
+		c.push("alice/demo.git", "refs/heads/main", c.commit(fmt.Sprintf("after the prune %d", i)))
+		c.checkpoint()
+		require.NoError(t, o.Step(ctx), "pass %d after the prune", i)
+	}
+	assert.NotContains(t, h.calls[calls:], first, "the hook ran again for the pruned checkpoint")
+	st := o.State()
+	require.Len(t, st.Checkpoints, 5)
+	assert.Equal(t, StateProtected, st.Checkpoints[4].State)
+	_, err := os.Stat(o.store.path("checkpoints", first))
+	assert.True(t, os.IsNotExist(err))
 }
 
 // A gap in the archive is not waited out: after gapPasses passes the base

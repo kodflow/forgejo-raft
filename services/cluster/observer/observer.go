@@ -1039,7 +1039,10 @@ func (o *Observer) fetchBase(ctx context.Context, leader string) error {
 func (o *Observer) protectPending(ctx context.Context) error {
 	for i := range o.state.Checkpoints {
 		a := &o.state.Checkpoints[i]
-		if a.State == StateProtected {
+		// Only a verified checkpoint waits for its snapshot: a pruned one
+		// was protected before its directory went, and is never protected
+		// again.
+		if a.State != StateVerified {
 			continue
 		}
 		if p, ok := o.store.Protection(a.Name); ok {
