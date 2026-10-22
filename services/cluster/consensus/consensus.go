@@ -380,7 +380,10 @@ type Report struct {
 	LastIndex   uint64
 	Snapshot    *SnapshotMeta
 	Quarantined bool
-	Detail      []string
+	// Markers names the stop markers of the directory, which only an
+	// operator clears.
+	Markers []string
+	Detail  []string
 }
 
 // QuarantineExit is the way out of a LOG_CORRUPT quarantine (R3-09).

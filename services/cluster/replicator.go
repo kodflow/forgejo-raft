@@ -323,6 +323,9 @@ func (r *Replicator) rejoinUnderNewID(ctx context.Context, driver consensus.Driv
 	if err := fenceClusterOrExit(ctx, cluster); err != nil {
 		return err
 	}
+	if err := refuseStoppedDir(driver, cfg.DataDir); err != nil {
+		return err
+	}
 	moved, err := retireDataDir(cfg.DataDir, time.Now())
 	if err != nil {
 		return err

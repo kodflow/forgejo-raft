@@ -74,6 +74,8 @@ type autoMode struct {
 	// rejoin replaces this node's consensus identity once a quorum says
 	// its id is retired (retire.go).
 	rejoin func(ctx context.Context) error
+	// stopNoted is set once a stopped engine's refusal to rejoin is logged.
+	stopNoted atomic.Bool
 	// disk is what the data directory held when the node read it.
 	disk atomic.Int32
 }
