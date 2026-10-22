@@ -14,6 +14,7 @@ import (
 	"forgejo.org/models/organization"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/lfs"
 	"forgejo.org/modules/log"
@@ -23,6 +24,14 @@ import (
 	"forgejo.org/modules/timeutil"
 	"forgejo.org/modules/util"
 )
+
+// cloneMirror is `git clone --mirror`, by batches of refs in a cluster.
+func cloneMirror(ctx context.Context, from, to string, opts git.CloneRepoOptions) error {
+	if clusterhook.Enabled() {
+		return cloneMirrorInCluster(ctx, from, to, opts)
+	}
+	return git.Clone(ctx, from, to, opts)
+}
 
 // MigrateRepositoryGitData starts migrating git related data after created migrating repository
 func MigrateRepositoryGitData(ctx context.Context, u *user_model.User,
@@ -48,7 +57,7 @@ func MigrateRepositoryGitData(ctx context.Context, u *user_model.User,
 		return repo, fmt.Errorf("Failed to remove %s: %w", repoPath, err)
 	}
 
-	if err = git.Clone(ctx, opts.CloneAddr, repoPath, git.CloneRepoOptions{
+	if err = cloneMirror(ctx, opts.CloneAddr, repoPath, git.CloneRepoOptions{
 		Mirror:        true,
 		Quiet:         true,
 		Timeout:       migrateTimeout,
@@ -75,7 +84,7 @@ func MigrateRepositoryGitData(ctx context.Context, u *user_model.User,
 				return repo, fmt.Errorf("Failed to remove %s: %w", wikiPath, err)
 			}
 
-			if err := git.Clone(ctx, wikiRemotePath, wikiPath, git.CloneRepoOptions{
+			if err := cloneMirror(ctx, wikiRemotePath, wikiPath, git.CloneRepoOptions{
 				Mirror:        true,
 				Quiet:         true,
 				Timeout:       migrateTimeout,

@@ -5,12 +5,14 @@ package repository
 
 import (
 	"context"
+	"fmt"
 
 	"forgejo.org/models/db"
 	git_model "forgejo.org/models/git"
 	issues_model "forgejo.org/models/issues"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/log"
 	notify_service "forgejo.org/services/notify"
 )
 
@@ -70,8 +72,15 @@ func GenerateRepository(ctx context.Context, doer, owner *user_model.User, templ
 	}
 
 	var generateRepo *repo_model.Repository
+	// initialized is set once git may have written the repository: a
+	// failed generation then removes it, from the cluster's table too,
+	// as a failed creation does (#102).
+	initialized := false
 	if err = db.WithTx(ctx, func(ctx context.Context) error {
 		generateRepo, err = generateRepository(ctx, doer, owner, templateRepo, opts)
+		// A repository is returned once its directory was found absent and
+		// `git init` ran; files found in place are never this call's.
+		initialized = generateRepo != nil && !repo_model.IsErrRepoFilesAlreadyExist(err)
 		if err != nil {
 			return err
 		}
@@ -126,6 +135,12 @@ func GenerateRepository(ctx context.Context, doer, owner *user_model.User, templ
 
 		return nil
 	}); err != nil {
+		if initialized {
+			if errDelete := removeAbandonedRepo(ctx, owner.Name, generateRepo.Name); errDelete != nil {
+				log.Error("GenerateRepository: %v", errDelete)
+				return nil, fmt.Errorf("%w; and the repository's files were not removed: %v", err, errDelete)
+			}
+		}
 		return nil, err
 	}
 

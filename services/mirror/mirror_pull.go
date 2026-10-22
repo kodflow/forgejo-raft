@@ -35,20 +35,14 @@ const gitShortEmptySha = "0000000"
 func UpdateAddress(ctx context.Context, m *repo_model.Mirror, addr string) error {
 	remoteName := m.GetRemoteName()
 	repoPath := m.GetRepository(ctx).RepoPath()
-	_, _, err := git.NewCommand(ctx, "remote", "set-url").
-		AddDynamicArguments(remoteName, addr).
-		RunStdString(&git.RunOpts{Dir: repoPath})
-	if err != nil {
+	if err := setPullRemoteURL(ctx, repoPath, remoteName, addr); err != nil {
 		return err
 	}
 
 	if m.Repo.HasWiki() {
 		wikiPath := m.Repo.WikiPath()
 		wikiRemotePath := repo_module.WikiRemoteURL(ctx, addr)
-		_, _, err = git.NewCommand(ctx, "remote", "set-url").
-			AddDynamicArguments(remoteName, wikiRemotePath).
-			RunStdString(&git.RunOpts{Dir: wikiPath})
-		if err != nil {
+		if err := setPullRemoteURL(ctx, wikiPath, remoteName, wikiRemotePath); err != nil {
 			return err
 		}
 	}
@@ -320,6 +314,11 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 
 	if err := ModernizePullMirrorConfig(ctx, m); err != nil {
 		log.Error("SyncMirrors [repo: %-v]: failed to modernize pull mirror configuration: %v", m.Repo, err)
+		return nil, false
+	}
+
+	if err := ensurePullMirrorRemote(ctx, m); err != nil {
+		log.Error("SyncMirrors [repo: %-v]: failed to recreate the mirror's remote: %v", m.Repo, err)
 		return nil, false
 	}
 

@@ -6,8 +6,6 @@ package repository
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -199,38 +197,32 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 // a key they know neither from the replicated table nor from SQL, where
 // the fork's row is not committed yet, and they refuse them. `git init`
 // writes HEAD alone first, which ships no object and makes the key known
-// to the table; the refs then follow with `git fetch`.
+// to the table; the refs then follow with `git fetch`, by batches that
+// stay within the cluster's bound of refs per transaction (#80).
 func copyForkInCluster(ctx context.Context, opts ForkRepoOptions, from, to, defaultBranch, objectFormat string) error {
 	if strings.ContainsAny(opts.SingleBranch, "*:") {
 		return fmt.Errorf("invalid branch name %q", opts.SingleBranch)
 	}
-	if err := os.MkdirAll(to, os.ModePerm); err != nil {
+	if err := initBareInCluster(ctx, to, defaultBranch, objectFormat); err != nil {
 		return err
-	}
-	initCmd := git.NewCommand(ctx, "init", "--bare", "--template", "").AddOptionValues("--initial-branch", defaultBranch)
-	if git.SupportHashSha256 && objectFormat != "" {
-		initCmd.AddOptionValues("--object-format", objectFormat)
-	}
-	if stdout, _, err := initCmd.SetDescription(fmt.Sprintf("ForkRepositoryIfNotExists(git init): %s", to)).
-		RunStdString(&git.RunOpts{Dir: to}); err != nil {
-		return fmt.Errorf("git init: %w: %s", err, stdout)
 	}
 
-	refspecs := []string{"+refs/heads/*:refs/heads/*"}
+	var refs []string
 	if opts.SingleBranch != "" {
-		refspecs = []string{"+refs/heads/" + opts.SingleBranch + ":refs/heads/" + opts.SingleBranch}
+		// Named even when absent: the fetch fails as the clone would.
+		refs = []string{git.BranchPrefix + opts.SingleBranch}
+	} else {
+		heads, err := listRefs(ctx, from, git.BranchPrefix)
+		if err != nil {
+			return err
+		}
+		refs = heads
 	}
-	refspecs = append(refspecs, "+refs/tags/*:refs/tags/*")
-	if stdout, _, err := git.NewCommand(ctx, "fetch", "--quiet", "--no-tags").AddDynamicArguments(from).AddDynamicArguments(refspecs...).
-		SetDescription(fmt.Sprintf("ForkRepositoryIfNotExists(git fetch): %s to %s", from, to)).
-		RunStdString(&git.RunOpts{Dir: to, Timeout: 10 * time.Minute}); err != nil {
-		return fmt.Errorf("git fetch: %w: %s", err, stdout)
-	}
-	// A clone leaves no FETCH_HEAD; nothing reads this one.
-	if err := os.Remove(filepath.Join(to, "FETCH_HEAD")); err != nil && !os.IsNotExist(err) {
+	tags, err := listRefs(ctx, from, git.TagPrefix)
+	if err != nil {
 		return err
 	}
-	return nil
+	return fetchRefsInBatches(ctx, from, to, append(refs, tags...), 10*time.Minute)
 }
 
 // ForkRepositoryAndUpdates forks a repository. On success it updates metadata (size, stats, etc.) and send a notification.

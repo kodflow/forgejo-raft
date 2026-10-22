@@ -34,42 +34,40 @@ var stripExitStatus = regexp.MustCompile(`exit status \d+ - `)
 var AddPushMirrorRemote = addPushMirrorRemote
 
 func addPushMirrorRemote(ctx context.Context, m *repo_model.PushMirror, addr string) error {
-	addRemoteAndConfig := func(addr, path string) error {
-		var cmd *git.Command
-		if m.BranchFilter == "" {
-			cmd = git.NewCommand(ctx, "remote", "add", "--mirror=push").AddDynamicArguments(m.RemoteName, addr)
-		} else {
-			cmd = git.NewCommand(ctx, "remote", "add").AddDynamicArguments(m.RemoteName, addr)
-		}
-		if strings.Contains(addr, "://") && strings.Contains(addr, "@") {
-			cmd.SetDescription(fmt.Sprintf("remote add %s %s [repo_path: %s]", m.RemoteName, util.SanitizeCredentialURLs(addr), path))
-		} else {
-			cmd.SetDescription(fmt.Sprintf("remote add %s %s [repo_path: %s]", m.RemoteName, addr, path))
-		}
-		if _, _, err := cmd.RunStdString(&git.RunOpts{Dir: path}); err != nil {
-			return err
-		}
-		err := addRemotePushRefSpecs(ctx, path, m)
-		if err != nil {
-			return err
-		}
-		return nil
-	}
-
-	if err := addRemoteAndConfig(addr, m.Repo.RepoPath()); err != nil {
+	if err := addPushRemoteAndConfig(ctx, m, addr, m.Repo.RepoPath()); err != nil {
 		return err
 	}
 
 	if m.Repo.HasWiki() {
 		wikiRemoteURL := repository.WikiRemoteURL(ctx, addr)
 		if len(wikiRemoteURL) > 0 {
-			if err := addRemoteAndConfig(wikiRemoteURL, m.Repo.WikiPath()); err != nil {
+			if err := addPushRemoteAndConfig(ctx, m, wikiRemoteURL, m.Repo.WikiPath()); err != nil {
 				return err
 			}
 		}
 	}
 
 	return nil
+}
+
+// addPushRemoteAndConfig adds the push mirror's remote to the repository
+// at path, with its push refspecs.
+func addPushRemoteAndConfig(ctx context.Context, m *repo_model.PushMirror, addr, path string) error {
+	var cmd *git.Command
+	if m.BranchFilter == "" {
+		cmd = git.NewCommand(ctx, "remote", "add", "--mirror=push").AddDynamicArguments(m.RemoteName, addr)
+	} else {
+		cmd = git.NewCommand(ctx, "remote", "add").AddDynamicArguments(m.RemoteName, addr)
+	}
+	if strings.Contains(addr, "://") && strings.Contains(addr, "@") {
+		cmd.SetDescription(fmt.Sprintf("remote add %s %s [repo_path: %s]", m.RemoteName, util.SanitizeCredentialURLs(addr), path))
+	} else {
+		cmd.SetDescription(fmt.Sprintf("remote add %s %s [repo_path: %s]", m.RemoteName, addr, path))
+	}
+	if _, _, err := cmd.RunStdString(&git.RunOpts{Dir: path}); err != nil {
+		return err
+	}
+	return addRemotePushRefSpecs(ctx, path, m)
 }
 
 func addRemotePushRefSpecs(ctx context.Context, path string, m *repo_model.PushMirror) error {
@@ -203,6 +201,9 @@ func runPushSync(ctx context.Context, m *repo_model.PushMirror) error {
 			AddDynamicArguments("remote." + m.RemoteName + ".fetch").
 			RunStdString(&git.RunOpts{Dir: path}); err != nil && !git.IsErrorExitCode(err, 5) {
 			return err
+		}
+		if err := ensurePushMirrorRemote(ctx, m, path, isWiki); err != nil {
+			log.Error("SyncPushMirror [repo: %-v]: recreating the remote of the push mirror: %v", m.Repo, err)
 		}
 		remoteURL, err := git.GetRemoteURL(ctx, path, m.RemoteName)
 		if err != nil {

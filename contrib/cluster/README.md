@@ -483,7 +483,8 @@ Watch, Custom, Releases on GitHub, or the tags of
   `HOOK_TIMEOUT` less ten seconds (fifty seconds by default). A very large
   push over a slow link may be refused; its shipment goes on in the
   background for five minutes, and a retry skips the members that already
-  hold its objects. Raise `HOOK_TIMEOUT` for larger pushes. A first large
+  hold its objects. Raise `HOOK_TIMEOUT` for larger pushes, up to the
+  30 minutes a member gives one incoming pack. A first large
   repository goes through `forgejo cluster import`, which has its own
   30-minute budget, like `reconcile`, `objects backfill` and
   `snapshot save`.
@@ -512,6 +513,18 @@ Watch, Custom, Releases on GitHub, or the tags of
   tracking kept intact for events still queued), so it is not done yet:
   an instance that deletes repositories by the hundred thousand should
   watch the snapshot size.
+- One git transaction updates at most 4096 refs. A larger one, a
+  `push --mirror` or `push --tags` of thousands of refs with git 2.54 and
+  later, is refused before its objects are shipped: push in several
+  smaller pushes. A fork and a migration take their refs by batches of
+  512, whatever their number.
+- A mirror's remote is a node's git config, which the cluster does not
+  replicate: a node that lacks it recreates it from the database before
+  each mirror operation. The database keeps no password of a push
+  mirror: one authenticated by a password in its address pushes only
+  from the node that created it, one authenticated by an SSH key from
+  every node. `forgejo doctor` never removes a push mirror in a cluster
+  because one node lacks its remote.
 - A ref name must be valid UTF-8. git accepts other bytes, which the
   replicated table, in JSON, cannot carry unchanged.
 - The object channel accepts what Forgejo accepts on a push: the fsck
