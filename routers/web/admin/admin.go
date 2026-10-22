@@ -152,14 +152,20 @@ func Dashboard(ctx *context.Context) {
 	entries := []string{
 		"delete_inactive_accounts",
 		"delete_repo_archives",
-		"delete_missing_repos",
-		"git_gc_repos",
 	}
+	// A node of a cluster cannot judge a repository missing from its own
+	// disk: these two would act on every member (#51).
+	if !setting.Cluster.Enabled {
+		entries = append(entries, "delete_missing_repos")
+	}
+	entries = append(entries, "git_gc_repos")
 	if !setting.SSH.Disabled && !setting.SSH.StartBuiltinServer {
 		entries = append(entries, "resync_all_sshkeys", "resync_all_sshprincipals")
 	}
+	if !setting.Cluster.Enabled {
+		entries = append(entries, "reinit_missing_repos")
+	}
 	entries = append(entries, []string{
-		"reinit_missing_repos",
 		"sync_external_users",
 		"repo_health_check",
 		"delete_generated_repository_avatars",

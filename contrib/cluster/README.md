@@ -338,7 +338,11 @@ These commands run with the server stopped, on the data directory.
   if SQL lost it too, then adopt the repository (Site administration >
   Repositories > Unadopted, or `POST /api/v1/admin/unadopted/{owner}/{repo}`).
   Never use "delete unadopted" in a cluster: it removes one node's files and
-  the projector brings them back.
+  the projector brings them back. "Delete all repositories missing their Git
+  files" and "Reinitialize all missing Git repositories" are not offered in
+  a cluster, and refused: they judge a repository missing from one node's
+  disk, which a node behind on its projection is, and would delete it, or
+  rewrite its HEAD, on every member.
 - Only a deletion or a failed creation the cluster did not record is
   deleted, explicitly, one repository at a time:
   `forgejo cluster reconcile --delete-orphan <owner>/<repo> --expect-index <index> --reason "..."`.

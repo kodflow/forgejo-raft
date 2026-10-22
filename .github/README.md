@@ -720,6 +720,13 @@ official release would give (clean, carried, or the conflicted files).
   init`, a default branch change), and up to 2.47 a push to the default
   branch reports a HEAD line the cluster refuses. Upgrade git on a node
   before upgrading Forgejo on it.
+- **Some maintenance operations are off.** "Delete all repositories missing
+  their Git files" and "Reinitialize all missing Git repositories" judge a
+  repository by one node's disk and would act on every member: they are not
+  offered, and refused. `forgejo cluster reconcile` compares SQL with the
+  cluster instead.
+- **Git hooks are disabled** cluster-wide (server-side hooks in the
+  repository settings). Webhooks and Forgejo Actions work as usual.
 - **A push is committed whole or not at all.** When git would reject one
   ref of a push (a lock held by another writer or left behind, a ref that
   moved on this node, a directory and file name conflict), the cluster

@@ -5,6 +5,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -195,8 +196,26 @@ func gatherMissingRepoRecords(ctx context.Context) (repo_model.RepositoryList, e
 	return repos, nil
 }
 
+// ErrMissingReposInCluster refuses the maintenance of repositories whose
+// Git files are missing on a node of a cluster.
+var ErrMissingReposInCluster = errors.New("in a cluster, a repository missing from this node's disk is not missing: the cluster projects it again from the other members. Deleting or reinitializing it here would act on every member (forgejo cluster reconcile compares the database with the cluster instead)")
+
+// missingReposRefused refuses, on a node of a cluster, to judge a
+// repository missing from the local disk alone: a member that lags, was
+// rebuilt on an empty disk or has not projected a new repository yet would
+// delete it, or rewrite its HEAD, on every member (#51).
+func missingReposRefused() error {
+	if setting.Cluster.Enabled || clusterhook.Enabled() {
+		return ErrMissingReposInCluster
+	}
+	return nil
+}
+
 // DeleteMissingRepositories deletes all repository records that lost Git files.
 func DeleteMissingRepositories(ctx context.Context) error {
+	if err := missingReposRefused(); err != nil {
+		return err
+	}
 	repos, err := gatherMissingRepoRecords(ctx)
 	if err != nil {
 		return err
@@ -225,6 +244,9 @@ func DeleteMissingRepositories(ctx context.Context) error {
 
 // ReinitMissingRepositories reinitializes all repository records that lost Git files.
 func ReinitMissingRepositories(ctx context.Context) error {
+	if err := missingReposRefused(); err != nil {
+		return err
+	}
 	repos, err := gatherMissingRepoRecords(ctx)
 	if err != nil {
 		return err

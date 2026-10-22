@@ -247,8 +247,12 @@ func initExtendedTasks() {
 	registerGarbageCollectRepositories()
 	registerRewriteAllPublicKeys()
 	registerRewriteAllPrincipalKeys()
-	registerReinitMissingRepositories()
-	registerDeleteMissingRepositories()
+	// A node of a cluster cannot judge a repository missing from its own
+	// disk: the services refuse these two, and they are not offered.
+	if !setting.Cluster.Enabled {
+		registerReinitMissingRepositories()
+		registerDeleteMissingRepositories()
+	}
 	registerRemoveRandomAvatars()
 	registerDeleteOldActions()
 	registerUpdateGiteaChecker()
