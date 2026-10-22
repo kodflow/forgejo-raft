@@ -26,6 +26,10 @@ var (
 		Name: metricsNamespace + "object_ships_total",
 		Help: "Object shipments to a majority before a ref is proposed, by outcome: ok, failed.",
 	}, []string{"outcome"})
+	staleLocksRemovedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: metricsNamespace + "stale_locks_removed_total",
+		Help: "Git locks left behind by a killed git that the projector removed to converge a repository.",
+	})
 	dispatchedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: metricsNamespace + "consumer_dispatched_events_total",
 		Help: "Events whose post-receive work the consumer committed with its cursor.",
@@ -120,6 +124,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	}
 	proposalsTotal.Describe(ch)
 	objectShipsTotal.Describe(ch)
+	staleLocksRemovedTotal.Describe(ch)
 	dispatchedTotal.Describe(ch)
 	dispatchFailuresTotal.Describe(ch)
 	parkedTotal.Describe(ch)
@@ -141,6 +146,7 @@ func b2f(b bool) float64 {
 func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	proposalsTotal.Collect(ch)
 	objectShipsTotal.Collect(ch)
+	staleLocksRemovedTotal.Collect(ch)
 	dispatchedTotal.Collect(ch)
 	dispatchFailuresTotal.Collect(ch)
 	parkedTotal.Collect(ch)

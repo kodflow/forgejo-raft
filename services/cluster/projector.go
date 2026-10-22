@@ -464,7 +464,15 @@ func (p *projector) project(ctx context.Context, repo string) error {
 	}
 	if len(set) > 0 || len(del) > 0 {
 		if err := writeRefs(ctx, dir, set, del); err != nil {
-			return err
+			// A git killed while it held its locks (SIGKILL, OOM, a power
+			// cut) leaves them behind, and every later transaction on
+			// those refs fails for good (#48).
+			if p.clearStaleLocks(repo, dir, set, del) == 0 {
+				return err
+			}
+			if err := writeRefs(ctx, dir, set, del); err != nil {
+				return err
+			}
 		}
 	}
 	// Certification re-reads git under the registry's lock, so a native
@@ -486,6 +494,47 @@ func (p *projector) project(ctx context.Context, repo string) error {
 		p.certify(repo, at, writeStamp(dir, repo, at, reftable.ProjectionDigest(want)))
 	})
 	return verr
+}
+
+// clearStaleLocks removes the locks a killed git left on the refs the
+// projector writes: each ref's own, HEAD's, packed-refs' and the
+// packed-refs.new a pack-refs writes before its rename. The projector is
+// the only authority over git: a lock is removed only while no native
+// transaction is registered for the repository, a reservation included,
+// and only past both the registry's TTL and staleLockAge, past which git
+// holds none of its own (git gc waits for the gate, which a repository
+// behind keeps closed). Only regular files are removed. It returns how
+// many were.
+func (p *projector) clearStaleLocks(repo, dir string, set map[string]reftable.RefValue, del []string) int {
+	if p.registry.busy(repo) {
+		return 0
+	}
+	age := max(p.registry.ttl, staleLockAge)
+	paths := []string{"HEAD.lock", "packed-refs.lock", "packed-refs.new"}
+	for name := range set {
+		paths = append(paths, name+".lock")
+	}
+	for _, name := range del {
+		paths = append(paths, name+".lock")
+	}
+	removed := 0
+	for _, rel := range paths {
+		// The names come from the table, whose Apply validated them: no
+		// ".." component, no absolute path.
+		path := filepath.Join(dir, filepath.FromSlash(rel))
+		st, err := os.Lstat(path)
+		if err != nil || !st.Mode().IsRegular() || time.Since(st.ModTime()) <= age {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			log.Warn("cluster: removing the stale lock %s of %s: %v", rel, repo, err)
+			continue
+		}
+		log.Warn("cluster: removed %s of %s, left behind by a git that died %s ago", rel, repo, time.Since(st.ModTime()).Round(time.Second))
+		staleLocksRemovedTotal.Inc()
+		removed++
+	}
+	return removed
 }
 
 // filterTracked keeps the refs of git the table knows about: a ref the

@@ -491,9 +491,15 @@ Watch, Custom, Releases on GitHub, or the tags of
   two minutes, a ref that moved on this node, a name that conflicts with
   one of this node's refs as a directory and a file) the whole push is
   refused and the client reads every ref rejected. Pushing again succeeds
-  once the other writer is done; a lock left behind by a crashed git is
-  removed by hand. An empty lock younger than two minutes, on a ref the
-  push deletes, cannot be told from git's own.
+  once the other writer is done. A lock left behind by a crashed git
+  (a ref's, `HEAD.lock`, `packed-refs.lock`, `packed-refs.new`) is
+  removed by the projector the next time it writes that ref, once no git
+  of the repository is registered and the lock is older than both
+  `TXN_TTL` and two minutes (counted in
+  `forgejo_cluster_stale_locks_removed_total`); a lock on a ref the
+  projector has nothing to write to is still removed by hand. An empty
+  lock younger than two minutes, on a ref the push deletes, cannot be told
+  from git's own.
 - A deleted or renamed repository leaves its key in the replicated table
   for good: tombstoned refs, a deletion mark, a rename mark. Each costs a
   few hundred bytes in every snapshot, and the projector's first pass
