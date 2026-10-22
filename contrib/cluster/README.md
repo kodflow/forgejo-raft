@@ -483,7 +483,8 @@ Watch, Custom, Releases on GitHub, or the tags of
   `HOOK_TIMEOUT` less ten seconds (fifty seconds by default). A very large
   push over a slow link may be refused; its shipment goes on in the
   background for five minutes, and a retry skips the members that already
-  hold its objects. Raise `HOOK_TIMEOUT` for larger pushes. A first large
+  hold its objects. Raise `HOOK_TIMEOUT` for larger pushes, up to the
+  30 minutes a member gives one incoming pack. A first large
   repository goes through `forgejo cluster import`, which has its own
   30-minute budget, like `reconcile`, `objects backfill` and
   `snapshot save`.

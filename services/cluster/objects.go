@@ -516,7 +516,10 @@ func (oc *objectChannel) client(m consensus.Member) *http.Client {
 		DialContext:         (&net.Dialer{Timeout: peerDialTimeout}).DialContext,
 		TLSHandshakeTimeout: peerHandshakeTimeout,
 		TLSClientConfig:     cfg, MaxIdleConnsPerHost: 4, IdleConnTimeout: 90 * time.Second,
-		ResponseHeaderTimeout: 5 * time.Minute,
+		// The answer to a shipment comes once the peer indexed the whole
+		// pack, which may take long for a large one: the peer's own bound
+		// (#75). Each request is bounded by its context besides.
+		ResponseHeaderTimeout: objectBudget,
 	}}
 	oc.clients[key] = c
 	return c
@@ -567,12 +570,13 @@ var errNoMajority = errors.New("the objects could not be written on a majority o
 // Bounds of one shipment to one peer. A peer that does not answer must not
 // hold a push back once a majority holds the objects: the push returns at
 // majority, and the stragglers keep receiving in the background within
-// stragglerBudget.
+// stragglerBudget, or the request's own deadline when it is later.
 const (
 	peerDialTimeout      = 3 * time.Second
 	peerHandshakeTimeout = 5 * time.Second
-	stragglerBudget      = 5 * time.Minute
 )
+
+var stragglerBudget = 5 * time.Minute
 
 // shipToMajority writes the objects of wants on enough peers that a majority
 // of voters, this node included, holds them, before the ref is proposed
@@ -593,7 +597,16 @@ func (oc *objectChannel) shipToMajority(ctx context.Context, repo, dir, format s
 	var thinOnce, fullOnce sync.Once
 	var thinErr, fullErr error
 
-	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stragglerBudget)
+	// The shipments the request waits for are bounded by the request's
+	// deadline, HOOK_TIMEOUT less ten seconds for a push: a fixed budget
+	// cut every push slower than it whatever HOOK_TIMEOUT said (#75).
+	// Detached from the request, the stragglers keep at least
+	// stragglerBudget once a majority returned.
+	deadline := time.Now().Add(stragglerBudget)
+	if d, ok := ctx.Deadline(); ok && d.After(deadline) {
+		deadline = d
+	}
+	sendCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
 	acks := make(chan error, len(peers))
 	var wg sync.WaitGroup
 	for _, m := range peers {
