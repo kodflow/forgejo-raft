@@ -51,6 +51,9 @@ type Replicator struct {
 	raw   map[string]rawWrite
 
 	started time.Time
+	// hookAcceptFailing is set while the hook socket's Accept fails: no
+	// git write reaches this node then.
+	hookAcceptFailing atomic.Bool
 	// wake signals the consumer that the table changed.
 	wake chan struct{}
 	ctx  context.Context
@@ -452,7 +455,7 @@ func (r *Replicator) Ready() bool {
 		return false
 	}
 	h := eng.Health()
-	return h.Ready && !h.Stopped && r.projector.Ready()
+	return h.Ready && !h.Stopped && r.projector.Ready() && !r.hookAcceptFailing.Load()
 }
 
 // repoKey turns a git directory under the repository root into the table's

@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"forgejo.org/modules/clusterhook"
@@ -47,19 +48,37 @@ func (r *Replicator) serveHookSocket(path string) error {
 		<-r.ctx.Done()
 		ln.Close()
 	}()
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				if r.ctx.Err() == nil {
-					log.Error("cluster: hook socket: %v", err)
-				}
+	go acceptHooks(r.ctx, ln, &r.hookAcceptFailing, r.serveHookConn)
+	return nil
+}
+
+// acceptHooks serves the hook socket until ctx ends or the listener is
+// closed. Any other Accept error (EMFILE, ENFILE, ENOMEM under pressure)
+// is waited out with a growing pause, as net/http does, instead of ending
+// the loop for good while the socket stays open and every hook hangs on it
+// (#66); failing is set meanwhile, and the node reports itself not ready.
+func acceptHooks(ctx context.Context, ln net.Listener, failing *atomic.Bool, serve func(net.Conn)) {
+	var pause time.Duration
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return
 			}
-			go r.serveHookConn(conn)
+			pause = min(max(2*pause, 5*time.Millisecond), time.Second)
+			failing.Store(true)
+			log.Error("cluster: hook socket: %v; accepting again in %s", err, pause)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(pause):
+			}
+			continue
 		}
-	}()
-	return nil
+		pause = 0
+		failing.Store(false)
+		go serve(conn)
+	}
 }
 
 func (r *Replicator) serveHookConn(conn net.Conn) {
