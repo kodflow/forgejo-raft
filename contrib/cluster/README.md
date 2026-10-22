@@ -513,6 +513,11 @@ Watch, Custom, Releases on GitHub, or the tags of
   tracking kept intact for events still queued), so it is not done yet:
   an instance that deletes repositories by the hundred thousand should
   watch the snapshot size.
+- One git transaction updates at most 4096 refs. A larger one, a
+  `push --mirror` or `push --tags` of thousands of refs with git 2.54 and
+  later, is refused before its objects are shipped: push in several
+  smaller pushes. A fork and a migration take their refs by batches of
+  512, whatever their number.
 - A ref name must be valid UTF-8. git accepts other bytes, which the
   replicated table, in JSON, cannot carry unchanged.
 - The object channel accepts what Forgejo accepts on a push: the fsck

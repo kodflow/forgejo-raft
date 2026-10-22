@@ -47,6 +47,11 @@ func (r *Replicator) prepared(ctx context.Context, req *clusterhook.Request) *cl
 		// Only pseudo-refs outside refs/, which the table does not hold.
 		return &clusterhook.Response{OK: true}
 	}
+	if len(tx.Updates) > reftable.MaxUpdatesPerTxn {
+		// Apply would refuse it, after its objects went to a majority for
+		// nothing (#80).
+		return fail(fmt.Errorf("the transaction updates %d refs and the cluster takes at most %d in one; push them in several smaller pushes; nothing was written", len(tx.Updates), reftable.MaxUpdatesPerTxn))
+	}
 	if req.PusherID != 0 {
 		if err := gitWillApply(ctx, req.GitDir, req.Lines); err != nil {
 			return fail(err)
