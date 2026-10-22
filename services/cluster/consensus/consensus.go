@@ -417,9 +417,10 @@ type RecoverOptions struct {
 
 // RestoreOptions mirrors the SDK's options for a restore from a backup.
 type RestoreOptions struct {
-	// Meta is the engine's encoding of the snapshot's metadata.
+	// Meta is the engine's encoding of the snapshot's metadata. The file
+	// itself is authenticated by its caller, against the digest `snapshot
+	// save` wrote; the engine checks the decoded stream against Meta.
 	Meta     []byte
-	Expected [32]byte
 	Confirm  string
 	Operator Operator
 	MaxBytes int64

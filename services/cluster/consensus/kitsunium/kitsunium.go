@@ -253,9 +253,6 @@ func (driver) Restore(dir string, r io.Reader, newCluster consensus.ClusterID, m
 	if err := sdk.ParseSnapshotMeta(opt.Meta, &expected); err != nil {
 		return consensus.SnapshotMeta{}, fmt.Errorf("the snapshot's metadata file: %w", err)
 	}
-	if expected.SHA256 != opt.Expected {
-		return consensus.SnapshotMeta{}, errors.New("the digest given does not match the snapshot's metadata")
-	}
 	ms := make([]sdk.MemberValue, 0, len(members))
 	for _, m := range members {
 		ms = append(ms, sdkMember(m))

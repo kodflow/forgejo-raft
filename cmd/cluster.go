@@ -88,7 +88,7 @@ func cmdCluster() *cli.Command {
 				Usage: "Offline, into an empty data directory: restore the ref snapshot of a backup",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "file", Required: true},
-					&cli.StringFlag{Name: "sha256", Required: true, Usage: "the digest read from the authenticated backup repository"},
+					&cli.StringFlag{Name: "sha256", Required: true, Usage: "the file's SHA-256, as snapshot save logged it and wrote on the first line of <file>.sha256, read from the authenticated backup repository"},
 					&cli.StringFlag{Name: "new-cluster", Required: true},
 					&cli.StringFlag{Name: "members", Required: true},
 				},
@@ -509,11 +509,7 @@ func runClusterRestore(ctx context.Context, c *cli.Command) error {
 	if err != nil || len(sum) != 32 {
 		return errors.New("--sha256 must be 64 hex digits")
 	}
-	meta, err := os.ReadFile(c.String("file") + ".meta")
-	if err != nil {
-		return fmt.Errorf("the snapshot's metadata, written beside it by `snapshot save`: %w", err)
-	}
-	f, err := os.Open(c.String("file"))
+	f, meta, err := cluster.OpenSavedSnapshot(c.String("file"), [32]byte(sum))
 	if err != nil {
 		return err
 	}
@@ -521,7 +517,7 @@ func runClusterRestore(ctx context.Context, c *cli.Command) error {
 	if err := confirmTyped(c, "the new cluster id", cid.String()); err != nil {
 		return err
 	}
-	opt := consensus.RestoreOptions{Meta: meta, Expected: [32]byte(sum), Confirm: cid.String(), Operator: localOperator(), MaxBytes: setting.Cluster.MaxSnapshotBytes}
+	opt := consensus.RestoreOptions{Meta: meta, Confirm: cid.String(), Operator: localOperator(), MaxBytes: setting.Cluster.MaxSnapshotBytes}
 	restored, err := d.Restore(setting.Cluster.DataDir, f, cid, members, opt)
 	if err != nil {
 		return err

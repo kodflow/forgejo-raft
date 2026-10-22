@@ -4,6 +4,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -743,8 +744,13 @@ func (r *Replicator) SaveSnapshot(ctx context.Context, op consensus.Operator, pa
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
 	// The digest names the file by its base name, so `sha256sum -c` works
-	// wherever the pair is copied.
-	if err := writeFileSynced(path+".sha256.partial", []byte(sum+"  "+filepath.Base(path)+"\n")); err != nil {
+	// wherever the pair is copied; a second line binds the metadata.
+	digests := sum + "  " + filepath.Base(path) + "\n"
+	if len(meta.Raw) > 0 {
+		ms := sha256.Sum256(meta.Raw)
+		digests += hex.EncodeToString(ms[:]) + "  " + filepath.Base(path) + ".meta\n"
+	}
+	if err := writeFileSynced(path+".sha256.partial", []byte(digests)); err != nil {
 		return meta, err
 	}
 	// The engine's metadata travels with the snapshot: a restore needs it.
@@ -774,6 +780,51 @@ func (r *Replicator) SaveSnapshot(ctx context.Context, op consensus.Operator, pa
 	}
 	log.Warn("cluster: operator %s saved the ref snapshot at %d to %s (sha256 %s)", op, meta.Position.Index, path, sum)
 	return meta, nil
+}
+
+// OpenSavedSnapshot opens a snapshot `snapshot save` wrote, for a restore.
+// sum is the digest of the file as `snapshot save` logged it and wrote on
+// the first line of path.sha256: the file is read whole and refused when
+// it differs, then rewound. The metadata beside it is checked against the
+// line path.sha256 holds for it, when it holds one (snapshots saved before
+// it was written have none). The engine checks the decoded stream against
+// the metadata itself.
+func OpenSavedSnapshot(path string, sum [32]byte) (*os.File, []byte, error) {
+	meta, err := os.ReadFile(path + ".meta")
+	if err != nil {
+		return nil, nil, fmt.Errorf("the snapshot's metadata, written beside it by `snapshot save`: %w", err)
+	}
+	if lines, err := os.ReadFile(path + ".sha256"); err == nil {
+		for line := range strings.SplitSeq(string(lines), "\n") {
+			want, name, ok := strings.Cut(line, "  ")
+			if !ok || name != filepath.Base(path)+".meta" {
+				continue
+			}
+			if got := sha256.Sum256(meta); hex.EncodeToString(got[:]) != want {
+				return nil, nil, fmt.Errorf("%s.meta does not match its digest in %s.sha256", path, path)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, nil, err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	if !bytes.Equal(h.Sum(nil), sum[:]) {
+		f.Close()
+		return nil, nil, fmt.Errorf("%s does not match the digest given: it is not the file `snapshot save` wrote", path)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	return f, meta, nil
 }
 
 // writeFileSynced writes b to path and syncs it before closing.
