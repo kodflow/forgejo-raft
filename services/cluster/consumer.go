@@ -794,7 +794,7 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 	}
 	repo, err := lookupRepo(ctx, first)
 	if err != nil {
-		if repo_model.IsErrRepoNotExist(err) && deletedAfter(tbl, first) {
+		if repo_model.IsErrRepoNotExist(err) && (deletedAfter(tbl, first) || idSuperseded(ctx, tbl, first)) {
 			// The repository was deleted after the push: its rows are gone
 			// with it, and the work has nothing left to land on. Kept, it
 			// would fail at every retry, parked for good, and hold back
@@ -993,6 +993,32 @@ func deletedAfter(tbl lifecycleTable, ev reftable.Event) bool {
 		key, at = to, idx
 	}
 	return false
+}
+
+// idSuperseded reports whether the repository an event's ID names is gone
+// for good: the key it leads to, following the table's renames forward,
+// is now held by a row with another ID. A repository deleted and created
+// again under its name clears the table's deletion mark at its first
+// write, so deletedAfter no longer sees it (#78). IDs are not handed out
+// again short of a database loss, which eventLeadsTo reports.
+func idSuperseded(ctx context.Context, tbl lifecycleTable, ev reftable.Event) bool {
+	if ev.RepoID <= 0 {
+		return false
+	}
+	key, at := ev.Repo, ev.Token.Index
+	for range 64 {
+		if tbl == nil {
+			break
+		}
+		to, idx, ok := tbl.RenamedAfter(key, at)
+		if !ok {
+			break
+		}
+		key, at = to, idx
+	}
+	owner, name, _ := strings.Cut(strings.TrimSuffix(key, ".git"), "/")
+	r, err := repo_model.GetRepositoryByOwnerAndName(ctx, owner, name)
+	return err == nil && r.ID != ev.RepoID
 }
 
 func lookupRepo(ctx context.Context, ev reftable.Event) (*repo_model.Repository, error) {
