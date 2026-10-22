@@ -560,7 +560,18 @@ func (r *Replicator) WaitFresh(ctx context.Context, repo string) bool {
 	if err != nil {
 		return false
 	}
-	return r.projector.Wait(ctx, repo, tok.Index) == nil
+	// The barrier's index counts the entries that are not commands (a new
+	// term's no-op, a membership change), which never reach the table: on
+	// a quiet forge after an election the projection would never reach
+	// it (#69). The barrier returns once the node applied its index, and
+	// a command is in the table before the engine counts it applied: every
+	// command up to the barrier is at or below the table's position read
+	// now, and what lies above it touches no repository.
+	target := tok.Index
+	if pos, _ := r.table.Applied(); pos.Index < target {
+		target = pos.Index
+	}
+	return r.projector.Wait(ctx, repo, target) == nil
 }
 
 // ReadRefusal refuses a read of repo while its directory here holds
