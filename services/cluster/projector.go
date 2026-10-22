@@ -45,8 +45,15 @@ type projector struct {
 	fenced bool
 	// pendingFirst counts repositories not yet reconciled once since the
 	// start: no watermark is certified as "everything" before they are.
+	// Each one holds the writes of its own key only (#39).
 	pendingFirst map[string]bool
-	failures     map[string]string
+	// unfencedAt is when the fence was lifted: past firstPassGrace, the
+	// keys still pending no longer hold the node's readiness.
+	unfencedAt time.Time
+	// graceLogged is set once the keys holding the first pass past its
+	// grace were reported.
+	graceLogged bool
+	failures    map[string]string
 	// deletedAt holds the index of a repository's deletion until this node
 	// removed its directory: a key revived meanwhile by a rename finds the
 	// deleted repository's directory still there.
@@ -119,6 +126,8 @@ func (p *projector) unfence() {
 		}
 	}
 	p.fenced = false
+	p.unfencedAt = time.Now()
+	p.graceLogged = false
 	p.mu.Unlock()
 	p.signal()
 }
@@ -144,11 +153,51 @@ func (p *projector) Fenced() bool {
 	return p.fenced
 }
 
-// Ready reports whether projection caught up once since the start.
+// firstPassGrace bounds how long the first reconciliation of every
+// repository holds the node's readiness after a start. A repository whose
+// projection keeps failing (a damaged packed-refs, a lock left behind)
+// would otherwise keep the node out of service for good (#39): past the
+// grace it stays behind alone, refused to writes and reported in Lag and
+// in projection_failing_repositories.
+var firstPassGrace = 10 * time.Minute
+
+// Ready reports whether projection caught up once since the start, or the
+// first pass's grace ran out with only some keys behind.
 func (p *projector) Ready() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return !p.fenced && len(p.pendingFirst) == 0
+	if p.fenced {
+		return false
+	}
+	if len(p.pendingFirst) == 0 {
+		return true
+	}
+	if time.Since(p.unfencedAt) < firstPassGrace {
+		return false
+	}
+	if !p.graceLogged {
+		p.graceLogged = true
+		keys := make([]string, 0, len(p.pendingFirst))
+		for r := range p.pendingFirst {
+			keys = append(keys, r)
+		}
+		sort.Strings(keys)
+		if len(keys) > 20 {
+			keys = append(keys[:20], "...")
+		}
+		log.Error("cluster: %d repositories are still not reconciled %s after the start, they stay refused to writes until their projection succeeds: %s", len(p.pendingFirst), firstPassGrace, strings.Join(keys, ", "))
+	}
+	return true
+}
+
+// Writable reports whether a write to repo may be proposed from this node:
+// the fence is lifted and repo itself was reconciled once since the start.
+// Another key still behind does not hold it (#39); Apply checks the old
+// values against the table, and gitWillApply the local git.
+func (p *projector) Writable(repo string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.fenced && !p.pendingFirst[repo]
 }
 
 // Projected returns the index up to which every entry touching repo is
@@ -207,6 +256,9 @@ type RepoLag struct {
 	Watermark uint64
 	Target    uint64
 	Error     string
+	// Pending is set while the repository was not reconciled once since
+	// the start: its writes are refused on this node.
+	Pending bool
 }
 
 func (p *projector) Lag() []RepoLag {
@@ -214,7 +266,7 @@ func (p *projector) Lag() []RepoLag {
 	defer p.mu.Unlock()
 	out := make([]RepoLag, 0, len(p.dirty))
 	for r, idx := range p.dirty {
-		out = append(out, RepoLag{Repo: r, Watermark: p.watermark[r], Target: idx, Error: p.failures[r]})
+		out = append(out, RepoLag{Repo: r, Watermark: p.watermark[r], Target: idx, Error: p.failures[r], Pending: p.pendingFirst[r]})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Target-out[i].Watermark > out[j].Target-out[j].Watermark })
 	return out
