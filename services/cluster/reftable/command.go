@@ -7,6 +7,8 @@ import (
 	"encoding/json" //nolint:depguard // the state machine decodes with the standard library alone: Apply's verdict must not depend on a third-party codec's version
 	"errors"
 	"fmt"
+
+	"forgejo.org/services/cluster/consensus"
 )
 
 // PayloadVersion is the highest command version this code applies; an
@@ -217,7 +219,7 @@ func EncodeVersion(v uint8, kind Kind, body any) ([]byte, error) {
 
 // ErrVersion is a command of a version this node does not know: the node
 // must stop, never skip it (D18).
-var ErrVersion = errors.New("VERSION_UNSUPPORTED")
+var ErrVersion = consensus.ErrVersionUnsupported
 
 // errMalformed is a body of a known kind that does not parse: a refusal.
 var errMalformed = errors.New("malformed command body")

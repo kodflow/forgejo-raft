@@ -465,6 +465,11 @@ var (
 	ErrNodeIDRetired         = errors.New("NODE_ID_RETIRED")
 	ErrNotImplemented        = errors.New("not implemented by this driver")
 	ErrCompacted             = errors.New("LOG_COMPACTED")
+	// ErrVersionUnsupported, from a StateMachine's Restore, says the snapshot
+	// is of a format this build does not read: the engine stops the node and
+	// refuses a restart over that snapshot (D18), instead of having the
+	// leader resend it forever.
+	ErrVersionUnsupported = errors.New("VERSION_UNSUPPORTED")
 )
 
 // Certain reports whether err says, with certainty, that nothing was
