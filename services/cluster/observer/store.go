@@ -172,7 +172,15 @@ func newStore(dir, git string) *store {
 	return &store{dir: dir, git: gitStore{root: filepath.Join(dir, "git"), git: git}}
 }
 
+// path joins elem under the store. An element that climbs out (a ".."
+// component) yields "", which every file operation refuses and RemoveAll
+// ignores: a name a member sent never reaches outside its subdirectory.
 func (s *store) path(elem ...string) string {
+	for _, e := range elem {
+		if slices.Contains(strings.FieldsFunc(e, func(r rune) bool { return r == '/' || r == filepath.Separator }), "..") {
+			return ""
+		}
+	}
 	return filepath.Join(append([]string{s.dir}, elem...)...)
 }
 

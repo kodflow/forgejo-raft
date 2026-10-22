@@ -316,6 +316,10 @@ func (o *Observer) leaderView(ctx context.Context) (*clusterhook.ExportView, str
 			errs = append(errs, fmt.Errorf("%s answered as %s", slot, v.Leader))
 			continue
 		}
+		if err := validView(&v); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", slot, err))
+			continue
+		}
 		if best == nil || v.Term > best.Term {
 			best, bestSlot = &v, slot
 		}
@@ -351,6 +355,27 @@ func (o *Observer) lastIndex() uint64 {
 		return a.Index
 	}
 	return 0
+}
+
+// validCheckpoint checks a checkpoint's name, which names directories of
+// the store, against the only form a member derives from its lineage and
+// index.
+func validCheckpoint(cp clusterhook.ExportCheckpoint) error {
+	if !checkpointName.MatchString(cp.Name) || cp.Name != reftable.CheckpointName(cp.Lineage, cp.Index) {
+		return fmt.Errorf("invalid checkpoint name %q", cp.Name)
+	}
+	return nil
+}
+
+// validView refuses a view that names a checkpoint otherwise than a member
+// would: it comes from no honest member, and nothing of it is used.
+func validView(v *clusterhook.ExportView) error {
+	for _, cp := range v.Checkpoints {
+		if err := validCheckpoint(cp); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 var errStale = errors.New("a deposed leader's view, behind the term already seen")
@@ -516,14 +541,17 @@ func (o *Observer) nextCheckpoint(v *clusterhook.ExportView) (clusterhook.Export
 // ingest verifies one checkpoint into staging, then publishes it. What a
 // checkpoint that fails leaves in staging goes with it.
 func (o *Observer) ingest(ctx context.Context, leader string, cp clusterhook.ExportCheckpoint, voters []string) (err error) {
+	// The name is checked before anything is cleaned up under it: a name
+	// such as ".." would otherwise remove the store, or what lies past it.
+	if err := validCheckpoint(cp); err != nil {
+		return err
+	}
+	stage := o.store.path("staging", cp.Name)
 	defer func() {
 		if err != nil {
-			_ = os.RemoveAll(o.store.path("staging", cp.Name))
+			_ = os.RemoveAll(stage)
 		}
 	}()
-	if !checkpointName.MatchString(cp.Name) || cp.Name != reftable.CheckpointName(cp.Lineage, cp.Index) {
-		return fmt.Errorf("invalid checkpoint name %q", cp.Name)
-	}
 	target, err := ParseLSN(cp.LSN)
 	if err != nil {
 		return err
@@ -531,10 +559,6 @@ func (o *Observer) ingest(ctx context.Context, leader string, cp clusterhook.Exp
 	if cp.WALSegmentSize <= 0 || cp.WALSegmentSize&(cp.WALSegmentSize-1) != 0 {
 		return errors.New("invalid WAL segment size")
 	}
-	if !checkpointName.MatchString(cp.Name) {
-		return fmt.Errorf("invalid checkpoint name %q", cp.Name)
-	}
-	stage := o.store.path("staging", cp.Name)
 	if err := os.RemoveAll(stage); err != nil {
 		return err
 	}

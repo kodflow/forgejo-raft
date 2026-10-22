@@ -196,7 +196,8 @@ func TestObserverRejectsForkOrRollback(t *testing.T) {
 				v.Checkpoints[i].Root = strings.Repeat("0", 64)
 			}
 			// The rewritten one is served again, whatever was asked.
-			v.Checkpoints = append(v.Checkpoints, clusterhook.ExportCheckpoint{Name: before.Checkpoints[0].Name, Root: strings.Repeat("f", 64)})
+			a := before.Checkpoints[0]
+			v.Checkpoints = append(v.Checkpoints, clusterhook.ExportCheckpoint{Name: a.Name, Lineage: before.Lineage, Index: a.Index, Root: strings.Repeat("f", 64)})
 			b, _ := json.Marshal(v)
 			return b
 		}
@@ -508,4 +509,67 @@ func TestObserverRefusesAnInvalidWALName(t *testing.T) {
 	require.ErrorContains(t, err, "invalid WAL name")
 	_, serr := os.Stat(filepath.Join(o.cfg.Dir, "..", "escape.history"))
 	assert.True(t, os.IsNotExist(serr))
+}
+
+// A checkpoint name comes from a member, which may be compromised: a name
+// that climbs out of staging ("..", "../..") or an absolute path never
+// removes the store, its protected checkpoints, nor a file beside it, and
+// the view that names it is passed over (#110).
+func TestHuntR8ProveObserverDotDotWipesStore(t *testing.T) {
+	for _, name := range []string{"..", "../..", "../../..", "/etc"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			c := newFakeCluster(t)
+			// The store sits four levels deep in the test's own directory:
+			// should the defect come back, what it removes stays there.
+			root := t.TempDir()
+			cfg := newTestObserver(t, c, &hookLog{}).cfg
+			cfg.Dir = filepath.Join(root, "a", "b", "c", "obs")
+			require.NoError(t, os.MkdirAll(cfg.Dir, 0o700))
+			o, err := New(cfg)
+			require.NoError(t, err)
+			seed(t, c, o)
+			require.NoError(t, o.Step(ctx))
+			protected := o.State().Checkpoints[0].Name
+			require.Equal(t, StateProtected, o.State().Checkpoints[0].State)
+			precious := filepath.Join(filepath.Dir(o.store.dir), "precious-outside-the-observer")
+			require.NoError(t, os.WriteFile(precious, []byte("keep"), 0o600))
+
+			// Every member, leader or not, names the forged checkpoint in a
+			// higher term.
+			c.tamper = func(_ string, req *clusterhook.ExportRequest, data []byte) []byte {
+				if req.Op != clusterhook.OpExportCheckpoints {
+					return data
+				}
+				var v clusterhook.ExportView
+				require.NoError(t, json.Unmarshal(data, &v))
+				v.Term++
+				v.Checkpoints = append(v.Checkpoints, clusterhook.ExportCheckpoint{Name: name, Lineage: v.Lineage, Index: 1 << 40})
+				b, err := json.Marshal(v)
+				require.NoError(t, err)
+				return b
+			}
+			require.Error(t, o.Step(ctx))
+			// The same name handed to ingest directly.
+			require.ErrorContains(t, o.ingest(ctx, "node-a", clusterhook.ExportCheckpoint{Name: name, Lineage: c.lineage().String(), Index: 1 << 40}, nil), "invalid checkpoint name")
+
+			for _, p := range []string{o.store.path("state.json"), o.store.path("checkpoints", protected, "PROTECTED"), o.store.path("git"), precious} {
+				_, err := os.Stat(p)
+				require.NoError(t, err, "%s survives", p)
+			}
+			reopened, err := New(o.cfg)
+			require.NoError(t, err)
+			assert.Equal(t, o.State().Lineage, reopened.State().Lineage)
+			assert.Len(t, reopened.State().Checkpoints, 1)
+		})
+	}
+}
+
+// store.path never yields a path outside the store.
+func TestStorePathStaysInside(t *testing.T) {
+	s := newStore(t.TempDir(), "git")
+	for _, elem := range [][]string{{"staging", ".."}, {"staging", "../.."}, {"..", "x"}, {"staging", "a/../../b"}} {
+		assert.Empty(t, s.path(elem...), "%v", elem)
+	}
+	assert.Equal(t, filepath.Join(s.dir, "staging", "x"), s.path("staging", "x"))
 }
