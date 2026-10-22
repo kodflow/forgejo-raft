@@ -12,8 +12,12 @@ import (
 	"testing"
 	"time"
 
+	"forgejo.org/models/db"
+	repo_model "forgejo.org/models/repo"
+	"forgejo.org/models/unittest"
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/setting"
+	repo_service "forgejo.org/services/repository"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -191,4 +195,60 @@ func TestThePackedRefsTransactionIsNotProposed(t *testing.T) {
 	t.Logf("table b tombstone=%v rev=%d", v.Tombstone, v.Rev)
 	assert.True(t, v.Tombstone)
 	assert.Equal(t, events+1, n.r.table.EventCount(), "one event for the deletion, none for the nested transaction")
+}
+
+// Forgejo's housekeeping (`git gc`, the "Garbage collect all repositories"
+// operation) runs `git pack-refs --all --prune`, which drives the
+// reference-transaction hook: one transaction "0 -> sha" per packed ref,
+// then one "sha -> 0" per pruned loose ref. Through the hook, every branch
+// and tag was deleted on every member (#72): gc runs without it.
+func TestGitGcKeepsTheRefs(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	out, _ := exec.Command("git", "--version").CombinedOutput()
+	t.Logf("%s", strings.TrimSpace(string(out)))
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	c1 := commit(t, work, "one")
+	zero := strings.Repeat("0", 40)
+	n := tc.nodes[0]
+	key := "user2/repo1.git"
+	refs := []string{"refs/heads/main", "refs/heads/feature", "refs/tags/v1"}
+	for _, ref := range refs {
+		require.True(t, tc.pushVia(n, work, key, ref, zero, c1).OK, ref)
+	}
+	for _, m := range tc.nodes {
+		for _, ref := range refs {
+			require.Eventually(t, func() bool { return gitRef(t, m, key, ref) == c1 }, 10*time.Second, 20*time.Millisecond, "%s %s", m.slot, ref)
+		}
+	}
+	revs := map[string]uint64{}
+	for _, ref := range refs {
+		v, _ := n.r.table.Get(key, ref)
+		revs[ref] = v.Rev
+	}
+	evBefore := n.r.table.EventCount()
+
+	withGitThroughReplicator(t, n)
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	require.Equal(t, filepath.Join(n.r.root, "user2", "repo1.git"), repo.RepoPath())
+	gcErr := repo_service.GitGcRepo(db.DefaultContext, repo, time.Minute, nil)
+	t.Logf("GitGcRepo: %v", gcErr)
+	require.NoError(t, gcErr)
+
+	for _, ref := range refs {
+		v, ok := n.r.table.Get(key, ref)
+		t.Logf("table after gc: %s live=%v sha=%s rev %d -> %d", ref, v.Live(), v.SHA, revs[ref], v.Rev)
+		assert.True(t, ok && v.Live() && v.SHA == c1, "%s: a git gc must not change the replicated table", ref)
+	}
+	t.Logf("events: %d -> %d", evBefore, n.r.table.EventCount())
+	assert.Equal(t, evBefore, n.r.table.EventCount(), "a git gc proposes nothing")
+	time.Sleep(3 * time.Second)
+	for _, m := range tc.nodes {
+		for _, ref := range refs {
+			got := gitRef(t, m, key, ref)
+			t.Logf("git on %s after gc: %s = %q", m.slot, ref, got)
+			assert.Equal(t, c1, got, "%s: %s must survive a git gc on %s", m.slot, ref, n.slot)
+		}
+	}
 }

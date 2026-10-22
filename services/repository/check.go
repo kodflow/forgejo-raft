@@ -125,6 +125,16 @@ func GitGcRepo(ctx context.Context, repo *repo_model.Repository, timeout time.Du
 		config, args = clusterGCArgs(args)
 		command.AddArguments(config...)
 	}
+	if setting.Cluster.Enabled || clusterhook.Enabled() {
+		// gc packs the refs (pack-refs --all --prune), which runs the
+		// reference-transaction hook: one transaction writing each packed
+		// ref into packed-refs, then one deleting each pruned loose ref.
+		// The hook would propose those deletions, and every member would
+		// delete every branch and tag (#72). Packing changes no ref's
+		// value, and git's locks guard it from concurrent writes: the
+		// cluster is left out of it, as the projector's own git is.
+		command.AddArguments("-c", "core.hooksPath=/dev/null")
+	}
 	log.Trace("Running git gc on %-v", repo)
 	command.AddArguments("gc").AddArguments(args...).
 		SetDescription(fmt.Sprintf("Repository Garbage Collection: %s", repo.FullName()))
