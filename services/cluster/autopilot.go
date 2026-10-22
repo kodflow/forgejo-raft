@@ -181,8 +181,8 @@ func (r *Replicator) revokedLearner(m consensus.Membership) (consensus.NodeID, b
 // promoted: the engine's own bound (PromoteLag), which refuses the rest.
 const promoteLag = 1024
 
-// promotable says whether a learner is ready to vote: the leader heard it
-// within the autopilot's period, it receives no snapshot and is caught up
+// promotable says whether a learner is ready to vote: the leader does not
+// count it out of reach (downAfter), it receives no snapshot and is caught up
 // (#92, #94), and, once the cluster writes a payload version above the
 // base, its binary applies that version: an older binary made a voter would
 // stop on the first entry it cannot read, or lead and lose what it cannot
@@ -196,7 +196,7 @@ func (r *Replicator) promotable(ctx context.Context, eng consensus.Engine) func(
 	asked := false
 	return func(x consensus.Member) bool {
 		p, ok := peers[x.ID]
-		if !ok || r.keyRevoked(x.SPKI) || p.Unreachable || p.Snapshot || p.Lag > promoteLag || p.LastContact > r.auto.tick {
+		if !ok || r.keyRevoked(x.SPKI) || p.Unreachable || p.Snapshot || p.Lag > promoteLag || p.LastContact > r.auto.downAfter {
 			return false
 		}
 		v := r.table.WriteVersion()
