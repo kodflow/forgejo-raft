@@ -92,6 +92,10 @@ func (r *Replicator) autopilotStep(ctx context.Context) {
 		r.autoChange(pctx, ActionRemove, id, "out of reach for DEAD_MEMBER_TIMEOUT", eng.Remove)
 		return
 	}
+	if id, ok := r.revokedLearner(m); ok {
+		r.autoChange(pctx, ActionRemove, id, "its key was revoked", eng.Remove)
+		return
+	}
 	if ids := NextPromotion(m, r.promotable(pctx, eng)); len(ids) > 0 {
 		// From one voter, both learners in this pass: a refusal of the
 		// second leaves two voters until the next pass, never by design.
@@ -161,6 +165,18 @@ func (r *Replicator) autoChange(ctx context.Context, action Action, id consensus
 	return true
 }
 
+// revokedLearner names a learner whose key this node's table holds revoked:
+// one admitted by a member whose table had not applied the revocation yet
+// (#70). It is removed, never promoted.
+func (r *Replicator) revokedLearner(m consensus.Membership) (consensus.NodeID, bool) {
+	for _, x := range m.Members {
+		if !x.Voter && r.keyRevoked(x.SPKI) {
+			return x.ID, true
+		}
+	}
+	return 0, false
+}
+
 // promoteLag is how far behind the commit a learner may be and still be
 // promoted: the engine's own bound (PromoteLag), which refuses the rest.
 const promoteLag = 1024
@@ -180,7 +196,7 @@ func (r *Replicator) promotable(ctx context.Context, eng consensus.Engine) func(
 	asked := false
 	return func(x consensus.Member) bool {
 		p, ok := peers[x.ID]
-		if !ok || p.Unreachable || p.Snapshot || p.Lag > promoteLag || p.LastContact > r.auto.tick {
+		if !ok || r.keyRevoked(x.SPKI) || p.Unreachable || p.Snapshot || p.Lag > promoteLag || p.LastContact > r.auto.tick {
 			return false
 		}
 		v := r.table.WriteVersion()

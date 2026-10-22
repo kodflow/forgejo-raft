@@ -680,6 +680,14 @@ func (r *Replicator) flushRevocations(ctx context.Context) {
 // still refuses, and the Nomad check still applies.
 func (r *Replicator) authorizeJoin(ctx context.Context, req consensus.JoinRequest) (consensus.Operator, error) {
 	slot, spki := req.Slot, req.SPKI
+	// The engine refused a slot that has a member on the membership it
+	// appended, which runs ahead of the table: the revocation a Remove
+	// commits before its membership change may not be applied here yet,
+	// after a restart or behind a snapshot cut. The table is read once it
+	// applied a commit boundary a quorum confirmed (#70).
+	if err := r.appliedToBoundary(ctx); err != nil {
+		return "", fmt.Errorf("JOIN_REFUSED: the cluster state cannot be confirmed on this node: %w", err)
+	}
 	// A key an operator revoked (Remove, DenyPin) never joins again,
 	// whatever the grant or the CA says.
 	if r.table.KeyRevoked(hex.EncodeToString(spki[:])) {
@@ -722,6 +730,22 @@ func (r *Replicator) authorizeJoin(ctx context.Context, req consensus.JoinReques
 	}
 	log.Warn("cluster: a node joins under slot %s, admitted by %s", slot, operator)
 	return operator, nil
+}
+
+// appliedToBoundary waits until this node's table applied a commit boundary
+// a quorum confirmed, within a few seconds.
+func (r *Replicator) appliedToBoundary(ctx context.Context) error {
+	eng := r.Engine()
+	if eng == nil {
+		return errors.New("the consensus node is not open")
+	}
+	bctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	tok, err := eng.Barrier(bctx)
+	if err != nil {
+		return err
+	}
+	return eng.WaitApplied(bctx, tok)
 }
 
 // joinerApplies refuses, in the autonomous mode, a joiner whose binary does
