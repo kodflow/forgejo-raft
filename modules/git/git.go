@@ -26,6 +26,16 @@ import (
 // RequiredVersion is the minimum Git version required
 const RequiredVersion = "2.34.1"
 
+// ClusterRequiredVersion is the minimum Git version of a node of a
+// replicated cluster. The cluster learns HEAD only from the
+// reference-transaction hook: before 2.46, `git init` and `git symbolic-ref`
+// write HEAD without a transaction, so a new repository, a fork or a default
+// branch change never reaches the other members. Up to 2.47, a push to the
+// branch HEAD names also reports a HEAD line, which the cluster refuses
+// (HEAD is held as a symbolic ref only): pushes to the default branch and
+// forks fail. From 2.48 neither happens.
+const ClusterRequiredVersion = "2.48"
+
 var (
 	// GitExecutable is the command name of git
 	// Could be updated to an absolute path while initialization
@@ -106,6 +116,20 @@ func SetExecutablePath(path string) error {
 	return nil
 }
 
+// ClusterGitVersionError refuses a git older than ClusterRequiredVersion
+// for a node of a cluster, naming the version found and the one required.
+func ClusterGitVersionError(v *version.Version) error {
+	required := version.Must(version.NewVersion(ClusterRequiredVersion))
+	if v != nil && !v.LessThan(required) {
+		return nil
+	}
+	found := "(none)"
+	if v != nil {
+		found = v.Original()
+	}
+	return fmt.Errorf("installed git version %q is too old for a cluster node: [cluster] ENABLED requires git >= %s, which routes HEAD through the reference-transaction hook (git init, symbolic-ref) and reports no HEAD line for a push to the default branch", found, ClusterRequiredVersion)
+}
+
 // VersionInfo returns git version information
 func VersionInfo() string {
 	if GitVersion == nil {
@@ -158,6 +182,11 @@ func InitSimple(ctx context.Context) error {
 func InitFull(ctx context.Context) (err error) {
 	if err = InitSimple(ctx); err != nil {
 		return err
+	}
+	if setting.Cluster.Enabled {
+		if err = ClusterGitVersionError(GitVersion); err != nil {
+			return err
+		}
 	}
 
 	// when git works with gnupg (commit signing), there should be a stable home for gnupg commands

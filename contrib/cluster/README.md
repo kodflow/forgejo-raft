@@ -23,6 +23,12 @@ derive in it is written by a single consumer, on the leader.
   `serverAuth` and `clientAuth` usages. The key stays on the node.
 - `[security] DISABLE_GIT_HOOKS = true`. Start-up fails without it, since a
   user hook would run inside the replication path.
+- git 2.48 or later. Start-up fails with an older git: the cluster learns
+  HEAD only from the reference-transaction hook, which git before 2.46
+  bypasses for `git init` and `git symbolic-ref`, and git up to 2.47 reports
+  a HEAD line for a push to the default branch, which the cluster refuses.
+  The standalone release binaries run with the distribution's git (2.39 on
+  Debian 12, 2.43 on Ubuntu 24.04): upgrade it first.
 
 ## PostgreSQL durability (REQUIRED)
 

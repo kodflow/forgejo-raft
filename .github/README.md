@@ -715,8 +715,11 @@ official release would give (clean, carried, or the conflicted files).
   been run in production for long. The consensus library is pre-1.0 and
   pinned to a specific revision.
 - **Three voters.** The tooling and examples target three voting members.
-- **Git hooks are disabled** cluster-wide (server-side hooks in the
-  repository settings). Webhooks and Forgejo Actions work as usual.
+- **git 2.48 or later** on every node. A node with an older git refuses to
+  start: before 2.46 HEAD bypasses the reference-transaction hook (`git
+  init`, a default branch change), and up to 2.47 a push to the default
+  branch reports a HEAD line the cluster refuses. Upgrade git on a node
+  before upgrading Forgejo on it.
 - **A push is committed whole or not at all.** When git would reject one
   ref of a push (a lock held by another writer or left behind, a ref that
   moved on this node, a directory and file name conflict), the cluster
