@@ -5,6 +5,7 @@ package clusterhook
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -94,4 +95,22 @@ func TestTxnNoncePerTransaction(t *testing.T) {
 	assert.Equal(t, TxnNonce("n", append(append([]Line{}, a...), b...)), TxnNonce("n", append(append([]Line{}, b...), a...)))
 	assert.True(t, strings.HasPrefix(TxnNonce("n", a), "n."))
 	assert.Empty(t, TxnNonce("", a))
+}
+
+// The creation asks the cluster whether it takes the repository, and its
+// wiki, before git init writes anything (#54).
+func TestCheckRepoKey(t *testing.T) {
+	require.NoError(t, CheckRepoKey("u", ".profile"), "no cluster, no check")
+	var asked []string
+	SetKeyCheck(func(key string) error {
+		asked = append(asked, key)
+		if strings.Contains(key, "/.") {
+			return errors.New("refused")
+		}
+		return nil
+	})
+	defer SetKeyCheck(nil)
+	require.Error(t, CheckRepoKey("User4", ".profile"))
+	require.NoError(t, CheckRepoKey("User4", "Demo"))
+	assert.Equal(t, []string{"user4/.profile.git", "user4/demo.git", "user4/demo.wiki.git"}, asked)
 }

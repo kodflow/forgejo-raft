@@ -52,6 +52,15 @@ func (r *Replicator) Import(ctx context.Context, only string) (ImportReport, err
 			if !d.IsDir() || reftable.ValidRepoKey(key) != nil || (only != "" && key != only) {
 				continue
 			}
+			if err := reftable.ValidRepoKeyAt(key, r.table.WriteVersion()); err != nil {
+				// A repository Forgejo holds and the cluster cannot take
+				// yet (a name that starts with a dot): counted and named,
+				// never skipped in silence (#54).
+				rep.Skipped++
+				rep.Failures = append(rep.Failures, fmt.Sprintf("%s: not imported: %v; the cluster takes it once its payload version is raised to %d", key, err, reftable.GenerationVersion))
+				log.Warn("cluster import: %s: not imported: %v", key, err)
+				continue
+			}
 			if ctx.Err() != nil {
 				return rep, ctx.Err()
 			}
@@ -93,7 +102,8 @@ func (r *Replicator) importRepo(ctx context.Context, key string) (int, error) {
 		n := min(len(names), 512)
 		chunk := names[:n]
 		names = names[n:]
-		tx := &reftable.RefTxn{Repo: key, Format: format, Time: time.Now().UnixNano(), Trigger: TriggerImport}
+		read, _ := r.table.Applied()
+		tx := &reftable.RefTxn{Repo: key, Format: format, Time: time.Now().UnixNano(), Trigger: TriggerImport, ReadAt: read.Index}
 		var wants []string
 		for _, name := range chunk {
 			g := have[name]
@@ -109,7 +119,7 @@ func (r *Replicator) importRepo(ctx context.Context, key string) (int, error) {
 				return total, err
 			}
 		}
-		data, err := reftable.Encode(reftable.KindRefTxn, tx)
+		data, err := reftable.EncodeVersion(r.table.WriteVersion(), reftable.KindRefTxn, tx)
 		if err != nil {
 			return total, err
 		}

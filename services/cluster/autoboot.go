@@ -209,6 +209,59 @@ func (r *Replicator) helloOf() hello {
 	return h
 }
 
+// memberHello is a member's answer outside the autonomous mode, to another
+// member only: its slot, its id and the command version its binary
+// applies, which an operator's raise of the version asks every member for
+// (#50).
+func (r *Replicator) memberHello() hello {
+	h := hello{Slot: setting.Cluster.Slot, State: helloMember, Payload: reftable.PayloadVersion}
+	if eng := r.Engine(); eng != nil {
+		h.Node = eng.Status().ID.String()
+	}
+	return h
+}
+
+// probeMember asks the member whose consensus listens at addr who it is.
+func (r *Replicator) probeMember(ctx context.Context, addr, slot string) (hello, error) {
+	if r.memberProbe != nil {
+		return r.memberProbe(ctx, addr, slot)
+	}
+	if r.objects == nil {
+		return hello{}, errors.New("no object channel")
+	}
+	return r.objects.probeHello(ctx, addr, slot)
+}
+
+// askMembers asks every member of m but self who it is, at once, at the
+// address its membership names; the answers that came back.
+func (r *Replicator) askMembers(ctx context.Context, m consensus.Membership, self consensus.NodeID) []hello {
+	answers := make([]*hello, len(m.Members))
+	var wg sync.WaitGroup
+	for i, x := range m.Members {
+		if x.ID == self {
+			continue
+		}
+		wg.Go(func() {
+			pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			h, err := r.probeMember(pctx, x.Address, x.Slot)
+			if err != nil {
+				log.Debug("cluster: %s (%s) did not answer: %v", x.ID, x.Slot, err)
+				return
+			}
+			answers[i] = &h
+		})
+	}
+	wg.Wait()
+	var out []hello
+	for _, h := range answers {
+		if h != nil {
+			out = append(out, *h)
+		}
+	}
+	return out
+}
+
 type target struct{ addr, slot string }
 
 // targets lists the other slots PEERS names, with their consensus

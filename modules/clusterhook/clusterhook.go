@@ -346,6 +346,35 @@ func SetRepoLifecycle(deleted func(ctx context.Context, key string, repoID int64
 	lifecycleMu.Unlock()
 }
 
+var checkKey func(key string) error
+
+// SetKeyCheck registers the replicator's check of a repository key: nil
+// when the cluster can take a repository under it now.
+func SetKeyCheck(f func(key string) error) {
+	lifecycleMu.Lock()
+	checkKey = f
+	lifecycleMu.Unlock()
+}
+
+// CheckRepoKey reports whether the cluster can take a repository named
+// name under owner now, its wiki included: a name it refuses would fail in
+// git init, and leave a directory no tool of the cluster removes (#54).
+// It is always nil without a cluster.
+func CheckRepoKey(owner, name string) error {
+	lifecycleMu.RLock()
+	f := checkKey
+	lifecycleMu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	for _, wiki := range []bool{false, true} {
+		if err := f(RepoKey(owner, name, wiki)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // RepoKey is the table's key of a repository: its path under the
 // repository root, lowercase, as Forgejo writes it.
 func RepoKey(owner, name string, wiki bool) string {
