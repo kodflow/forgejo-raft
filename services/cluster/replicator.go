@@ -333,13 +333,26 @@ func (r *Replicator) rejoinUnderNewID(ctx context.Context, driver consensus.Driv
 		return fmt.Errorf("stamping a new id: %w", err)
 	}
 	r.auto.noteDisk(false)
+	r.resetForRejoin()
 	eng, err := driver.Open(r.ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("opening under the new id %s: %w", id, err)
 	}
 	r.setEngine(eng)
+	go r.startupBarrier(r.ctx)
 	log.Warn("cluster: rejoining under the new id %s", id)
 	return nil
+}
+
+// resetForRejoin forgets what this node derived from the log before the
+// engine of its new id opens: that engine applies the log from its start,
+// and the table that already holds it would apply a deletion or a rename
+// twice (#41). The projector stays fenced until the new engine applied a
+// barrier; startupBarrier lifts it again.
+func (r *Replicator) resetForRejoin() {
+	r.projector.refence()
+	r.table.Reset()
+	r.consumer.forget()
 }
 
 func (r *Replicator) selfID() consensus.NodeID {

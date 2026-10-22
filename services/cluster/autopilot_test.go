@@ -272,11 +272,16 @@ func (b *autoBench) rejoin(an *autoNode) error {
 		return err
 	}
 	an.r().auto.noteDisk(false)
+	an.r().resetForRejoin()
 	b.mu.Lock()
 	an.retired = append(an.retired, moved)
 	an.dd, an.id, an.tr = ndd, id, sdk.NewMemoryTransport(b.network, id)
 	b.mu.Unlock()
-	return b.open(an)
+	if err := b.open(an); err != nil {
+		return err
+	}
+	go an.r().startupBarrier(b.ctx)
+	return nil
 }
 
 // kill stops a node as a crash would: engine and data directory closed,

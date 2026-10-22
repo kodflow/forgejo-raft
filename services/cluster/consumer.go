@@ -153,6 +153,18 @@ func newConsumer(r *Replicator) *consumer {
 
 func cursorName(lineage string) string { return "dispatch@" + lineage }
 
+// forget drops what the consumer remembers of the table's events, for a
+// node whose table is emptied to rejoin under a new id (#41).
+func (c *consumer) forget() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastAck = map[string]uint64{}
+	c.seen = map[string]int64{}
+	c.failures = map[uint64]int{}
+	c.reasons = map[uint64]string{}
+	c.stall.index, c.stall.repo = 0, ""
+}
+
 // projected reports whether the events of one entry are projected on this
 // node. When the head entry has waited longer than projectionStallBound,
 // its events are let through marked as failed, so dispatch parks them and

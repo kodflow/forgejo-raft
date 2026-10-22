@@ -418,3 +418,59 @@ func TestRenamedAfter(t *testing.T) {
 	_, _, ok = h.table.RenamedAfter("a/d.git", 0)
 	assert.False(t, ok)
 }
+
+// A node that rejoins under a new id replays the log on its table: an
+// entry of the lineage already applied changes nothing, so a deletion
+// followed by a recreation, or a rename and its undo, gives the same table
+// (#41, TestHuntR1ProveRejoinReplay). Reset empties the table, and the
+// replay from the start gives the same table again.
+func TestReplayingAppliedEntriesKeepsTheTable(t *testing.T) {
+	for name, cmds := range map[string][]struct {
+		kind Kind
+		body any
+	}{
+		"delete and recreate": {
+			{KindRefTxn, push("o/x.git", RefUpdate{Ref: "refs/heads/main", New: sha1A})},
+			{KindRepoDelete, &RepoDelete{Repo: "o/x.git"}},
+			{KindRefTxn, push("o/x.git", RefUpdate{Ref: "refs/heads/main", New: sha1B, ExpectRev: 2})},
+		},
+		"rename and undo": {
+			{KindRefTxn, push("p/a.git", RefUpdate{Ref: "refs/heads/main", New: sha1A})},
+			{KindRepoRename, &RepoRename{From: "p/a.git", To: "p/b.git"}},
+			{KindRepoRename, &RepoRename{From: "p/b.git", To: "p/a.git"}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			entries := make([]consensus.Entry, 0, len(cmds))
+			for i, c := range cmds {
+				data, err := Encode(c.kind, c.body)
+				require.NoError(t, err)
+				idx := uint64(i + 1)
+				entries = append(entries, consensus.Entry{
+					Term: 1, Index: idx, Kind: consensus.EntryCommand, Version: PayloadVersion, Data: data,
+					Token: consensus.Token{Cluster: consensus.ClusterID{1}, Epoch: 1, Term: 1, Index: idx},
+				})
+			}
+			once, twice := New(), New()
+			for _, e := range entries {
+				require.True(t, once.Apply(e).(Result).OK)
+				require.True(t, twice.Apply(e).(Result).OK)
+			}
+			for _, e := range entries {
+				assert.False(t, twice.Apply(e).(Result).OK, "a replayed entry is not applied again")
+			}
+			assert.Equal(t, once.Root(), twice.Root())
+			assert.Equal(t, once.Events(), twice.Events())
+
+			twice.Reset()
+			assert.Equal(t, Sum{}, twice.Root())
+			pos, _ := twice.Applied()
+			assert.Zero(t, pos.Index)
+			assert.Empty(t, twice.Events())
+			for _, e := range entries {
+				require.True(t, twice.Apply(e).(Result).OK)
+			}
+			assert.Equal(t, once.Root(), twice.Root())
+		})
+	}
+}

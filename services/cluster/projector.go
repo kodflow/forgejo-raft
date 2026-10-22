@@ -31,6 +31,9 @@ type projector struct {
 	// fetch brings missing objects from the other members.
 	fetch func(ctx context.Context, repo, dir string, shas []string) error
 
+	// passMu is held by a pass, so refence knows when none runs.
+	passMu sync.Mutex
+
 	mu sync.Mutex
 	// dirty maps a repository to the highest index that touched it and is
 	// not yet certified.
@@ -118,6 +121,20 @@ func (p *projector) unfence() {
 	p.fenced = false
 	p.mu.Unlock()
 	p.signal()
+}
+
+// refence puts the start-up fence back and waits for a pass in flight,
+// before the table is emptied for a rejoin under a new id (#41): no pass
+// may project a table that replays from its start.
+func (p *projector) refence() {
+	p.mu.Lock()
+	p.fenced = true
+	p.pendingFirst = map[string]bool{}
+	p.dirty = map[string]uint64{}
+	p.watermark = map[string]uint64{}
+	p.mu.Unlock()
+	p.passMu.Lock()
+	defer p.passMu.Unlock()
 }
 
 // Fenced reports whether the start-up fence still holds.
@@ -226,6 +243,8 @@ var projectBudget = time.Hour
 
 // pass projects every dirty repository once.
 func (p *projector) pass(ctx context.Context) {
+	p.passMu.Lock()
+	defer p.passMu.Unlock()
 	p.mu.Lock()
 	if p.fenced {
 		p.mu.Unlock()
