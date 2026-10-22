@@ -278,7 +278,13 @@ forgejo cluster recover --from-observer <checkpoint> --new-cluster <new id> \
 ```
 
 It follows this order, and stops for the operator where a step is theirs;
-running the same command again resumes from `<out>/progress.json`:
+running the same command again resumes from `<out>/progress.json`. A step
+cut midway (SSH lost, kill, power loss, an error) is replayed: the
+PostgreSQL step empties again `--pgdata` and the WAL restore directory,
+which it found empty and began writing; the repository step keeps every
+repository already written whole, writes again one it left marked
+`forgejo-restore-incomplete`, and refuses any other non-empty directory;
+the stored files already copied with the same bytes are kept:
 
 1. Forgejo stays fenced and offline: the command refuses while the node
    answers on its socket. The old cluster is fenced and silent: both

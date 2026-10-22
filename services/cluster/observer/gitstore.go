@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -180,6 +181,26 @@ func (g gitStore) dropRefs(ctx context.Context, dir, checkpoint string) error {
 	return err
 }
 
+// IncompleteMark is the file a repository being restored holds until it is
+// whole and durable.
+const IncompleteMark = "forgejo-restore-incomplete"
+
+// restoredRefs reports whether target already holds exactly refs: a
+// repository an earlier run of the same restore wrote whole.
+func (g gitStore) restoredRefs(ctx context.Context, target string, refs map[string]string) bool {
+	out, err := g.run(ctx, target, nil, "for-each-ref", "--format=%(objectname) %(refname)", "refs/")
+	if err != nil {
+		return false
+	}
+	have := map[string]string{}
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+		if sha, name, ok := strings.Cut(line, " "); ok {
+			have[name] = sha
+		}
+	}
+	return maps.Equal(have, refs)
+}
+
 // Materialize writes a checkpoint's repository into target, an absent or
 // empty directory: its refs, their objects checked again by fetch, and its
 // symbolic refs.
@@ -192,6 +213,15 @@ func (g gitStore) Materialize(ctx context.Context, repo, checkpoint, target, for
 	}
 	if format == "" {
 		format = "sha1"
+	}
+	// The mark goes first: a target left by an interrupted restore is known
+	// as this restore's, removed and written again; the restore removes it
+	// once the repository is durable.
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		return err
+	}
+	if err := writeAtomic(filepath.Join(target, IncompleteMark), nil, true); err != nil {
+		return err
 	}
 	if _, err := g.run(ctx, filepath.Dir(target), nil, "init", "-q", "--bare", "--object-format="+format, target); err != nil {
 		return err

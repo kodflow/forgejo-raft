@@ -56,13 +56,18 @@ func recoverFromObserverFlags() []cli.Flag {
 // recoverProgress is what a recovery did, kept in <out>/progress.json so a
 // stop for the operator resumes where it was.
 type recoverProgress struct {
-	Checkpoint string    `json:"checkpoint"`
-	NewCluster string    `json:"new_cluster"`
-	Done       []string  `json:"done"`
-	Started    time.Time `json:"started"`
+	Checkpoint string   `json:"checkpoint"`
+	NewCluster string   `json:"new_cluster"`
+	Done       []string `json:"done"`
+	// Begun are the steps that started writing into a target they found
+	// empty: an interrupted one empties it again before it is replayed.
+	Begun   []string  `json:"begun,omitempty"`
+	Started time.Time `json:"started"`
 }
 
 func (p *recoverProgress) done(step string) bool { return slices.Contains(p.Done, step) }
+
+func (p *recoverProgress) begun(step string) bool { return slices.Contains(p.Begun, step) }
 
 // The steps of plan v4's order, by name.
 const (
@@ -125,6 +130,11 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		prog.Done = append(prog.Done, step)
 		b, _ := json.MarshalIndent(prog, "", "  ")
 		fmt.Fprintf(w, "done: %s\n", step)
+		return observer.WriteFileDurable(filepath.Join(out, progressFile), b)
+	}
+	begin := func(step string) error {
+		prog.Begun = append(prog.Begun, step)
+		b, _ := json.MarshalIndent(prog, "", "  ")
 		return observer.WriteFileDurable(filepath.Join(out, progressFile), b)
 	}
 
@@ -200,6 +210,24 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		opt.HBA = string(b)
 	}
 	if !prog.done(stepPG) {
+		// The data directory and the restore directory are emptied again
+		// only when this recovery found them empty and began writing them.
+		targets := []string{c.String("pgdata"), restoreDir}
+		if prog.begun(stepPG) {
+			if err := emptyDirs(targets...); err != nil {
+				return err
+			}
+			fmt.Fprintf(w, "resuming: %s emptied of what the interrupted run wrote\n", strings.Join(targets, " and "))
+		} else {
+			for _, d := range targets {
+				if entries, err := os.ReadDir(d); err == nil && len(entries) > 0 {
+					return fmt.Errorf("%s is not empty", d)
+				}
+			}
+			if err := begin(stepPG); err != nil {
+				return err
+			}
+		}
 		if err := archive.RestorePG(name, c.String("pgdata"), opt); err != nil {
 			return err
 		}
@@ -505,6 +533,26 @@ func runPGCtl(ctx context.Context, ctl, pgdata, action string) error {
 // system is the checkpoint's, it left recovery, and promoted past the
 // checkpoint's timeline, which PostgreSQL does only once the target is
 // reached (an unreached target stops it instead).
+// emptyDirs removes what each directory holds, keeping the directory: a
+// data directory may be a mount point.
+func emptyDirs(dirs ...string) error {
+	for _, d := range dirs {
+		entries, err := os.ReadDir(d)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if err := os.RemoveAll(filepath.Join(d, e.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // historyName is a timeline history file in pg_wal.
 var historyName = regexp.MustCompile(`^[0-9A-F]{8}\.history$`)
 

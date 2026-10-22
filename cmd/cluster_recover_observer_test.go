@@ -358,3 +358,18 @@ func TestHuntR1ProveRecoverInterruptedAfterStamp(t *testing.T) {
 	_, err = os.Stat(filepath.Join(dir, consensus.MarkerRecover))
 	assert.True(t, os.IsNotExist(err))
 }
+
+// A PostgreSQL restore the recovery began is emptied again before it is
+// replayed: what each directory holds goes, the directory stays (#58).
+func TestRecoverEmptiesWhatItBegan(t *testing.T) {
+	pgdata := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(pgdata, "base", "1"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(pgdata, "PG_VERSION"), []byte("18"), 0o600))
+	require.NoError(t, emptyDirs(pgdata, filepath.Join(t.TempDir(), "absent")))
+	entries, err := os.ReadDir(pgdata)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+	p := recoverProgress{Begun: []string{stepPG}}
+	assert.True(t, p.begun(stepPG))
+	assert.False(t, p.done(stepPG))
+}
