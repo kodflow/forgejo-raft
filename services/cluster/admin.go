@@ -418,7 +418,12 @@ func (r *Replicator) operate(ctx context.Context, eng consensus.Engine, op conse
 	case ActionPromote:
 		return eng.Promote(ctx, op, id)
 	case ActionRemove, ActionDenyPin:
-		pending, err := r.revokeMember(ctx, eng, op, id)
+		if o.Action == ActionRemove {
+			if err := r.removable(eng, id); err != nil {
+				return err
+			}
+		}
+		pending, deferred, err := r.revokeMember(ctx, eng, op, id)
 		if err != nil {
 			return err
 		}
@@ -427,10 +432,25 @@ func (r *Replicator) operate(ctx context.Context, eng consensus.Engine, op conse
 		} else {
 			err = eng.DenyPin(ctx, op, id)
 		}
-		if err == nil && pending {
+		if err != nil {
+			if deferred {
+				// Nothing was recorded: the key stays usable, as the
+				// member still holds it (#64).
+				return err
+			}
+			log.Error("cluster: the key of %s was revoked, and the %s that followed was refused: %v; the member keeps its place with a revoked key until it is removed", id, o.Action, err)
+			return err
+		}
+		if deferred {
+			// Recorded once the change is made, so a refused change never
+			// leaves a revocation for the next raise to write (#64).
+			if err := r.recordPendingRevocation(ctx, pending); err != nil {
+				return fmt.Errorf("recording the revocation of %s: %w", id, err)
+			}
+			log.Warn("cluster: the key of %s (slot %s) is not revoked yet: the cluster writes payload version %d, the revocation waits for %d", id, pending.Slot, r.table.WriteVersion(), reftable.RevokeVersion)
 			return ErrRevocationPending
 		}
-		return err
+		return nil
 	case ActionTransfer:
 		return eng.TransferLeadership(ctx, op, id)
 	case ActionUpdateAddress:
@@ -588,25 +608,44 @@ var ErrRevocationPending = errors.New("the key is not revoked yet: some members 
 //
 // A revocation is written at payload version reftable.RevokeVersion only,
 // which an older binary stops on: while the cluster writes an older
-// version, it is recorded as a pending audit record, which every binary
-// applies, and pending reports it; flushRevocations writes it once the
-// version is raised.
-func (r *Replicator) revokeMember(ctx context.Context, eng consensus.Engine, op consensus.Operator, id consensus.NodeID) (pending bool, err error) {
+// version, nothing is written here and the revocation is returned as
+// pending, for the caller to record once the change it precedes is made;
+// flushRevocations writes it once the version is raised.
+func (r *Replicator) revokeMember(ctx context.Context, eng consensus.Engine, op consensus.Operator, id consensus.NodeID) (pending reftable.RevokeKey, deferred bool, err error) {
 	for _, m := range eng.Membership().Members {
 		if m.ID != id || m.SPKI == ([32]byte{}) {
 			continue
 		}
 		k := reftable.RevokeKey{SPKI: hex.EncodeToString(m.SPKI[:]), Slot: m.Slot, Operator: string(op), Time: time.Now().Unix()}
 		if r.table.WriteVersion() < reftable.RevokeVersion {
-			if err := r.recordPendingRevocation(ctx, k); err != nil {
-				return false, fmt.Errorf("recording the revocation of %s: %w", id, err)
-			}
-			log.Warn("cluster: the key of %s (slot %s) is not revoked yet: the cluster writes payload version %d, the revocation waits for %d", id, m.Slot, r.table.WriteVersion(), reftable.RevokeVersion)
-			return true, nil
+			return k, true, nil
 		}
-		return false, r.writeRevocation(ctx, k)
+		return k, false, r.writeRevocation(ctx, k)
 	}
-	return false, nil
+	return reftable.RevokeKey{}, false, nil
+}
+
+// removable refuses up front a removal the engine would refuse after the
+// key was revoked: the leader itself (the engine never removes its leader;
+// the leadership is transferred first), and a voter below the floor of
+// voters. A revocation written before a refused change would leave the
+// member in place with its key revoked, its object channel refused on every
+// peer (#64).
+func (r *Replicator) removable(eng consensus.Engine, id consensus.NodeID) error {
+	if st := eng.Status(); st.Leader == id || (st.Role == consensus.RoleLeader && st.ID == id) {
+		return fmt.Errorf("%w: %s leads the cluster: transfer the leadership to another voter first", consensus.ErrMembershipInvalid, id)
+	}
+	m := eng.Membership()
+	i := Rank(m, id) - 1
+	if i < 0 || !m.Members[i].Voter {
+		return nil
+	}
+	// The engine's floor is three voters in both modes: the autonomous
+	// mode sets it, and the engine defaults to it otherwise.
+	if left := m.Voters() - 1; left < autoMinVoters {
+		return fmt.Errorf("%w: removing %s would leave %d voters, the floor is %d", consensus.ErrMembershipInvalid, id, left, autoMinVoters)
+	}
+	return nil
 }
 
 // recordPendingRevocation records a revocation the cluster cannot write
@@ -656,7 +695,21 @@ func (r *Replicator) flushRevocations(ctx context.Context) {
 	if r.table.WriteVersion() < reftable.RevokeVersion {
 		return
 	}
+	var held map[string]string
+	if eng := r.Engine(); eng != nil {
+		held = map[string]string{}
+		for _, m := range eng.Membership().Members {
+			held[hex.EncodeToString(m.SPKI[:])] = m.Slot
+		}
+	}
 	for _, k := range r.table.PendingRevocations() {
+		if slot, ok := held[k.SPKI]; ok {
+			// A member still holds the key: its removal was refused after
+			// the revocation was recorded, by an older binary. Writing it
+			// would cut a healthy member off the object channel (#64).
+			log.Error("cluster: the pending revocation of slot %s is not written: member %s still holds the key; remove that member first", k.Slot, slot)
+			continue
+		}
 		if err := r.writeRevocation(ctx, k); err != nil {
 			log.Warn("cluster: writing the pending revocation of slot %s: %v; retried", k.Slot, err)
 			return
