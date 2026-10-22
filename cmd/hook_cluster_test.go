@@ -140,7 +140,10 @@ func newClusterHookEnv(t *testing.T) *clusterHookEnv {
 
 	gcfg := filepath.Join(base, "gitconfig")
 	require.NoError(t, os.WriteFile(gcfg, []byte("[user]\n\tname = t\n\temail = t@t\n[commit]\n\tgpgSign = false\n[init]\n\tdefaultBranch = main\n"), 0o644))
-	e.env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+gcfg, "GIT_CONFIG_NOSYSTEM=1",
+	// The hook's temporary directory is the test's own: t.TempDir() is
+	// under the system's.
+	require.NoError(t, os.MkdirAll(filepath.Join(base, "tmp"), 0o755))
+	e.env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+gcfg, "GIT_CONFIG_NOSYSTEM=1", "TMPDIR="+filepath.Join(base, "tmp"),
 		testClusterHookEnv+"=1", testClusterRootEnv+"="+e.root, testClusterSockEnv+"="+sock)
 	e.bare = filepath.Join(e.root, "alice", "r.git")
 	e.work = filepath.Join(base, "wc")
@@ -275,6 +278,68 @@ func TestClusterHookNamesTheGitProcess(t *testing.T) {
 	require.Contains(t, pids, clusterhook.OpAborted)
 	assert.Positive(t, pids[clusterhook.OpPrepared])
 	assert.Equal(t, pids[clusterhook.OpPrepared], pids[clusterhook.OpAborted], "the PID is the hook wrapper's, one per phase")
+}
+
+// A repository reached through a symbolic link under the root (an owner
+// moved to another disk) resolves outside it: the hook asks the replicator
+// anyway, which refuses, instead of letting git write outside the cluster
+// (#40).
+func TestClusterHookSymlinkedOwnerFailsClosed(t *testing.T) {
+	e := newClusterHookEnv(t)
+	disk2 := filepath.Join(e.base, "disk2", "bigorg")
+	require.NoError(t, os.MkdirAll(disk2, 0o755))
+	require.NoError(t, os.Symlink(disk2, filepath.Join(e.root, "bigorg")))
+	linked := filepath.Join(e.root, "bigorg", "r.git")
+	e.git(t, e.base, "init", "-q", "--bare", linked)
+	e.git(t, linked, "config", "core.hooksPath", filepath.Join(e.home, "hooks"))
+
+	out, err := e.push(linked, "refs/heads/main")
+	t.Logf("push into %s: err=%v\n%s", linked, err, out)
+	require.Error(t, err, "the push into the symlinked owner was acknowledged")
+	assert.False(t, e.refExists(linked, "refs/heads/main"), "git wrote the ref outside the cluster")
+	assert.Len(t, e.rep.prepared(), 1, "the push never reached the replicator")
+
+	// A temporary clone is still let through.
+	tmp := filepath.Join(e.base, "tmp", "clone.git")
+	e.git(t, e.base, "init", "-q", "--bare", tmp)
+	e.git(t, tmp, "config", "core.hooksPath", filepath.Join(e.home, "hooks"))
+	out, err = e.push(tmp, "refs/heads/main")
+	require.NoError(t, err, "a temporary clone: %s", out)
+	assert.Len(t, e.rep.prepared(), 1, "a temporary clone went to the replicator")
+}
+
+// [cluster] ENABLED=false written while the replicator still runs: the
+// replicator answering on its socket is what counts (#40).
+func TestClusterHookAsksAReplicatorThatRuns(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	root := filepath.Join(base, "root")
+	repo := filepath.Join(root, "alice", "r.git")
+	require.NoError(t, os.MkdirAll(repo, 0o755))
+	sock, rep := serveTestReplicator(t)
+	defer test.MockVariableValue(&setting.InstallLock, true)()
+	defer test.MockVariableValue(&setting.RepoRootPath, root)()
+	defer test.MockVariableValue(&setting.Cluster.Enabled, false)()
+	defer test.MockVariableValue(&setting.Cluster.HookSocket, sock)()
+	t.Chdir(repo)
+	t.Setenv("GIT_DIR", ".")
+	t.Setenv(clusterhook.EnvTxn, clusterhook.NewNonce())
+
+	runPrepared := func() error {
+		r, w, err := os.Pipe()
+		require.NoError(t, err)
+		_, _ = w.WriteString(strings.Repeat("0", 40) + " " + strings.Repeat("a", 40) + " refs/heads/main\n")
+		w.Close()
+		defer test.MockVariableValue(&os.Stdin, r)()
+		app := &cli.Command{Name: "hook", Commands: []*cli.Command{subcmdHookReferenceTransaction()}, ExitErrHandler: func(context.Context, *cli.Command, error) {}}
+		return app.Run(context.Background(), []string{"hook", "reference-transaction", "prepared"})
+	}
+	require.Error(t, runPrepared(), "prepared answered success without asking the replicator that runs")
+	assert.Len(t, rep.prepared(), 1)
+
+	// No replicator on the socket: the cluster is off.
+	setting.Cluster.HookSocket = filepath.Join(base, "none.sock")
+	require.NoError(t, runPrepared())
 }
 
 // A node of a cluster refuses a git older than 2.48 (#83).
