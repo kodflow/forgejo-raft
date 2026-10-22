@@ -296,8 +296,15 @@ func (a machine) Apply(e sdk.EntryValue) any {
 
 func (a machine) Snapshot() (sdk.Snapshot, error) { return a.m.Snapshot() }
 
+// Restore carries a snapshot of a format the table does not read to the
+// engine under the SDK's VERSION_UNSUPPORTED code, which stops the node
+// (#513): any other error only refuses that one install.
 func (a machine) Restore(r io.Reader, meta sdk.SnapshotMetaValue) error {
-	return a.m.Restore(r, snapshotMeta(meta))
+	err := a.m.Restore(r, snapshotMeta(meta))
+	if errors.Is(err, consensus.ErrVersionUnsupported) && !errors.Is(err, sdk.VersionUnsupported) {
+		return fmt.Errorf("%w: %w", sdk.VersionUnsupported, err)
+	}
+	return err
 }
 
 // Machine wraps a Forgejo state machine for the SDK.
