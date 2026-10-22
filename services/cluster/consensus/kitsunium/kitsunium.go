@@ -473,6 +473,7 @@ func (e *Engine) Health() consensus.Health {
 	}
 	if h.StopReason.Err != nil {
 		out.StopReason = h.StopReason.Err.Error()
+		out.StopExitCode = h.StopReason.ExitCode()
 	}
 	if st.NoSpace != 0 {
 		out.Alarms = append(out.Alarms, consensus.Alarm{ID: consensus.AlarmID(st.NoSpace), Kind: "NO_SPACE"})

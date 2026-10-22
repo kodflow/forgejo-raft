@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# The consensus node's boot-scoped marker directory, a bind mount of the
+# host's /run/kitsunium-consensus in a cluster: the git user writes there.
+if [ -d /run/kitsunium-consensus ]; then
+    chown git:git /run/kitsunium-consensus
+    chmod 0700 /run/kitsunium-consensus
+fi
+
 if [ ! -d /data/git/.ssh ]; then
     mkdir -p /data/git/.ssh
 fi

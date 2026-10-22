@@ -77,6 +77,12 @@ spec:
             - name: members
               mountPath: /etc/forgejo-raft/members
               readOnly: true
+            # The consensus node's boot-scoped STORAGE_FAILED marker: it
+            # outlives a restart of the pod and goes with a reboot of the
+            # node (ADR 0152 D4, R9-05). The image's setup, as root, hands
+            # it to the git user.
+            - name: consensus-run
+              mountPath: /run/kitsunium-consensus
         - name: witness-check
           image: registry.example.com/forgejo-raft@sha256:0000000000000000000000000000000000000000000000000000000000000000
           command: ["/bin/bash", "/etc/forgejo-raft/scripts/witness-check.sh"]
@@ -129,6 +135,12 @@ spec:
           configMap:
             name: forgejo-raft-members
             optional: true
+        # A tmpfs of the node, emptied at each boot. After a STORAGE_FAILED,
+        # reboot the node, never only the pod.
+        - name: consensus-run
+          hostPath:
+            path: /run/kitsunium-consensus
+            type: DirectoryOrCreate
       securityContext:
         # The image starts as root and drops to the git user (uid 1000);
         # the volumes are handed to that group.

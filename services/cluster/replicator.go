@@ -272,6 +272,7 @@ func Init(ctx context.Context) error {
 
 	go r.projector.run(r.ctx)
 	go r.startupBarrier(r.ctx)
+	go r.exitOnStop(r.ctx)
 	go r.consumer.run(r.ctx)
 	go r.sweepRaw(r.ctx)
 	if r.checkpoints != nil {
@@ -356,6 +357,49 @@ func (r *Replicator) resetForRejoin() {
 	r.projector.refence()
 	r.table.Reset()
 	r.consumer.forget()
+}
+
+// stopPoll paces exitOnStop.
+var stopPoll = time.Second
+
+// exitProcess ends the process; tests replace it.
+var exitProcess = func(code int) {
+	log.GetManager().Close()
+	os.Exit(code)
+}
+
+// exitOnStop ends the process once the engine stopped itself, with the
+// stop's exit code (ADR 0152 D4, R9-05): a supervisor that does not
+// restart on it keeps the node down in the same boot, where a restart
+// could read back a page cache a failed fsync left behind and acknowledge
+// what the disk does not hold (#116). An engine closed, by a shutdown or
+// a rejoin, has no exit code.
+func (r *Replicator) exitOnStop(ctx context.Context) {
+	t := time.NewTicker(stopPoll)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		eng := r.Engine()
+		if eng == nil {
+			continue
+		}
+		h := eng.Health()
+		if !h.Stopped || h.StopExitCode == 0 {
+			continue
+		}
+		log.Critical("cluster: the consensus node stopped (%s); Forgejo exits %d, and an operator clears the stop: after a STORAGE_FAILED, reboot the machine, never only the service", h.StopReason, h.StopExitCode)
+		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := eng.Close(cctx); err != nil {
+			log.Error("cluster: closing the stopped consensus node: %v", err)
+		}
+		cancel()
+		exitProcess(h.StopExitCode)
+		return
+	}
 }
 
 func (r *Replicator) selfID() consensus.NodeID {

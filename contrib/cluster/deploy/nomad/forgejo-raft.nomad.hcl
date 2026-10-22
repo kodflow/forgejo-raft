@@ -14,6 +14,13 @@
 #     encrypted, persistent disk. It holds the node's key and certificate
 #     (tls/), the consensus data directory and the repositories. The key is
 #     born there and never enters Nomad Variables or Vault;
+#   - on each machine, a host volume "kitsunium-consensus" (client config)
+#     on /run/kitsunium-consensus, a tmpfs created at boot owned by uid 1000
+#     with mode 0700 (systemd-tmpfiles:
+#     "d /run/kitsunium-consensus 0700 1000 1000 -"). It holds the
+#     consensus node's boot-scoped STORAGE_FAILED marker, which must outlive
+#     a restart of the allocation and go with a reboot of the machine
+#     (ADR 0152 D4, R9-05);
 #   - each Nomad client's meta forgejo_slot = "<slot>", read by the JOIN
 #     drain check, and a client max_kill_timeout of at least kill_timeout;
 #   - the Nomad ACL policy forgejo-raft.policy.hcl attached to this job;
@@ -120,7 +127,12 @@ job "forgejo-raft" {
       }
 
       # Local restarts only, then the allocation stays failed. A fenced
-      # node (exit 77) is an operator's matter, not a retry loop.
+      # node (exit 77) is an operator's matter, not a retry loop, and so is
+      # a consensus node that stopped itself (exit 65, 69, 73, 74 or 76):
+      # Nomad cannot skip a restart on an exit code, but its stop marker,
+      # in the data directory or in /run/kitsunium-consensus, refuses every
+      # restart until an operator clears it. After a STORAGE_FAILED, reboot
+      # the machine, never only the allocation.
       restart {
         attempts = 3
         interval = "30m"
@@ -149,6 +161,11 @@ job "forgejo-raft" {
       volume "data" {
         type   = "host"
         source = "forgejo-${group.key}"
+      }
+
+      volume "consensus-run" {
+        type   = "host"
+        source = "kitsunium-consensus"
       }
 
       # The Recover fence, before Forgejo. It asks every witness whether the
@@ -212,6 +229,11 @@ job "forgejo-raft" {
           volume_mount {
             volume      = "data"
             destination = "/data"
+          }
+
+          volume_mount {
+            volume      = "consensus-run"
+            destination = "/run/kitsunium-consensus"
           }
 
           # The default identity: the task API socket (secrets/api.sock) and
