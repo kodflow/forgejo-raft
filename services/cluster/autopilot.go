@@ -42,8 +42,8 @@ func (a *autoMode) admits(slot string, eng consensus.Engine) error {
 // node sees (the status's "since"), and
 //
 //   - on the leader, removes a member out of reach for DEAD_MEMBER_TIMEOUT
-//     while three voters remain, or promotes the eldest learner, one change
-//     per pass;
+//     while three voters remain (a learner always), or promotes the eldest
+//     learner ready to vote, two at once from one voter;
 //   - elsewhere, rejoins under a new id once a quorum says this node's id
 //     is retired.
 //
@@ -92,8 +92,14 @@ func (r *Replicator) autopilotStep(ctx context.Context) {
 		r.autoChange(pctx, ActionRemove, id, "out of reach for DEAD_MEMBER_TIMEOUT", eng.Remove)
 		return
 	}
-	if id, ok := NextPromotion(m); ok {
-		r.autoChange(pctx, ActionPromote, id, "every live member votes", eng.Promote)
+	if ids := NextPromotion(m, r.promotable(pctx, eng)); len(ids) > 0 {
+		// From one voter, both learners in this pass: a refusal of the
+		// second leaves two voters until the next pass, never by design.
+		for _, id := range ids {
+			if !r.autoChange(pctx, ActionPromote, id, "every live member votes", eng.Promote) {
+				break
+			}
+		}
 		return
 	}
 	r.maybeRaisePayload(pctx, m)
@@ -143,14 +149,34 @@ func everyMemberApplies(m consensus.Membership, self consensus.NodeID, seen []he
 }
 
 // autoChange runs one membership change of the autopilot, logged and
-// audited; a refusal is retried at the next pass.
-func (r *Replicator) autoChange(ctx context.Context, action Action, id consensus.NodeID, why string, change func(context.Context, consensus.Operator, consensus.NodeID) error) {
+// audited, and reports whether it was made; a refusal is retried at the
+// next pass.
+func (r *Replicator) autoChange(ctx context.Context, action Action, id consensus.NodeID, why string, change func(context.Context, consensus.Operator, consensus.NodeID) error) bool {
 	if err := change(ctx, autopilotOperator, id); err != nil {
 		log.Debug("cluster: autopilot: %s %s: %v; retried", action, id, err)
-		return
+		return false
 	}
 	log.Warn("cluster: autopilot: %s %s: %s", action, id, why)
 	r.audit(ctx, autopilotOperator, Operation{Action: action, Target: id.String()}, "ok", why)
+	return true
+}
+
+// promoteLag is how far behind the commit a learner may be and still be
+// promoted: the engine's own bound (PromoteLag), which refuses the rest.
+const promoteLag = 1024
+
+// promotable says whether a learner is ready to vote: the leader heard it
+// within the autopilot's period, it receives no snapshot and is caught up
+// (#92, #94).
+func (r *Replicator) promotable(ctx context.Context, eng consensus.Engine) func(consensus.Member) bool {
+	peers := map[consensus.NodeID]consensus.PeerHealth{}
+	for _, p := range eng.Health().Peers {
+		peers[p.ID] = p
+	}
+	return func(x consensus.Member) bool {
+		p, ok := peers[x.ID]
+		return ok && !p.Unreachable && !p.Snapshot && p.Lag <= promoteLag && p.LastContact <= r.auto.tick
+	}
 }
 
 // deadClock is when the leader first found each member out of reach. Only

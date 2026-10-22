@@ -43,21 +43,32 @@ func Rank(m consensus.Membership, id consensus.NodeID) int {
 	return slices.IndexFunc(m.Members, func(x consensus.Member) bool { return x.ID == id }) + 1
 }
 
-// NextPromotion names the learner to promote: the eldest one, from three
-// members only.
-func NextPromotion(m consensus.Membership) (consensus.NodeID, bool) {
+// NextPromotion names the learners to promote: the eldest ones ready (a
+// learner the leader hears, caught up), from three members only. From one
+// voter it names two or none: a cluster at two voters loses its leader for
+// good with the second one, and the learners left never campaign (#92). A
+// learner that is not ready never holds back the ones after it (#94).
+func NextPromotion(m consensus.Membership, ready func(consensus.Member) bool) []consensus.NodeID {
 	if len(m.Members) < minVotingMembers {
-		return 0, false
+		return nil
 	}
+	var out []consensus.NodeID
 	for _, x := range m.Members {
-		if !x.Voter {
-			return x.ID, true
+		if !x.Voter && ready(x) {
+			out = append(out, x.ID)
 		}
 	}
-	return 0, false
+	if m.Voters() <= 1 {
+		if len(out) < 2 {
+			return nil
+		}
+		return out[:2]
+	}
+	return out[:min(len(out), 1)]
 }
 
-// Removable reports whether a dead member may be removed: only while at
+// Removable reports whether a dead member may be removed: a learner always,
+// since it votes nowhere and holds its slot (#94); a voter only while at
 // least three voters remain after it. With three voters and one dead, the
 // two others are a majority already: removing it would buy no availability
 // and halve the copies of each write.
@@ -66,11 +77,10 @@ func Removable(m consensus.Membership, id consensus.NodeID) bool {
 	if i < 0 {
 		return false
 	}
-	voters := m.Voters()
-	if m.Members[i].Voter {
-		voters--
+	if !m.Members[i].Voter {
+		return true
 	}
-	return voters >= minVotingMembers
+	return m.Voters()-1 >= minVotingMembers
 }
 
 // formingRefusal refuses a write while the autonomous cluster has fewer
