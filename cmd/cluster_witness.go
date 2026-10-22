@@ -153,9 +153,18 @@ func runWitnessCheck(ctx context.Context, c *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	if err := cluster.FenceCheck(ctx, rep.Cluster); err != nil {
-		fmt.Fprintln(c.Root().ErrWriter, "fenced:", err)
-		return cli.Exit("", cluster.ExitFenced)
+	// Witnesses that do not answer are waited for: an outage is no
+	// verdict, and 77 would keep the node down once they are back (#68).
+	if err := cluster.FenceWait(ctx, rep.Cluster); err != nil {
+		switch {
+		case errors.Is(err, witness.ErrSuperseded):
+			fmt.Fprintln(c.Root().ErrWriter, "fenced:", err)
+			return cli.Exit("", cluster.ExitFenced)
+		case errors.Is(err, cluster.ErrWitnessConfig):
+			fmt.Fprintln(c.Root().ErrWriter, "misconfigured:", err)
+			return cli.Exit("", cluster.ExitWitnessConfig)
+		}
+		return err
 	}
 	fmt.Fprintf(c.Root().Writer, "cluster %s is clear\n", rep.Cluster)
 	return nil

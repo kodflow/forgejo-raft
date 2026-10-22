@@ -150,7 +150,8 @@ data:
     fi
     cd /etc/s6/gitea && source ./setup >/dev/null
     # Exit 77 when a witness says this volume's cluster was superseded by a
-    # Recover, or when none answers: the pod then never starts Forgejo.
+    # Recover: the pod then never starts Forgejo. While no witness answers
+    # it waits and asks again; 78 on wrong witness settings.
     exec su-exec git /usr/local/bin/gitea cluster witness check
 ---
 # Settings shared by every pod. Each pod adds its slot (from its label) and

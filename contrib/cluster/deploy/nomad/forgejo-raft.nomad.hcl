@@ -170,8 +170,10 @@ job "forgejo-raft" {
 
       # The Recover fence, before Forgejo. It asks every witness whether the
       # cluster this data directory belongs to was superseded by a Recover.
-      # It exits 77 when one says so, and when none answers: the main task
-      # then never starts, and reschedule (attempts = 0) keeps it down.
+      # It exits 77 when one says so: the main task then never starts, and
+      # reschedule (attempts = 0) keeps it down. While none answers it waits
+      # and asks again, so the node starts once the witnesses are back; it
+      # exits 78 on wrong witness settings.
       # It runs through the image's setup so that app.ini carries the same
       # FORGEJO__* settings as the server's.
       task "witness-check" {

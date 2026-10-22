@@ -426,8 +426,11 @@ reports nothing.
   `forgejo cluster witness check` through the image's setup, so it reads the
   same `[cluster]` settings as Forgejo, on the data volume mounted read-write
   (opening the data directory takes its lock file). It exits 77 when a witness
-  says the lineage was superseded, or when none answers: Forgejo does not
-  start, the allocation fails and Nomad does not reschedule it.
+  says the lineage was superseded: Forgejo does not start, the allocation
+  fails and Nomad does not reschedule it. While no witness answers, it waits
+  and asks again (5 s, doubled up to a minute), and Forgejo starts once one
+  says the lineage is clear; Forgejo's own boot check does the same. It
+  exits 78 when the witness settings are wrong.
 - **Vault through the workload identity.** The renewer logs in at
   `auth/jwt-consensus/login` with its slot's role and the JWT Nomad writes into
   the task's secrets. It keeps the token to two thirds of its TTL, then logs in
