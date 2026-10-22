@@ -237,7 +237,7 @@ func (o *Observer) Accept(lineage string) error {
 	case q.Lineage == "" && lineage == o.state.Lineage:
 		o.state.Term, o.state.Commit = 0, 0
 		o.state.LogIndex, o.state.LogTerm = 0, 0
-		if a, ok := o.state.newest(); ok {
+		if a, ok := o.state.newestOf(lineage); ok {
 			o.state.LogIndex, o.state.LogTerm = a.Index, a.Term
 		}
 	default:
@@ -350,8 +350,10 @@ func (o *Observer) order() []string {
 	return out
 }
 
+// lastIndex is the index of the newest checkpoint accepted in the lineage
+// followed, 0 in a lineage newly accepted: the cursor of nextCheckpoint.
 func (o *Observer) lastIndex() uint64 {
-	if a, ok := o.state.newest(); ok {
+	if a, ok := o.state.newestOf(o.state.Lineage); ok {
 		return a.Index
 	}
 	return 0
@@ -426,7 +428,7 @@ func (o *Observer) follow(ctx context.Context, slot string, v *clusterhook.Expor
 		case clusterhook.CodeDiverged:
 			return o.quarantineFor(fmt.Sprintf("fork: the leader's log does not hold term %d at %d, which this observer accepted", st.LogTerm, st.LogIndex), "")
 		case clusterhook.CodeCompacted:
-			a, ok := o.state.newest()
+			a, ok := o.state.newestOf(st.Lineage)
 			if !ok || a.Index <= st.LogIndex {
 				st.Rebootstrap = "the log was compacted past this observer; waiting for a checkpoint to restart from"
 				return o.store.saveState(st)

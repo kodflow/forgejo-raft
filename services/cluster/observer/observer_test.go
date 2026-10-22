@@ -22,6 +22,8 @@ import (
 
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/json"
+	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/reftable"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -602,4 +604,92 @@ func TestStorePathStaysInside(t *testing.T) {
 		assert.Empty(t, s.path(elem...), "%v", elem)
 	}
 	assert.Equal(t, filepath.Join(s.dir, "staging", "x"), s.path("staging", "x"))
+}
+
+// recoverFake starts a new lineage on the fake cluster as recover
+// --from-observer does: a new identity, a log that restarts from index 1,
+// a table holding the restored refs.
+func recoverFake(c *fakeCluster, id byte) {
+	c.mu.Lock()
+	c.cluster = consensus.ClusterID{id, 0x15}
+	c.log, c.compacted = nil, 0
+	c.table = reftable.New()
+	c.term = 1
+	c.mu.Unlock()
+}
+
+// The cursor is held per lineage: after a new lineage is accepted, its
+// checkpoints are ingested although their indexes are below the newest
+// one accepted in the old lineage (#55).
+func TestHuntR2ProveLinCurRecoverRestartsAtOne(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	for i := range 4 {
+		c.push("alice/demo.git", "refs/heads/main", c.commit(fmt.Sprintf("old %d", i)))
+		c.checkpoint()
+		require.NoError(t, o.Step(ctx))
+	}
+	oldLast := o.lastIndex()
+	require.Greater(t, oldLast, uint64(12))
+
+	recoverFake(c, 0x0d)
+	c.push("alice/demo.git", "refs/heads/main", c.commit("after recover"))
+	cp := c.checkpoint()
+	require.Less(t, cp.Index, oldLast)
+	require.ErrorIs(t, o.Step(ctx), ErrQuarantined)
+	q := o.State().Quarantine
+	require.NotNil(t, q)
+	require.NoError(t, o.Accept(q.Lineage))
+	require.NoError(t, o.Step(ctx))
+	st := o.State()
+	a, ok := st.newestOf(q.Lineage)
+	require.True(t, ok, "a checkpoint of the new lineage is accepted")
+	assert.Equal(t, cp.Name(), a.Name)
+
+	// The next one follows in the new lineage.
+	c.push("alice/demo.git", "refs/heads/main", c.commit("after recover 2"))
+	cp = c.checkpoint()
+	require.NoError(t, o.Step(ctx))
+	st = o.State()
+	a, _ = st.newestOf(q.Lineage)
+	assert.Equal(t, cp.Name(), a.Name)
+}
+
+// A restore of an older snapshot starts a lineage below the newest index
+// accepted: it is followed from its first checkpoint (#55).
+func TestHuntR2ProveLinCurRestoreOlderSnapshot(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	snapshot := append([]consensus.Entry(nil), c.log...)
+	for i := range 3 {
+		c.push("alice/demo.git", "refs/heads/main", c.commit(fmt.Sprintf("old %d", i)))
+		c.checkpoint()
+		require.NoError(t, o.Step(ctx))
+	}
+	oldLast := o.lastIndex()
+
+	// The restored cluster replays the snapshot's entries under its new
+	// identity, then goes on.
+	recoverFake(c, 0x0e)
+	for _, e := range snapshot {
+		e.Token.Cluster = c.cluster
+		c.log = append(c.log, e)
+		c.table.Apply(e)
+	}
+	c.push("alice/demo.git", "refs/heads/main", c.commit("after restore"))
+	cp := c.checkpoint()
+	require.Less(t, cp.Index, oldLast)
+	require.ErrorIs(t, o.Step(ctx), ErrQuarantined)
+	require.NoError(t, o.Accept(o.State().Quarantine.Lineage))
+	require.NoError(t, o.Step(ctx))
+	st := o.State()
+	a, ok := st.newestOf(c.lineage().String())
+	require.True(t, ok)
+	assert.Equal(t, cp.Name(), a.Name)
 }

@@ -20,6 +20,7 @@ import (
 
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/json"
+	"forgejo.org/services/cluster/reftable"
 )
 
 // The observer's directory, which the snapshot hook covers whole:
@@ -141,6 +142,24 @@ func (s *State) newest() (Accepted, bool) {
 		return Accepted{}, false
 	}
 	return s.Checkpoints[len(s.Checkpoints)-1], true
+}
+
+// newestOf returns the newest checkpoint accepted in lineage. A new
+// lineage restarts its indexes (a Recover from 1, a restore from its
+// snapshot), so a cursor is only ever compared within one lineage.
+func (s *State) newestOf(lineage string) (Accepted, bool) {
+	for _, a := range slices.Backward(s.Checkpoints) {
+		if inLineage(a, lineage) {
+			return a, true
+		}
+	}
+	return Accepted{}, false
+}
+
+// inLineage tells whether an accepted checkpoint belongs to lineage: its
+// name is derived from the lineage and its index.
+func inLineage(a Accepted, lineage string) bool {
+	return lineage != "" && a.Name == reftable.CheckpointName(lineage, a.Index)
 }
 
 func (s *State) accepted(name string) (int, bool) {
