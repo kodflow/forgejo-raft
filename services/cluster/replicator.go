@@ -196,7 +196,7 @@ func Init(ctx context.Context) error {
 	r.objects = &objectChannel{
 		root: r.root, port: setting.Cluster.ObjectPort, cluster: clusterHex, id: id,
 		engine: r.Engine, self: r.selfID, repoKnown: r.repoKnown, revoked: r.table.KeyRevoked,
-		leavesKey: r.projector.leavesKey,
+		leavesKey: r.projector.leavesKey, awaitsRename: r.projector.awaitsRename,
 	}
 	if setting.Cluster.ExpectedNodes >= 3 {
 		r.auto = newAutoMode(r.objects)
@@ -587,13 +587,24 @@ func (r *Replicator) waitWrites(ctx context.Context, nonces []string) bool {
 // the creating request's transaction, and the first push of an
 // auto-initialised repository ships its objects then. Only Forgejo's own
 // hook path proposes, so a key in the table was created by a member.
+// A key whose refs are all tombstones (renamed away) is not known by the
+// table: a shipment there would create a stray repository (#100).
 func (r *Replicator) repoKnown(ctx context.Context, key string) (bool, error) {
 	if refs, _ := r.table.Refs(key); len(refs) > 0 {
-		if _, deleted := r.table.Deleted(key); !deleted {
+		if _, deleted := r.table.Deleted(key); !deleted && anyLive(refs) {
 			return true, nil
 		}
 	}
 	return repoKnownInDB(ctx, key)
+}
+
+func anyLive(refs map[string]reftable.RefValue) bool {
+	for _, v := range refs {
+		if v.Live() {
+			return true
+		}
+	}
+	return false
 }
 
 // peerPins decodes [cluster] PEER_PINS, already validated.

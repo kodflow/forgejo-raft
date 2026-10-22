@@ -50,6 +50,9 @@ type objectChannel struct {
 	// leavesKey reports a directory under the key the projector is about
 	// to set aside or remove: objects indexed there would leave with it.
 	leavesKey func(repo string) bool
+	// awaitsRename reports a key whose renamed repository's directory the
+	// projector has not moved in yet.
+	awaitsRename func(repo string) bool
 	// revoked reports a key an operator revoked (hex SPKI): a member
 	// holding it is not admitted, even before its removal commits.
 	revoked func(spki string) bool
@@ -181,6 +184,13 @@ func (oc *objectChannel) handlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		if oc.awaitsRename != nil && oc.awaitsRename(repo) {
+			// The renamed repository's directory is still under its old
+			// key here: created empty now, the key would never take it,
+			// and it would stay under the freed name (#100).
+			http.Error(w, fmt.Sprintf("%s waits for its rename to be projected on this node", repo), http.StatusServiceUnavailable)
+			return
+		}
 		if err := initBare(r.Context(), dir, format); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

@@ -939,3 +939,19 @@ func (p *projector) leavesKey(repo string) bool {
 	held, known := heldBefore(dir, repo, renIdx)
 	return known && held
 }
+
+// awaitsRename reports whether repo's directory is absent here while the
+// repository a rename moved into it still sits under an older key of the
+// chain, which the projection moves in: a directory created under repo
+// meanwhile would keep it out (#100).
+func (p *projector) awaitsRename(repo string) bool {
+	if _, err := os.Stat(filepath.Join(p.root, filepath.FromSlash(repo))); err == nil {
+		return false
+	}
+	first, firstIdx, ok := p.table.RenamedFrom(repo)
+	if !ok {
+		return false
+	}
+	from, to, renIdx := p.renameSource(repo, first, firstIdx)
+	return p.holdsRenamed(filepath.Join(p.root, filepath.FromSlash(from)), from, to, renIdx)
+}
