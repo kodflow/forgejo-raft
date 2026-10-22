@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"forgejo.org/modules/json"
+	"forgejo.org/services/cluster/reftable"
 
 	"golang.org/x/crypto/nacl/box"
 )
@@ -180,6 +181,11 @@ func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, err
 	n := 0
 	repos := make([]string, 0, len(m.Repos))
 	for repo := range m.Repos {
+		// The key becomes a path under root: one Apply would refuse is
+		// never written, wherever the manifest came from (#81).
+		if err := reftable.ValidRepoKey(repo); err != nil {
+			return 0, fmt.Errorf("the checkpoint %s names the repository %q: %w", name, repo, err)
+		}
 		repos = append(repos, repo)
 	}
 	sort.Strings(repos)

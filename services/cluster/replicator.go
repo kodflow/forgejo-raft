@@ -71,8 +71,17 @@ type Replicator struct {
 	// payloadProbe is when the autopilot next asks the members which
 	// command version they apply.
 	payloadProbe time.Time
-	seenMu       sync.Mutex
-	seen         map[consensus.NodeID]memberRecord
+	// hookFails counts the writer hook's failed promotions in a row, and
+	// yielded is when this leader last gave the leadership away because it
+	// could not derive the SQL (autopilot.go). Only the autopilot's
+	// goroutine touches them.
+	hookFails int
+	yielded   time.Time
+	// consumerFails counts the consumer's failed passes in a row, which
+	// the autopilot reads (consumer.go).
+	consumerFails atomic.Int32
+	seenMu        sync.Mutex
+	seen          map[consensus.NodeID]memberRecord
 	// fence queues this node's own writers while a checkpoint reads
 	// PostgreSQL's position; checkpoints is the coordinator, nil while
 	// [cluster] CHECKPOINT_INTERVAL is 0 (checkpoint.go).
@@ -190,6 +199,7 @@ func Init(ctx context.Context) error {
 	}
 	if setting.Cluster.ExpectedNodes >= 3 {
 		r.auto = newAutoMode(r.objects)
+		r.auto.revoked = r.keyRevoked
 		r.objects.hello = r.helloOf
 		r.writerHook = registeredWriterHook()
 	}

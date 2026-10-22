@@ -91,15 +91,20 @@ func (r *Replicator) stepWriter(ctx context.Context, eng consensus.Engine) {
 	t := WriterTransition{Slot: st.Slot, Node: st.ID, Identity: st.Identity}
 	// Only the autopilot's goroutine steps: no two hook calls overlap.
 	cur := writerState(r.writer.Load())
+	if st.Role != consensus.RoleLeader {
+		r.hookFails = 0
+	}
 	switch leads := st.Role == consensus.RoleLeader; {
 	case leads && !r.promotedFor(st):
 		// Writes stop here first: a promotion of an earlier term does not
 		// cover this one.
 		r.writer.Store(uint32(writerUnknown))
 		if err := r.writerHook.Promote(ctx, t); err != nil {
+			r.hookFails++
 			log.Error("cluster: writer hook: promoting %s: %v; writes stay refused, retried", st.Slot, err)
 			return
 		}
+		r.hookFails = 0
 		r.writerAt.Store(&writerMark{Term: st.Term, Identity: st.Identity})
 		r.writer.Store(uint32(writerReady))
 		log.Warn("cluster: writer hook: %s promoted, writes accepted", st.Slot)

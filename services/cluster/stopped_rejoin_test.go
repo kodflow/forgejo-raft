@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -27,6 +28,10 @@ func (e *stoppedEngine) Status() consensus.Status { return consensus.Status{ID: 
 
 func (e *stoppedEngine) Membership() consensus.Membership { return consensus.Membership{} }
 
+func (e *stoppedEngine) Barrier(context.Context) (consensus.Token, error) {
+	return consensus.Token{}, consensus.ErrNodeStopped
+}
+
 func (e *stoppedEngine) Health() consensus.Health {
 	if e.stopped {
 		return consensus.Health{Stopped: true, StopReason: "STATE_MACHINE_FAILED"}
@@ -42,12 +47,19 @@ func TestAStoppedNodeNeverRejoinsUnderANewID(t *testing.T) {
 	self := consensus.NodeID(0x51)
 	voters := []string{"a1", "a2", "a3"}
 	peers := map[string]string{"node-a": "self:1", "a1": "a1:1", "a2": "a2:1", "a3": "a3:1"}
+	// The membership the engine listed before it lost it: the node keeps
+	// trusting it (retire.go).
+	last := consensus.Membership{Members: []consensus.Member{{ID: self, Slot: "node-a", SPKI: [32]byte{0x51}, Voter: true}}}
+	for i, slot := range voters {
+		last.Members = append(last.Members, consensus.Member{ID: consensus.NodeID(i + 1), Slot: slot, SPKI: [32]byte{byte(i + 1)}, Voter: true})
+	}
 	for _, stopped := range []bool{true, false} {
 		rejoins := 0
 		r := &Replicator{auto: &autoMode{
-			self: "node-a", peers: peers, tick: time.Second,
+			self: "node-a", peers: peers, tick: time.Second, lastOwn: last,
 			probe: func(_ context.Context, addr, slot string) (hello, error) {
-				return hello{Slot: slot, State: helloMember, Node: slot, Index: 9, Voters: voters, Retired: []string{self.String()}}, nil
+				i := slices.Index(voters, slot)
+				return hello{Slot: slot, State: helloMember, Node: slot, Index: 9, Voters: voters, Retired: []string{self.String()}, SPKI: [32]byte{byte(i + 1)}}, nil
 			},
 			rejoin: func(context.Context) error { rejoins++; return nil },
 		}}

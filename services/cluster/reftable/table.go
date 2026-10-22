@@ -1007,6 +1007,51 @@ func (t *Table) persistedLocked() *persisted {
 	return p
 }
 
+// validNames refuses a snapshot holding a repository key or a ref name
+// Apply refuses: the projector, the observer and a recover turn these keys
+// into paths, and a key such as "../raft-data" would reach outside the
+// repository root (#81). The snapshot's digest is its sender's, so nothing
+// else stands between a compromised leader and those paths.
+func (p *persisted) validNames() error {
+	refuse := func(what string, err error) error {
+		return fmt.Errorf("%w: the ref table snapshot holds %s: %w", consensus.ErrStateMachineFailed, what, err)
+	}
+	for repo, refs := range p.Repos {
+		if err := ValidRepoKey(repo); err != nil {
+			return refuse(fmt.Sprintf("the repository key %q", repo), err)
+		}
+		for name, v := range refs {
+			if err := ValidRefName(name); err != nil {
+				return refuse(fmt.Sprintf("the ref %q of %s", name, repo), err)
+			}
+			if v != nil && v.Symbolic != "" {
+				if err := ValidRefName(v.Symbolic); err != nil {
+					return refuse(fmt.Sprintf("the target %q of %s %s", v.Symbolic, repo, name), err)
+				}
+			}
+		}
+	}
+	for repo := range p.Last {
+		if err := ValidRepoKey(repo); err != nil {
+			return refuse(fmt.Sprintf("the repository key %q", repo), err)
+		}
+	}
+	for repo := range p.Deleted {
+		if err := ValidRepoKey(repo); err != nil {
+			return refuse(fmt.Sprintf("the deleted repository key %q", repo), err)
+		}
+	}
+	for to, m := range p.Renamed {
+		if err := ValidRepoKey(to); err != nil {
+			return refuse(fmt.Sprintf("the renamed repository key %q", to), err)
+		}
+		if err := ValidRepoKey(m.From); err != nil {
+			return refuse(fmt.Sprintf("the rename source %q", m.From), err)
+		}
+	}
+	return nil
+}
+
 // Restore replaces the table with a snapshot and recomputes both checksums.
 func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	var buf bytes.Buffer
@@ -1019,6 +1064,15 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	}
 	if p.Format != SnapshotFormat {
 		return fmt.Errorf("%w: snapshot format %d", ErrVersion, p.Format)
+	}
+	// A snapshot cut at a payload version this binary does not apply holds
+	// state it cannot keep: restoring it would drop that state and leave
+	// the node writing a version it cannot encode (#50). It stops here.
+	if p.Payload > PayloadVersion {
+		return fmt.Errorf("%w: snapshot written at payload version %d, this binary applies %d", ErrVersion, p.Payload, PayloadVersion)
+	}
+	if err := p.validNames(); err != nil {
+		return err
 	}
 	nt := New()
 	for repo, refs := range p.Repos {

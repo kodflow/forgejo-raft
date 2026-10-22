@@ -25,7 +25,7 @@ import (
 func TestPusherNameWaitsForEveryMember(t *testing.T) {
 	m := consensus.Membership{Members: []consensus.Member{{ID: 1}, {ID: 2}, {ID: 3}}}
 	mixed := []hello{{Node: consensus.NodeID(2).String(), Payload: reftable.PayloadVersion}, {Node: consensus.NodeID(3).String(), Payload: reftable.RevokeVersion}}
-	assert.False(t, everyMemberApplies(m, 1, mixed), "a member applying version 3 holds the raise")
+	assert.False(t, everyMemberApplies(m, 1, mixed, anyAnswer), "a member applying version 3 holds the raise")
 
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	work := t.TempDir()

@@ -286,9 +286,9 @@ func TestObjectChannelRefusesARevokedKey(t *testing.T) {
 		}
 	}
 	require.NoError(t, r.RaisePayloadVersion(context.Background(), "op"))
-	pending, err := r.revokeMember(context.Background(), r.Engine(), OperatorFor(1), idB)
+	_, deferred, err := r.revokeMember(context.Background(), r.Engine(), OperatorFor(1), idB)
 	require.NoError(t, err)
-	require.False(t, pending)
+	require.False(t, deferred)
 	_, err = oc.admit(peer{Slot: "node-b", SPKI: keyB})
 	require.ErrorContains(t, err, "revoked")
 }

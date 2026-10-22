@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -795,6 +796,10 @@ func (h *fakeWriterHook) counts() (promoted, demoted int) {
 // succeeds, writes are accepted. The other nodes are demoted, never
 // promoted.
 func TestWriterHookGatesTheWriter(t *testing.T) {
+	// The gate alone: no leader yields to another for a failing hook.
+	prev := yieldAfterPromotions
+	yieldAfterPromotions = math.MaxInt
+	t.Cleanup(func() { yieldAfterPromotions = prev })
 	hooks := map[string]*fakeWriterHook{"node-a": {failing: true}, "node-b": {failing: true}, "node-c": {failing: true}}
 	writerHooks := map[string]WriterHook{}
 	for slot, h := range hooks {
@@ -838,6 +843,42 @@ func TestWriterHookGatesTheWriter(t *testing.T) {
 		assert.Zero(t, p, "%s is never promoted", slot)
 		assert.Equal(t, 1, d, "%s is demoted once", slot)
 	}
+}
+
+// A leader whose writer hook keeps failing gives the leadership to a voter
+// whose hook works, and the SQL is derived again (#47).
+func TestHuntR1ProveWriterStall(t *testing.T) {
+	hooks := map[string]*fakeWriterHook{"node-a": {failing: true}, "node-b": {failing: true}, "node-c": {failing: true}}
+	writerHooks := map[string]WriterHook{}
+	for slot, h := range hooks {
+		writerHooks[slot] = h
+	}
+	tc, b := newAutoClusterWith(t, 3, writerHooks, "node-a", "node-b", "node-c")
+	b.waitMembers(3, 3)
+	var first *autoNode
+	require.Eventually(t, func() bool { first = b.leader(); return first != nil }, 10*time.Second, 20*time.Millisecond)
+	for slot, h := range hooks {
+		if slot != first.n.slot {
+			h.mu.Lock()
+			h.failing = false
+			h.mu.Unlock()
+		}
+	}
+	var via *autoNode
+	for _, an := range b.alive() {
+		if an != first {
+			via = an
+			break
+		}
+	}
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	_, ok, msg := pushOne(tc, via.n, work, "auto/stall.git", strings.Repeat("0", 40), "one")
+	require.True(t, ok, msg)
+	require.Eventually(t, func() bool {
+		l := b.leader()
+		return l != nil && l != first && l.n.work.count() > 0
+	}, 20*time.Second, 50*time.Millisecond, "the leadership left the leader whose hook fails, and the SQL is derived")
 }
 
 // statusEngine answers Status alone, for the writer hook's steps.

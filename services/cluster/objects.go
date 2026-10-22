@@ -127,8 +127,12 @@ func (oc *objectChannel) handler() http.Handler {
 				http.Error(w, "CLUSTER_MISMATCH", http.StatusForbidden)
 				return
 			}
+			h := oc.hello()
+			if id := r.URL.Query().Get("node"); id != "" {
+				h.answerFor(id)
+			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(oc.hello())
+			_ = json.NewEncoder(w).Encode(h)
 			return
 		}
 		if err == nil {

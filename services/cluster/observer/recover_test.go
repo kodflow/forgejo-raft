@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"forgejo.org/modules/json"
 	"forgejo.org/services/cluster/reftable"
 
 	"github.com/stretchr/testify/assert"
@@ -307,4 +308,39 @@ func TestHuntR8ProveEmptyRepoRestored(t *testing.T) {
 	n, err = a.RestoreRepos(ctx, cp.Name(), root)
 	require.NoError(t, err)
 	assert.Equal(t, 3, n)
+}
+
+// A manifest naming a repository key Apply refuses is never written: the
+// key would climb out of the root the operator gave (#81). The key climbs
+// one level, to a directory of the test.
+func TestRestoreReposRefusesAnEscapingKey(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	cp := seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	a, err := OpenArchive(o.cfg.Dir, "")
+	require.NoError(t, err)
+
+	dir := filepath.Join(o.cfg.Dir, "checkpoints", cp.Name())
+	path := filepath.Join(dir, "manifest.json")
+	m, err := a.store.ReadManifest(cp.Name())
+	require.NoError(t, err)
+	for _, rm := range m.Repos {
+		m.Repos["../escape.git"] = rm
+		break
+	}
+	require.Contains(t, m.Repos, "../escape.git")
+	b, err := json.Marshal(m)
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(dir, 0o755))
+	require.NoError(t, os.Chmod(path, 0o644))
+	require.NoError(t, os.WriteFile(path, b, 0o644))
+
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	require.NoError(t, os.Mkdir(root, 0o755))
+	_, err = a.RestoreRepos(ctx, cp.Name(), root)
+	require.Error(t, err)
+	assert.NoDirExists(t, filepath.Join(base, "escape.git"))
 }
