@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -180,4 +181,45 @@ func TestAFailingPusherDoesNotSkipAnotherPushersEvents(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, n)
 	assert.Equal(t, [][]int64{{3}, {7}, {3}}, ran, "both ran once, in their order")
+}
+
+// The stall bound is the repository's: three events of a repository that
+// never projects hold the others back one bound, not three, and the
+// parked events are retried meanwhile (#45,
+// TestHuntR1ProveStallBoundIsPerEventNotPerRepo).
+func TestStallBoundIsPerRepoNotPerEvent(t *testing.T) {
+	defer test.MockVariableValue(&projectionStallBound, 300*time.Millisecond)()
+	defer test.MockVariableValue(&parkedRetryEvery, 50*time.Millisecond)()
+	store, lg, parked := newSQLStore(), &memLog{}, &memParked{}
+	for i, repo := range []string{"o/stuck.git", "o/stuck.git", "o/stuck.git", "o/ok.git"} {
+		lg.events = append(lg.events, reftable.Event{Token: testToken(uint64(i + 1)), Kind: reftable.EventRef, Repo: repo, Ref: "refs/heads/a", PusherID: 1})
+	}
+	var ran []string
+	c := unitConsumer(store, lg, parked, func(_ context.Context, evs []reftable.Event) error {
+		ran = append(ran, evs[0].Repo)
+		return nil
+	})
+	c.lineageNow = func() string { return testToken(1).Identity().String() }
+	c.projectedAt = func(r string) uint64 {
+		if r == "o/stuck.git" {
+			return 0
+		}
+		return 1 << 62
+	}
+	retries := 0
+	list := c.listParked
+	c.listParked = func(ctx context.Context) ([]*cluster_model.ParkedEvent, error) {
+		retries++
+		return list(ctx)
+	}
+	start := time.Now()
+	for !slices.Contains(ran, "o/ok.git") && time.Since(start) < 5*time.Second {
+		_ = c.pass(context.Background())
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.Contains(t, ran, "o/ok.git")
+	assert.Less(t, time.Since(start), 2*projectionStallBound)
+	assert.NotContains(t, ran, "o/stuck.git", "never derived unprojected")
+	assert.Equal(t, []int64{1, 2, 3}, parked.indexes())
+	assert.Greater(t, retries, 1, "the parked events are retried while the head waits")
 }

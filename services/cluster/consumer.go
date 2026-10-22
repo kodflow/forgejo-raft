@@ -96,6 +96,9 @@ type consumer struct {
 	// backupLag is how far the backup cursor lags the dispatch cursor when
 	// that lag is beyond backupMaxLag and holds the trim; 0 otherwise.
 	backupLag uint64
+	// stalledOut holds the repositories whose event was parked for want of
+	// projection, until one of their events is projected.
+	stalledOut map[string]bool
 	// stall is the head event waiting for its repository's projection.
 	stall struct {
 		index uint64
@@ -142,6 +145,7 @@ func newConsumer(r *Replicator) *consumer {
 		park:    cluster_model.ParkEvents, hasParked: cluster_model.RepoHasParked, minParked: cluster_model.MinParkedIndex,
 		listParked: cluster_model.ListParked, unpark: cluster_model.UnparkEntry, noteParked: cluster_model.NoteParkedFailure,
 		lastAck: map[string]uint64{}, failures: map[uint64]int{}, reasons: map[uint64]string{}, seen: map[string]int64{},
+		stalledOut: map[string]bool{},
 	}
 	c.ack = func(ctx context.Context, lineage string, index uint64) error {
 		data, err := reftable.Encode(reftable.KindAck, &reftable.Ack{Identity: lineage, Index: index})
@@ -186,6 +190,7 @@ func (c *consumer) forget() {
 	c.seen = map[string]int64{}
 	c.failures = map[uint64]int{}
 	c.reasons = map[uint64]string{}
+	c.stalledOut = map[string]bool{}
 	c.stall.index, c.stall.repo = 0, ""
 }
 
@@ -201,12 +206,23 @@ func (c *consumer) projected(evs []reftable.Event) bool {
 			break
 		}
 	}
-	if waiting == "" {
-		return true
-	}
 	idx := evs[0].Token.Index
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if waiting == "" {
+		for _, ev := range evs {
+			delete(c.stalledOut, ev.Repo)
+		}
+		return true
+	}
+	if c.stalledOut[waiting] {
+		// The bound is the repository's, not each event's: the later
+		// events of a repository whose head event was parked unprojected
+		// are parked at once, not after a bound each (#45).
+		c.failures[idx] = maxAttempts
+		c.reasons[idx] = fmt.Sprintf("%s is still not projected; parked behind its stalled event", waiting)
+		return true
+	}
 	if c.stall.index != idx || c.stall.repo != waiting {
 		c.stall.index, c.stall.repo, c.stall.since = idx, waiting, time.Now()
 		return false
@@ -217,6 +233,10 @@ func (c *consumer) projected(evs []reftable.Event) bool {
 	log.Error("cluster consumer: %s is still not projected at %d after %s; parking its event", waiting, idx, projectionStallBound)
 	c.failures[idx] = maxAttempts
 	c.reasons[idx] = fmt.Sprintf("not projected after %s", projectionStallBound)
+	if c.stalledOut == nil {
+		c.stalledOut = map[string]bool{}
+	}
+	c.stalledOut[waiting] = true
 	return true
 }
 
@@ -378,7 +398,9 @@ func (c *consumer) pass(ctx context.Context) error {
 			n = end
 		}
 		if n == 0 {
-			return nil // the projector has not caught up; the next pass retries
+			// The projector has not caught up; the next pass retries. The
+			// parked events and the trim do not wait for it (#45).
+			break
 		}
 		c.clearStall()
 		batch := pending[:n]
