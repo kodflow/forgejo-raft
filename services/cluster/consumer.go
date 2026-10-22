@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -431,7 +432,10 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 			// One group per pusher too: the work attributes its branch rows to
 			// the group's first pusher, and a group parked after maxAttempts
 			// must not take another user's push down with it.
-			if i < len(batch) && batch[i].Repo == batch[start].Repo && batch[i].Kind == batch[start].Kind &&
+			// And one group per entry: two pushes of a ref grouped together
+			// insert its new branch or tag twice, and a creation and its
+			// deletion fail on the row the creation never wrote (#76, #44).
+			if i < len(batch) && batch[i].Token == batch[start].Token && batch[i].Repo == batch[start].Repo && batch[i].Kind == batch[start].Kind &&
 				batch[i].Trigger == batch[start].Trigger && batch[i].PusherID == batch[start].PusherID {
 				continue
 			}
@@ -843,7 +847,7 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 				if err := git_model.AddDeletedBranch(ctx, repo.ID, ref.BranchName(), ev.PusherID); err != nil {
 					return err
 				}
-			} else {
+			} else if !slices.Contains(branches, ref.BranchName()) {
 				branches = append(branches, ref.BranchName())
 			}
 		}
