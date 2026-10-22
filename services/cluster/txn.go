@@ -26,6 +26,10 @@ type txn struct {
 	prepared bool
 	// proposed is set once the transaction's entry committed.
 	proposed bool
+	// nested is set while the files backend's nested transaction on
+	// packed-refs, which ran before this one, has not ended: its
+	// "committed" or "aborted" comes first and releases nothing.
+	nested bool
 }
 
 // registry tracks native git transactions so the projector never certifies
@@ -35,6 +39,10 @@ type registry struct {
 	mu      sync.Mutex
 	byNonce map[string]*txn
 	byRepo  map[string]map[string]*txn
+	// nested holds the nonces whose last "prepared" was the files
+	// backend's nested transaction on packed-refs (packedRefsTxn): the
+	// next "prepared" under the nonce is the transaction it belongs to.
+	nested map[string]bool
 	// certifying holds the repositories being certified, each with the
 	// channel closed when its certification ends. The certification runs
 	// git outside mu: only a transaction of THAT repository waits for it.
@@ -48,7 +56,7 @@ type registry struct {
 
 func newRegistry(ttl time.Duration, perRepo, total int) *registry {
 	return &registry{
-		byNonce: map[string]*txn{}, byRepo: map[string]map[string]*txn{}, certifying: map[string]chan struct{}{},
+		byNonce: map[string]*txn{}, byRepo: map[string]map[string]*txn{}, nested: map[string]bool{}, certifying: map[string]chan struct{}{},
 		ttl: ttl, perRepo: perRepo, total: total, alive: pidAlive, now: time.Now,
 	}
 }
@@ -78,9 +86,51 @@ func (r *registry) reserve(nonce, repo string, pid int) error {
 	return r.addLocked(&txn{nonce: nonce, repo: repo, pid: pid, deadline: r.now().Add(r.ttl)})
 }
 
+// markNested records that the nonce's git process prepared the nested
+// transaction on packed-refs; takeNested, at its next "prepared", reports
+// and clears it.
+func (r *registry) markNested(nonce string) {
+	r.mu.Lock()
+	r.nested[nonce] = true
+	r.mu.Unlock()
+}
+
+func (r *registry) takeNested(nonce string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	was := r.nested[nonce]
+	delete(r.nested, nonce)
+	return was
+}
+
+// nestedFinished reports whether a "committed" or "aborted" whose lines all
+// carry two null ids is that of a nested transaction on packed-refs, which
+// must not release the transaction it belongs to: the nested one of a
+// registered transaction, one whose own "prepared" never came, or one
+// aborted before it was prepared, which leaves a reservation (the SSH
+// path) in place.
+func (r *registry) nestedFinished(nonce string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.nested[nonce] {
+		delete(r.nested, nonce)
+		return true
+	}
+	t := r.byNonce[nonce]
+	if t == nil {
+		return false
+	}
+	if t.nested {
+		t.nested = false
+		return true
+	}
+	return !t.prepared
+}
+
 // register records a transaction in "prepared". Above the caps it refuses
-// before git publishes anything.
-func (r *registry) register(nonce, repo string, refs []string, pid int) error {
+// before git publishes anything. nested says the files backend's nested
+// transaction on packed-refs ran before it, and has yet to end.
+func (r *registry) register(nonce, repo string, refs []string, pid int, nested bool) error {
 	if nonce == "" {
 		return errNoNonce
 	}
@@ -122,13 +172,13 @@ func (r *registry) register(nonce, repo string, refs []string, pid int) error {
 			// The reservation counted against no prepared cap.
 			return errTooManyTxn
 		}
-		t.refs, t.deadline, t.prepared = refs, r.now().Add(r.ttl), true
+		t.refs, t.deadline, t.prepared, t.nested = refs, r.now().Add(r.ttl), true, nested
 		if pid > 0 {
 			t.pid = pid
 		}
 		return nil
 	}
-	return r.addLocked(&txn{nonce: nonce, repo: repo, refs: refs, pid: pid, deadline: r.now().Add(r.ttl), prepared: true})
+	return r.addLocked(&txn{nonce: nonce, repo: repo, refs: refs, pid: pid, deadline: r.now().Add(r.ttl), prepared: true, nested: nested})
 }
 
 func (r *registry) addLocked(t *txn) error {
@@ -188,6 +238,7 @@ func (r *registry) release(nonce string) *txn {
 }
 
 func (r *registry) releaseLocked(nonce string) *txn {
+	delete(r.nested, nonce)
 	t := r.byNonce[nonce]
 	if t == nil {
 		return nil

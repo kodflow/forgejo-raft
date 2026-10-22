@@ -33,7 +33,7 @@ func TestAReservationFencesNothingUntilPrepared(t *testing.T) {
 	assert.True(t, reg.certify("alice/a.git", func() { ran = true }))
 	assert.True(t, ran)
 
-	require.NoError(t, reg.register("n1", "alice/a.git", []string{"refs/heads/main"}, os.Getpid()))
+	require.NoError(t, reg.register("n1", "alice/a.git", []string{"refs/heads/main"}, os.Getpid(), false))
 	assert.Equal(t, 1, reg.count(), "prepared completes the reservation")
 	assert.True(t, reg.inFlight("alice/a.git"))
 	assert.False(t, reg.certify("alice/a.git", func() { t.Error("certified behind a prepared transaction") }))
@@ -85,11 +85,11 @@ func TestHangingSSHSessionsDoNotTurnARepositoryAway(t *testing.T) {
 	for _, n := range []string{"r1", "r2", "r3"} {
 		require.NoError(t, reg.reserve(n, "alice/a.git", os.Getpid()))
 	}
-	require.NoError(t, reg.register("p1", "alice/a.git", []string{"refs/heads/main"}, os.Getpid()))
-	require.NoError(t, reg.register("r1", "alice/a.git", []string{"refs/heads/b"}, os.Getpid()), "a reservation completes")
-	require.ErrorIs(t, reg.register("r2", "alice/a.git", []string{"refs/heads/c"}, os.Getpid()), errTooManyTxn,
+	require.NoError(t, reg.register("p1", "alice/a.git", []string{"refs/heads/main"}, os.Getpid(), false))
+	require.NoError(t, reg.register("r1", "alice/a.git", []string{"refs/heads/b"}, os.Getpid(), false), "a reservation completes")
+	require.ErrorIs(t, reg.register("r2", "alice/a.git", []string{"refs/heads/c"}, os.Getpid(), false), errTooManyTxn,
 		"the per-repository cap holds for prepared transactions")
-	require.ErrorIs(t, reg.register("p2", "alice/a.git", []string{"refs/heads/d"}, os.Getpid()), errTooManyTxn)
+	require.ErrorIs(t, reg.register("p2", "alice/a.git", []string{"refs/heads/d"}, os.Getpid(), false), errTooManyTxn)
 
 	// Reservations have their own total cap.
 	require.NoError(t, reg.reserve("r4", "bob/b.git", os.Getpid()))
