@@ -193,14 +193,15 @@ func TestObserverRejectsForkOrRollback(t *testing.T) {
 			if req.Op != clusterhook.OpExportCheckpoints {
 				return data
 			}
+			// The leader's table describes the accepted checkpoint
+			// otherwise; the view goes through the export's own filter.
 			var v clusterhook.ExportView
 			require.NoError(t, json.Unmarshal(data, &v))
 			for i := range v.Checkpoints {
-				v.Checkpoints[i].Root = strings.Repeat("0", 64)
+				if v.Checkpoints[i].Name == before.Checkpoints[0].Name {
+					v.Checkpoints[i].Root = strings.Repeat("f", 64)
+				}
 			}
-			// The rewritten one is served again, whatever was asked.
-			a := before.Checkpoints[0]
-			v.Checkpoints = append(v.Checkpoints, clusterhook.ExportCheckpoint{Name: a.Name, Lineage: before.Lineage, Index: a.Index, Root: strings.Repeat("f", 64)})
 			b, _ := json.Marshal(v)
 			return b
 		}
@@ -692,4 +693,85 @@ func TestHuntR2ProveLinCurRestoreOlderSnapshot(t *testing.T) {
 	a, ok := st.newestOf(c.lineage().String())
 	require.True(t, ok)
 	assert.Equal(t, cp.Name(), a.Name)
+}
+
+// An accepted checkpoint described otherwise is seen through the
+// export's real filter, and before a compacted log jumps past it; one
+// gone from the leader's table while an older one is listed is a fork too
+// (#87).
+func TestHuntR5ProveCheckKnownDead(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T) (*fakeCluster, *Observer, Accepted) {
+		c := newFakeCluster(t)
+		o := newTestObserver(t, c, &hookLog{})
+		seed(t, c, o)
+		require.NoError(t, o.Step(ctx))
+		c.push("alice/demo.git", "refs/heads/main", c.commit("two"))
+		c.checkpoint()
+		require.NoError(t, o.Step(ctx))
+		require.Len(t, o.State().Checkpoints, 2)
+		return c, o, o.State().Checkpoints[1]
+	}
+	rewrite := func(c *fakeCluster, name string) {
+		c.tamper = func(_ string, req *clusterhook.ExportRequest, data []byte) []byte {
+			if req.Op != clusterhook.OpExportCheckpoints {
+				return data
+			}
+			var v clusterhook.ExportView
+			_ = json.Unmarshal(data, &v)
+			for i := range v.Checkpoints {
+				if v.Checkpoints[i].Name == name {
+					v.Checkpoints[i].Root = strings.Repeat("e", 64)
+				}
+			}
+			b, _ := json.Marshal(v)
+			return b
+		}
+	}
+
+	t.Run("the real filter shows an accepted checkpoint", func(t *testing.T) {
+		c, o, a := setup(t)
+		rewrite(c, a.Name)
+		err := o.Step(ctx)
+		require.ErrorIs(t, err, ErrQuarantined)
+		assert.Contains(t, err.Error(), "described otherwise")
+	})
+
+	t.Run("fork then compaction", func(t *testing.T) {
+		c, o, a := setup(t)
+		rewrite(c, a.Name)
+		c.push("alice/demo.git", "refs/heads/main", c.commit("three"))
+		c.checkpoint()
+		c.mu.Lock()
+		c.compacted = uint64(len(c.log))
+		c.mu.Unlock()
+		err := o.Step(ctx)
+		require.ErrorIs(t, err, ErrQuarantined)
+		assert.Len(t, o.State().Checkpoints, 2, "nothing of the divergent history is accepted")
+	})
+
+	t.Run("an accepted checkpoint gone from the table", func(t *testing.T) {
+		c, o, a := setup(t)
+		c.tamper = func(_ string, req *clusterhook.ExportRequest, data []byte) []byte {
+			if req.Op != clusterhook.OpExportCheckpoints {
+				return data
+			}
+			var v clusterhook.ExportView
+			_ = json.Unmarshal(data, &v)
+			v.Checkpoints = slices.DeleteFunc(v.Checkpoints, func(cp clusterhook.ExportCheckpoint) bool { return cp.Name == a.Name })
+			b, _ := json.Marshal(v)
+			return b
+		}
+		err := o.Step(ctx)
+		require.ErrorIs(t, err, ErrQuarantined)
+		assert.Contains(t, err.Error(), "gone from the leader's table")
+	})
+
+	t.Run("control: an honest leader", func(t *testing.T) {
+		c, o, _ := setup(t)
+		c.push("alice/demo.git", "refs/heads/main", c.commit("three"))
+		c.checkpoint()
+		require.NoError(t, o.Step(ctx))
+		assert.Len(t, o.State().Checkpoints, 3)
+	})
 }

@@ -195,13 +195,15 @@ func (o *Observer) Step(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The accepted checkpoints are compared first: a compacted log jumps
+	// to the newest of them, which must still be the leader's.
+	if err := o.checkKnown(view); err != nil {
+		return err
+	}
 	if view.LogSupported {
 		if err := o.follow(ctx, slot, view); err != nil {
 			return err
 		}
-	}
-	if err := o.checkKnown(view); err != nil {
-		return err
 	}
 	cp, ok := o.nextCheckpoint(view)
 	if !ok {
@@ -300,7 +302,7 @@ func (o *Observer) leaderView(ctx context.Context) (*clusterhook.ExportView, str
 	for _, slot := range o.order() {
 		var v clusterhook.ExportView
 		vctx, cancel := context.WithTimeout(ctx, viewTimeout)
-		body, err := call(vctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportCheckpoints, Observer: o.cfg.Name, FromIndex: o.lastIndex()}, &v)
+		body, err := call(vctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportCheckpoints, Observer: o.cfg.Name, FromIndex: o.viewFrom()}, &v)
 		if err == nil {
 			body.Close()
 		}
@@ -355,6 +357,17 @@ func (o *Observer) order() []string {
 func (o *Observer) lastIndex() uint64 {
 	if a, ok := o.state.newestOf(o.state.Lineage); ok {
 		return a.Index
+	}
+	return 0
+}
+
+// viewFrom is the index the view is asked from: just before the oldest
+// checkpoint accepted in the lineage followed, so that the view describes
+// again every accepted checkpoint the leader's table still lists, which
+// checkKnown compares.
+func (o *Observer) viewFrom() uint64 {
+	if a, ok := o.state.oldestOf(o.state.Lineage); ok {
+		return a.Index - 1
 	}
 	return 0
 }
@@ -514,11 +527,26 @@ func checkpointDigest(cp clusterhook.ExportCheckpoint) string {
 // accepted with what was accepted: an accepted checkpoint is immutable, and
 // another description of it is a fork.
 func (o *Observer) checkKnown(v *clusterhook.ExportView) error {
+	listed := map[string]bool{}
+	var oldest uint64
 	for _, cp := range v.Checkpoints {
+		listed[cp.Name] = true
+		if cp.Lineage == o.state.Lineage && (oldest == 0 || cp.Index < oldest) {
+			oldest = cp.Index
+		}
 		if i, ok := o.state.accepted(cp.Name); ok && o.state.Checkpoints[i].Digest != checkpointDigest(cp) {
 			b, _ := json.Marshal(cp)
 			o.store.quarantine("checkpoint", b)
 			return o.quarantineFor(fmt.Sprintf("fork: checkpoint %s is described otherwise than when it was accepted", cp.Name), "")
+		}
+	}
+	// The table keeps its newest checkpoints: one it lists older than an
+	// accepted checkpoint means that accepted one should be listed too.
+	for _, a := range o.state.Checkpoints {
+		if inLineage(a, o.state.Lineage) && oldest != 0 && oldest < a.Index && !listed[a.Name] {
+			b, _ := json.Marshal(v.Checkpoints)
+			o.store.quarantine("checkpoint", b)
+			return o.quarantineFor(fmt.Sprintf("fork: checkpoint %s, accepted, is gone from the leader's table", a.Name), "")
 		}
 	}
 	return nil

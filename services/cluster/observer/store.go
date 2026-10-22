@@ -156,6 +156,16 @@ func (s *State) newestOf(lineage string) (Accepted, bool) {
 	return Accepted{}, false
 }
 
+// oldestOf returns the oldest checkpoint accepted in lineage.
+func (s *State) oldestOf(lineage string) (Accepted, bool) {
+	for _, a := range s.Checkpoints {
+		if inLineage(a, lineage) {
+			return a, true
+		}
+	}
+	return Accepted{}, false
+}
+
 // inLineage tells whether an accepted checkpoint belongs to lineage: its
 // name is derived from the lineage and its index.
 func inLineage(a Accepted, lineage string) bool {
