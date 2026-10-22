@@ -848,29 +848,23 @@ func TestWriterHookGatesTheWriter(t *testing.T) {
 // A leader whose writer hook keeps failing gives the leadership to a voter
 // whose hook works, and the SQL is derived again (#47).
 func TestHuntR1ProveWriterStall(t *testing.T) {
-	hooks := map[string]*fakeWriterHook{"node-a": {failing: true}, "node-b": {failing: true}, "node-c": {failing: true}}
+	// node-a founds the cluster and leads it first; only its hook fails.
+	hooks := map[string]*fakeWriterHook{"node-a": {failing: true}, "node-b": {}, "node-c": {}}
 	writerHooks := map[string]WriterHook{}
 	for slot, h := range hooks {
 		writerHooks[slot] = h
 	}
 	tc, b := newAutoClusterWith(t, 3, writerHooks, "node-a", "node-b", "node-c")
 	b.waitMembers(3, 3)
-	var first *autoNode
-	require.Eventually(t, func() bool { first = b.leader(); return first != nil }, 10*time.Second, 20*time.Millisecond)
-	for slot, h := range hooks {
-		if slot != first.n.slot {
-			h.mu.Lock()
-			h.failing = false
-			h.mu.Unlock()
-		}
-	}
-	var via *autoNode
+	var first, via *autoNode
 	for _, an := range b.alive() {
-		if an != first {
+		if an.n.slot == "node-a" {
+			first = an
+		} else if via == nil {
 			via = an
-			break
 		}
 	}
+	require.NotNil(t, first)
 	work := t.TempDir()
 	run(t, work, "init", "-q")
 	_, ok, msg := pushOne(tc, via.n, work, "auto/stall.git", strings.Repeat("0", 40), "one")
@@ -879,6 +873,8 @@ func TestHuntR1ProveWriterStall(t *testing.T) {
 		l := b.leader()
 		return l != nil && l != first && l.n.work.count() > 0
 	}, 20*time.Second, 50*time.Millisecond, "the leadership left the leader whose hook fails, and the SQL is derived")
+	p, _ := hooks["node-a"].counts()
+	assert.Zero(t, p, "node-a never promoted")
 }
 
 // statusEngine answers Status alone, for the writer hook's steps.
