@@ -30,7 +30,12 @@ import (
 // startSDKEngines founds a cluster of the SDK's real engine over its
 // in-memory network, each node applying to its replicator's table.
 func startSDKEngines(t *testing.T, cluster consensus.ClusterID, nodes []*testNode) {
-	network := sdk.NewMemoryNetwork()
+	startSDKEnginesOver(t, cluster, nodes, sdk.NewMemoryNetwork())
+}
+
+// startSDKEnginesOver is startSDKEngines over a network the test holds, to
+// cut links.
+func startSDKEnginesOver(t *testing.T, cluster consensus.ClusterID, nodes []*testNode, network *sdk.MemoryNetwork) {
 	type parts struct {
 		log   *sdk.MemoryLog
 		snaps *sdk.MemorySnapshots

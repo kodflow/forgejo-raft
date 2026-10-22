@@ -50,11 +50,13 @@ func ReadAfterWrite(next http.Handler) http.Handler {
 // happens before authentication, and must not be a lever on the node.
 var rawWaiters = make(chan struct{}, 256)
 
-// waitBounded waits for the cookie's write, unless the node does not know
-// that entry committed (a cookie from elsewhere is not waited for) or too
-// many requests already wait; both answer "maybe behind".
+// waitBounded waits for the cookie's write, unless too many requests
+// already wait, which answers "maybe behind". A node that has not learnt
+// the write committed yet, the lagging node the cookie exists for, waits
+// too (#71): only this forge signs a cookie, another lineage is not waited
+// for, and the wait is bounded by READ_AFTER_WRITE_TIMEOUT.
 func (r *Replicator) waitBounded(req *http.Request, tok consensus.Token, repo string) bool {
-	if eng := r.Engine(); eng == nil || tok.Index > eng.Status().Commit {
+	if r.Engine() == nil {
 		return false
 	}
 	select {

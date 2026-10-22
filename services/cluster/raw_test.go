@@ -17,8 +17,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Only a cookie this forge signed is read, and a token the node does not
-// know committed is never waited for: the wait comes before authentication.
+// Only a cookie this forge signed is read, and the wait, which comes before
+// authentication, is bounded in time and in number.
 func TestReadAfterWriteCookieIsSignedAndBounded(t *testing.T) {
 	defer test.MockVariableValue(&setting.SecretKey, "secret-a")()
 	tok := consensus.Token{Cluster: consensus.ClusterID{1}, Epoch: 1, Term: 1, Index: 7}
@@ -41,10 +41,16 @@ func TestReadAfterWriteCookieIsSignedAndBounded(t *testing.T) {
 
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	r := tc.nodes[0].r
-	far := consensus.Token{Cluster: tok.Cluster, Epoch: 1, Term: 1, Index: r.Engine().Status().Commit + 1000}
-	start := time.Now()
-	assert.False(t, r.waitBounded(httptest.NewRequest("GET", "/", nil), far, "o/r.git"))
-	assert.Less(t, time.Since(start), 100*time.Millisecond, "beyond the known commit: no wait")
+	_, ident := r.table.Applied()
+	far := consensus.Token{Cluster: ident.Cluster, Epoch: ident.Epoch, Term: 1, Index: r.Engine().Status().Commit + 1000}
+	func() {
+		defer test.MockVariableValue(&setting.Cluster.ReadAfterWriteTimeout, 200*time.Millisecond)()
+		start := time.Now()
+		assert.False(t, r.waitBounded(httptest.NewRequest("GET", "/", nil), far, "o/r.git"))
+		took := time.Since(start)
+		assert.GreaterOrEqual(t, took, 200*time.Millisecond, "beyond the known commit: the node waits for it")
+		assert.Less(t, took, 2*time.Second, "within READ_AFTER_WRITE_TIMEOUT")
+	}()
 
 	// Past the cap, a request does not wait either.
 	for range cap(rawWaiters) {
@@ -55,8 +61,8 @@ func TestReadAfterWriteCookieIsSignedAndBounded(t *testing.T) {
 			<-rawWaiters
 		}
 	}()
-	near := consensus.Token{Cluster: tok.Cluster, Epoch: 1, Term: 1, Index: r.Engine().Status().Commit}
-	start = time.Now()
+	near := consensus.Token{Cluster: ident.Cluster, Epoch: ident.Epoch, Term: 1, Index: r.Engine().Status().Commit + 1000}
+	start := time.Now()
 	assert.False(t, r.waitBounded(httptest.NewRequest("GET", "/", nil), near, "o/r.git"))
 	assert.Less(t, time.Since(start), 100*time.Millisecond)
 }
