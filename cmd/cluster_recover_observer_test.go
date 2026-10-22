@@ -8,6 +8,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -176,4 +178,27 @@ func TestRecoverProbesTheOldMembers(t *testing.T) {
 	defer test.MockVariableValue(&setting.Cluster.Peers, map[string]string{})()
 	require.ErrorContains(t, run(), "no old member to probe")
 	require.NoError(t, run("--force-old-members-answer"))
+}
+
+// The promotion's timeline history reaches the fresh archive: PostgreSQL
+// wrote it with archiving off and never hands it to archive_command, and
+// without it the observer covers no checkpoint of the new timeline (#115).
+func TestRecoverArchivesThePromotedHistory(t *testing.T) {
+	pgdata, dir := t.TempDir(), t.TempDir()
+	wal := filepath.Join(pgdata, "pg_wal")
+	require.NoError(t, os.MkdirAll(filepath.Join(wal, "archive_status"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(wal, "00000002.history"), []byte("1\t0/3000000\tno recovery target specified\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(wal, "00000003.history"), []byte("1\t0/3000000\n2\t0/5011940\tbefore 0/5011940\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(wal, "000000030000000000000005"), []byte("segment"), 0o600))
+
+	require.Error(t, archiveHistories(pgdata, dir, 3), "no history past the checkpoint's timeline: not promoted")
+	require.NoError(t, archiveHistories(pgdata, dir, 2))
+	for _, name := range []string{"00000002.history", "00000003.history"} {
+		_, err := os.Stat(filepath.Join(dir, name))
+		require.NoError(t, err, name)
+	}
+	_, err := os.Stat(filepath.Join(dir, "000000030000000000000005"))
+	assert.True(t, os.IsNotExist(err), "segments are PostgreSQL's to archive")
+	// A second run, after a crash, finds the same bytes and succeeds.
+	require.NoError(t, archiveHistories(pgdata, dir, 2))
 }

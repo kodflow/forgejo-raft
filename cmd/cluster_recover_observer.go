@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -263,6 +264,12 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		if dir == "" {
 			return errors.New("--wal-archive-dir or [cluster] WAL_ARCHIVE_DIR is required: the recovered primary archives afresh")
 		}
+		// The promotion wrote the new timeline's history with archiving
+		// off: PostgreSQL never hands it to archive_command, and without
+		// it the observer covers no checkpoint of the new timeline.
+		if err := archiveHistories(c.String("pgdata"), dir, m.Checkpoint.Timeline); err != nil {
+			return err
+		}
 		exe, _ := os.Executable()
 		opt.ArchiveCommand = fmt.Sprintf("%s cluster wal-archive --dir %s %%p %%f", exe, dir)
 		conf, err := observer.PrimaryConfig(opt)
@@ -498,6 +505,38 @@ func runPGCtl(ctx context.Context, ctl, pgdata, action string) error {
 // system is the checkpoint's, it left recovery, and promoted past the
 // checkpoint's timeline, which PostgreSQL does only once the target is
 // reached (an unreached target stops it instead).
+// historyName is a timeline history file in pg_wal.
+var historyName = regexp.MustCompile(`^[0-9A-F]{8}\.history$`)
+
+// archiveHistories copies every timeline history of pgdata's pg_wal into
+// the fresh archive, then checks that it holds the history of a timeline
+// past the checkpoint's: the one the promotion started.
+func archiveHistories(pgdata, dir string, from uint32) error {
+	walDir := filepath.Join(pgdata, "pg_wal")
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		return fmt.Errorf("reading the promoted timeline's history: %w", err)
+	}
+	newest := uint64(0)
+	for _, e := range entries {
+		if e.IsDir() || !historyName.MatchString(e.Name()) {
+			continue
+		}
+		if err := cluster.ArchiveWAL(filepath.Join(walDir, e.Name()), e.Name(), dir); err != nil {
+			return fmt.Errorf("archiving %s: %w", e.Name(), err)
+		}
+		tli, _ := strconv.ParseUint(strings.TrimSuffix(e.Name(), ".history"), 16, 32)
+		newest = max(newest, tli)
+	}
+	if newest <= uint64(from) {
+		return fmt.Errorf("%s holds no history past timeline %d: PostgreSQL did not promote", walDir, from)
+	}
+	if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("%08X.history", newest))); err != nil {
+		return fmt.Errorf("the fresh archive does not hold the history of timeline %d: %w", newest, err)
+	}
+	return nil
+}
+
 func checkPromoted(ctx context.Context, m *observer.Manifest) error {
 	rows, err := db.GetEngine(ctx).Query(`SELECT pg_is_in_recovery()::text AS rec,
 		(SELECT system_identifier::text FROM pg_control_system()) AS sysid,

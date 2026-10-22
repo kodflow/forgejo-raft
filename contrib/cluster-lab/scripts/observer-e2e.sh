@@ -299,6 +299,11 @@ OFF_STATE="$(dco exec -T -u git forgejo-r psql -h /data/pgsock -p 5432 -U forgej
   "SELECT (SELECT count(*) FROM issue), (SELECT string_agg(commit_id, ',' ORDER BY name) FROM branch WHERE is_deleted = false)" | tr -d '\r')"
 [ "$OFF_STATE" = "$ON_STATE" ] || fail "inclusive off ($OFF_STATE) and on ($ON_STATE) disagree"
 ok "inclusive off and on replay to the same rows: the position starts no record before it"
+# The promotion wrote the new timeline's history with archiving off: the
+# recovery archives it itself, or no observer ever covers the new lineage.
+HISTORIES="$(dco exec -T -u git forgejo-r sh -c 'ls /data/wal-archive | grep "\.history$"' | tr -d '\r' | tr '\n' ' ')"
+[ -n "$HISTORIES" ] || fail "the fresh archive holds no timeline history"
+ok "the fresh archive holds the promoted timeline's history: $HISTORIES"
 
 say "7. The recovered forge"
 dco exec -d -u 0 forgejo-r sh -c 'set -a; . /data/recover/rotated.env; set +a; cd /etc/s6/gitea && . ./setup >/dev/null && exec su-exec git /usr/local/bin/gitea web'
