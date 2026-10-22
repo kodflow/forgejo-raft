@@ -190,6 +190,7 @@ func Init(ctx context.Context) error {
 	}
 	if setting.Cluster.ExpectedNodes >= 3 {
 		r.auto = newAutoMode(r.objects)
+		r.auto.revoked = r.keyRevoked
 		r.objects.hello = r.helloOf
 		r.writerHook = registeredWriterHook()
 	}

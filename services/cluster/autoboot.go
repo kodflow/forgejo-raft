@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"sort"
@@ -74,6 +75,13 @@ type autoMode struct {
 	// rejoin replaces this node's consensus identity once a quorum says
 	// its id is retired (retire.go).
 	rejoin func(ctx context.Context) error
+	// lastOwn is the last membership this node's engine listed, which a
+	// closed engine no longer does (retire.go). Only the autopilot's
+	// goroutine touches it.
+	lastOwn consensus.Membership
+	// revoked reports a key this node's table holds revoked: a JOIN never
+	// trusts an answer under such a key. Nil revokes nothing.
+	revoked func(spki [32]byte) bool
 	// stopNoted is set once a stopped engine's refusal to rejoin is logged.
 	stopNoted atomic.Bool
 	// disk is what the data directory held when the node read it.
@@ -106,11 +114,38 @@ type hello struct {
 	Index   uint64   `json:"index,omitempty"`
 	Voters  []string `json:"voters,omitempty"`
 	Retired []string `json:"retired,omitempty"`
+	// Asked is the id the asking node named (?node=), and AskedRetired
+	// whether the answering node's membership retired it: the answer to
+	// a node that names itself, in place of the Retired list, which only
+	// grows (#93). An older binary ignores the question and sends the
+	// list, which a node reads all the same.
+	Asked        string `json:"asked,omitempty"`
+	AskedRetired bool   `json:"asked_retired,omitempty"`
 	// Payload is the highest command version the answering binary
 	// applies; absent from older binaries, which apply version 1 only.
 	Payload int `json:"payload,omitempty"`
 	// SPKI is the key the handshake proved, never read from the body.
 	SPKI [32]byte `json:"-"`
+}
+
+// helloReadLimit bounds a hello read: far above any answer to a node that
+// names itself, and room for about fifty thousand retired ids from an
+// older binary that sends the whole list (#93).
+const helloReadLimit = 1 << 20
+
+// retires reports whether this answer says the node id is retired: the
+// direct answer to the question when the node asked it, else the list.
+func (h hello) retires(id string) bool {
+	if h.Asked == id {
+		return h.AskedRetired
+	}
+	return slices.Contains(h.Retired, id)
+}
+
+// answerFor turns a hello into the answer to a node that named itself:
+// whether that id is retired, without the list.
+func (h *hello) answerFor(id string) {
+	h.Asked, h.AskedRetired, h.Retired = id, slices.Contains(h.Retired, id), nil
 }
 
 const (
@@ -369,7 +404,9 @@ func (a *autoMode) discoverForJoin(ctx context.Context) ([]string, [][32]byte) {
 	var addrs []string
 	var pins [][32]byte
 	for _, h := range a.round(ctx) {
-		if h.State != helloMember {
+		if h.State != helloMember || (a.revoked != nil && a.revoked(h.SPKI)) {
+			// A revoked key's answer is no member to join through: it
+			// would pin that key for the JOIN (#49).
 			continue
 		}
 		addrs = append(addrs, h.Address)
@@ -398,7 +435,15 @@ func (oc *objectChannel) probeHello(ctx context.Context, consensusAddr, slot str
 		TLSClientConfig:   cfg,
 		DisableKeepAlives: true, TLSHandshakeTimeout: peerHandshakeTimeout,
 	}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+addr+helloPath, nil)
+	u := "https://" + addr + helloPath
+	if oc.self != nil {
+		if id := oc.self(); id != 0 {
+			// Naming itself, the node gets whether its id is retired
+			// rather than every retired id (#93).
+			u += "?node=" + url.QueryEscape(id.String())
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return hello{}, err
 	}
@@ -411,7 +456,7 @@ func (oc *objectChannel) probeHello(ctx context.Context, consensusAddr, slot str
 		return hello{}, fmt.Errorf("%s answered %s", addr, resp.Status)
 	}
 	var h hello
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&h); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, helloReadLimit)).Decode(&h); err != nil {
 		return hello{}, err
 	}
 	// The slot and the key are the certificate's, whatever the body says.

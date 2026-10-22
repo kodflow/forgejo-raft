@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"forgejo.org/modules/log"
@@ -112,7 +113,7 @@ func (r *Replicator) maybeRaisePayload(ctx context.Context, m consensus.Membersh
 		return
 	}
 	r.payloadProbe = r.auto.now().Add(payloadProbeEvery)
-	if !everyMemberApplies(m, r.selfID(), r.auto.round(ctx)) {
+	if !everyMemberApplies(m, r.selfID(), r.auto.round(ctx), r.trustedAnswer) {
 		return
 	}
 	if err := r.RaisePayloadVersion(ctx, autopilotOperator); err != nil {
@@ -123,16 +124,18 @@ func (r *Replicator) maybeRaisePayload(ctx context.Context, m consensus.Membersh
 }
 
 // everyMemberApplies reports whether every member other than self answered
-// as itself (its node id) with a binary that applies reftable.PayloadVersion.
-func everyMemberApplies(m consensus.Membership, self consensus.NodeID, seen []hello) bool {
-	ok := map[string]bool{}
-	for _, h := range seen {
-		if h.Payload >= reftable.PayloadVersion {
-			ok[h.Node] = true
-		}
-	}
+// as itself, under its slot and its key (trusted) and with its node id,
+// with a binary that applies reftable.PayloadVersion. The node id alone is
+// the body's word: any holder of a certificate of the CA could claim to be
+// the member still on an older binary (#49).
+func everyMemberApplies(m consensus.Membership, self consensus.NodeID, seen []hello, trusted func(consensus.Member, hello) bool) bool {
 	for _, x := range m.Members {
-		if x.ID != self && !ok[x.ID.String()] {
+		if x.ID == self {
+			continue
+		}
+		if !slices.ContainsFunc(seen, func(h hello) bool {
+			return h.Node == x.ID.String() && h.Payload >= reftable.PayloadVersion && trusted(x, h)
+		}) {
 			return false
 		}
 	}

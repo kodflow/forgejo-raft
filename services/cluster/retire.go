@@ -5,9 +5,9 @@ package cluster
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
-	"slices"
 	"time"
 
 	"forgejo.org/modules/log"
@@ -19,8 +19,9 @@ import (
 // the engine never admits it again (R8-11). It rejoins under a new id, by
 // itself, and only once a quorum confirmed that its id is retired:
 //
-//  1. a majority of the voters of the newest committed membership any
-//     member reports list this node's id among the retired ones;
+//  1. a majority of the voters of this node's own committed membership,
+//     each authenticated by its slot and key, say this node's id is
+//     retired;
 //  2. the consensus data directory is RENAMED to a dated directory, kept
 //     for the operator, never deleted;
 //  3. a new id is stamped, the node joins through the CA admission and
@@ -96,27 +97,51 @@ func (r *Replicator) removedRecords(m consensus.Membership) []RemovedView {
 }
 
 // retiredConfirmed reports whether a quorum says self is retired: a
-// majority of the voters of the newest membership among the answers each
-// list it as retired. Answers from other nodes only: this node's own view
-// may be stale either way.
-func retiredConfirmed(self consensus.NodeID, seen []hello) bool {
-	var newest *hello
-	for i := range seen {
-		h := &seen[i]
-		if h.State == helloMember && (newest == nil || h.Index > newest.Index) {
-			newest = h
+// majority of the voters of this node's own committed membership, the one
+// view it can trust, each answered under its own key that self is retired.
+// Nothing an answer's body says of the membership (its node id, its index,
+// its voters) is believed: one forged answer, from any holder of a
+// certificate of the CA, would otherwise retire a healthy member (#49).
+// trusted says whether an answer came from a member, by its slot and the
+// key the handshake proved, under a key nobody revoked.
+func retiredConfirmed(self consensus.NodeID, own consensus.Membership, seen []hello, trusted func(consensus.Member, hello) bool) bool {
+	voters, confirmed := 0, 0
+	for _, m := range own.Members {
+		if !m.Voter {
+			continue
+		}
+		voters++
+		if m.ID == self {
+			continue
+		}
+		for _, h := range seen {
+			if h.State == helloMember && trusted(m, h) && h.retires(self.String()) {
+				confirmed++
+				break
+			}
 		}
 	}
-	if newest == nil || len(newest.Voters) == 0 {
+	return voters > 0 && confirmed >= voters/2+1
+}
+
+// trustedAnswer reports whether a hello came from member m: the slot and
+// the key of its object channel, which the handshake proved, and neither
+// key revoked. The body's node id is not compared: a member's machine that
+// rejoined under a new id still speaks for that key.
+func (r *Replicator) trustedAnswer(m consensus.Member, h hello) bool {
+	if m.SPKI == ([32]byte{}) || h.Slot != m.Slot {
 		return false
 	}
-	confirmed := 0
-	for _, h := range seen {
-		if slices.Contains(newest.Voters, h.Node) && slices.Contains(h.Retired, self.String()) {
-			confirmed++
-		}
+	pin := m.SPKI
+	if r.objects != nil {
+		pin = r.objects.pin(m)
 	}
-	return confirmed >= len(newest.Voters)/2+1
+	return h.SPKI == pin && !r.keyRevoked(m.SPKI) && !r.keyRevoked(h.SPKI)
+}
+
+// keyRevoked reports whether this node's table holds the key revoked.
+func (r *Replicator) keyRevoked(spki [32]byte) bool {
+	return r.table != nil && r.table.KeyRevoked(hex.EncodeToString(spki[:]))
 }
 
 // checkRetired runs on a node that does not lead: when it is not in its own
@@ -137,10 +162,18 @@ func (r *Replicator) checkRetired(ctx context.Context, eng consensus.Engine) {
 		}
 		return
 	}
-	if Rank(eng.Membership(), self) > 0 && probeLeader(ctx, eng) {
+	own := eng.Membership()
+	if len(own.Members) > 0 {
+		r.auto.lastOwn = own
+	} else {
+		// An engine a failed rejoin closed lists nobody: the membership
+		// it held last is still the one this node trusts.
+		own = r.auto.lastOwn
+	}
+	if Rank(own, self) > 0 && probeLeader(ctx, eng) {
 		return
 	}
-	if !retiredConfirmed(self, r.auto.round(ctx)) {
+	if !retiredConfirmed(self, own, r.auto.round(ctx), r.trustedAnswer) {
 		return
 	}
 	log.Warn("cluster: a quorum says this node's id %s is retired: it rejoins under a new id", self)
