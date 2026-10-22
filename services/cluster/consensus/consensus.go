@@ -386,10 +386,14 @@ type Report struct {
 	Snapshot    *SnapshotMeta
 	Quarantined bool
 	// Markers names the stop markers of the directory, which only an
-	// operator clears.
+	// operator clears: STOP-RECOVER for a Recover interrupted before it
+	// completed.
 	Markers []string
 	Detail  []string
 }
+
+// MarkerRecover is the stop marker of a Recover that did not complete.
+const MarkerRecover = "STOP-RECOVER"
 
 // QuarantineExit is the way out of a LOG_CORRUPT quarantine (R3-09).
 type QuarantineExit uint8
@@ -417,9 +421,10 @@ type RecoverOptions struct {
 
 // RestoreOptions mirrors the SDK's options for a restore from a backup.
 type RestoreOptions struct {
-	// Meta is the engine's encoding of the snapshot's metadata.
+	// Meta is the engine's encoding of the snapshot's metadata. The file
+	// itself is authenticated by its caller, against the digest `snapshot
+	// save` wrote; the engine checks the decoded stream against Meta.
 	Meta     []byte
-	Expected [32]byte
 	Confirm  string
 	Operator Operator
 	MaxBytes int64
@@ -436,6 +441,13 @@ type Driver interface {
 	Recover(dir string, newCluster ClusterID, members []Member, opt RecoverOptions) error
 	Restore(dir string, r io.Reader, newCluster ClusterID, members []Member, opt RestoreOptions) (SnapshotMeta, error)
 	ClearQuarantine(dir string, exit QuarantineExit, op Operator) error
+}
+
+// SnapshotOrigin is implemented by a driver that reads, in a snapshot's
+// metadata, the cluster it was cut from and that cluster's voters at the
+// cut: a restore fences them before it founds a new cluster.
+type SnapshotOrigin interface {
+	SnapshotOrigin(meta []byte) (ClusterID, []NodeID, error)
 }
 
 var drivers = map[string]Driver{}

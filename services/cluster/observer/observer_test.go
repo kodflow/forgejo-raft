@@ -6,6 +6,7 @@ package observer
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -21,6 +22,8 @@ import (
 
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/json"
+	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/reftable"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -190,13 +193,15 @@ func TestObserverRejectsForkOrRollback(t *testing.T) {
 			if req.Op != clusterhook.OpExportCheckpoints {
 				return data
 			}
+			// The leader's table describes the accepted checkpoint
+			// otherwise; the view goes through the export's own filter.
 			var v clusterhook.ExportView
 			require.NoError(t, json.Unmarshal(data, &v))
 			for i := range v.Checkpoints {
-				v.Checkpoints[i].Root = strings.Repeat("0", 64)
+				if v.Checkpoints[i].Name == before.Checkpoints[0].Name {
+					v.Checkpoints[i].Root = strings.Repeat("f", 64)
+				}
 			}
-			// The rewritten one is served again, whatever was asked.
-			v.Checkpoints = append(v.Checkpoints, clusterhook.ExportCheckpoint{Name: before.Checkpoints[0].Name, Root: strings.Repeat("f", 64)})
 			b, _ := json.Marshal(v)
 			return b
 		}
@@ -277,7 +282,7 @@ func TestObserverPoisonKeepsOlderCheckpoint(t *testing.T) {
 
 	// The clean repository materializes from its namespace, checked again.
 	target := filepath.Join(t.TempDir(), "demo.git")
-	require.NoError(t, o.store.git.Materialize(ctx, "alice/demo.git", clean.Name(), target, "sha1", m.Repos["alice/demo.git"].Symbolic))
+	require.NoError(t, o.store.git.Materialize(ctx, "alice/demo.git", clean.Name(), target, "sha1", true, m.Repos["alice/demo.git"].Symbolic))
 	c.git(target, "fsck", "--strict")
 	assert.Equal(t, cleanMain.SHA, c.git(target, "rev-parse", "refs/heads/main"))
 	assert.Equal(t, "refs/heads/main", c.git(target, "symbolic-ref", "HEAD"))
@@ -390,6 +395,35 @@ func TestObserverPrunesOnlyProtectedOldCheckpoints(t *testing.T) {
 	refs, err := o.store.git.refs(ctx, o.store.git.dir("alice/demo.git"), first)
 	require.NoError(t, err)
 	assert.Empty(t, refs)
+}
+
+// Passes after a prune go on: the pruned checkpoint is never handed to the
+// hook again, and new checkpoints are ingested and protected (#109).
+func TestHuntR8ProvePassesAfterPrune(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	h := &hookLog{}
+	o := newTestObserver(t, c, h)
+	seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	first := o.State().Checkpoints[0].Name
+	o.cfg.LiveKeep = 1
+	c.push("alice/demo.git", "refs/heads/main", c.commit("z"))
+	c.checkpoint()
+	require.NoError(t, o.Step(ctx))
+	require.Equal(t, StatePruned, o.State().Checkpoints[0].State)
+	calls := len(h.calls)
+	for i := range 3 {
+		c.push("alice/demo.git", "refs/heads/main", c.commit(fmt.Sprintf("after the prune %d", i)))
+		c.checkpoint()
+		require.NoError(t, o.Step(ctx), "pass %d after the prune", i)
+	}
+	assert.NotContains(t, h.calls[calls:], first, "the hook ran again for the pruned checkpoint")
+	st := o.State()
+	require.Len(t, st.Checkpoints, 5)
+	assert.Equal(t, StateProtected, st.Checkpoints[4].State)
+	_, err := os.Stat(o.store.path("checkpoints", first))
+	assert.True(t, os.IsNotExist(err))
 }
 
 // A gap in the archive is not waited out: after gapPasses passes the base
@@ -508,4 +542,236 @@ func TestObserverRefusesAnInvalidWALName(t *testing.T) {
 	require.ErrorContains(t, err, "invalid WAL name")
 	_, serr := os.Stat(filepath.Join(o.cfg.Dir, "..", "escape.history"))
 	assert.True(t, os.IsNotExist(serr))
+}
+
+// A checkpoint name comes from a member, which may be compromised: a name
+// that climbs out of staging ("..", "../..") or an absolute path never
+// removes the store, its protected checkpoints, nor a file beside it, and
+// the view that names it is passed over (#110).
+func TestHuntR8ProveObserverDotDotWipesStore(t *testing.T) {
+	for _, name := range []string{"..", "../..", "../../..", "/etc"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			c := newFakeCluster(t)
+			// The store sits four levels deep in the test's own directory:
+			// should the defect come back, what it removes stays there.
+			root := t.TempDir()
+			cfg := newTestObserver(t, c, &hookLog{}).cfg
+			cfg.Dir = filepath.Join(root, "a", "b", "c", "obs")
+			require.NoError(t, os.MkdirAll(cfg.Dir, 0o700))
+			o, err := New(cfg)
+			require.NoError(t, err)
+			seed(t, c, o)
+			require.NoError(t, o.Step(ctx))
+			protected := o.State().Checkpoints[0].Name
+			require.Equal(t, StateProtected, o.State().Checkpoints[0].State)
+			precious := filepath.Join(filepath.Dir(o.store.dir), "precious-outside-the-observer")
+			require.NoError(t, os.WriteFile(precious, []byte("keep"), 0o600))
+
+			// Every member, leader or not, names the forged checkpoint in a
+			// higher term.
+			c.tamper = func(_ string, req *clusterhook.ExportRequest, data []byte) []byte {
+				if req.Op != clusterhook.OpExportCheckpoints {
+					return data
+				}
+				var v clusterhook.ExportView
+				require.NoError(t, json.Unmarshal(data, &v))
+				v.Term++
+				v.Checkpoints = append(v.Checkpoints, clusterhook.ExportCheckpoint{Name: name, Lineage: v.Lineage, Index: 1 << 40})
+				b, err := json.Marshal(v)
+				require.NoError(t, err)
+				return b
+			}
+			require.Error(t, o.Step(ctx))
+			// The same name handed to ingest directly.
+			require.ErrorContains(t, o.ingest(ctx, "node-a", clusterhook.ExportCheckpoint{Name: name, Lineage: c.lineage().String(), Index: 1 << 40}, nil), "invalid checkpoint name")
+
+			for _, p := range []string{o.store.path("state.json"), o.store.path("checkpoints", protected, "PROTECTED"), o.store.path("git"), precious} {
+				_, err := os.Stat(p)
+				require.NoError(t, err, "%s survives", p)
+			}
+			reopened, err := New(o.cfg)
+			require.NoError(t, err)
+			assert.Equal(t, o.State().Lineage, reopened.State().Lineage)
+			assert.Len(t, reopened.State().Checkpoints, 1)
+		})
+	}
+}
+
+// store.path never yields a path outside the store.
+func TestStorePathStaysInside(t *testing.T) {
+	s := newStore(t.TempDir(), "git")
+	for _, elem := range [][]string{{"staging", ".."}, {"staging", "../.."}, {"..", "x"}, {"staging", "a/../../b"}} {
+		assert.Empty(t, s.path(elem...), "%v", elem)
+	}
+	assert.Equal(t, filepath.Join(s.dir, "staging", "x"), s.path("staging", "x"))
+}
+
+// recoverFake starts a new lineage on the fake cluster as recover
+// --from-observer does: a new identity, a log that restarts from index 1,
+// a table holding the restored refs.
+func recoverFake(c *fakeCluster, id byte) {
+	c.mu.Lock()
+	c.cluster = consensus.ClusterID{id, 0x15}
+	c.log, c.compacted = nil, 0
+	c.table = reftable.New()
+	c.term = 1
+	c.mu.Unlock()
+}
+
+// The cursor is held per lineage: after a new lineage is accepted, its
+// checkpoints are ingested although their indexes are below the newest
+// one accepted in the old lineage (#55).
+func TestHuntR2ProveLinCurRecoverRestartsAtOne(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	for i := range 4 {
+		c.push("alice/demo.git", "refs/heads/main", c.commit(fmt.Sprintf("old %d", i)))
+		c.checkpoint()
+		require.NoError(t, o.Step(ctx))
+	}
+	oldLast := o.lastIndex()
+	require.Greater(t, oldLast, uint64(12))
+
+	recoverFake(c, 0x0d)
+	c.push("alice/demo.git", "refs/heads/main", c.commit("after recover"))
+	cp := c.checkpoint()
+	require.Less(t, cp.Index, oldLast)
+	require.ErrorIs(t, o.Step(ctx), ErrQuarantined)
+	q := o.State().Quarantine
+	require.NotNil(t, q)
+	require.NoError(t, o.Accept(q.Lineage))
+	require.NoError(t, o.Step(ctx))
+	st := o.State()
+	a, ok := st.newestOf(q.Lineage)
+	require.True(t, ok, "a checkpoint of the new lineage is accepted")
+	assert.Equal(t, cp.Name(), a.Name)
+
+	// The next one follows in the new lineage.
+	c.push("alice/demo.git", "refs/heads/main", c.commit("after recover 2"))
+	cp = c.checkpoint()
+	require.NoError(t, o.Step(ctx))
+	st = o.State()
+	a, _ = st.newestOf(q.Lineage)
+	assert.Equal(t, cp.Name(), a.Name)
+}
+
+// A restore of an older snapshot starts a lineage below the newest index
+// accepted: it is followed from its first checkpoint (#55).
+func TestHuntR2ProveLinCurRestoreOlderSnapshot(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	snapshot := append([]consensus.Entry(nil), c.log...)
+	for i := range 3 {
+		c.push("alice/demo.git", "refs/heads/main", c.commit(fmt.Sprintf("old %d", i)))
+		c.checkpoint()
+		require.NoError(t, o.Step(ctx))
+	}
+	oldLast := o.lastIndex()
+
+	// The restored cluster replays the snapshot's entries under its new
+	// identity, then goes on.
+	recoverFake(c, 0x0e)
+	for _, e := range snapshot {
+		e.Token.Cluster = c.cluster
+		c.log = append(c.log, e)
+		c.table.Apply(e)
+	}
+	c.push("alice/demo.git", "refs/heads/main", c.commit("after restore"))
+	cp := c.checkpoint()
+	require.Less(t, cp.Index, oldLast)
+	require.ErrorIs(t, o.Step(ctx), ErrQuarantined)
+	require.NoError(t, o.Accept(o.State().Quarantine.Lineage))
+	require.NoError(t, o.Step(ctx))
+	st := o.State()
+	a, ok := st.newestOf(c.lineage().String())
+	require.True(t, ok)
+	assert.Equal(t, cp.Name(), a.Name)
+}
+
+// An accepted checkpoint described otherwise is seen through the
+// export's real filter, and before a compacted log jumps past it; one
+// gone from the leader's table while an older one is listed is a fork too
+// (#87).
+func TestHuntR5ProveCheckKnownDead(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T) (*fakeCluster, *Observer, Accepted) {
+		c := newFakeCluster(t)
+		o := newTestObserver(t, c, &hookLog{})
+		seed(t, c, o)
+		require.NoError(t, o.Step(ctx))
+		c.push("alice/demo.git", "refs/heads/main", c.commit("two"))
+		c.checkpoint()
+		require.NoError(t, o.Step(ctx))
+		require.Len(t, o.State().Checkpoints, 2)
+		return c, o, o.State().Checkpoints[1]
+	}
+	rewrite := func(c *fakeCluster, name string) {
+		c.tamper = func(_ string, req *clusterhook.ExportRequest, data []byte) []byte {
+			if req.Op != clusterhook.OpExportCheckpoints {
+				return data
+			}
+			var v clusterhook.ExportView
+			_ = json.Unmarshal(data, &v)
+			for i := range v.Checkpoints {
+				if v.Checkpoints[i].Name == name {
+					v.Checkpoints[i].Root = strings.Repeat("e", 64)
+				}
+			}
+			b, _ := json.Marshal(v)
+			return b
+		}
+	}
+
+	t.Run("the real filter shows an accepted checkpoint", func(t *testing.T) {
+		c, o, a := setup(t)
+		rewrite(c, a.Name)
+		err := o.Step(ctx)
+		require.ErrorIs(t, err, ErrQuarantined)
+		assert.Contains(t, err.Error(), "described otherwise")
+	})
+
+	t.Run("fork then compaction", func(t *testing.T) {
+		c, o, a := setup(t)
+		rewrite(c, a.Name)
+		c.push("alice/demo.git", "refs/heads/main", c.commit("three"))
+		c.checkpoint()
+		c.mu.Lock()
+		c.compacted = uint64(len(c.log))
+		c.mu.Unlock()
+		err := o.Step(ctx)
+		require.ErrorIs(t, err, ErrQuarantined)
+		assert.Len(t, o.State().Checkpoints, 2, "nothing of the divergent history is accepted")
+	})
+
+	t.Run("an accepted checkpoint gone from the table", func(t *testing.T) {
+		c, o, a := setup(t)
+		c.tamper = func(_ string, req *clusterhook.ExportRequest, data []byte) []byte {
+			if req.Op != clusterhook.OpExportCheckpoints {
+				return data
+			}
+			var v clusterhook.ExportView
+			_ = json.Unmarshal(data, &v)
+			v.Checkpoints = slices.DeleteFunc(v.Checkpoints, func(cp clusterhook.ExportCheckpoint) bool { return cp.Name == a.Name })
+			b, _ := json.Marshal(v)
+			return b
+		}
+		err := o.Step(ctx)
+		require.ErrorIs(t, err, ErrQuarantined)
+		assert.Contains(t, err.Error(), "gone from the leader's table")
+	})
+
+	t.Run("control: an honest leader", func(t *testing.T) {
+		c, o, _ := setup(t)
+		c.push("alice/demo.git", "refs/heads/main", c.commit("three"))
+		c.checkpoint()
+		require.NoError(t, o.Step(ctx))
+		assert.Len(t, o.State().Checkpoints, 3)
+	})
 }

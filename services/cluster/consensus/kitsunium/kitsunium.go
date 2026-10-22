@@ -253,9 +253,6 @@ func (driver) Restore(dir string, r io.Reader, newCluster consensus.ClusterID, m
 	if err := sdk.ParseSnapshotMeta(opt.Meta, &expected); err != nil {
 		return consensus.SnapshotMeta{}, fmt.Errorf("the snapshot's metadata file: %w", err)
 	}
-	if expected.SHA256 != opt.Expected {
-		return consensus.SnapshotMeta{}, errors.New("the digest given does not match the snapshot's metadata")
-	}
 	ms := make([]sdk.MemberValue, 0, len(members))
 	for _, m := range members {
 		ms = append(ms, sdkMember(m))
@@ -265,6 +262,20 @@ func (driver) Restore(dir string, r io.Reader, newCluster consensus.ClusterID, m
 		m, err := sdk.RestoreSnapshot(d, r, sdk.ClusterID(newCluster), ms, &so)
 		return snapshotMeta(m), err
 	})
+}
+
+// SnapshotOrigin reads the cluster a snapshot was cut from and its voters
+// at the cut.
+func (driver) SnapshotOrigin(meta []byte) (consensus.ClusterID, []consensus.NodeID, error) {
+	var m sdk.SnapshotMetaValue
+	if err := sdk.ParseSnapshotMeta(meta, &m); err != nil {
+		return consensus.ClusterID{}, nil, fmt.Errorf("the snapshot's metadata file: %w", err)
+	}
+	var voters []consensus.NodeID
+	for _, id := range m.Membership.Voters() {
+		voters = append(voters, consensus.NodeID(id))
+	}
+	return consensus.ClusterID(m.Log.Cluster), voters, nil
 }
 
 func (driver) ClearQuarantine(dir string, exit consensus.QuarantineExit, op consensus.Operator) error {

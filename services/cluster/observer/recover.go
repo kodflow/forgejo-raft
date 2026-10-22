@@ -168,7 +168,10 @@ func (a *Archive) OpenSecrets(name string, priv *[32]byte) (*Bundle, error) {
 }
 
 // RestoreRepos writes every repository of a checkpoint under root, which
-// must hold none of them yet.
+// must hold none of them yet. Run again after an interruption, it keeps a
+// repository an earlier run wrote whole (the checkpoint's refs exactly, no
+// mark left), writes again one it left marked incomplete, and refuses any
+// other.
 func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, error) {
 	m, err := a.store.ReadManifest(name)
 	if err != nil {
@@ -182,11 +185,23 @@ func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, err
 	sort.Strings(repos)
 	for _, repo := range repos {
 		rm := m.Repos[repo]
-		if len(rm.Refs) == 0 {
+		// A repository with no ref but its symbolic HEAD (created empty, or
+		// every branch deleted) exists all the same: it is written empty.
+		if len(rm.Refs) == 0 && len(rm.Symbolic) == 0 {
 			continue
 		}
 		target := filepath.Join(root, filepath.FromSlash(repo))
-		if err := a.store.git.Materialize(ctx, repo, name, target, rm.Format, rm.Symbolic); err != nil {
+		if entries, err := os.ReadDir(target); err == nil && len(entries) > 0 {
+			if _, err := os.Stat(filepath.Join(target, IncompleteMark)); err == nil {
+				if err := os.RemoveAll(target); err != nil {
+					return n, fmt.Errorf("%s: %w", repo, err)
+				}
+			} else if a.store.git.restoredRefs(ctx, target, rm.Refs) {
+				n++
+				continue
+			}
+		}
+		if err := a.store.git.Materialize(ctx, repo, name, target, rm.Format, len(rm.Refs) > 0, rm.Symbolic); err != nil {
 			return n, fmt.Errorf("%s: %w", repo, err)
 		}
 		// git syncs its packs, not its refs nor its directories.
@@ -194,6 +209,12 @@ func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, err
 			return n, fmt.Errorf("%s: %w", repo, err)
 		}
 		if err := syncParents(target, root); err != nil {
+			return n, fmt.Errorf("%s: %w", repo, err)
+		}
+		if err := os.Remove(filepath.Join(target, IncompleteMark)); err != nil {
+			return n, fmt.Errorf("%s: %w", repo, err)
+		}
+		if err := syncDir(target); err != nil {
 			return n, fmt.Errorf("%s: %w", repo, err)
 		}
 		n++

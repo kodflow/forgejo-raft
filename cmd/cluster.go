@@ -15,6 +15,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -88,9 +89,14 @@ func cmdCluster() *cli.Command {
 				Usage: "Offline, into an empty data directory: restore the ref snapshot of a backup",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "file", Required: true},
-					&cli.StringFlag{Name: "sha256", Required: true, Usage: "the digest read from the authenticated backup repository"},
+					&cli.StringFlag{Name: "sha256", Required: true, Usage: "the file's SHA-256, as snapshot save logged it and wrote on the first line of <file>.sha256, read from the authenticated backup repository"},
 					&cli.StringFlag{Name: "new-cluster", Required: true},
 					&cli.StringFlag{Name: "members", Required: true},
+					&cli.StringSliceFlag{Name: "fenced", Usage: "old voter fence: id:method:receipt-file[+receipt-file], one per voter of the cluster the snapshot was cut from"},
+					&cli.StringSliceFlag{Name: "witness-key", Usage: "hex Ed25519 public key of a witness"},
+					&cli.StringFlag{Name: "old-cluster", Usage: "the old cluster to fence, when the one still running succeeded the snapshot's (default: the snapshot's own)"},
+					&cli.StringSliceFlag{Name: "old-peer", Usage: "slot=host:port of an old member's consensus address, probed with PEERS before restoring"},
+					&cli.BoolFlag{Name: "force-old-members-answer", Usage: "restore although an old member answers the probe; logged and kept in the output"},
 				},
 				Action: runClusterRestore,
 			},
@@ -319,7 +325,7 @@ func runClusterRecover(ctx context.Context, c *cli.Command) error {
 	if c.String("from-observer") != "" {
 		return runRecoverFromObserver(ctx, c)
 	}
-	if c.String("members") == "" || len(c.StringSlice("fenced")) == 0 {
+	if c.String("members") == "" {
 		return errors.New("--members and --fenced are required, unless --from-observer")
 	}
 	d, err := clusterDriver()
@@ -334,15 +340,30 @@ func runClusterRecover(ctx context.Context, c *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	opt := consensus.RecoverOptions{Operator: localOperator()}
-	if opt.Fenced, err = parseFenced(c.StringSlice("fenced")); err != nil {
-		return err
-	}
 	rep, err := d.Inspect(setting.Cluster.DataDir)
 	if err != nil {
 		return err
 	}
 	if err := checkRecoverVoters(members, rep); err != nil {
+		return err
+	}
+	opt := consensus.RecoverOptions{Operator: localOperator()}
+	if recoverInterruptedAfterStamp(rep, cid) {
+		// The Recover to cid wrote its stamp and was cut before it removed
+		// its marker: the old cluster was fenced then, and the stamp names
+		// cid now, against which no receipt can exist. Running it again
+		// only removes the marker, confirmed and audited.
+		fmt.Fprintf(c.Root().Writer, "Completing the Recover to %s that was interrupted after its stamp.\n", cid)
+		if err := confirmTyped(c, "the new cluster id", cid.String()); err != nil {
+			return err
+		}
+		opt.Confirm = cid.String()
+		return d.Recover(setting.Cluster.DataDir, cid, members, opt)
+	}
+	if len(c.StringSlice("fenced")) == 0 {
+		return errors.New("--members and --fenced are required, unless --from-observer")
+	}
+	if opt.Fenced, err = parseFenced(c.StringSlice("fenced")); err != nil {
 		return err
 	}
 	old := rep.Cluster
@@ -366,6 +387,12 @@ func runClusterRecover(ctx context.Context, c *cli.Command) error {
 	}
 	opt.Confirm = cid.String()
 	return d.Recover(setting.Cluster.DataDir, cid, members, opt)
+}
+
+// recoverInterruptedAfterStamp tells whether the data directory holds a
+// Recover to cid that wrote its stamp and was cut before it completed.
+func recoverInterruptedAfterStamp(rep consensus.Report, cid consensus.ClusterID) bool {
+	return rep.Cluster == cid && slices.Contains(rep.Markers, consensus.MarkerRecover)
 }
 
 // parseFenced reads the --fenced attestations, id:method:receipt-file
@@ -509,25 +536,73 @@ func runClusterRestore(ctx context.Context, c *cli.Command) error {
 	if err != nil || len(sum) != 32 {
 		return errors.New("--sha256 must be 64 hex digits")
 	}
-	meta, err := os.ReadFile(c.String("file") + ".meta")
-	if err != nil {
-		return fmt.Errorf("the snapshot's metadata, written beside it by `snapshot save`: %w", err)
-	}
-	f, err := os.Open(c.String("file"))
+	f, meta, err := cluster.OpenSavedSnapshot(c.String("file"), [32]byte(sum))
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	// The old cluster is fenced at the witnesses, and none of its members
+	// answers, before a new one is founded from its snapshot: otherwise the
+	// old site, back up, forms its cluster again and two forges write.
+	if err := checkRestoreFence(ctx, c, d, meta, cid); err != nil {
+		return err
+	}
 	if err := confirmTyped(c, "the new cluster id", cid.String()); err != nil {
 		return err
 	}
-	opt := consensus.RestoreOptions{Meta: meta, Expected: [32]byte(sum), Confirm: cid.String(), Operator: localOperator(), MaxBytes: setting.Cluster.MaxSnapshotBytes}
+	opt := consensus.RestoreOptions{Meta: meta, Confirm: cid.String(), Operator: localOperator(), MaxBytes: setting.Cluster.MaxSnapshotBytes}
 	restored, err := d.Restore(setting.Cluster.DataDir, f, cid, members, opt)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(c.Root().Writer, "restored snapshot %s at index %d\n", restored.ID, restored.Position.Index)
 	return nil
+}
+
+// checkRestoreFence refuses a restore until the cluster the snapshot was
+// cut from is fenced: a receipt of every witness for every voter it had at
+// the cut, and no old member answering, as recover requires.
+func checkRestoreFence(ctx context.Context, c *cli.Command, d consensus.Driver, meta []byte, cid consensus.ClusterID) error {
+	var old consensus.ClusterID
+	var voters []string
+	if o, ok := d.(consensus.SnapshotOrigin); ok {
+		cluster, ids, err := o.SnapshotOrigin(meta)
+		if err != nil {
+			return err
+		}
+		old = cluster
+		for _, id := range ids {
+			voters = append(voters, id.String())
+		}
+	}
+	if s := c.String("old-cluster"); s != "" {
+		named, err := consensus.ParseClusterID(s)
+		if err != nil {
+			return fmt.Errorf("--old-cluster: %w", err)
+		}
+		if named != old {
+			// Another cluster's voters are not the snapshot's: the
+			// operator answers for them, with at least one fence.
+			old, voters = named, nil
+		}
+	}
+	if old == (consensus.ClusterID{}) {
+		return errors.New("RECOVER_REFUSED: the snapshot does not name its cluster; give --old-cluster")
+	}
+	if old == cid {
+		return errors.New("RECOVER_REFUSED: --new-cluster is the old cluster's own id")
+	}
+	fenced, err := parseFenced(c.StringSlice("fenced"))
+	if err != nil {
+		return err
+	}
+	if err := fenceCovers(voters, fenced); err != nil {
+		return err
+	}
+	if _, err := verifyWitnessFence(c, old, cid, fenced); err != nil {
+		return err
+	}
+	return checkOldMembersSilent(ctx, c, old, cid)
 }
 
 func runClusterQuarantineClear(ctx context.Context, c *cli.Command) error {

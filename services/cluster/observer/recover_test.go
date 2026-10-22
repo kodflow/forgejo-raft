@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"forgejo.org/services/cluster/reftable"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -206,4 +208,103 @@ func TestRecoverCopiesEveryTimelineHistory(t *testing.T) {
 		require.NoError(t, err, "the restore directory holds %s", h)
 		assert.Equal(t, c.pg.archive[h], b)
 	}
+}
+
+// A repository restore interrupted or failed midway is resumed by running
+// it again: a repository written whole is kept, one left marked incomplete
+// (killed between git init and the fetch) is written again, and a
+// directory this restore did not write is still refused (#58).
+func TestHuntR2ProveStep4ResumeAfterFilesError(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	c.push("bob/other.git", "refs/heads/main", c.commit("other"))
+	cp := seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	a, err := OpenArchive(o.cfg.Dir, "")
+	require.NoError(t, err)
+	m, err := a.Manifest(cp.Name())
+	require.NoError(t, err)
+
+	root := t.TempDir()
+	n, err := a.RestoreRepos(ctx, cp.Name(), root)
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+	for repo := range m.Repos {
+		_, err := os.Stat(filepath.Join(root, repo, IncompleteMark))
+		assert.True(t, os.IsNotExist(err), "%s carries no mark once whole", repo)
+	}
+
+	t.Run("a run that stopped after the repositories", func(t *testing.T) {
+		n, err := a.RestoreRepos(ctx, cp.Name(), root)
+		require.NoError(t, err)
+		assert.Equal(t, 2, n)
+	})
+
+	t.Run("a repository killed between git init and the fetch", func(t *testing.T) {
+		target := filepath.Join(root, "bob", "other.git")
+		require.NoError(t, os.RemoveAll(target))
+		require.NoError(t, os.MkdirAll(target, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(target, IncompleteMark), nil, 0o600))
+		_, err := o.store.git.run(ctx, filepath.Dir(target), nil, "init", "-q", "--bare", target)
+		require.NoError(t, err)
+		n, err := a.RestoreRepos(ctx, cp.Name(), root)
+		require.NoError(t, err)
+		assert.Equal(t, 2, n)
+		assert.True(t, o.store.git.restoredRefs(ctx, target, m.Repos["bob/other.git"].Refs))
+	})
+
+	t.Run("a repository this restore did not write", func(t *testing.T) {
+		other := t.TempDir()
+		target := filepath.Join(other, "alice", "demo.git")
+		require.NoError(t, os.MkdirAll(target, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(target, "precious"), []byte("x"), 0o600))
+		_, err := a.RestoreRepos(ctx, cp.Name(), other)
+		require.ErrorContains(t, err, "is not empty")
+		_, err = os.Stat(filepath.Join(target, "precious"))
+		require.NoError(t, err, "never removed")
+	})
+}
+
+// A repository with its symbolic HEAD alone (created without auto-init, or
+// whose only branch was deleted) is restored, empty, with its HEAD: the
+// forge would otherwise find its row and no directory (#114).
+func TestHuntR8ProveEmptyRepoRestored(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	c.mu.Lock()
+	require.True(t, c.append(reftable.KindRefTxn, &reftable.RefTxn{Repo: "alice/empty.git", Format: "sha1", Updates: []reftable.RefUpdate{{Ref: "HEAD", Symbolic: "refs/heads/trunk"}}}).OK)
+	c.mu.Unlock()
+	c.push("bob/gone.git", "refs/heads/main", c.commit("gone"))
+	c.push("bob/gone.git", "refs/heads/main", "")
+	cp := seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	a, err := OpenArchive(o.cfg.Dir, "")
+	require.NoError(t, err)
+	m, err := a.Manifest(cp.Name())
+	require.NoError(t, err)
+	require.Contains(t, m.Repos, "alice/empty.git")
+	require.Contains(t, m.Repos, "bob/gone.git")
+	require.NoError(t, a.Check(ctx, cp.Name()))
+
+	root := t.TempDir()
+	n, err := a.RestoreRepos(ctx, cp.Name(), root)
+	require.NoError(t, err)
+	assert.Equal(t, 3, n)
+	for repo, head := range map[string]string{"alice/empty.git": "refs/heads/trunk", "bob/gone.git": "refs/heads/main"} {
+		target := filepath.Join(root, repo)
+		out, err := o.store.git.run(ctx, target, nil, "symbolic-ref", "HEAD")
+		require.NoError(t, err, repo)
+		assert.Equal(t, head, strings.TrimSpace(out), repo)
+		out, err = o.store.git.run(ctx, target, nil, "for-each-ref")
+		require.NoError(t, err, repo)
+		assert.Empty(t, strings.TrimSpace(out), "%s holds no ref", repo)
+		_, err = os.Stat(filepath.Join(target, IncompleteMark))
+		assert.True(t, os.IsNotExist(err))
+	}
+	// Resumed, the empty repositories are kept as they are.
+	n, err = a.RestoreRepos(ctx, cp.Name(), root)
+	require.NoError(t, err)
+	assert.Equal(t, 3, n)
 }

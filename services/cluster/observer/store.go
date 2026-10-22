@@ -20,6 +20,7 @@ import (
 
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/json"
+	"forgejo.org/services/cluster/reftable"
 )
 
 // The observer's directory, which the snapshot hook covers whole:
@@ -143,6 +144,34 @@ func (s *State) newest() (Accepted, bool) {
 	return s.Checkpoints[len(s.Checkpoints)-1], true
 }
 
+// newestOf returns the newest checkpoint accepted in lineage. A new
+// lineage restarts its indexes (a Recover from 1, a restore from its
+// snapshot), so a cursor is only ever compared within one lineage.
+func (s *State) newestOf(lineage string) (Accepted, bool) {
+	for _, a := range slices.Backward(s.Checkpoints) {
+		if inLineage(a, lineage) {
+			return a, true
+		}
+	}
+	return Accepted{}, false
+}
+
+// oldestOf returns the oldest checkpoint accepted in lineage.
+func (s *State) oldestOf(lineage string) (Accepted, bool) {
+	for _, a := range s.Checkpoints {
+		if inLineage(a, lineage) {
+			return a, true
+		}
+	}
+	return Accepted{}, false
+}
+
+// inLineage tells whether an accepted checkpoint belongs to lineage: its
+// name is derived from the lineage and its index.
+func inLineage(a Accepted, lineage string) bool {
+	return lineage != "" && a.Name == reftable.CheckpointName(lineage, a.Index)
+}
+
 func (s *State) accepted(name string) (int, bool) {
 	for i, a := range s.Checkpoints {
 		if a.Name == name {
@@ -172,7 +201,15 @@ func newStore(dir, git string) *store {
 	return &store{dir: dir, git: gitStore{root: filepath.Join(dir, "git"), git: git}}
 }
 
+// path joins elem under the store. An element that climbs out (a ".."
+// component) yields "", which every file operation refuses and RemoveAll
+// ignores: a name a member sent never reaches outside its subdirectory.
 func (s *store) path(elem ...string) string {
+	for _, e := range elem {
+		if slices.Contains(strings.FieldsFunc(e, func(r rune) bool { return r == '/' || r == filepath.Separator }), "..") {
+			return ""
+		}
+	}
 	return filepath.Join(append([]string{s.dir}, elem...)...)
 }
 

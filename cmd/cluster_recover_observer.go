@@ -13,7 +13,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -55,13 +57,18 @@ func recoverFromObserverFlags() []cli.Flag {
 // recoverProgress is what a recovery did, kept in <out>/progress.json so a
 // stop for the operator resumes where it was.
 type recoverProgress struct {
-	Checkpoint string    `json:"checkpoint"`
-	NewCluster string    `json:"new_cluster"`
-	Done       []string  `json:"done"`
-	Started    time.Time `json:"started"`
+	Checkpoint string   `json:"checkpoint"`
+	NewCluster string   `json:"new_cluster"`
+	Done       []string `json:"done"`
+	// Begun are the steps that started writing into a target they found
+	// empty: an interrupted one empties it again before it is replayed.
+	Begun   []string  `json:"begun,omitempty"`
+	Started time.Time `json:"started"`
 }
 
 func (p *recoverProgress) done(step string) bool { return slices.Contains(p.Done, step) }
+
+func (p *recoverProgress) begun(step string) bool { return slices.Contains(p.Begun, step) }
 
 // The steps of plan v4's order, by name.
 const (
@@ -124,6 +131,11 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		prog.Done = append(prog.Done, step)
 		b, _ := json.MarshalIndent(prog, "", "  ")
 		fmt.Fprintf(w, "done: %s\n", step)
+		return observer.WriteFileDurable(filepath.Join(out, progressFile), b)
+	}
+	begin := func(step string) error {
+		prog.Begun = append(prog.Begun, step)
+		b, _ := json.MarshalIndent(prog, "", "  ")
 		return observer.WriteFileDurable(filepath.Join(out, progressFile), b)
 	}
 
@@ -199,6 +211,24 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		opt.HBA = string(b)
 	}
 	if !prog.done(stepPG) {
+		// The data directory and the restore directory are emptied again
+		// only when this recovery found them empty and began writing them.
+		targets := []string{c.String("pgdata"), restoreDir}
+		if prog.begun(stepPG) {
+			if err := emptyDirs(targets...); err != nil {
+				return err
+			}
+			fmt.Fprintf(w, "resuming: %s emptied of what the interrupted run wrote\n", strings.Join(targets, " and "))
+		} else {
+			for _, d := range targets {
+				if entries, err := os.ReadDir(d); err == nil && len(entries) > 0 {
+					return fmt.Errorf("%s is not empty", d)
+				}
+			}
+			if err := begin(stepPG); err != nil {
+				return err
+			}
+		}
 		if err := archive.RestorePG(name, c.String("pgdata"), opt); err != nil {
 			return err
 		}
@@ -262,6 +292,12 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		}
 		if dir == "" {
 			return errors.New("--wal-archive-dir or [cluster] WAL_ARCHIVE_DIR is required: the recovered primary archives afresh")
+		}
+		// The promotion wrote the new timeline's history with archiving
+		// off: PostgreSQL never hands it to archive_command, and without
+		// it the observer covers no checkpoint of the new timeline.
+		if err := archiveHistories(c.String("pgdata"), dir, m.Checkpoint.Timeline); err != nil {
+			return err
 		}
 		exe, _ := os.Executable()
 		opt.ArchiveCommand = fmt.Sprintf("%s cluster wal-archive --dir %s %%p %%f", exe, dir)
@@ -498,6 +534,94 @@ func runPGCtl(ctx context.Context, ctl, pgdata, action string) error {
 // system is the checkpoint's, it left recovery, and promoted past the
 // checkpoint's timeline, which PostgreSQL does only once the target is
 // reached (an unreached target stops it instead).
+// emptyDirs removes what each directory holds, keeping the directory: a
+// data directory may be a mount point.
+func emptyDirs(dirs ...string) error {
+	for _, d := range dirs {
+		entries, err := os.ReadDir(d)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if err := os.RemoveAll(filepath.Join(d, e.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// verifyRestoredRepos checks that every repository of the checkpoint,
+// empty ones included, has its directory under root, and reports the SQL
+// repository rows that have none: the forge marks those broken.
+func verifyRestoredRepos(ctx context.Context, m *observer.Manifest, root string, w interface{ Write([]byte) (int, error) }) error {
+	var missing []string
+	for repo, rm := range m.Repos {
+		if len(rm.Refs) == 0 && len(rm.Symbolic) == 0 {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(repo), "HEAD")); err != nil {
+			missing = append(missing, repo)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("repositories of the checkpoint were not restored: %s", strings.Join(missing, ", "))
+	}
+	rows, err := db.GetEngine(ctx).Query(`SELECT owner_name AS owner, lower_name AS repo FROM repository`)
+	if err != nil {
+		return err
+	}
+	var orphans []string
+	for _, r := range rows {
+		repo := strings.ToLower(string(r["owner"])) + "/" + string(r["repo"]) + ".git"
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(repo), "HEAD")); err != nil {
+			orphans = append(orphans, repo)
+		}
+	}
+	sort.Strings(orphans)
+	for _, repo := range orphans {
+		fmt.Fprintf(w, "WARNING: %s has a repository row and no directory: the checkpoint does not hold it\n", repo)
+	}
+	fmt.Fprintf(w, "verified: %d repositories restored, empty ones included\n", len(rows)-len(orphans))
+	return nil
+}
+
+// historyName is a timeline history file in pg_wal.
+var historyName = regexp.MustCompile(`^[0-9A-F]{8}\.history$`)
+
+// archiveHistories copies every timeline history of pgdata's pg_wal into
+// the fresh archive, then checks that it holds the history of a timeline
+// past the checkpoint's: the one the promotion started.
+func archiveHistories(pgdata, dir string, from uint32) error {
+	walDir := filepath.Join(pgdata, "pg_wal")
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		return fmt.Errorf("reading the promoted timeline's history: %w", err)
+	}
+	newest := uint64(0)
+	for _, e := range entries {
+		if e.IsDir() || !historyName.MatchString(e.Name()) {
+			continue
+		}
+		if err := cluster.ArchiveWAL(filepath.Join(walDir, e.Name()), e.Name(), dir); err != nil {
+			return fmt.Errorf("archiving %s: %w", e.Name(), err)
+		}
+		tli, _ := strconv.ParseUint(strings.TrimSuffix(e.Name(), ".history"), 16, 32)
+		newest = max(newest, tli)
+	}
+	if newest <= uint64(from) {
+		return fmt.Errorf("%s holds no history past timeline %d: PostgreSQL did not promote", walDir, from)
+	}
+	if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("%08X.history", newest))); err != nil {
+		return fmt.Errorf("the fresh archive does not hold the history of timeline %d: %w", newest, err)
+	}
+	return nil
+}
+
 func checkPromoted(ctx context.Context, m *observer.Manifest) error {
 	rows, err := db.GetEngine(ctx).Query(`SELECT pg_is_in_recovery()::text AS rec,
 		(SELECT system_identifier::text FROM pg_control_system()) AS sysid,
@@ -559,6 +683,9 @@ func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Wri
 		return fmt.Errorf("the refs and the SQL rows differ at the checkpoint:\n  %s", strings.Join(mismatch, "\n  "))
 	}
 	fmt.Fprintf(w, "verified: %d branches, refs and SQL rows match\n", refs)
+	if err := verifyRestoredRepos(ctx, m, setting.RepoRootPath, w); err != nil {
+		return err
+	}
 
 	if setting.LFS.Storage != nil && setting.LFS.Storage.Type == setting.LocalStorageType {
 		objs, err := e.Query("SELECT DISTINCT oid FROM lfs_meta_object")

@@ -195,13 +195,15 @@ func (o *Observer) Step(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The accepted checkpoints are compared first: a compacted log jumps
+	// to the newest of them, which must still be the leader's.
+	if err := o.checkKnown(view); err != nil {
+		return err
+	}
 	if view.LogSupported {
 		if err := o.follow(ctx, slot, view); err != nil {
 			return err
 		}
-	}
-	if err := o.checkKnown(view); err != nil {
-		return err
 	}
 	cp, ok := o.nextCheckpoint(view)
 	if !ok {
@@ -237,7 +239,7 @@ func (o *Observer) Accept(lineage string) error {
 	case q.Lineage == "" && lineage == o.state.Lineage:
 		o.state.Term, o.state.Commit = 0, 0
 		o.state.LogIndex, o.state.LogTerm = 0, 0
-		if a, ok := o.state.newest(); ok {
+		if a, ok := o.state.newestOf(lineage); ok {
 			o.state.LogIndex, o.state.LogTerm = a.Index, a.Term
 		}
 	default:
@@ -300,7 +302,7 @@ func (o *Observer) leaderView(ctx context.Context) (*clusterhook.ExportView, str
 	for _, slot := range o.order() {
 		var v clusterhook.ExportView
 		vctx, cancel := context.WithTimeout(ctx, viewTimeout)
-		body, err := call(vctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportCheckpoints, Observer: o.cfg.Name, FromIndex: o.lastIndex()}, &v)
+		body, err := call(vctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportCheckpoints, Observer: o.cfg.Name, FromIndex: o.viewFrom()}, &v)
 		if err == nil {
 			body.Close()
 		}
@@ -314,6 +316,10 @@ func (o *Observer) leaderView(ctx context.Context) (*clusterhook.ExportView, str
 		}
 		if v.Leader != slot {
 			errs = append(errs, fmt.Errorf("%s answered as %s", slot, v.Leader))
+			continue
+		}
+		if err := validView(&v); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", slot, err))
 			continue
 		}
 		if best == nil || v.Term > best.Term {
@@ -346,11 +352,45 @@ func (o *Observer) order() []string {
 	return out
 }
 
+// lastIndex is the index of the newest checkpoint accepted in the lineage
+// followed, 0 in a lineage newly accepted: the cursor of nextCheckpoint.
 func (o *Observer) lastIndex() uint64 {
-	if a, ok := o.state.newest(); ok {
+	if a, ok := o.state.newestOf(o.state.Lineage); ok {
 		return a.Index
 	}
 	return 0
+}
+
+// viewFrom is the index the view is asked from: just before the oldest
+// checkpoint accepted in the lineage followed, so that the view describes
+// again every accepted checkpoint the leader's table still lists, which
+// checkKnown compares.
+func (o *Observer) viewFrom() uint64 {
+	if a, ok := o.state.oldestOf(o.state.Lineage); ok {
+		return a.Index - 1
+	}
+	return 0
+}
+
+// validCheckpoint checks a checkpoint's name, which names directories of
+// the store, against the only form a member derives from its lineage and
+// index.
+func validCheckpoint(cp clusterhook.ExportCheckpoint) error {
+	if !checkpointName.MatchString(cp.Name) || cp.Name != reftable.CheckpointName(cp.Lineage, cp.Index) {
+		return fmt.Errorf("invalid checkpoint name %q", cp.Name)
+	}
+	return nil
+}
+
+// validView refuses a view that names a checkpoint otherwise than a member
+// would: it comes from no honest member, and nothing of it is used.
+func validView(v *clusterhook.ExportView) error {
+	for _, cp := range v.Checkpoints {
+		if err := validCheckpoint(cp); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 var errStale = errors.New("a deposed leader's view, behind the term already seen")
@@ -401,7 +441,7 @@ func (o *Observer) follow(ctx context.Context, slot string, v *clusterhook.Expor
 		case clusterhook.CodeDiverged:
 			return o.quarantineFor(fmt.Sprintf("fork: the leader's log does not hold term %d at %d, which this observer accepted", st.LogTerm, st.LogIndex), "")
 		case clusterhook.CodeCompacted:
-			a, ok := o.state.newest()
+			a, ok := o.state.newestOf(st.Lineage)
 			if !ok || a.Index <= st.LogIndex {
 				st.Rebootstrap = "the log was compacted past this observer; waiting for a checkpoint to restart from"
 				return o.store.saveState(st)
@@ -487,11 +527,26 @@ func checkpointDigest(cp clusterhook.ExportCheckpoint) string {
 // accepted with what was accepted: an accepted checkpoint is immutable, and
 // another description of it is a fork.
 func (o *Observer) checkKnown(v *clusterhook.ExportView) error {
+	listed := map[string]bool{}
+	var oldest uint64
 	for _, cp := range v.Checkpoints {
+		listed[cp.Name] = true
+		if cp.Lineage == o.state.Lineage && (oldest == 0 || cp.Index < oldest) {
+			oldest = cp.Index
+		}
 		if i, ok := o.state.accepted(cp.Name); ok && o.state.Checkpoints[i].Digest != checkpointDigest(cp) {
 			b, _ := json.Marshal(cp)
 			o.store.quarantine("checkpoint", b)
 			return o.quarantineFor(fmt.Sprintf("fork: checkpoint %s is described otherwise than when it was accepted", cp.Name), "")
+		}
+	}
+	// The table keeps its newest checkpoints: one it lists older than an
+	// accepted checkpoint means that accepted one should be listed too.
+	for _, a := range o.state.Checkpoints {
+		if inLineage(a, o.state.Lineage) && oldest != 0 && oldest < a.Index && !listed[a.Name] {
+			b, _ := json.Marshal(v.Checkpoints)
+			o.store.quarantine("checkpoint", b)
+			return o.quarantineFor(fmt.Sprintf("fork: checkpoint %s, accepted, is gone from the leader's table", a.Name), "")
 		}
 	}
 	return nil
@@ -516,14 +571,17 @@ func (o *Observer) nextCheckpoint(v *clusterhook.ExportView) (clusterhook.Export
 // ingest verifies one checkpoint into staging, then publishes it. What a
 // checkpoint that fails leaves in staging goes with it.
 func (o *Observer) ingest(ctx context.Context, leader string, cp clusterhook.ExportCheckpoint, voters []string) (err error) {
+	// The name is checked before anything is cleaned up under it: a name
+	// such as ".." would otherwise remove the store, or what lies past it.
+	if err := validCheckpoint(cp); err != nil {
+		return err
+	}
+	stage := o.store.path("staging", cp.Name)
 	defer func() {
 		if err != nil {
-			_ = os.RemoveAll(o.store.path("staging", cp.Name))
+			_ = os.RemoveAll(stage)
 		}
 	}()
-	if !checkpointName.MatchString(cp.Name) || cp.Name != reftable.CheckpointName(cp.Lineage, cp.Index) {
-		return fmt.Errorf("invalid checkpoint name %q", cp.Name)
-	}
 	target, err := ParseLSN(cp.LSN)
 	if err != nil {
 		return err
@@ -531,10 +589,6 @@ func (o *Observer) ingest(ctx context.Context, leader string, cp clusterhook.Exp
 	if cp.WALSegmentSize <= 0 || cp.WALSegmentSize&(cp.WALSegmentSize-1) != 0 {
 		return errors.New("invalid WAL segment size")
 	}
-	if !checkpointName.MatchString(cp.Name) {
-		return fmt.Errorf("invalid checkpoint name %q", cp.Name)
-	}
-	stage := o.store.path("staging", cp.Name)
 	if err := os.RemoveAll(stage); err != nil {
 		return err
 	}
@@ -1015,7 +1069,10 @@ func (o *Observer) fetchBase(ctx context.Context, leader string) error {
 func (o *Observer) protectPending(ctx context.Context) error {
 	for i := range o.state.Checkpoints {
 		a := &o.state.Checkpoints[i]
-		if a.State == StateProtected {
+		// Only a verified checkpoint waits for its snapshot: a pruned one
+		// was protected before its directory went, and is never protected
+		// again.
+		if a.State != StateVerified {
 			continue
 		}
 		if p, ok := o.store.Protection(a.Name); ok {
