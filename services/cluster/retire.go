@@ -124,19 +124,16 @@ func retiredConfirmed(self consensus.NodeID, own consensus.Membership, seen []he
 	return voters > 0 && confirmed >= voters/2+1
 }
 
-// trustedAnswer reports whether a hello came from member m: the slot and
-// the key of its object channel, which the handshake proved, and neither
-// key revoked. The body's node id is not compared: a member's machine that
-// rejoined under a new id still speaks for that key.
+// trustedAnswer reports whether a hello came from member m: its slot, and
+// its key, which the handshake of the object channel proved (a node's
+// object channel and consensus share their certificate), never revoked.
+// The body's node id is not compared: a member's machine that rejoined
+// under a new id still speaks for that key.
 func (r *Replicator) trustedAnswer(m consensus.Member, h hello) bool {
 	if m.SPKI == ([32]byte{}) || h.Slot != m.Slot {
 		return false
 	}
-	pin := m.SPKI
-	if r.objects != nil {
-		pin = r.objects.pin(m)
-	}
-	return h.SPKI == pin && !r.keyRevoked(m.SPKI) && !r.keyRevoked(h.SPKI)
+	return h.SPKI == m.SPKI && !r.keyRevoked(m.SPKI)
 }
 
 // keyRevoked reports whether this node's table holds the key revoked.
