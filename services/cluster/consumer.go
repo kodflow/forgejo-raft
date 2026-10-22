@@ -318,10 +318,29 @@ func (c *consumer) Lag() uint64 {
 // and only once the writer hook, when there is one, promoted the leader.
 func (c *consumer) step(ctx context.Context) error {
 	eng := c.r.Engine()
-	if eng == nil || eng.Status().Role != consensus.RoleLeader || !c.dbReady() || c.r.writerGate(eng) != nil {
+	if eng == nil || eng.Status().Role != consensus.RoleLeader {
+		c.notePass(nil)
 		return nil
 	}
-	return c.pass(ctx)
+	if !c.dbReady() || c.r.writerGate(eng) != nil {
+		return nil
+	}
+	err := c.pass(ctx)
+	if ctx.Err() == nil {
+		c.notePass(err)
+	}
+	return err
+}
+
+// notePass counts the failed passes in a row on the replicator, which the
+// autopilot reads to make the leader yield (#47); a pass that went
+// through, or a node that does not lead, starts over.
+func (c *consumer) notePass(err error) {
+	if err != nil {
+		c.r.consumerFails.Add(1)
+		return
+	}
+	c.r.consumerFails.Store(0)
 }
 
 // readCursor reads a lineage's cursor and notices when it went back.

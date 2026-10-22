@@ -88,6 +88,9 @@ func (r *Replicator) autopilotStep(ctx context.Context) {
 	}
 	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	if r.yieldIfStuck(pctx, eng, m) {
+		return
+	}
 	if id, ok := r.deadMember(eng, m); ok {
 		r.autoChange(pctx, ActionRemove, id, "out of reach for DEAD_MEMBER_TIMEOUT", eng.Remove)
 		return
@@ -216,6 +219,68 @@ func (r *Replicator) promotable(ctx context.Context, eng consensus.Engine) func(
 // version v; a binary older than the field applies the base version only.
 func appliesVersion(h hello, v uint8) bool {
 	return max(h.Payload, reftable.BaseVersion) >= int(v)
+}
+
+// The leader that cannot derive the SQL gives the leadership away: only
+// the leader runs the consumer, and nothing in the election knows about
+// the database, so a leader whose writer hook keeps failing, or whose
+// consumer keeps failing while events wait, would otherwise freeze the SQL
+// of the whole cluster, then every write once the event queue is full
+// (#47). It yields to the voter least behind, at most once per
+// yieldBackoff, so a database down for every node does not make the
+// leadership spin.
+var (
+	yieldAfterPromotions = 5
+	yieldAfterPasses     = 60
+	yieldBackoff         = 5 * time.Minute
+)
+
+// yieldIfStuck transfers the leadership when this leader cannot derive the
+// SQL, and reports whether it did.
+func (r *Replicator) yieldIfStuck(ctx context.Context, eng consensus.Engine, m consensus.Membership) bool {
+	var why string
+	switch {
+	case r.writerHook != nil && r.hookFails >= yieldAfterPromotions:
+		why = fmt.Sprintf("its writer hook failed %d times in a row", r.hookFails)
+	case int(r.consumerFails.Load()) >= yieldAfterPasses && r.table.EventCount() > 0:
+		why = fmt.Sprintf("its consumer failed %d passes in a row with %d events waiting", r.consumerFails.Load(), r.table.EventCount())
+	default:
+		return false
+	}
+	now := r.auto.now()
+	if !r.yielded.IsZero() && now.Sub(r.yielded) < yieldBackoff {
+		return false
+	}
+	to, ok := successor(eng, m)
+	if !ok {
+		return false
+	}
+	r.yielded = now
+	if err := eng.TransferLeadership(ctx, autopilotOperator, to); err != nil {
+		log.Warn("cluster: autopilot: this leader cannot derive the SQL (%s); transferring the leadership to %s: %v", why, to, err)
+		return false
+	}
+	log.Error("cluster: autopilot: this leader cannot derive the SQL (%s): the leadership goes to %s", why, to)
+	r.audit(ctx, autopilotOperator, Operation{Action: ActionTransfer, Target: to.String()}, "ok", "the leader cannot derive the SQL: "+why)
+	return true
+}
+
+// successor is the voter other than the leader the leader hears and that
+// is least behind.
+func successor(eng consensus.Engine, m consensus.Membership) (consensus.NodeID, bool) {
+	self := eng.Status().ID
+	var best consensus.PeerHealth
+	found := false
+	for _, p := range eng.Health().Peers {
+		i := Rank(m, p.ID) - 1
+		if p.ID == self || i < 0 || !m.Members[i].Voter || p.Unreachable || p.Snapshot {
+			continue
+		}
+		if !found || p.Lag < best.Lag {
+			best, found = p, true
+		}
+	}
+	return best.ID, found
 }
 
 // deadClock is when the leader first found each member out of reach. Only
