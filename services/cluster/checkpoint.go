@@ -292,7 +292,7 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 			log.Warn("cluster checkpoint %s: recording the backup cursor: %v", name, err)
 		}
 	}
-	c.prune()
+	c.prune(tok.Identity().String())
 	for _, cp := range r.table.Checkpoints() {
 		if cp.Nonce == nonce {
 			return cp, nil
@@ -354,22 +354,37 @@ func (c *coordinator) writeArtifact(name, file string, b []byte) (string, error)
 }
 
 // prune keeps the artifacts of the newest checkpoints only.
-func (c *coordinator) prune() {
+// prune keeps the artifacts of the newest checkpointArtifactsKept
+// checkpoints of lineage, by index, and removes every other lineage's: a
+// Recover or a restore starts a lineage whose name may sort before the old
+// one's, and the export serves the current lineage only.
+func (c *coordinator) prune(lineage string) {
 	entries, err := os.ReadDir(c.dir)
 	if err != nil {
 		return
 	}
-	var names []string
-	for _, e := range entries {
-		if e.IsDir() && checkpointNamePattern.MatchString(e.Name()) {
-			names = append(names, e.Name())
-		}
+	prefix := strings.TrimSuffix(reftable.CheckpointName(lineage, 0), fmt.Sprintf("%020d", 0))
+	type kept struct {
+		name  string
+		index uint64
 	}
-	// Names sort by lineage, then by the zero-padded index.
-	sort.Strings(names)
-	for len(names) > checkpointArtifactsKept {
-		_ = os.RemoveAll(filepath.Join(c.dir, names[0]))
-		names = names[1:]
+	var current []kept
+	for _, e := range entries {
+		if !e.IsDir() || !checkpointNamePattern.MatchString(e.Name()) {
+			continue
+		}
+		rest, ok := strings.CutPrefix(e.Name(), prefix)
+		index, err := strconv.ParseUint(rest, 10, 64)
+		if !ok || err != nil || len(rest) != 20 {
+			_ = os.RemoveAll(filepath.Join(c.dir, e.Name()))
+			continue
+		}
+		current = append(current, kept{e.Name(), index})
+	}
+	sort.Slice(current, func(i, j int) bool { return current[i].index < current[j].index })
+	for len(current) > checkpointArtifactsKept {
+		_ = os.RemoveAll(filepath.Join(c.dir, current[0].name))
+		current = current[1:]
 	}
 }
 

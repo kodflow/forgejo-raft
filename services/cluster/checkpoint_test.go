@@ -372,3 +372,56 @@ func TestStoredFilesSkipTheTemporaryDirectory(t *testing.T) {
 	}
 	assert.Equal(t, []string{"attachments:kept", "lfs:ab/cd/obj", "lfs:x/tmp/kept"}, got)
 }
+
+// A lineage whose identity sorts before the old one's keeps its newest
+// artifacts: the old lineage's go first, then the current one's oldest by
+// index (#59).
+func TestHuntR2ProvePruneLineageKeepsCurrent(t *testing.T) {
+	dir := t.TempDir()
+	c := &coordinator{dir: dir}
+	write := func(name string) {
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, name), 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name, "refs.snapshot"), []byte(name), 0o600))
+	}
+	old := consensus.LogIdentity{Cluster: consensus.ClusterID{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, Epoch: 1}.String()
+	cur := consensus.LogIdentity{Cluster: consensus.ClusterID{15: 0x01}, Epoch: 1}.String()
+	for i := uint64(1); i <= checkpointArtifactsKept; i++ {
+		write(reftable.CheckpointName(old, i*100))
+		c.prune(old)
+	}
+	x := exportSide{ckptDir: dir}
+	for round := uint64(1); round <= checkpointArtifactsKept+3; round++ {
+		name := reftable.CheckpointName(cur, round*10)
+		write(name)
+		c.prune(cur)
+		_, err := x.artifact(name, "refs.snapshot")
+		require.NoError(t, err, "round %d: the current lineage's newest checkpoint stays exportable", round)
+	}
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	require.Len(t, names, checkpointArtifactsKept)
+	for i, n := range names {
+		assert.Equal(t, reftable.CheckpointName(cur, uint64(i+4)*10), n)
+	}
+}
+
+// Indexes compare as numbers, not as names (#59).
+func TestPruneKeepsTheHighestIndexes(t *testing.T) {
+	dir := t.TempDir()
+	c := &coordinator{dir: dir}
+	cur := consensus.LogIdentity{Cluster: consensus.ClusterID{0: 0xab}, Epoch: 2}.String()
+	for _, i := range []uint64{9, 10, 99, 100, 1000, 5, 7, 8, 11, 12} {
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, reftable.CheckpointName(cur, i)), 0o700))
+	}
+	c.prune(cur)
+	for _, i := range []uint64{5, 7} {
+		_, err := os.Stat(filepath.Join(dir, reftable.CheckpointName(cur, i)))
+		assert.True(t, os.IsNotExist(err), "index %d goes", i)
+	}
+	_, err := os.Stat(filepath.Join(dir, reftable.CheckpointName(cur, 1000)))
+	assert.NoError(t, err)
+}
