@@ -1016,6 +1016,10 @@ func SettingsPost(ctx *context.Context) {
 		err := wiki_service.DeleteWiki(ctx, repo)
 		if err != nil {
 			log.Error("Delete Wiki: %v", err.Error())
+			// The wiki is still there: say so rather than announce success.
+			ctx.Flash.Error(err.Error())
+			ctx.Redirect(ctx.Repo.RepoLink + "/settings")
+			return
 		}
 		log.Trace("Repository wiki deleted: %s/%s", ctx.Repo.Owner.Name, repo.Name)
 
