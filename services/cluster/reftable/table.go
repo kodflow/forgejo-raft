@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -128,6 +129,20 @@ type Table struct {
 	// its own entry there even after another write moved the ref.
 	nonces  []NonceMark
 	byNonce map[string]uint64
+	// deletions keeps the indexes of each key's newest deletions, oldest
+	// first, also once the key was written again: the projector tells by
+	// them which repository a directory under the key holds (#52, #98). No
+	// verdict reads it, so it is kept at every version.
+	deletions map[string][]uint64
+	// departedAt is the index at which the repository under a key last
+	// left it, deleted or renamed away, written by GenerationVersion
+	// entries only and read by their verdicts: Apply refuses a ref
+	// transaction read before it, even once another repository took the
+	// key (#91).
+	departedAt map[string]uint64
+	// limit is the highest payload version this table applies:
+	// PayloadVersion, but for the tests that play an older binary.
+	limit uint8
 
 	// onChange is called after each Apply, outside the lock. It is not state.
 	onChange func(Change)
@@ -150,7 +165,21 @@ func New() *Table {
 		revoked:       map[string]RevokeKey{},
 		pendingRevoke: map[string]RevokeKey{},
 		byNonce:       map[string]uint64{},
+		deletions:     map[string][]uint64{},
+		departedAt:    map[string]uint64{},
+		limit:         PayloadVersion,
 	}
+}
+
+// keptPerKey bounds the deletions kept per key.
+const keptPerKey = 16
+
+func keepLast[T any](s []T, v T) []T {
+	s = append(s, v)
+	if len(s) > keptPerKey {
+		s = append([]T(nil), s[len(s)-keptPerKey:]...)
+	}
+	return s
 }
 
 // NonceMark is a committed ref transaction's nonce and index.
@@ -214,7 +243,7 @@ func (t *Table) Apply(e consensus.Entry) any {
 		// diverges, a deletion or a rename being unconditional (#41).
 		return refuse("entry %d is already applied", e.Index)
 	}
-	kind, body, err := decode(e.Data)
+	kind, body, err := decode(e.Data, t.limit)
 	var version uint8
 	if len(e.Data) > 0 {
 		version = e.Data[0]
@@ -236,11 +265,11 @@ func (t *Table) Apply(e consensus.Entry) any {
 		case KindAudit:
 			res = t.applyAudit(e, body.(*Audit))
 		case KindRepoDelete:
-			res, ch = t.applyRepoDelete(e, body.(*RepoDelete))
+			res, ch = t.applyRepoDelete(e, version, body.(*RepoDelete))
 		case KindRepoRename:
-			res, ch = t.applyRepoRename(e, body.(*RepoRename))
+			res, ch = t.applyRepoRename(e, version, body.(*RepoRename))
 		case KindJoinGrant:
-			res = t.applyJoinGrant(body.(*JoinGrant))
+			res = t.applyJoinGrant(version, body.(*JoinGrant))
 		case KindCheckpointBarrier:
 			res = t.applyCheckpointBarrier(e, body.(*CheckpointBarrier))
 		case KindCheckpointPosition:
@@ -294,6 +323,7 @@ func (t *Table) Reset() {
 	t.applied, t.identity = consensus.Position{}, consensus.LogIdentity{}
 	t.pending, t.checkpoints = nil, nil
 	t.payload, t.nonces, t.byNonce = 0, nil, nt.byNonce
+	t.deletions, t.departedAt = nt.deletions, nt.departedAt
 	t.mu.Unlock()
 }
 
@@ -320,10 +350,14 @@ func (t *Table) setRef(repo string, r *repoState, ref string, v *RefValue) {
 }
 
 func (t *Table) applyRefTxn(e consensus.Entry, version uint8, tx *RefTxn) (Result, Change) {
-	if err := ValidRepoKey(tx.Repo); err != nil {
+	if err := ValidRepoKeyAt(tx.Repo, version); err != nil {
 		return refuse("repository: %v", err), Change{}
 	}
-	if version >= 2 && tx.Push {
+	if version >= GenerationVersion {
+		if why := t.generationRefuses(tx); why != "" {
+			return refuse("%s", why), Change{}
+		}
+	} else if version >= 2 && tx.Push {
 		// A push still running when its repository was deleted or renamed
 		// on another member: it must not bring the key back to life under
 		// a name the database no longer has (payload version 2).
@@ -459,6 +493,57 @@ func (t *Table) applyRefTxn(e consensus.Entry, version uint8, tx *RefTxn) (Resul
 	return Result{OK: true, Revs: revs}, Change{Repos: []string{tx.Repo}}
 }
 
+// generationRefuses is the GenerationVersion rule of a ref transaction, ""
+// when it passes. Version 2 refused a push into a deleted or renamed-away
+// key, and only a push: a mirror sync, a ref Forgejo writes or an API tag
+// in flight during a deletion brought the deleted repository back (#77).
+// A key that was deleted or renamed away now takes only a creation, the
+// HEAD that git init writes; whatever comes later finds the key live.
+// Version 2 also lost its guard once the name was taken again: a push
+// prepared against the old repository landed in the new one (#91). A
+// transaction read before the key's repository left it is refused now,
+// a creation aside, as is one of another object format than the key's
+// live refs.
+func (t *Table) generationRefuses(tx *RefTxn) string {
+	_, deleted := t.deleted[tx.Repo]
+	to, moved := t.movedAwayLocked(tx.Repo)
+	if (deleted || moved) && !creates(tx) {
+		if deleted {
+			return fmt.Sprintf("the repository %s was deleted", tx.Repo)
+		}
+		return fmt.Sprintf("the repository %s was renamed to %s", tx.Repo, to)
+	}
+	if at := max(t.deleted[tx.Repo], t.departedAt[tx.Repo]); tx.ReadAt != 0 && tx.ReadAt < at && !creates(tx) {
+		return fmt.Sprintf("the transaction was read at %d, before the repository %s was deleted or renamed away at %d: retry", tx.ReadAt, tx.Repo, at)
+	}
+	if r := t.repos[tx.Repo]; r != nil {
+		names := make([]string, 0, len(r.refs))
+		for name, v := range r.refs {
+			if v.Live() && v.Format != "" && v.Format != tx.Format {
+				names = append(names, name)
+			}
+		}
+		if len(names) > 0 {
+			// The smallest name, so the refusal reads the same on every node.
+			sort.Strings(names)
+			return fmt.Sprintf("the repository %s holds %s objects (%s), the transaction %s ones", tx.Repo, r.refs[names[0]].Format, names[0], tx.Format)
+		}
+	}
+	return ""
+}
+
+// creates reports whether a transaction is a repository's creation: git
+// init writes HEAD, symbolic, alone. A fork and a migration clone into a
+// directory git init made first, so their refs find the key live.
+func creates(tx *RefTxn) bool {
+	for _, u := range tx.Updates {
+		if u.Ref != "HEAD" || u.Symbolic == "" {
+			return false
+		}
+	}
+	return len(tx.Updates) > 0
+}
+
 // dirFileConflict refuses a ref whose name is a directory prefix of another
 // live ref, or the reverse, on the state the transaction would leave (R7-35).
 func (t *Table) dirFileConflict(tx *RefTxn) error {
@@ -550,7 +635,7 @@ func (t *Table) applyAudit(e consensus.Entry, a *Audit) Result {
 		}
 	}
 	t.audit = append(t.audit, AuditRecord{Audit: *a, Token: e.Token})
-	t.payload = max(t.payload, raisedVersion(a))
+	t.payload = max(t.payload, adoptedVersion(a, t.limit))
 	if k, ok := pendingRevocation(a); ok {
 		if _, done := t.revoked[k.SPKI]; !done {
 			t.pendingRevoke[k.SPKI] = k
@@ -562,8 +647,8 @@ func (t *Table) applyAudit(e consensus.Entry, a *Audit) Result {
 	return Result{OK: true}
 }
 
-func (t *Table) applyRepoDelete(e consensus.Entry, d *RepoDelete) (Result, Change) {
-	if err := ValidRepoKey(d.Repo); err != nil {
+func (t *Table) applyRepoDelete(e consensus.Entry, version uint8, d *RepoDelete) (Result, Change) {
+	if err := ValidRepoKeyAt(d.Repo, version); err != nil {
 		return refuse("repository: %v", err), Change{}
 	}
 	r := t.repo(d.Repo)
@@ -579,17 +664,22 @@ func (t *Table) applyRepoDelete(e consensus.Entry, d *RepoDelete) (Result, Chang
 	}
 	r.last = e.Index
 	t.deleted[d.Repo] = e.Index
+	t.deletions[d.Repo] = keepLast(t.deletions[d.Repo], e.Index)
+	if version >= GenerationVersion {
+		t.departedAt[d.Repo] = e.Index
+		t.keepNonce(d.Nonce, e.Index)
+	}
 	t.pushEvent(Event{Token: e.Token, Kind: EventRepoDelete, Repo: d.Repo, RepoID: d.RepoID, Time: d.Time})
 	return Result{OK: true}, Change{Repos: []string{d.Repo}, Deleted: []string{d.Repo}}
 }
 
-func (t *Table) applyRepoRename(e consensus.Entry, rn *RepoRename) (Result, Change) {
+func (t *Table) applyRepoRename(e consensus.Entry, version uint8, rn *RepoRename) (Result, Change) {
 	moves := rn.Moves()
 	// All moves are checked before any is applied: one refused move leaves
 	// every key as it was.
 	sources, targets := map[string]bool{}, map[string]bool{}
 	for _, m := range moves {
-		if ValidRepoKey(m[0]) != nil || ValidRepoKey(m[1]) != nil || m[0] == m[1] {
+		if ValidRepoKeyAt(m[0], version) != nil || ValidRepoKeyAt(m[1], version) != nil || m[0] == m[1] {
 			return refuse("invalid rename"), Change{}
 		}
 		if sources[m[0]] || targets[m[1]] {
@@ -609,13 +699,57 @@ func (t *Table) applyRepoRename(e consensus.Entry, rn *RepoRename) (Result, Chan
 			return refuse("a rename chains through %s", m[0]), Change{}
 		}
 	}
+	if version >= GenerationVersion && rn.Owner != [2]string{} {
+		if why := t.ownerRenameRefuses(rn.Owner, moves, sources); why != "" {
+			return refuse("%s", why), Change{}
+		}
+	}
 	var ch Change
+	if version >= GenerationVersion {
+		t.keepNonce(rn.Nonce, e.Index)
+	}
 	for _, m := range moves {
+		if version >= GenerationVersion {
+			t.departedAt[m[0]] = e.Index
+		}
 		t.moveRepo(e, m[0], m[1], rn.Time)
 		ch.Repos = append(ch.Repos, m[0], m[1])
 		ch.Renamed = append(ch.Renamed, [2]string{m[0], m[1]})
 	}
 	return Result{OK: true}, ch
+}
+
+// ownerRenameRefuses checks an owner's rename against the table at its
+// index, "" when it passes: every move goes from the old owner to the new
+// one, and every key under the old owner with a live ref moves. The
+// proposer lists the keys in its own table, which may be behind the log: a
+// repository created just before would stay under the old owner while the
+// database renamed it (#56). The refusal is retried on a table that caught
+// up.
+func (t *Table) ownerRenameRefuses(owner [2]string, moves [][2]string, sources map[string]bool) string {
+	from, to := owner[0]+"/", owner[1]+"/"
+	for _, m := range moves {
+		if !strings.HasPrefix(m[0], from) || m[1] != to+strings.TrimPrefix(m[0], from) {
+			return fmt.Sprintf("the rename of owner %s moves %s to %s", owner[0], m[0], m[1])
+		}
+	}
+	var keys []string
+	for key, r := range t.repos {
+		if !strings.HasPrefix(key, from) || sources[key] {
+			continue
+		}
+		for _, v := range r.refs {
+			if v.Live() {
+				keys = append(keys, key)
+				break
+			}
+		}
+	}
+	if len(keys) > 0 {
+		sort.Strings(keys)
+		return fmt.Sprintf("the owner %s holds %s, which the rename does not move", owner[0], keys[0])
+	}
+	return ""
 }
 
 func (t *Table) moveRepo(e consensus.Entry, fromKey, toKey string, at int64) {
@@ -646,12 +780,18 @@ func (t *Table) moveRepo(e consensus.Entry, fromKey, toKey string, at int64) {
 	t.pushEvent(Event{Token: e.Token, Kind: EventRepoRename, Repo: toKey, RenamedFrom: fromKey, Time: at})
 }
 
-func (t *Table) applyJoinGrant(g *JoinGrant) Result {
+func (t *Table) applyJoinGrant(version uint8, g *JoinGrant) Result {
 	if !validSlot(g.Slot) || consensus.Operator(g.Operator).Validate() != nil || g.Expires <= 0 {
 		return refuse("malformed join grant")
 	}
 	if g.SPKI != "" && !(len(g.SPKI) == 64 && validSHA(g.SPKI, "sha256")) {
 		return refuse("a join grant's key is 64 hex digits")
+	}
+	if cur, ok := t.grants[g.Slot]; version >= GenerationVersion && ok && cur.SPKI != "" && g.SPKI != cur.SPKI && cur.Expires == g.Expires {
+		// Two members binding the same grant to two joiners at once: the
+		// first binding stands, the second joiner is refused (#70). An
+		// operator's new grant carries a new expiry.
+		return refuse("the join grant for slot %s is already bound to another key", g.Slot)
 	}
 	t.grants[g.Slot] = *g
 	return Result{OK: true}
@@ -799,6 +939,20 @@ func (t *Table) Deleted(repo string) (uint64, bool) {
 	return i, ok
 }
 
+// DeletedBefore reports the newest deletion of repo at an index below
+// before, kept also once the key was written again; deletions older than
+// the last few are forgotten.
+func (t *Table) DeletedBefore(repo string, before uint64) (uint64, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for _, at := range slices.Backward(t.deletions[repo]) {
+		if at < before {
+			return at, true
+		}
+	}
+	return 0, false
+}
+
 // RenamedFrom reports the key a repository was renamed from.
 func (t *Table) RenamedFrom(repo string) (string, uint64, bool) {
 	t.mu.RLock()
@@ -858,6 +1012,14 @@ func raisedVersion(a *Audit) uint8 {
 		return 0
 	}
 	return uint8(v)
+}
+
+// adoptedVersion is raisedVersion on a binary applying versions up to limit.
+func adoptedVersion(a *Audit, limit uint8) uint8 {
+	if v := raisedVersion(a); v <= limit {
+		return v
+	}
+	return 0
 }
 
 func (t *Table) movedAwayLocked(repo string) (string, bool) {
@@ -943,8 +1105,22 @@ func (t *Table) PinnedObjects(repo string) []string {
 
 // ---- snapshots ----
 
-// SnapshotFormat is the version of the snapshot encoding.
-const SnapshotFormat = 1
+// SnapshotFormat is the newest version of the snapshot encoding. Format 1
+// is written while the cluster writes a payload version below
+// GenerationVersion, format 2 from then on: a binary that cannot keep the
+// state of these versions (the departures of the keys, the revocations of
+// an older one still) refuses format 2 and stops, rather than restore without error
+// and lose it, then hand its own cut to a current member (#50). Format 2
+// is format 1's encoding.
+const SnapshotFormat = 2
+
+// snapshotFormat is the format a table at payload version payload writes.
+func snapshotFormat(payload uint8) int {
+	if payload >= GenerationVersion {
+		return 2
+	}
+	return 1
+}
 
 type persisted struct {
 	Format   int                             `json:"format"`
@@ -969,6 +1145,11 @@ type persisted struct {
 	// version is then read back from the audit records kept.
 	Payload uint8       `json:"payload,omitempty"`
 	Nonces  []NonceMark `json:"nonces,omitempty"`
+	// Deletions is absent from older snapshots: the projector then knows
+	// the deletions it applies from then on only. DepartedAt is written
+	// from GenerationVersion, in format 2.
+	Deletions  map[string][]uint64 `json:"deletions,omitempty"`
+	DepartedAt map[string]uint64   `json:"departed_at,omitempty"`
 }
 
 type bytesSnapshot struct{ b []byte }
@@ -995,10 +1176,11 @@ func (t *Table) Snapshot() (consensus.Snapshot, error) {
 // persistedLocked is the table's snapshot form; the caller holds the lock.
 func (t *Table) persistedLocked() *persisted {
 	p := &persisted{
-		Format: SnapshotFormat, Applied: t.applied, Identity: t.identity,
+		Format: snapshotFormat(t.payload), Applied: t.applied, Identity: t.identity,
 		Repos: make(map[string]map[string]*RefValue, len(t.repos)), Last: map[string]uint64{},
 		Events: t.events, Audit: t.audit, Deleted: t.deleted, Renamed: t.renamed, Grants: t.grants, Revoked: t.revoked, PendingRevoke: t.pendingRevoke,
 		Pending: t.pending, Checkpoints: t.checkpoints, Payload: t.payload, Nonces: t.nonces,
+		Deletions: t.deletions, DepartedAt: t.departedAt,
 	}
 	for k, r := range t.repos {
 		p.Repos[k] = r.refs
@@ -1041,6 +1223,16 @@ func (p *persisted) validNames() error {
 			return refuse(fmt.Sprintf("the deleted repository key %q", repo), err)
 		}
 	}
+	for repo := range p.Deletions {
+		if err := ValidRepoKey(repo); err != nil {
+			return refuse(fmt.Sprintf("the deleted repository key %q", repo), err)
+		}
+	}
+	for repo := range p.DepartedAt {
+		if err := ValidRepoKey(repo); err != nil {
+			return refuse(fmt.Sprintf("the departed repository key %q", repo), err)
+		}
+	}
 	for to, m := range p.Renamed {
 		if err := ValidRepoKey(to); err != nil {
 			return refuse(fmt.Sprintf("the renamed repository key %q", to), err)
@@ -1062,19 +1254,20 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	if err := json.Unmarshal(buf.Bytes(), &p); err != nil {
 		return fmt.Errorf("decode ref table snapshot: %w", err)
 	}
-	if p.Format != SnapshotFormat {
+	if p.Format < 1 || p.Format > snapshotFormat(t.limit) {
 		return fmt.Errorf("%w: snapshot format %d", ErrVersion, p.Format)
 	}
 	// A snapshot cut at a payload version this binary does not apply holds
 	// state it cannot keep: restoring it would drop that state and leave
 	// the node writing a version it cannot encode (#50). It stops here.
-	if p.Payload > PayloadVersion {
-		return fmt.Errorf("%w: snapshot written at payload version %d, this binary applies %d", ErrVersion, p.Payload, PayloadVersion)
+	if p.Payload > t.limit {
+		return fmt.Errorf("%w: snapshot written at payload version %d, this binary applies %d", ErrVersion, p.Payload, t.limit)
 	}
 	if err := p.validNames(); err != nil {
 		return err
 	}
 	nt := New()
+	nt.limit = t.limit
 	for repo, refs := range p.Repos {
 		rs := nt.repo(repo)
 		rs.last = p.Last[repo]
@@ -1092,7 +1285,13 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	nt.audit = p.Audit
 	nt.payload = p.Payload
 	for i := range nt.audit {
-		nt.payload = max(nt.payload, raisedVersion(&nt.audit[i].Audit))
+		nt.payload = max(nt.payload, adoptedVersion(&nt.audit[i].Audit, nt.limit))
+	}
+	if p.Format < snapshotFormat(nt.payload) {
+		// A format 1 snapshot of a cluster that raised its version to
+		// GenerationVersion was cut by a binary that could not read the
+		// raise: what it dropped (#50) would be lost here without a word.
+		return fmt.Errorf("%w: snapshot format %d cut after the cluster raised its payload version to %d: an older binary cut it", ErrVersion, p.Format, nt.payload)
 	}
 	for _, m := range p.Nonces {
 		nt.keepNonce(m.Nonce, m.Index)
@@ -1102,6 +1301,12 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	}
 	if p.Renamed != nil {
 		nt.renamed = p.Renamed
+	}
+	if p.Deletions != nil {
+		nt.deletions = p.Deletions
+	}
+	if p.DepartedAt != nil {
+		nt.departedAt = p.DepartedAt
 	}
 	if p.Grants != nil {
 		nt.grants = p.Grants
@@ -1127,6 +1332,7 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	t.applied, t.identity = p.Applied, p.Identity
 	t.pending, t.checkpoints = p.Pending, p.Checkpoints
 	t.payload, t.nonces, t.byNonce = nt.payload, nt.nonces, nt.byNonce
+	t.deletions, t.departedAt = nt.deletions, nt.departedAt
 	if t.onChange != nil {
 		repos := make([]string, 0, len(t.repos))
 		for k := range t.repos {

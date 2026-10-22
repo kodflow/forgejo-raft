@@ -35,7 +35,19 @@ import (
 // again after a database loss by the name, not by comparing two nodes'
 // clocks. Below version 4 Apply ignores the field, as an older binary
 // does, so a log written before the upgrade replays to the same table.
-const PayloadVersion = 4
+//
+// Version 5 tells a repository from the key it lives under (GenerationVersion):
+// a ref transaction into a deleted or renamed-away key is refused unless it
+// creates the repository anew, and one carrying the id of a repository that
+// left the key is refused even once the key was taken again (#77, #91); a
+// transaction of another object format than the key's live refs is
+// refused; a lifecycle command carries a nonce its proposer finds again
+// (#74); an owner's rename moves every live key under the owner or none
+// (#56); a repository name may start with a dot (#54); a join grant bound
+// to a key is not bound again to another one (#70). Every kind may be
+// written at version 5, and the table's snapshot is then written in format
+// 2, which an older binary refuses (#50).
+const PayloadVersion = 5
 
 // RevokeVersion is the payload version that carries KindRevokeKey.
 const RevokeVersion = 3
@@ -43,6 +55,10 @@ const RevokeVersion = 3
 // PusherVersion is the payload version from which a ref transaction's
 // PusherName is applied.
 const PusherVersion = 4
+
+// GenerationVersion is the payload version of the rules listed above
+// PayloadVersion's version 5.
+const GenerationVersion = 5
 
 // MaxPusherName bounds a pusher's name, from PusherVersion: a longer one
 // is refused, on every node alike.
@@ -130,6 +146,11 @@ type RefTxn struct {
 	// applied from PusherVersion only: an older binary drops it, and so
 	// does Apply below that version.
 	PusherName string `json:"pn,omitempty"`
+	// ReadAt is the index the proposer's table had applied when it read
+	// the revisions, from GenerationVersion: a transaction read before its
+	// repository left the key, deleted or renamed away, is refused, even
+	// once another repository took the key (#91). 0 skips the check.
+	ReadAt uint64 `json:"read,omitempty"`
 }
 
 // Ack trims the events of a lineage up to an index, once the dispatcher read
@@ -158,6 +179,9 @@ type RepoDelete struct {
 	RepoID   int64  `json:"repo_id"`
 	Operator string `json:"op,omitempty"`
 	Time     int64  `json:"t"`
+	// Nonce names this command, from GenerationVersion: its proposer tells
+	// by it whether THIS command committed, not a state an older one left.
+	Nonce string `json:"nonce,omitempty"`
 }
 
 // RepoRename moves a repository's refs to a new key; the projector moves it.
@@ -168,6 +192,12 @@ type RepoRename struct {
 	To   string      `json:"to"`
 	Time int64       `json:"t"`
 	Also [][2]string `json:"also,omitempty"`
+	// Nonce names this command, from GenerationVersion (RepoDelete.Nonce).
+	Nonce string `json:"nonce,omitempty"`
+	// Owner is set on an owner's rename, old and new names, from
+	// GenerationVersion: Apply refuses it when a live key under the old
+	// owner is not moved, which a proposer behind the log omitted (#56).
+	Owner [2]string `json:"owner,omitzero"`
 }
 
 // Moves returns every move of the command, the first one first.
@@ -205,8 +235,13 @@ func Encode(kind Kind, body any) ([]byte, error) {
 
 // EncodeVersion writes the envelope at version v, which the caller read from
 // Table.WriteVersion: a version the cluster has not agreed to would stop
-// the members that cannot read it.
+// the members that cannot read it. Below GenerationVersion only a ref
+// transaction and a key revocation are written above BaseVersion: v is
+// lowered to BaseVersion for the other kinds, as older binaries read them.
 func EncodeVersion(v uint8, kind Kind, body any) ([]byte, error) {
+	if v > BaseVersion && v < GenerationVersion && kind != KindRefTxn && (kind != KindRevokeKey || v < RevokeVersion) {
+		v = BaseVersion
+	}
 	if v < BaseVersion || v > PayloadVersion {
 		return nil, fmt.Errorf("%w: cannot write payload version %d", ErrVersion, v)
 	}
@@ -224,17 +259,20 @@ var ErrVersion = consensus.ErrVersionUnsupported
 // errMalformed is a body of a known kind that does not parse: a refusal.
 var errMalformed = errors.New("malformed command body")
 
-func decode(data []byte) (Kind, any, error) {
+// decode reads an envelope a binary applying versions up to limit reads:
+// PayloadVersion, but for the tests that play an older binary.
+func decode(data []byte, limit uint8) (Kind, any, error) {
 	if len(data) < 2 {
 		return 0, nil, errors.New("short command")
 	}
-	if data[0] == 0 || data[0] > PayloadVersion {
+	if data[0] == 0 || data[0] > limit {
 		return 0, nil, fmt.Errorf("%w: payload version %d", ErrVersion, data[0])
 	}
-	if data[0] > BaseVersion && Kind(data[1]) != KindRefTxn && (Kind(data[1]) != KindRevokeKey || data[0] < RevokeVersion) {
+	if data[0] > BaseVersion && data[0] < GenerationVersion && Kind(data[1]) != KindRefTxn && (Kind(data[1]) != KindRevokeKey || data[0] < RevokeVersion) {
 		// Versions 2 and 4 change the ref transaction only, version 3 adds
-		// the key revocation: any other kind above version 1 was written by
-		// no version of this code.
+		// the key revocation: any other kind between versions 2 and 4 was
+		// written by no version of this code. From version 5 every kind
+		// may be.
 		return 0, nil, fmt.Errorf("%w: command kind %d at payload version %d", ErrVersion, data[1], data[0])
 	}
 	kind := Kind(data[1])

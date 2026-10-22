@@ -75,8 +75,19 @@ func ValidRefName(name string) error {
 
 // ValidRepoKey checks a repository key lexically: "owner/name.git", both
 // components lowercase as Forgejo stores them on disk, nothing that could
-// escape the repository root. Version 1 of the payload.
+// escape the repository root. Payload versions 1 to 4 refuse a name that
+// starts with a dot; a key that only GenerationVersion admits passes too,
+// so this is the check of a key the table already holds, or of a path.
 func ValidRepoKey(key string) error {
+	return ValidRepoKeyAt(key, PayloadVersion)
+}
+
+// ValidRepoKeyAt is ValidRepoKey as Apply checks it at payload version v.
+// Forgejo accepts a repository name that starts with a dot, ".profile" the
+// owner's profile among them, and refuses "." and ".." only: from
+// GenerationVersion the name may too (#54). The owner never starts with a
+// dot, which keeps the projector's ".cluster-stale" outside every key.
+func ValidRepoKeyAt(key string, v uint8) error {
 	if key == "" || len(key) > 512 {
 		return errors.New("repository key empty or too long")
 	}
@@ -87,8 +98,10 @@ func ValidRepoKey(key string) error {
 	if len(parts) != 2 || !strings.HasSuffix(parts[1], ".git") || len(parts[1]) == len(".git") {
 		return errors.New("repository key must be owner/name.git")
 	}
-	for _, p := range parts {
-		if p == "." || p == ".." || strings.HasPrefix(p, ".") {
+	for i, p := range parts {
+		if name := strings.TrimSuffix(p, ".git"); i == 1 && v >= GenerationVersion && name != "." && name != ".." {
+			// The name: a leading dot is Forgejo's, "." and ".." are not.
+		} else if p == "." || p == ".." || strings.HasPrefix(p, ".") {
 			return errors.New("repository key component starts with a dot")
 		}
 		for i := 0; i < len(p); i++ {
