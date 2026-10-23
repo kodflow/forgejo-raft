@@ -110,6 +110,11 @@ type Table struct {
 	deleted map[string]uint64
 	// renamed maps a new key to the old one and the index of the rename.
 	renamed map[string]renameMark
+	// renames keeps the newest renames into each key, oldest first, also
+	// once another rename took the key again: a walk along a chain of
+	// renames finds the rename into a key before a given index (#138). No
+	// verdict reads it, so it is kept at every version.
+	renames map[string][]renameMark
 	grants  map[string]JoinGrant
 	// revoked maps a revoked key, 64 hex digits, to its revocation;
 	// pendingRevoke the revocations an operator asked for before the
@@ -161,6 +166,7 @@ func New() *Table {
 		repos:         map[string]*repoState{},
 		deleted:       map[string]uint64{},
 		renamed:       map[string]renameMark{},
+		renames:       map[string][]renameMark{},
 		grants:        map[string]JoinGrant{},
 		revoked:       map[string]RevokeKey{},
 		pendingRevoke: map[string]RevokeKey{},
@@ -323,7 +329,7 @@ func (t *Table) Reset() {
 	t.applied, t.identity = consensus.Position{}, consensus.LogIdentity{}
 	t.pending, t.checkpoints = nil, nil
 	t.payload, t.nonces, t.byNonce = 0, nil, nt.byNonce
-	t.deletions, t.departedAt = nt.deletions, nt.departedAt
+	t.deletions, t.departedAt, t.renames = nt.deletions, nt.departedAt, nt.renames
 	t.mu.Unlock()
 }
 
@@ -780,6 +786,7 @@ func (t *Table) moveRepo(e consensus.Entry, fromKey, toKey string, at int64) {
 	from.last, to.last = e.Index, e.Index
 	delete(t.deleted, toKey)
 	t.renamed[toKey] = renameMark{From: fromKey, Index: e.Index}
+	t.renames[toKey] = keepLast(t.renames[toKey], renameMark{From: fromKey, Index: e.Index})
 	t.pushEvent(Event{Token: e.Token, Kind: EventRepoRename, Repo: toKey, RenamedFrom: fromKey, Time: at})
 }
 
@@ -991,16 +998,59 @@ func (t *Table) RenamedInto(from string, before uint64) (string, uint64, bool) {
 
 // RenamedAfter reports the oldest rename after index that moved from's refs
 // to another key: the way forward from an event written under from.
+//
+// It reads every rename kept, not only the newest into each key: a key
+// freed by a rename and taken again by another one still leads forward
+// from an event written before (#138).
 func (t *Table) RenamedAfter(from string, after uint64) (string, uint64, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	to, at, found := "", uint64(0), false
-	for k, m := range t.renamed {
-		if m.From == from && m.Index > after && (!found || m.Index < at || m.Index == at && k < to) {
-			to, at, found = k, m.Index, true
+	for k := range t.renameTargetsLocked() {
+		for _, m := range t.marksLocked(k) {
+			if m.From == from && m.Index > after && (!found || m.Index < at || m.Index == at && k < to) {
+				to, at, found = k, m.Index, true
+			}
 		}
 	}
 	return to, at, found
+}
+
+// RenamedFromBefore reports the newest rename into repo before index: the
+// way back from repo along a chain of renames, also once another rename
+// took repo again after it (#138).
+func (t *Table) RenamedFromBefore(repo string, before uint64) (string, uint64, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for _, m := range slices.Backward(t.marksLocked(repo)) {
+		if m.Index < before {
+			return m.From, m.Index, true
+		}
+	}
+	return "", 0, false
+}
+
+// marksLocked is the renames into to kept, oldest first. A table restored
+// from a snapshot cut before the history was kept knows the newest one
+// only.
+func (t *Table) marksLocked(to string) []renameMark {
+	h := t.renames[to]
+	if m, ok := t.renamed[to]; ok && (len(h) == 0 || h[len(h)-1] != m) {
+		h = append(slices.Clip(h), m)
+	}
+	return h
+}
+
+// renameTargetsLocked is every key a rename moved a repository into.
+func (t *Table) renameTargetsLocked() map[string]struct{} {
+	keys := make(map[string]struct{}, len(t.renamed))
+	for k := range t.renamed {
+		keys[k] = struct{}{}
+	}
+	for k := range t.renames {
+		keys[k] = struct{}{}
+	}
+	return keys
 }
 
 // raisedVersion is the payload version an audit record raises the cluster
@@ -1153,6 +1203,9 @@ type persisted struct {
 	// from GenerationVersion, in format 2.
 	Deletions  map[string][]uint64 `json:"deletions,omitempty"`
 	DepartedAt map[string]uint64   `json:"departed_at,omitempty"`
+	// Renames is absent from older snapshots: the table then knows the
+	// newest rename into each key only, as before (#138).
+	Renames map[string][]renameMark `json:"renames,omitempty"`
 }
 
 type bytesSnapshot struct{ b []byte }
@@ -1183,7 +1236,7 @@ func (t *Table) persistedLocked() *persisted {
 		Repos: make(map[string]map[string]*RefValue, len(t.repos)), Last: map[string]uint64{},
 		Events: t.events, Audit: t.audit, Deleted: t.deleted, Renamed: t.renamed, Grants: t.grants, Revoked: t.revoked, PendingRevoke: t.pendingRevoke,
 		Pending: t.pending, Checkpoints: t.checkpoints, Payload: t.payload, Nonces: t.nonces,
-		Deletions: t.deletions, DepartedAt: t.departedAt,
+		Deletions: t.deletions, DepartedAt: t.departedAt, Renames: t.renames,
 	}
 	for k, r := range t.repos {
 		p.Repos[k] = r.refs
@@ -1242,6 +1295,16 @@ func (p *persisted) validNames() error {
 		}
 		if err := ValidRepoKey(m.From); err != nil {
 			return refuse(fmt.Sprintf("the rename source %q", m.From), err)
+		}
+	}
+	for to, marks := range p.Renames {
+		if err := ValidRepoKey(to); err != nil {
+			return refuse(fmt.Sprintf("the renamed repository key %q", to), err)
+		}
+		for _, m := range marks {
+			if err := ValidRepoKey(m.From); err != nil {
+				return refuse(fmt.Sprintf("the rename source %q", m.From), err)
+			}
 		}
 	}
 	return nil
@@ -1308,6 +1371,9 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	if p.Deletions != nil {
 		nt.deletions = p.Deletions
 	}
+	if p.Renames != nil {
+		nt.renames = p.Renames
+	}
 	if p.DepartedAt != nil {
 		nt.departedAt = p.DepartedAt
 	}
@@ -1335,7 +1401,7 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	t.applied, t.identity = p.Applied, p.Identity
 	t.pending, t.checkpoints = p.Pending, p.Checkpoints
 	t.payload, t.nonces, t.byNonce = nt.payload, nt.nonces, nt.byNonce
-	t.deletions, t.departedAt = nt.deletions, nt.departedAt
+	t.deletions, t.departedAt, t.renames = nt.deletions, nt.departedAt, nt.renames
 	if t.onChange != nil {
 		repos := make([]string, 0, len(t.repos))
 		for k := range t.repos {

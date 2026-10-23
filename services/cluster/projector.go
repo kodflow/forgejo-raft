@@ -1079,8 +1079,8 @@ func (p *projector) servesAnother(repo string) bool {
 		// certified yet: the same repository.
 		key, before := repo, uint64(math.MaxUint64)
 		for range renameLineageDepth {
-			from, idx, ok := p.table.RenamedFrom(key)
-			if !ok || idx >= before {
+			from, idx, ok := p.table.RenamedFromBefore(key, before)
+			if !ok {
 				break
 			}
 			if from == s.Repo && s.Watermark < idx {
