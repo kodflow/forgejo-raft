@@ -722,7 +722,9 @@ func (r *Replicator) proposeLifecycle(ctx context.Context, v uint8, kind reftabl
 	if clusterhook.IsOutcomeUnresolved(err) && landed != nil {
 		if ok, rerr := r.resolveLanded(detached, landed); rerr == nil {
 			if !ok {
-				return fmt.Errorf("the cluster did not record it: not applied at a commit boundary after %w", err)
+				// Certain: a commit boundary a quorum confirmed was applied
+				// without it, so the callers move the directories back.
+				return fmt.Errorf("the cluster did not record it: not applied at a commit boundary after %v", err)
 			}
 			result, err = reftable.Result{OK: true}, nil
 		}

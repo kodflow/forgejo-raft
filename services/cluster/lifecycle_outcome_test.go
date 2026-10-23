@@ -26,8 +26,11 @@ type unknownEngine struct {
 	consensus.Engine
 	table       *reftable.Table
 	barrierFrom time.Time
-	mu          sync.Mutex
-	index       uint64
+	// lost drops the proposal instead of applying it: the outcome stays
+	// unknown, and a commit boundary shows it did not land.
+	lost  bool
+	mu    sync.Mutex
+	index uint64
 }
 
 func (e *unknownEngine) token() consensus.Token {
@@ -38,6 +41,9 @@ func (e *unknownEngine) Propose(_ context.Context, data []byte) (consensus.Token
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.index++
+	if e.lost {
+		return e.token(), nil, consensus.ErrOutcomeUnknown
+	}
 	e.table.Apply(consensus.Entry{Term: 1, Index: e.index, Kind: consensus.EntryCommand, Data: data, Token: e.token()})
 	return e.token(), nil, consensus.ErrOutcomeUnknown
 }
@@ -84,4 +90,21 @@ func TestARenameWithAnUnknownOutcomeIsNotReportedRefused(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, clusterhook.IsOutcomeUnresolved(err), "%v", err)
 	assert.True(t, errors.Is(err, consensus.ErrOutcomeUnknown))
+}
+
+// A rename whose outcome was unknown, then shown at a commit boundary not
+// to have landed, is a refusal: the caller moves the directories back, and
+// the user's transaction rolls back. Reported unresolved, both kept the
+// directories at their new paths (CodeRabbit on #120).
+func TestARenameShownLostAtACommitBoundaryIsRefused(t *testing.T) {
+	moves := [][2]string{{"o/a.git", "o/b.git"}}
+	r := newReplicator(t.TempDir(), newRegistry(0, 1, 1))
+	r.setEngine(&unknownEngine{table: r.table, lost: true, barrierFrom: time.Now().Add(400 * time.Millisecond)})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := r.proposeRepoMoves(ctx, moves)
+	require.Error(t, err)
+	assert.False(t, clusterhook.IsOutcomeUnresolved(err), "%v", err)
+	_, _, ok := r.table.RenamedFrom("o/b.git")
+	assert.False(t, ok)
 }
