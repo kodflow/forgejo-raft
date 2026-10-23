@@ -310,6 +310,7 @@ func transferOwnership(ctx context.Context, doer *user_model.User, newOwnerName 
 // changeRepositoryName changes all corresponding setting from old repository name to new one.
 func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newRepoName string) (err error) {
 	oldRepoName := repo.Name
+	displayName := newRepoName
 	newRepoName = strings.ToLower(newRepoName)
 	if err = repo_model.IsUsableRepoName(newRepoName); err != nil {
 		return err
@@ -372,6 +373,16 @@ func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newR
 	defer committer.Close()
 
 	if err := repo_model.NewRedirect(ctx, repo.Owner.ID, repo.ID, oldRepoName, newRepoName); err != nil {
+		undoClusterRename(ctx, repo.Owner.Name, oldRepoName, newRepoName)
+		return err
+	}
+
+	// The name is written with the redirect, in the transaction that
+	// follows the move of the directories: a caller that failed after
+	// this function returned, before writing it, left the database under
+	// the old name and the directories, on every node of a cluster, under
+	// the new one (#135).
+	if err := repo_model.UpdateRepositoryCols(ctx, &repo_model.Repository{ID: repo.ID, Name: displayName, LowerName: newRepoName}, "name", "lower_name"); err != nil {
 		undoClusterRename(ctx, repo.Owner.Name, oldRepoName, newRepoName)
 		return err
 	}

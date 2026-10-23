@@ -748,6 +748,29 @@ func updateBasicProperties(ctx *context.APIContext, opts api.EditRepoOption) err
 	if opts.Name != nil {
 		newRepoName = *opts.Name
 	}
+	// The visibility is checked before the rename: a rename is committed
+	// at once, in a cluster on every node, and a refusal after it would
+	// leave the repository renamed with its other settings unchanged (#135).
+	visibilityChanged := false
+	if opts.Private != nil {
+		// Visibility of forked repository is forced sync with base repository.
+		if repo.IsFork {
+			if err := repo.GetBaseRepo(ctx); err != nil {
+				ctx.Error(http.StatusInternalServerError, "Unable to load base repository", err)
+				return err
+			}
+			*opts.Private = repo.BaseRepo.IsPrivate
+		}
+
+		visibilityChanged = repo.IsPrivate != *opts.Private
+		// when ForcePrivate enabled, you could change public repo to private, but only admin users can change private to public
+		if visibilityChanged && setting.Repository.ForcePrivate && !*opts.Private && !ctx.IsUserSiteAdmin() {
+			err := errors.New("cannot change private repository to public")
+			ctx.Error(http.StatusUnprocessableEntity, "Force Private enabled", err)
+			return err
+		}
+	}
+
 	// Check if repository name has been changed and not just a case change
 	if repo.LowerName != strings.ToLower(newRepoName) {
 		if err := repo_service.ChangeRepositoryName(ctx, ctx.Doer(), repo, newRepoName); err != nil {
@@ -778,25 +801,7 @@ func updateBasicProperties(ctx *context.APIContext, opts api.EditRepoOption) err
 		repo.Website = *opts.Website
 	}
 
-	visibilityChanged := false
 	if opts.Private != nil {
-		// Visibility of forked repository is forced sync with base repository.
-		if repo.IsFork {
-			if err := repo.GetBaseRepo(ctx); err != nil {
-				ctx.Error(http.StatusInternalServerError, "Unable to load base repository", err)
-				return err
-			}
-			*opts.Private = repo.BaseRepo.IsPrivate
-		}
-
-		visibilityChanged = repo.IsPrivate != *opts.Private
-		// when ForcePrivate enabled, you could change public repo to private, but only admin users can change private to public
-		if visibilityChanged && setting.Repository.ForcePrivate && !*opts.Private && !ctx.IsUserSiteAdmin() {
-			err := errors.New("cannot change private repository to public")
-			ctx.Error(http.StatusUnprocessableEntity, "Force Private enabled", err)
-			return err
-		}
-
 		repo.IsPrivate = *opts.Private
 	}
 
