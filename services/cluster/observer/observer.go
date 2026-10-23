@@ -1097,7 +1097,7 @@ func (o *Observer) fetchWAL(ctx context.Context, leader string) error {
 	return nil
 }
 
-func (o *Observer) fetchBase(ctx context.Context, leader string) error {
+func (o *Observer) fetchBase(ctx context.Context, leader string) (err error) {
 	body, err := call(ctx, o.cfg.Endpoints[leader], &clusterhook.ExportRequest{Op: clusterhook.OpExportPGBase, Observer: o.cfg.Name}, nil)
 	if err != nil {
 		return err
@@ -1108,17 +1108,24 @@ func (o *Observer) fetchBase(ctx context.Context, leader string) error {
 	// still sorts after the first, instead of failing on the rename.
 	label := o.cfg.Now().UTC().Format("20060102T150405Z")
 	for i, first := 1, label; ; i++ {
-		_, err := os.Stat(o.store.path("pg", "base", label))
-		if errors.Is(err, os.ErrNotExist) {
-			break
-		}
+		free, err := o.freeLabel(label)
 		if err != nil {
 			// A storage failure is reported, never taken for a used label.
 			return fmt.Errorf("base backup label %s: %w", label, err)
 		}
+		if free {
+			break
+		}
 		label = fmt.Sprintf("%s-%02d", first, i)
 	}
 	stage := o.store.path("pg", "staging", label)
+	// A base refused leaves nothing in staging: a tar left there would
+	// count against the quota until a restart (#112).
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(stage)
+		}
+	}()
 	if err := os.MkdirAll(stage, 0o700); err != nil {
 		return err
 	}
@@ -1153,6 +1160,21 @@ func (o *Observer) fetchBase(ctx context.Context, leader string) error {
 	o.state.Bases = append(o.state.Bases, info)
 	log.Info("cluster observer: base backup %s at %s on timeline %d (%d bytes)", label, info.Start, info.Timeline, n)
 	return o.store.saveState(o.state)
+}
+
+// freeLabel reports whether no base backup, published or in staging, has
+// label.
+func (o *Observer) freeLabel(label string) (bool, error) {
+	for _, dir := range []string{"base", "staging"} {
+		_, err := os.Stat(o.store.path("pg", dir, label))
+		if err == nil {
+			return false, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // ---- protection ----
