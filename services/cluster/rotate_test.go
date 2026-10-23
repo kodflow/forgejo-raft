@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -69,10 +70,14 @@ func TestRenewedCertificateRotatesTheObjectChannel(t *testing.T) {
 	id, err := newIdentity(file, file, pki.caFile)
 	require.NoError(t, err)
 
-	release := make(chan struct{})
+	release, entered := make(chan struct{}), make(chan struct{}, 1)
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /serial", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("block") != "" {
+			entered <- struct{}{}
 			<-release
 		}
 		_, _ = io.WriteString(w, r.TLS.PeerCertificates[0].SerialNumber.String())
@@ -90,16 +95,25 @@ func TestRenewedCertificateRotatesTheObjectChannel(t *testing.T) {
 		server, client string // the serial the server presented, the one it saw
 		reused         bool
 	}
-	get := func(c *http.Client, query string) answer {
+	try := func(c *http.Client, query string) (answer, error) {
 		var reused bool
 		ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{GotConn: func(i httptrace.GotConnInfo) { reused = i.Reused }})
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+ln.Addr().String()+"/serial"+query, nil)
-		require.NoError(t, err)
+		if err != nil {
+			return answer{}, err
+		}
 		resp, err := c.Do(req)
-		require.NoError(t, err)
+		if err != nil {
+			return answer{}, err
+		}
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(resp.Body)
-		return answer{server: resp.TLS.PeerCertificates[0].SerialNumber.String(), client: string(b), reused: reused}
+		return answer{server: resp.TLS.PeerCertificates[0].SerialNumber.String(), client: string(b), reused: reused}, nil
+	}
+	get := func(c *http.Client, query string) answer {
+		a, err := try(c, query)
+		require.NoError(t, err)
+		return a
 	}
 
 	first, _ := id.load()
@@ -112,14 +126,31 @@ func TestRenewedCertificateRotatesTheObjectChannel(t *testing.T) {
 
 	// A second client holds a request in flight across the renewal.
 	busy := &http.Client{Transport: &http.Transport{TLSClientConfig: c1.Transport.(*http.Transport).TLSClientConfig.Clone()}}
-	inflight := make(chan answer, 1)
-	go func() { inflight <- get(busy, "?block=1") }()
-	require.Eventually(t, func() bool { return rot.open() == 2 }, 5*time.Second, 10*time.Millisecond)
+	// It reports from its goroutine, not through t, which a failure may
+	// have ended meanwhile.
+	type result struct {
+		answer
+		err error
+	}
+	inflight := make(chan result, 1)
+	go func() {
+		a, err := try(busy, "?block=1")
+		inflight <- result{a, err}
+	}()
+	// The handler runs once the handshake is done, with the certificate of
+	// before the renewal: a connection is counted open at its accept,
+	// before its handshake, which a renewal could then precede (#153).
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the busy request did not reach the server")
+	}
+	require.Equal(t, 2, rot.open())
 
 	rotated := make(chan struct{}, 4)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go watchIdentity(ctx, id, 20*time.Millisecond, func() {
+	watchIdentity(ctx, id, 20*time.Millisecond, func() {
 		oc.rotate()
 		rot.rotate()
 		rotated <- struct{}{}
@@ -139,8 +170,9 @@ func TestRenewedCertificateRotatesTheObjectChannel(t *testing.T) {
 	assert.Equal(t, answer{s2, s2, false}, get(c2, ""))
 
 	// The request in flight ends on its old connection, which then closes.
-	close(release)
+	unblock()
 	old := <-inflight
+	require.NoError(t, old.err)
 	assert.Equal(t, s1, old.server)
 	assert.Equal(t, s1, old.client)
 	require.Eventually(t, func() bool { return rot.open() == 1 }, 5*time.Second, 10*time.Millisecond, "only c2's connection remains")

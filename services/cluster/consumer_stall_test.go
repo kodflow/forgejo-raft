@@ -9,6 +9,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -27,15 +28,20 @@ import (
 // every other repository: past projectionStallBound its event is parked,
 // never dropped, and applied once its repository projects, and the stall is visible meanwhile.
 func TestAStalledProjectionDoesNotHoldBackOtherRepositories(t *testing.T) {
-	defer test.MockVariableValue(&projectionStallBound, 500*time.Millisecond)()
+	// The bound also counts o/other.git's own projection on the leader,
+	// which takes more than half a second on a loaded machine: it was
+	// parked too (#153).
+	defer test.MockVariableValue(&projectionStallBound, 3*time.Second)()
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	leader := tc.nodes[0]
 	// A native git transaction that does not end keeps the leader from
 	// projecting o/stall.git.
 	require.NoError(t, leader.r.registry.register("held", "o/stall.git", nil, os.Getpid(), false))
 
-	// The stall is reported while it lasts.
-	var seen atomic.Value
+	// The stall is reported while it lasts. Stalled names any repository
+	// the consumer waits for, o/other.git too while the leader projects
+	// it: every name seen is kept, not the last one (#153).
+	var seen sync.Map
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -46,7 +52,7 @@ func TestAStalledProjectionDoesNotHoldBackOtherRepositories(t *testing.T) {
 			case <-time.After(5 * time.Millisecond):
 			}
 			if repo, _ := leader.r.consumer.Stalled(); repo != "" {
-				seen.Store(repo)
+				seen.Store(repo, true)
 			}
 		}
 	}()
@@ -67,13 +73,14 @@ func TestAStalledProjectionDoesNotHoldBackOtherRepositories(t *testing.T) {
 			}
 		}
 		return false
-	}, 5*time.Second, 10*time.Millisecond, "the next repository's event is dispatched")
+	}, 4*projectionStallBound, 10*time.Millisecond, "the next repository's event is dispatched")
 	leader.work.mu.Lock()
 	for _, ev := range leader.work.events {
 		assert.NotEqual(t, "o/stall.git", ev.Repo, "the stalled event was skipped, not run unprojected")
 	}
 	leader.work.mu.Unlock()
-	assert.Equal(t, "o/stall.git", seen.Load(), "the stall was reported")
+	_, reported := seen.Load("o/stall.git")
+	assert.True(t, reported, "the stall was reported")
 	repo, _ := leader.r.consumer.Stalled()
 	assert.Empty(t, repo, "the stall clears once the queue moves")
 
@@ -85,9 +92,14 @@ func TestAStalledProjectionDoesNotHoldBackOtherRepositories(t *testing.T) {
 	assert.Equal(t, "o/stall.git", rows[0].Repo)
 	leader.r.registry.release("held")
 	leader.r.projector.signal()
+	// The consumer's own retry may apply it first, on a loaded machine
+	// (#153): what counts is that it is applied, once.
 	require.Eventually(t, func() bool {
-		n, err := leader.r.consumer.retryParked(context.Background())
-		return err == nil && n == 1
+		if _, err := leader.r.consumer.retryParked(context.Background()); err != nil {
+			return false
+		}
+		rows, err := tc.parked.list(context.Background())
+		return err == nil && len(rows) == 0
 	}, 10*time.Second, 50*time.Millisecond, "the parked event is applied once projected")
 	n, err := leader.r.consumer.retryParked(context.Background())
 	require.NoError(t, err)

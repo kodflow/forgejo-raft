@@ -100,7 +100,11 @@ func TestHuntR2ProveRecreateSameFormatKeepsDeletedObjects(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Join(lag.r.root, staleDirName))
 	require.NoError(t, err)
 	assert.Len(t, entries, 1, "the deleted repository's directory was set aside")
-	assert.Empty(t, lag.r.projector.Lag())
+	// The ref is written before the projection certifies it, and a
+	// certification a newer transaction overtook waits for the next pass:
+	// the lag clears once it certified (#153).
+	require.Eventually(t, func() bool { return len(lag.r.projector.Lag()) == 0 }, 10*time.Second, 20*time.Millisecond,
+		"the lagging node certifies the new repository: %v", lag.r.projector.Lag())
 }
 
 // A node behind the log moved a deleted repository's directory under a
