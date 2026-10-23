@@ -5,7 +5,9 @@ package clusterhook
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"path/filepath"
@@ -63,4 +65,33 @@ func TestCallExportBoundsTheHead(t *testing.T) {
 	defer cancel()
 	_, _, err = CallExport(ctx, sock, &ExportRequest{Op: OpExportCheckpoints})
 	require.ErrorIs(t, err, ErrExportHead)
+}
+
+// A framed stream reads back as its bytes, then io.EOF at its end mark, the
+// node's error at an error mark, and ErrStreamTruncated when cut (#111).
+func TestFramedStream(t *testing.T) {
+	frame := func(end func(FrameWriter)) *bytes.Buffer {
+		var buf bytes.Buffer
+		fw := FrameWriter{W: &buf}
+		_, _ = fw.Write([]byte("hello "))
+		_, _ = fw.Write(nil)
+		_, _ = fw.Write([]byte("world"))
+		if end != nil {
+			end(fw)
+		}
+		return &buf
+	}
+	got, err := io.ReadAll(&frameReader{r: bufio.NewReader(frame(func(fw FrameWriter) { _ = fw.End() }))})
+	require.NoError(t, err)
+	assert.Equal(t, "hello world", string(got))
+
+	got, err = io.ReadAll(&frameReader{r: bufio.NewReader(frame(func(fw FrameWriter) { _ = fw.Fail(errors.New("killed\nby the budget")) }))})
+	require.ErrorContains(t, err, "killed by the budget")
+	assert.Equal(t, "hello world", string(got))
+
+	_, err = io.ReadAll(&frameReader{r: bufio.NewReader(frame(nil))})
+	require.ErrorIs(t, err, ErrStreamTruncated)
+	b := frame(func(fw FrameWriter) { _ = fw.End() }).Bytes()
+	_, err = io.ReadAll(&frameReader{r: bufio.NewReader(bytes.NewReader(b[:8]))})
+	require.ErrorIs(t, err, ErrStreamTruncated)
 }

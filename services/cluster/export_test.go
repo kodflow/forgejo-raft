@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -251,6 +252,50 @@ func TestExportStreamsOverTheHookSocket(t *testing.T) {
 	ans, _, err = clusterhook.CallExport(context.Background(), sock, &clusterhook.ExportRequest{Op: clusterhook.OpExportWAL, Name: "nope"})
 	require.NoError(t, err)
 	assert.False(t, ans.OK)
+}
+
+// A stream the node fails part-way reaches the export command as an
+// error, never as an end: pg_basebackup killed after some of its tar
+// (#111). A complete stream still ends cleanly.
+func TestExportStreamFailureIsNotAnEnd(t *testing.T) {
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	n := tc.nodes[0]
+	fail := true
+	n.r.export = exportSide{wal: newFakePG(), baseBackup: func(_ context.Context, w io.Writer) error {
+		if _, err := w.Write(bytes.Repeat([]byte{0x5a}, 70<<10)); err != nil {
+			return err
+		}
+		if fail {
+			return errors.New("pg_basebackup: signal: killed")
+		}
+		return nil
+	}}
+	sock := filepath.Join(shortTempDir(t), "h.sock")
+	require.NoError(t, n.r.serveHookSocket(sock))
+
+	ans, body, err := clusterhook.CallExport(context.Background(), sock, &clusterhook.ExportRequest{Op: clusterhook.OpExportPGBase})
+	require.NoError(t, err)
+	require.True(t, ans.OK && ans.Stream)
+	assert.False(t, ans.Framed, "the body CallExport returns is the raw stream")
+	got, err := io.ReadAll(body)
+	body.Close()
+	require.ErrorContains(t, err, "pg_basebackup: signal: killed")
+	assert.Len(t, got, 70<<10)
+
+	fail = false
+	_, body, err = clusterhook.CallExport(context.Background(), sock, &clusterhook.ExportRequest{Op: clusterhook.OpExportPGBase})
+	require.NoError(t, err)
+	got, err = io.ReadAll(body)
+	body.Close()
+	require.NoError(t, err)
+	assert.Len(t, got, 70<<10)
+}
+
+// An export op gets the export's budget, not the operator's 30 minutes.
+func TestExportBudgetOutlastsTheAdminTimeout(t *testing.T) {
+	for _, op := range []string{clusterhook.OpExportPGBase, clusterhook.OpExportPacks, clusterhook.OpExportFile, clusterhook.OpExportWAL} {
+		assert.Greater(t, clusterhook.Budget(op), clusterhook.AdminTimeout, op)
+	}
 }
 
 // shortTempDir is a temporary directory whose path fits a Unix socket's.

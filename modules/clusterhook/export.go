@@ -6,6 +6,7 @@ package clusterhook
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -68,6 +69,10 @@ type ExportRequest struct {
 	Haves      []string `json:"haves,omitempty"`
 	Name       string   `json:"name,omitempty"`
 	Storage    string   `json:"storage,omitempty"`
+	// Framed asks the member's node to frame a stream, so that a stream
+	// cut short by an error is told from its end (#111). Only the
+	// member's own export command sets it, on its socket.
+	Framed bool `json:"framed,omitempty"`
 }
 
 // ExportAnswer heads every export answer; when Stream is set, the raw bytes
@@ -80,6 +85,9 @@ type ExportAnswer struct {
 	Term    uint64  `json:"term,omitempty"`
 	Stream  bool    `json:"stream,omitempty"`
 	Data    RawJSON `json:"data,omitempty"`
+	// Framed says the stream that follows is framed: chunks, then an end
+	// or an error. A node that predates framing never sets it.
+	Framed bool `json:"framed,omitempty"`
 }
 
 // ExportError is a refused export.
@@ -204,10 +212,106 @@ func ReadExportHead(br *bufio.Reader, max int) ([]byte, error) {
 	}
 }
 
+// A framed stream is a sequence of chunks, each a big-endian length then
+// its bytes, ended by a zero length (the end) or by frameError then the
+// error's message up to a newline: a stream cut otherwise is truncated.
+const frameError = 0xffffffff
+
+// maxFrameMessage bounds an error's message in a framed stream.
+const maxFrameMessage = 64 << 10
+
+// FrameWriter frames a stream's bytes; End or Fail closes it.
+type FrameWriter struct{ W io.Writer }
+
+func (f FrameWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	var head [4]byte
+	binary.BigEndian.PutUint32(head[:], uint32(len(p)))
+	if _, err := f.W.Write(head[:]); err != nil {
+		return 0, err
+	}
+	return f.W.Write(p)
+}
+
+// End marks the stream complete.
+func (f FrameWriter) End() error {
+	_, err := f.W.Write([]byte{0, 0, 0, 0})
+	return err
+}
+
+// Fail marks the stream failed with err.
+func (f FrameWriter) Fail(err error) error {
+	msg := strings.ReplaceAll(err.Error(), "\n", " ")
+	if len(msg) > maxFrameMessage-1 {
+		msg = msg[:maxFrameMessage-1]
+	}
+	var head [4]byte
+	binary.BigEndian.PutUint32(head[:], frameError)
+	_, werr := f.W.Write(append(head[:], msg+"\n"...))
+	return werr
+}
+
+// ErrStreamTruncated is a framed stream that ended without its end mark.
+var ErrStreamTruncated = errors.New("the export's stream was cut short")
+
+// frameReader reads a framed stream's bytes: io.EOF at its end mark, the
+// node's error at an error mark, ErrStreamTruncated otherwise.
+type frameReader struct {
+	r    *bufio.Reader
+	left uint32
+	err  error
+}
+
+func (f *frameReader) Read(p []byte) (int, error) {
+	for f.left == 0 {
+		if f.err != nil {
+			return 0, f.err
+		}
+		var head [4]byte
+		if _, err := io.ReadFull(f.r, head[:]); err != nil {
+			f.err = fmt.Errorf("%w: %w", ErrStreamTruncated, err)
+			continue
+		}
+		switch n := binary.BigEndian.Uint32(head[:]); n {
+		case 0:
+			f.err = io.EOF
+		case frameError:
+			msg, err := ReadExportHead(f.r, maxFrameMessage)
+			if err != nil && !errors.Is(err, io.EOF) {
+				f.err = fmt.Errorf("%w: %w", ErrStreamTruncated, err)
+				continue
+			}
+			f.err = fmt.Errorf("the export's stream failed on the member: %s", strings.TrimSpace(string(msg)))
+		default:
+			f.left = n
+		}
+	}
+	if uint32(len(p)) > f.left {
+		p = p[:f.left]
+	}
+	n, err := f.r.Read(p)
+	f.left -= uint32(n)
+	if errors.Is(err, io.EOF) {
+		if f.left > 0 {
+			f.err = fmt.Errorf("%w: %w", ErrStreamTruncated, io.ErrUnexpectedEOF)
+			return n, f.err
+		}
+		err = nil
+	}
+	return n, err
+}
+
 // CallExport sends an export request on the replicator's socket and
 // returns its answer and the body to read the stream from, empty unless
-// the answer is a stream; the caller closes it.
+// the answer is a stream; the caller closes it. It asks for a framed
+// stream: the body it returns holds the raw bytes, and fails when the node
+// failed or the stream was cut short.
 func CallExport(ctx context.Context, socket string, req *ExportRequest) (*ExportAnswer, io.ReadCloser, error) {
+	framed := *req
+	framed.Framed = true
+	req = &framed
 	d := net.Dialer{}
 	conn, err := d.DialContext(ctx, "unix", socket)
 	if err != nil {
@@ -234,6 +338,10 @@ func CallExport(ctx context.Context, socket string, req *ExportRequest) (*Export
 	if !ans.Stream {
 		conn.Close()
 		return &ans, io.NopCloser(strings.NewReader("")), nil
+	}
+	if ans.Framed {
+		ans.Framed = false
+		return &ans, readCloser{Reader: &frameReader{r: br}, Closer: conn}, nil
 	}
 	return &ans, readCloser{Reader: br, Closer: conn}, nil
 }

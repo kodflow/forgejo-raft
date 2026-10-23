@@ -79,7 +79,8 @@ func runClusterExport(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("%q is not an export op", req.Op)
 	}
 	req.Observer = c.String("observer")
-	ctx, cancel := context.WithTimeout(ctx, clusterhook.AdminTimeout)
+	// A base backup runs as long as the node's export budget allows.
+	ctx, cancel := context.WithTimeout(ctx, clusterhook.ExportTimeout)
 	defer cancel()
 	ans, body, err := clusterhook.CallExport(ctx, setting.Cluster.HookSocket, &req)
 	if err != nil {

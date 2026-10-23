@@ -100,14 +100,26 @@ func (r *Replicator) serveExport(ctx context.Context, conn net.Conn, req *cluste
 		head(clusterhook.ExportAnswer{OK: true, Data: data})
 		return
 	}
-	if !head(clusterhook.ExportAnswer{OK: true, Stream: true, Data: data}) {
+	if !head(clusterhook.ExportAnswer{OK: true, Stream: true, Data: data, Framed: req.Framed}) {
 		return
 	}
-	if err := stream(ctx, w); err != nil {
-		// The head is gone: the observer sees a stream that does not
-		// verify, and discards it.
-		log.Warn("cluster export: %s: %v", req.Op, err)
+	if !req.Framed {
+		if err := stream(ctx, w); err != nil {
+			// The head is gone: the observer sees a stream that does not
+			// verify, and discards it.
+			log.Warn("cluster export: %s: %v", req.Op, err)
+		}
+		return
 	}
+	// Framed, a failure reaches the export command, which exits non-zero:
+	// the observer never takes a stream cut short for its end (#111).
+	fw := clusterhook.FrameWriter{W: w}
+	if err := stream(ctx, fw); err != nil {
+		log.Warn("cluster export: %s: %v", req.Op, err)
+		_ = fw.Fail(err)
+		return
+	}
+	_ = fw.End()
 }
 
 type streamFunc func(ctx context.Context, w io.Writer) error

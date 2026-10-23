@@ -349,3 +349,8 @@ key and the new lineage (`observe accept`).
   SDK draft `ImportObserved` will keep the lineage chain).
 - The SQL a web request writes beside a push is reconciled after a
   recovery, not fenced.
+- One export call, a base backup included, may run for 6 hours at most
+  (`ExportTimeout`, the default length of an observer's pass): past it, the
+  member's node stops the stream and the observer sees a failed call, never
+  a short one taken for complete. A base backup that cannot cross the link
+  in that time never completes.
