@@ -175,7 +175,7 @@ func newObserverFromSettings() (*observer.Observer, error) {
 	}
 	eps := map[string]observer.Source{}
 	for slot, target := range o.Endpoints {
-		src, err := observer.NewSSHSource(target, o.SSHKeyFile, o.KnownHostsFile)
+		src, err := observer.NewSSHSource(target, o.SSHKeyFile, o.KnownHostsFile, o.ExportSilence)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", slot, err)
 		}
