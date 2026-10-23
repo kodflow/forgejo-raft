@@ -46,11 +46,15 @@ import (
 // SQL committed after step 4 is past L, whatever entry it derives from.
 // Followers' pushes are ordered after B by the log, and their SQL is held
 // by the consumer. A deletion, a rename or a transfer writes its own SQL
-// beside its entry, on any member: it holds the cluster's cut across
-// both, which the coordinator takes with the fence (cut.go), so both fall
-// on one side of (B, L). What else a web request writes to SQL beside a
-// push is reconciled after a Recover (doctor, pull request heads). Nothing
-// here waits on an observer.
+// beside its entry, on any member, and a creation, a fork or a generation
+// from a template writes a repository's refs inside the transaction of its
+// row: each holds the cluster's cut across both, which the coordinator
+// takes with the fence (cut.go), so both fall on one side of (B, L). The
+// branch rows a mirror's synchronisation or a migration writes long after
+// their refs derive from the refs, and a Recover derives them again (#159).
+// What else a web request writes to SQL beside a push is reconciled after
+// a Recover (doctor, pull request heads). Nothing here waits on an
+// observer.
 
 // readToCommitBound is how long the position may take to commit once read:
 // a checkpoint that exceeds it is discarded and taken again.
