@@ -450,10 +450,22 @@ func (s *store) walPath(sysid, name string) string {
 	if _, err := os.Stat(p); err != nil {
 		return ""
 	}
-	if !strings.HasSuffix(name, ".history") && !legacySegmentOf(p, name, sysid) {
+	if strings.HasSuffix(name, ".history") {
+		if !s.legacyOf(sysid) {
+			return ""
+		}
+	} else if !legacySegmentOf(p, name, sysid) {
 		return ""
 	}
 	return p
+}
+
+// legacyOf reports whether the flat archive is sysid's: its greatest
+// segment's header names it. A history there has no header of its own,
+// and is the flat archive's system's only.
+func (s *store) legacyOf(sysid string) bool {
+	last := greatestSegment(s.path("pg", "wal"))
+	return last != "" && legacySegmentOf(s.legacyWALPath(last), last, sysid)
 }
 
 // legacySegmentOf reports whether a segment held flat belongs to sysid.
@@ -481,7 +493,11 @@ func legacySegmentOf(path, name, sysid string) bool {
 // histories lists every timeline history the archive of sysid holds.
 func (s *store) histories(sysid string) ([]string, error) {
 	var out []string
-	for _, dir := range []string{s.walDir(sysid), s.path("pg", "wal")} {
+	dirs := []string{s.walDir(sysid)}
+	if s.legacyOf(sysid) {
+		dirs = append(dirs, s.path("pg", "wal"))
+	}
+	for _, dir := range dirs {
 		if dir == "" {
 			continue
 		}
@@ -562,11 +578,10 @@ func (s *store) lastSegment(sysid string) string {
 	if last := greatestSegment(s.walDir(sysid)); last != "" {
 		return last
 	}
-	last := greatestSegment(s.path("pg", "wal"))
-	if last == "" || !legacySegmentOf(s.legacyWALPath(last), last, sysid) {
+	if !s.legacyOf(sysid) {
 		return ""
 	}
-	return last
+	return greatestSegment(s.path("pg", "wal"))
 }
 
 func greatestSegment(dir string) string {
