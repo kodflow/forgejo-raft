@@ -121,7 +121,7 @@ func (s *SSHSource) Export(ctx context.Context, req *clusterhook.ExportRequest) 
 		return nil, nil, err
 	}
 	br := bufio.NewReader(stdout)
-	line, err := br.ReadBytes('\n')
+	line, err := clusterhook.ReadExportHead(br, clusterhook.MaxExportHead)
 	if err != nil {
 		closeAll()
 		return nil, nil, fmt.Errorf("the export's answer: %w", err)

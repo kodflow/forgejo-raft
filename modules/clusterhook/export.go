@@ -179,6 +179,31 @@ type FilesManifest struct {
 // observer: the wants of one repository fit it.
 const MaxExportRequest = 16 << 20
 
+// MaxExportHead bounds the head line of an export's answer, which a member
+// writes and an observer reads before anything else: a view, a WAL list.
+const MaxExportHead = 64 << 20
+
+// ErrExportHead is a head line past MaxExportHead.
+var ErrExportHead = errors.New("the export's answer head is larger than its bound")
+
+// ReadExportHead reads an answer's head line, never more than max bytes
+// of it: a member that writes without end costs the reader that much at
+// most (#107).
+func ReadExportHead(br *bufio.Reader, max int) ([]byte, error) {
+	var line []byte
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if len(line)+len(chunk) > max {
+			return nil, ErrExportHead
+		}
+		line = append(line, chunk...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return line, err
+	}
+}
+
 // CallExport sends an export request on the replicator's socket and
 // returns its answer and the body to read the stream from, empty unless
 // the answer is a stream; the caller closes it.
@@ -196,7 +221,7 @@ func CallExport(ctx context.Context, socket string, req *ExportRequest) (*Export
 		return nil, nil, err
 	}
 	br := bufio.NewReader(conn)
-	line, err := br.ReadBytes('\n')
+	line, err := ReadExportHead(br, MaxExportHead)
 	if err != nil {
 		conn.Close()
 		return nil, nil, fmt.Errorf("cluster replicator answer: %w", err)
