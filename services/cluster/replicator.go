@@ -568,10 +568,13 @@ func (r *Replicator) WaitFresh(ctx context.Context, repo string) bool {
 	if eng == nil || reftable.ValidRepoKey(repo) != nil {
 		return false
 	}
-	// Without a known leader no barrier completes within the bound: every
-	// git request would wait READ_AFTER_WRITE_TIMEOUT to be served as the
-	// node has it anyway. It is served at once, reported possibly behind.
-	if !eng.Health().LeaderKnown {
+	// Without a leader no barrier completes within the bound: every git
+	// request would wait READ_AFTER_WRITE_TIMEOUT to be served as the node
+	// has it anyway. It is served at once, reported possibly behind. A
+	// leader the node names counts even before it answered the node's
+	// probe: the engine reports it known only then (kitsunium/sdk#541),
+	// and right after an election the barrier is the read that proves it.
+	if !eng.Health().LeaderKnown && eng.Status().Leader == 0 {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(ctx, setting.Cluster.ReadAfterWriteTimeout)

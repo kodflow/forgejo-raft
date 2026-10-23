@@ -25,6 +25,17 @@ func init() {
 	consensus.Register(driver{})
 }
 
+// RuntimeDir is the boot-scoped directory of the engine's second
+// STORAGE_FAILED marker (kitsunium/sdk#562); empty is the SDK's own,
+// /run/kitsunium-consensus on Linux, which the shipped deployments provide.
+// Only a test sets it, to a directory an unprivileged process can create.
+var RuntimeDir string
+
+// openDataDir opens a data directory with the marker directory above.
+func openDataDir(dir string) (sdk.DataDir, error) {
+	return sdk.NewDataDirWith(dir, sdk.DataDirOptions{RuntimeDir: RuntimeDir})
+}
+
 type driver struct{}
 
 func (driver) Name() string { return "kitsunium" }
@@ -34,7 +45,7 @@ func (driver) Name() string { return "kitsunium" }
 // directory must have been prepared by `forgejo cluster init` and
 // `forgejo cluster bootstrap` (or a JOIN): NewRaft never bootstraps.
 func (driver) Open(ctx context.Context, cfg consensus.Config) (consensus.Engine, error) {
-	d, err := sdk.NewDataDir(cfg.DataDir)
+	d, err := openDataDir(cfg.DataDir)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -150,7 +161,7 @@ func (f joinAuthorizer) Authorize(ctx context.Context, r sdk.JoinRequestValue) (
 // withDir runs f on the data directory, under its lock, offline.
 func withDir[T any](dir string, f func(d sdk.DataDir) (T, error)) (T, error) {
 	var zero T
-	d, err := sdk.NewDataDir(dir)
+	d, err := openDataDir(dir)
 	if err != nil {
 		return zero, mapErr(err)
 	}

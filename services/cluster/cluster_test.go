@@ -30,6 +30,7 @@ import (
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/setting"
 	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/consensus/kitsunium"
 	"forgejo.org/services/cluster/consensus/memraft"
 	"forgejo.org/services/cluster/reftable"
 
@@ -43,6 +44,9 @@ func TestMain(m *testing.M) {
 	if sock := os.Getenv(testHookSocketEnv); sock != "" {
 		os.Exit(runTestHook(sock))
 	}
+	// The engine's boot-scoped marker directory, which a runner cannot
+	// create at its Linux default, /run/kitsunium-consensus.
+	kitsunium.RuntimeDir = filepath.Join(os.TempDir(), "kitsunium-consensus")
 	// The full test environment: git with its home, and a fixture database
 	// for the consumer's transactions.
 	unittest.MainTest(m)

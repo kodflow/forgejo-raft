@@ -176,7 +176,7 @@ func (b *autoBench) formAll(nodes []*testNode) {
 // found or join, open.
 func (b *autoBench) form(an *autoNode) {
 	t := b.t
-	dd, err := sdk.NewDataDir(an.dir)
+	dd, err := sdk.NewDataDirWith(an.dir, sdk.DataDirOptions{RuntimeDir: kitsunium.RuntimeDir})
 	require.NoError(t, err)
 	id, inc, err := sdk.Init(dd, an.cluster, an.n.slot)
 	require.NoError(t, err)
@@ -264,7 +264,7 @@ func (b *autoBench) rejoin(an *autoNode) error {
 	if err != nil {
 		return err
 	}
-	ndd, err := sdk.NewDataDir(an.dir)
+	ndd, err := sdk.NewDataDirWith(an.dir, sdk.DataDirOptions{RuntimeDir: kitsunium.RuntimeDir})
 	if err != nil {
 		return err
 	}
@@ -312,7 +312,7 @@ func (b *autoBench) restart(an *autoNode) {
 // its data directory holds for delay before its engine opens, as a node
 // replaying a long log does.
 func (b *autoBench) restartAfter(an *autoNode, delay time.Duration) {
-	dd, err := sdk.NewDataDir(an.dir)
+	dd, err := sdk.NewDataDirWith(an.dir, sdk.DataDirOptions{RuntimeDir: kitsunium.RuntimeDir})
 	require.NoError(b.t, err)
 	stamp, err := dd.Log().Stamp()
 	require.NoError(b.t, err)
@@ -722,7 +722,7 @@ func TestFullRebootWithAWipedFounderNeverFoundsTwice(t *testing.T) {
 
 	// node-a starts on an empty directory and runs the founding rule.
 	time.Sleep(100 * time.Millisecond)
-	dd, err := sdk.NewDataDir(a.dir)
+	dd, err := sdk.NewDataDirWith(a.dir, sdk.DataDirOptions{RuntimeDir: kitsunium.RuntimeDir})
 	require.NoError(t, err)
 	id, inc, err := sdk.Init(dd, a.cluster, a.n.slot)
 	require.NoError(t, err)

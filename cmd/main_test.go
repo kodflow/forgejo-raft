@@ -16,6 +16,7 @@ import (
 	"forgejo.org/models/unittest"
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/test"
+	"forgejo.org/services/cluster/consensus/kitsunium"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -23,6 +24,9 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	// The engine's boot-scoped marker directory, which a runner cannot
+	// create at its Linux default, /run/kitsunium-consensus.
+	kitsunium.RuntimeDir = filepath.Join(os.TempDir(), "kitsunium-consensus")
 	unittest.MainTest(m)
 }
 
