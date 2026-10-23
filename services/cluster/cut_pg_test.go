@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib" // the driver Forgejo uses for PostgreSQL
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	_ "github.com/jackc/pgx/v5/stdlib" // the driver Forgejo uses for PostgreSQL
 )
 
 // The cut on a real PostgreSQL, two members as two connection pools:
