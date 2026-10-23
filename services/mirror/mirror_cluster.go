@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -283,9 +284,20 @@ func fetchInBatches(ctx context.Context, dry *git.Command, dir string, timeout t
 	if !ok || len(updates) <= reftable.MaxUpdatesPerTxn {
 		return "", false, nil
 	}
+	// git fetch prunes in a transaction of its own before it writes the
+	// rest. In one batch, git refuses to create a/b while a, pruned in the
+	// same batch, still exists, and every later sync failed the same way
+	// (#149): the pruned refs come first, in batches of their own.
+	rest := slices.DeleteFunc(slices.Clone(updates), func(u porcelainUpdate) bool { return u.flag == '-' })
+	updates = append(slices.DeleteFunc(updates, func(u porcelainUpdate) bool { return u.flag != '-' }), rest...)
+	pruned := len(updates) - len(rest)
 	var out strings.Builder
 	for len(updates) > 0 {
 		n := min(len(updates), syncRefBatch)
+		if pruned > 0 {
+			n = min(n, pruned)
+			pruned -= n
+		}
 		var in bytes.Buffer
 		for _, u := range updates[:n] {
 			switch u.flag {
