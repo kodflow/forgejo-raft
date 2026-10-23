@@ -802,8 +802,12 @@ func (t *Table) moveRepo(e consensus.Entry, fromKey, toKey string, at int64) {
 		delete(t.ids, toKey)
 	}
 	delete(t.ids, fromKey)
+	// The history starts from the marks already known: a table restored
+	// from a snapshot cut before it was kept holds the newest one in
+	// renamed only.
+	marks := t.marksLocked(toKey)
 	t.renamed[toKey] = renameMark{From: fromKey, Index: e.Index}
-	t.renames[toKey] = keepLast(t.renames[toKey], renameMark{From: fromKey, Index: e.Index})
+	t.renames[toKey] = keepLast(marks, renameMark{From: fromKey, Index: e.Index})
 	t.pushEvent(Event{Token: e.Token, Kind: EventRepoRename, Repo: toKey, RenamedFrom: fromKey, Time: at})
 }
 

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"testing"
 
+	"forgejo.org/modules/json"
 	"forgejo.org/services/cluster/consensus"
 
 	"github.com/stretchr/testify/assert"
@@ -96,4 +97,41 @@ func TestTheTableKeepsEachKeysRepositoryID(t *testing.T) {
 
 	require.True(t, h.apply(KindRepoDelete, &RepoDelete{Repo: "o/b.git"}).OK)
 	assert.Zero(t, id(h.table, "o/b.git"), "a deletion forgets it")
+}
+
+// A table restored from a snapshot cut before the history was kept knows
+// the newest rename into each key: the next rename into that key keeps it
+// (#138).
+func TestARenameAfterAnOlderSnapshotKeepsTheMarkItHeld(t *testing.T) {
+	h := newHarness(t)
+	require.True(t, h.apply(KindRefTxn, push("a/a.git", RefUpdate{Ref: "refs/heads/main", New: sha1A})).OK)
+	require.True(t, h.apply(KindRepoRename, &RepoRename{From: "a/a.git", To: "a/b.git"}).OK)
+	require.True(t, h.apply(KindRepoRename, &RepoRename{From: "a/b.git", To: "a/c.git"}).OK)
+
+	snap, err := h.table.Snapshot()
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+	var p map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &p))
+	require.Contains(t, p, "renames")
+	delete(p, "renames")
+	older, err := json.Marshal(p)
+	require.NoError(t, err)
+	h.table = New()
+	require.NoError(t, h.table.Restore(bytes.NewReader(older), consensus.SnapshotMeta{}))
+
+	require.True(t, h.apply(KindRefTxn, push("a/x.git", RefUpdate{Ref: "refs/heads/main", New: sha1B})).OK)
+	require.True(t, h.apply(KindRepoRename, &RepoRename{From: "a/x.git", To: "a/b.git"}).OK)
+	from, at, ok := h.table.RenamedFromBefore("a/b.git", 3)
+	require.True(t, ok, "the rename into a/b.git the snapshot held")
+	assert.Equal(t, "a/a.git", from)
+	assert.EqualValues(t, 2, at)
+	from, _, ok = h.table.RenamedFromBefore("a/b.git", ^uint64(0))
+	require.True(t, ok)
+	assert.Equal(t, "a/x.git", from)
+	to, _, ok := h.table.RenamedAfter("a/a.git", 1)
+	require.True(t, ok)
+	assert.Equal(t, "a/b.git", to)
 }
