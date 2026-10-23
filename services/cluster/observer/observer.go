@@ -25,6 +25,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -88,7 +89,15 @@ type Observer struct {
 	uncovered int
 	// stepStarted is when the running pass began, zero between passes.
 	stepStarted time.Time
+	// lock holds the directory for this process.
+	lock *os.File
 }
+
+// The files of the observer directory that coordinate its processes.
+const (
+	lockFile   = "observer.lock"
+	acceptFile = "ACCEPT"
+)
 
 // viewTimeout bounds one member's answer to the view request.
 const viewTimeout = time.Minute
@@ -103,6 +112,9 @@ var (
 	ErrHookFailing = errors.New("SNAPSHOT_HOOK_FAILING")
 	ErrQuota       = errors.New("STAGING_QUOTA_REACHED")
 )
+
+// ErrBusy is an observer directory another process holds.
+var ErrBusy = errors.New("another process runs the observer on this directory")
 
 // New opens an observer's directory.
 func New(cfg Config) (*Observer, error) {
@@ -125,19 +137,71 @@ func New(cfg Config) (*Observer, error) {
 		return nil, errors.New("no endpoint")
 	}
 	st := newStore(cfg.Dir, cfg.Git)
+	// The lock comes before staging is cleaned: a second process never
+	// removes what the running one is ingesting (#86).
+	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
+		return nil, err
+	}
+	lock, err := lockDir(st.path(lockFile))
+	if err != nil {
+		if errors.Is(err, ErrBusy) {
+			return nil, fmt.Errorf("%w: %s", ErrBusy, cfg.Dir)
+		}
+		return nil, err
+	}
 	if err := st.init(); err != nil {
+		lock.Close()
 		return nil, err
 	}
 	state, err := st.loadState()
 	if err != nil {
+		lock.Close()
 		return nil, err
 	}
-	o := &Observer{cfg: cfg, store: st, state: state}
+	o := &Observer{cfg: cfg, store: st, state: state, lock: lock}
 	for slot := range cfg.Endpoints {
 		o.slots = append(o.slots, slot)
 	}
 	sort.Strings(o.slots)
 	return o, nil
+}
+
+// Close releases the observer's directory.
+func (o *Observer) Close() {
+	if o.lock != nil {
+		o.lock.Close()
+		o.lock = nil
+	}
+}
+
+// RequestAccept asks the observer that runs on dir to accept lineage at its
+// next pass: `observe accept` while the service runs, which holds the
+// directory and keeps its state in memory (#86).
+func RequestAccept(dir, lineage string) error {
+	return writeAtomic(filepath.Join(dir, acceptFile), []byte(lineage+"\n"), true)
+}
+
+// acceptRequested applies an accept another process asked for, once: the
+// request goes whether it was granted or not, and a refusal ends the pass.
+func (o *Observer) acceptRequested() error {
+	path := o.store.path(acceptFile)
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	if err := syncDir(o.cfg.Dir); err != nil {
+		return err
+	}
+	if err := o.Accept(strings.TrimSpace(string(b))); err != nil {
+		return fmt.Errorf("the accept asked by `forgejo cluster observe accept`: %w", err)
+	}
+	return nil
 }
 
 // State returns a copy of the observer's state.
@@ -182,6 +246,9 @@ func (o *Observer) Run(ctx context.Context, interval time.Duration) {
 // Step runs one pass: the pending hooks, the leader's view, the log, the
 // newest new checkpoint.
 func (o *Observer) Step(ctx context.Context) error {
+	if err := o.acceptRequested(); err != nil {
+		return err
+	}
 	if q := o.state.Quarantine; q != nil {
 		return fmt.Errorf("%w since %s: %s; see `forgejo cluster observe status`", ErrQuarantined, q.At.Format(time.RFC3339), q.Reason)
 	}

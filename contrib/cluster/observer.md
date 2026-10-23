@@ -217,7 +217,12 @@ ingestion until a human acts, the accepted checkpoints untouched:
 `forgejo cluster observe status` says why. `forgejo cluster observe accept
 <lineage>` ends the quarantine: naming the new lineage, the observer follows
 it; naming the current one after a fork, it restarts its log from its newest
-checkpoint. The first lineage the observer meets is its trust root; check it
+checkpoint. Beside the running service, which holds the directory, the
+command leaves the request in the directory (`ACCEPT`) and the service takes
+it at its next pass; `observe status` then shows the quarantine gone, or why
+the accept was refused. No restart is needed. One process at a time holds an
+observer directory (`observer.lock`): `observe once` beside the service is
+refused. The first lineage the observer meets is its trust root; check it
 against a member's `forgejo cluster status` (`lineage`).
 
 ### Integrity is not authenticity

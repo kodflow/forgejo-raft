@@ -17,8 +17,11 @@ import (
 // reopen stands for a restart: a new Observer on the same directory.
 func reopen(t *testing.T, o *Observer) *Observer {
 	t.Helper()
-	n, err := New(o.cfg)
+	cfg := o.cfg
+	o.Close()
+	n, err := New(cfg)
 	require.NoError(t, err)
+	t.Cleanup(n.Close)
 	return n
 }
 

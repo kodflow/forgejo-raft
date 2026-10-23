@@ -559,6 +559,7 @@ func newTestObserver(t *testing.T, c *fakeCluster, h *hookLog) *Observer {
 		StagingQuota: 1 << 30,
 	})
 	require.NoError(t, err)
+	t.Cleanup(o.Close)
 	return o
 }
 
