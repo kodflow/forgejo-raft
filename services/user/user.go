@@ -114,6 +114,14 @@ func renameUser(ctx context.Context, u *user_model.User, newUserName string, doe
 		return repo_model.UpdateRepositoryOwnerNames(ctx, u.ID, newUserName)
 	}
 
+	// In a cluster, the moves recorded in the replicated table and the SQL
+	// committed below fall on the same side of a checkpoint (#88).
+	releaseCut, err := clusterhook.HoldCut(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseCut()
+
 	ctx, committer, err := db.TxContext(ctx)
 	if err != nil {
 		return err

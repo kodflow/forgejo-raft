@@ -45,9 +45,12 @@ import (
 //
 // SQL committed after step 4 is past L, whatever entry it derives from.
 // Followers' pushes are ordered after B by the log, and their SQL is held
-// by the consumer. What a web request writes to SQL beside a push is
-// reconciled after a Recover (doctor, pull request heads). Nothing here
-// waits on an observer.
+// by the consumer. A deletion, a rename or a transfer writes its own SQL
+// beside its entry, on any member: it holds the cluster's cut across
+// both, which the coordinator takes with the fence (cut.go), so both fall
+// on one side of (B, L). What else a web request writes to SQL beside a
+// push is reconciled after a Recover (doctor, pull request heads). Nothing
+// here waits on an observer.
 
 // readToCommitBound is how long the position may take to commit once read:
 // a checkpoint that exceeds it is discarded and taken again.
@@ -111,6 +114,36 @@ func newCoordinator(r *Replicator, interval time.Duration, dir string, wal walSo
 	return c
 }
 
+// fenceAndCut takes the leader's fence, then the cluster's cut, within
+// drainBound; neither is waited for while the other is held. It returns
+// with the fence held, and the function that releases the cut, once.
+func (c *coordinator) fenceAndCut(r *Replicator) (func(), error) {
+	deadline := c.now().Add(drainBound)
+	for {
+		if r.fence.TryLock() {
+			if r.cut == nil {
+				return func() {}, nil
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), drainBound)
+			unlock, ok, err := r.cut.TryExclusive(ctx)
+			cancel()
+			if err != nil {
+				r.fence.Unlock()
+				return nil, fmt.Errorf("taking the checkpoint's cut: %w", err)
+			}
+			if ok {
+				var once sync.Once
+				return func() { once.Do(unlock) }, nil
+			}
+			r.fence.Unlock()
+		}
+		if c.now().After(deadline) {
+			return nil, errors.New("writers, or a deletion, a rename or a transfer, kept the fence for longer than the bound")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // capture keeps the table at the barrier this node is waiting for. It runs
 // under the table's lock: it encodes and hands the bytes over, nothing more.
 func (c *coordinator) capture(nonce string, index uint64, encode func() ([]byte, error)) {
@@ -169,15 +202,16 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 	got := c.expect(nonce)
 	defer c.expect("")
 
-	// 1. The fence: the leader's writers queue, the consumer holds. A
-	// writer in flight (objects on their way to a majority) is not waited
-	// for past the bound: this period is skipped instead.
-	for deadline := c.now().Add(drainBound); !r.fence.TryLock(); {
-		if c.now().After(deadline) {
-			return reftable.CheckpointRecord{}, errors.New("writers kept the fence for longer than the bound")
-		}
-		time.Sleep(10 * time.Millisecond)
+	// 1. The fence: the leader's writers queue, the consumer holds; and
+	// the cut: a deletion, a rename, a transfer or the deletion of a
+	// stored file on any member waits (cut.go). A writer in flight
+	// (objects on their way to a majority) or an operation holding the cut
+	// is not waited for past the bound: this period is skipped instead.
+	unlockCut, err := c.fenceAndCut(r)
+	if err != nil {
+		return reftable.CheckpointRecord{}, err
 	}
+	defer unlockCut()
 	fenced := true
 	release := func() {
 		if fenced {
@@ -237,11 +271,13 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 
 	// 5. Released: the rest is bounded, and waits on nobody. The stored
 	// files are listed here, outside the fence: a walk of a large storage
-	// would otherwise freeze the leader's writers for its whole length. A
-	// list taken after L holds every file the SQL at L names, plus files
-	// added since, which a restore ignores.
+	// would otherwise freeze the leader's writers for its whole length.
+	// The cut is still held: no stored file is deleted until the walk
+	// ends, so the list holds every file the SQL at L names (#90), plus
+	// files added since, which a restore ignores.
 	release()
 	files, err := c.files()
+	unlockCut()
 	if err != nil {
 		return reftable.CheckpointRecord{}, fmt.Errorf("listing the stored files: %w", err)
 	}

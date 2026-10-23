@@ -28,6 +28,7 @@ import (
 	"forgejo.org/modules/graceful"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/setting"
+	"forgejo.org/modules/storage"
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/nomadgate"
 	"forgejo.org/services/cluster/reftable"
@@ -92,6 +93,9 @@ type Replicator struct {
 	// [cluster] CHECKPOINT_INTERVAL is 0 (checkpoint.go).
 	fence       sync.RWMutex
 	checkpoints *coordinator
+	// cut is the checkpoint's cut, one lock for the whole cluster in
+	// PostgreSQL; nil without PostgreSQL, where no checkpoint runs (cut.go).
+	cut cutLock
 	// export is the PostgreSQL and archive side of the observers' export
 	// (export.go).
 	export exportSide
@@ -225,6 +229,11 @@ func Init(ctx context.Context) error {
 	// Before the socket opens: a request on it may read the consumer.
 	r.consumer = newConsumer(r)
 	wal := pgWAL{role: setting.Cluster.CheckpointRole}
+	if setting.Database.Type.IsPostgreSQL() {
+		// On every member, whatever its own CHECKPOINT_INTERVAL: the leader
+		// that takes the checkpoints may be another one.
+		r.cut = pgCut{db: cutDB}
+	}
 	r.export = newExportSide(wal)
 	if setting.Cluster.CheckpointInterval > 0 {
 		if !setting.Database.Type.IsPostgreSQL() {
@@ -284,6 +293,8 @@ func Init(ctx context.Context) error {
 	clusterhook.SetEnabled(true)
 	clusterhook.SetRepoLifecycle(r.proposeRepoDelete, r.proposeRepoMoves)
 	clusterhook.SetOwnerLifecycle(r.proposeOwnerRename)
+	clusterhook.SetCutHold(r.holdCut)
+	storage.SetDeleteGate(r.gateDelete)
 	clusterhook.SetKeyCheck(r.writableKey)
 	clusterhook.SetGarbageCollectionGate(r.projector.MayCollectGarbage)
 	clusterhook.SetWriteWaiter(r.waitWrites)

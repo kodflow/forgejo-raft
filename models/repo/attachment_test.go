@@ -6,12 +6,18 @@ package repo_test
 
 import (
 	"cmp"
+	"context"
+	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"forgejo.org/models/db"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unittest"
+	"forgejo.org/modules/setting"
+	"forgejo.org/modules/storage"
+	"forgejo.org/modules/test"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -76,6 +82,45 @@ func TestDeleteAttachments(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, repo_model.IsErrAttachmentNotExist(err))
 	assert.Nil(t, attachment)
+}
+
+// Inside a transaction, the files of deleted attachments go once it
+// commits, and stay when it rolls back: removed before, they would be
+// missing while the rows still exist (#90).
+func TestDeleteAttachmentsInATransactionRemoveTheFilesAfterTheCommit(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	local, err := storage.NewLocalStorage(t.Context(), &setting.Storage{Path: t.TempDir()})
+	require.NoError(t, err)
+	defer test.MockVariableValue(&storage.Attachments, local)()
+	exists := func(a *repo_model.Attachment) bool {
+		_, err := storage.Attachments.Stat(a.RelativePath())
+		return err == nil
+	}
+
+	for _, commit := range []bool{false, true} {
+		a, err := repo_model.GetAttachmentByID(db.DefaultContext, 1)
+		require.NoError(t, err)
+		_, err = storage.Attachments.Save(a.RelativePath(), strings.NewReader("file"), 4)
+		require.NoError(t, err)
+		rollback := errors.New("rolled back")
+		err = db.WithTx(db.DefaultContext, func(ctx context.Context) error {
+			n, err := repo_model.DeleteAttachments(ctx, []*repo_model.Attachment{a}, true)
+			require.NoError(t, err)
+			assert.Equal(t, 1, n)
+			assert.True(t, exists(a), "the file stays while the transaction is open")
+			if !commit {
+				return rollback
+			}
+			return nil
+		})
+		if !commit {
+			require.ErrorIs(t, err, rollback)
+			assert.True(t, exists(a), "a rolled back deletion keeps the file")
+			continue
+		}
+		require.NoError(t, err)
+		assert.False(t, exists(a), "the file goes with the commit")
+	}
 }
 
 func TestGetAttachmentByID(t *testing.T) {
