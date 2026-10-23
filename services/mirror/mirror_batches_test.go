@@ -161,3 +161,48 @@ func TestParsePorcelainFetch(t *testing.T) {
 		assert.False(t, ok, bad)
 	}
 }
+
+// A sync by batches that prunes a branch and creates one under its name (a,
+// then a/b) writes the pruning first, as git fetch does: in one transaction
+// git refuses to create a/b while a exists, and every later sync failed the
+// same way (#149).
+func TestMirrorSyncInBatchesPrunesBeforeCreating(t *testing.T) {
+	t.Setenv("GIT_CONFIG_COUNT", "2")
+	t.Setenv("GIT_CONFIG_KEY_0", "gc.auto")
+	t.Setenv("GIT_CONFIG_VALUE_0", "0")
+	t.Setenv("GIT_CONFIG_KEY_1", "maintenance.auto")
+	t.Setenv("GIT_CONFIG_VALUE_1", "false")
+	defer clusterhook.SetEnabled(clusterhook.Enabled())
+	clusterhook.SetEnabled(true)
+
+	src := filepath.Join(t.TempDir(), "src.git")
+	gitIn(t, filepath.Dir(src), "", "init", "-q", src)
+	gitIn(t, src, "", "commit", "-q", "--allow-empty", "-m", "one")
+	gitIn(t, src, "", "branch", "a")
+	gitIn(t, src, "", "branch", "b/c")
+	root := t.TempDir()
+	mirror := filepath.Join(root, "mirror.git")
+	gitIn(t, root, "", "clone", "-q", "--mirror", src, mirror)
+
+	head := gitIn(t, src, "", "rev-parse", "HEAD")
+	var in strings.Builder
+	for i := range reftable.MaxUpdatesPerTxn + 100 {
+		fmt.Fprintf(&in, "create refs/tags/big-%05d %s\n", i, head)
+	}
+	gitIn(t, src, in.String(), "update-ref", "--stdin")
+	// A directory becomes a file, and a file a directory.
+	gitIn(t, src, "", "branch", "-D", "a", "b/c")
+	gitIn(t, src, "", "branch", "a/b")
+	gitIn(t, src, "", "branch", "b")
+
+	dry := git.NewCommand(t.Context(), "fetch", "--dry-run", "--porcelain", "--prune", "--tags").AddDynamicArguments("origin")
+	out, batched, err := fetchInBatches(t.Context(), dry, mirror, time.Minute, nil)
+	require.NoError(t, err)
+	require.True(t, batched)
+	assert.Equal(t, head, gitIn(t, mirror, "", "rev-parse", "refs/heads/a/b"))
+	assert.Equal(t, head, gitIn(t, mirror, "", "rev-parse", "refs/heads/b"))
+	assert.Equal(t, head, gitIn(t, mirror, "", "rev-parse", "refs/tags/big-04195"))
+	assert.Empty(t, gitIn(t, mirror, "", "for-each-ref", "refs/heads/b/c"), "pruned")
+	results := parseRemoteUpdateOutput(out, "origin")
+	assert.Len(t, results, reftable.MaxUpdatesPerTxn+100+4, "every tag, a, b/c, a/b and b")
+}
