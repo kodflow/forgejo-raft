@@ -111,12 +111,14 @@ func TestSaveSnapshotOutlivedByALateWrite(t *testing.T) {
 	_, rs := NewForTesting(t.TempDir(), "node-a")
 	r := rs[0]
 	wrote := make(chan error, 1)
-	r.setEngine(lateSaver{Engine: r.Engine(), wrote: wrote})
+	release := make(chan struct{})
+	r.setEngine(lateSaver{Engine: r.Engine(), release: release, wrote: wrote})
 	path := filepath.Join(t.TempDir(), "refs.snap")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := r.SaveSnapshot(ctx, "op", path)
 	require.ErrorIs(t, err, context.Canceled)
+	close(release)
 	require.Error(t, <-wrote, "the late write reached a closed file")
 	for _, p := range []string{path, path + ".partial", path + ".sha256", path + ".meta"} {
 		assert.NoFileExists(t, p)
@@ -124,21 +126,20 @@ func TestSaveSnapshotOutlivedByALateWrite(t *testing.T) {
 }
 
 // lateSaver answers SaveSnapshot at its context's end, and writes to w
-// after it returned, as the engine's copy goroutine may.
+// once released after the caller's SaveSnapshot returned, as the engine's
+// copy goroutine may.
 type lateSaver struct {
 	consensus.Engine
-	wrote chan<- error
+	release <-chan struct{}
+	wrote   chan<- error
 }
 
 func (l lateSaver) SaveSnapshot(ctx context.Context, _ consensus.Operator, w io.Writer) (consensus.SnapshotMeta, error) {
-	started := make(chan struct{})
 	go func() {
-		close(started)
-		time.Sleep(50 * time.Millisecond)
+		<-l.release
 		_, err := w.Write([]byte("late"))
 		l.wrote <- err
 	}()
-	<-started
 	<-ctx.Done()
 	return consensus.SnapshotMeta{}, ctx.Err()
 }
