@@ -370,6 +370,10 @@ These commands run with the server stopped, on the data directory.
   new row's ID, which every member then binds to the directory: every node
   refuses to serve a directory stamped with another ID than the database's,
   and the lost row's ID stays in the stamps until a write carries the new one.
+  That write is part of the adoption: when the cluster refuses it or does not
+  answer (no quorum, a leader change), the adoption fails and is rolled back,
+  and the repository stays in the unadopted list, to adopt again once the
+  cluster has a leader.
   Never use "delete unadopted" in a cluster: it removes one node's files and
   the projector brings them back. "Delete all repositories missing their Git
   files" and "Reinitialize all missing Git repositories" are not offered in
