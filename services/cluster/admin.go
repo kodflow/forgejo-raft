@@ -666,7 +666,53 @@ func (r *Replicator) removable(eng consensus.Engine, id consensus.NodeID) error 
 	if left := m.Voters() - 1; left < autoMinVoters {
 		return fmt.Errorf("%w: removing %s would leave %d voters, the floor is %d", consensus.ErrMembershipInvalid, id, left, autoMinVoters)
 	}
+	if v, ok := strandedBy(m, eng.Health(), eng.Status().ID, id); ok {
+		return fmt.Errorf("%w: %s does not answer or lags behind the membership: removing %s, which answers, may leave it no member it knows to vouch for the leader once it is back; bring %s back, or remove it first", consensus.ErrMembershipInvalid, v, id, v)
+	}
 	return nil
+}
+
+// voteWindow is the engine's default ElectionTimeoutMin: a peer the leader
+// heard within it answers, for the engine's guard below.
+const voteWindow = time.Second
+
+// strandedBy names a voter the engine's leader may refuse to strand by the
+// removal of target, a voter, as it refuses MEMBERSHIP_INVALID the removal
+// of a member that answers when a voter of the new configuration might list
+// neither the leader nor a voter that stays (kitsunium/sdk#603). The leader
+// alone knows its peers; elsewhere the engine decides alone.
+//
+// It errs on the side of refusing: a voter that lags behind the membership
+// may hold an older configuration, and a silent one listed before the
+// leader may hold one from before the leader joined. A voter caught up
+// with the membership lists the leader, which stays.
+func strandedBy(m consensus.Membership, h consensus.Health, leader, target consensus.NodeID) (consensus.NodeID, bool) {
+	if len(h.Peers) == 0 {
+		return 0, false
+	}
+	peers := make(map[consensus.NodeID]consensus.PeerHealth, len(h.Peers))
+	for _, p := range h.Peers {
+		peers[p.ID] = p
+	}
+	silent := func(id consensus.NodeID) bool {
+		p, ok := peers[id]
+		return !ok || p.Unreachable || p.LastContact >= voteWindow
+	}
+	if silent(target) {
+		// A member that does not answer vouches for no one now: the
+		// engine never refuses its removal on this ground.
+		return 0, false
+	}
+	for _, x := range m.Members {
+		if !x.Voter || x.ID == leader || x.ID == target {
+			continue
+		}
+		p, ok := peers[x.ID]
+		if !ok || p.Match < m.At.Index || (silent(x.ID) && Rank(m, x.ID) < Rank(m, leader)) {
+			return x.ID, true
+		}
+	}
+	return 0, false
 }
 
 // recordPendingRevocation records a revocation the cluster cannot write
