@@ -228,6 +228,16 @@ func initBare(ctx context.Context, dir, format string) error {
 	// The objects about to land here are acknowledged once their pack is
 	// synced: the directories leading to them are synced first, up to the
 	// repository root.
+	return syncRepoParents(dir)
+}
+
+// syncRepoParents makes the name of a repository's directory durable: its
+// parent and the parent's parent, the repository root, are synced. initBare
+// does it after its rename; one whose sync failed leaves the directory in
+// place, and every later user of it that vouches for it (an acknowledged
+// pack, an answer that objects are held, a first certification) does it
+// again, so the obligation survives the failure.
+func syncRepoParents(dir string) error {
 	for _, d := range []string{filepath.Dir(dir), filepath.Dir(filepath.Dir(dir))} {
 		if err := syncDirFn(d); err != nil {
 			return err

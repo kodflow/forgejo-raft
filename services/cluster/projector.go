@@ -491,6 +491,13 @@ func (p *projector) project(ctx context.Context, repo string) error {
 			}
 		}
 	}
+	// A directory never certified may come from an init whose sync of its
+	// name failed: certified, it is vouched for, so its name is synced.
+	if _, known := readStamp(dir); !known {
+		if err := syncRepoParents(dir); err != nil {
+			return err
+		}
+	}
 	// Certification re-reads git under the registry's lock, so a native
 	// transaction cannot publish between the check and the watermark (R3-12).
 	// When a transaction registered meanwhile, certify does nothing and the
