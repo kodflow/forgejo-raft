@@ -35,23 +35,28 @@ import (
 // or an external agent.
 var identityPoll = 15 * time.Second
 
-// watchIdentity calls rotated each time the node certificate on disk
-// changes, once the new pair loaded.
+// watchIdentity calls rotated, from a goroutine of its own until ctx ends,
+// each time the node certificate on disk changes, once the new pair
+// loaded. The certificate it starts from is read before it returns: read
+// by the goroutine, a renewal that came first was its starting point, and
+// was never noticed (#153).
 func watchIdentity(ctx context.Context, id *identity, every time.Duration, rotated func()) {
 	last := id.SPKIAndSerial()
-	t := time.NewTicker(every)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			if cur := id.SPKIAndSerial(); cur != "" && cur != last {
+				last = cur
+				rotated()
+			}
 		}
-		if cur := id.SPKIAndSerial(); cur != "" && cur != last {
-			last = cur
-			rotated()
-		}
-	}
+	}()
 }
 
 // connRotator closes the object channel's server connections opened

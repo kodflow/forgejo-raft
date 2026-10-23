@@ -70,6 +70,24 @@ jobs:
     runs-on: ubuntu-latest
     # The race tests alone are bounded at 20 minutes.
     timeout-minutes: 30
+    # The checkpoint's cut is a PostgreSQL advisory lock: TestCutOnPostgreSQL
+    # runs against this one, and is skipped without it. It changes the
+    # database's idle_in_transaction_session_timeout for a while, which no
+    # other test reads.
+    services:
+      postgres:
+        image: postgres:18-alpine@sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5
+        # A throwaway database on the runner, reached by the job alone: no
+        # password, which a secret scanner would take for a real one.
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
     steps:
       # The merge commit GitHub would produce on a pull request, which is
       # what the cluster must build against.
@@ -95,6 +113,8 @@ jobs:
           go vet -tags "$TAGS" $SCOPE
 
       - name: Race tests of the cluster scope, but TestL to TestZ of services/cluster
+        env:
+          FORGEJO_CLUSTER_TEST_PGSQL: postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable
         run: |
           # Every package of the scope but services/cluster itself, then
           # services/cluster without the half race-l-z runs.
