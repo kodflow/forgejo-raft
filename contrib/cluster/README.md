@@ -336,8 +336,9 @@ These commands run with the server stopped, on the data directory.
   SHA-256 of the file, then of `<file>.meta` (`sha256sum -c` checks both).
 - `forgejo cluster restore --file <file> --sha256 <digest> --new-cluster <id> --members ...`
   restores that snapshot into an empty directory, on every node of the new
-  cluster. `<digest>` is the file's, the first line of `<file>.sha256`, as
-  `snapshot save` logged it: read it from the authenticated backup store.
+  cluster. `<digest>` is the file's: the 64 hex digits that open the first
+  line of `<file>.sha256`, without the file name that follows them, as
+  `snapshot save` logged it; read it from the authenticated backup store.
   The file is refused when it differs, and so is `<file>.meta` when it
   differs from its line in `<file>.sha256`.
   Like `recover`, it founds the new cluster only once the old one cannot
@@ -347,7 +348,10 @@ These commands run with the server stopped, on the data directory.
   the probe (`PEERS`, `--old-peer slot=host:port`, or
   `--force-old-members-answer`, logged). The old cluster is the snapshot's;
   `--old-cluster <id>` names another one when the cluster still running
-  succeeded it. Without the fence, the old site, back up, forms its
+  succeeded it. The fence is then that cluster's: receipts the witnesses
+  signed for `<id>`, given for every voter it has (the command no longer
+  knows them, and requires at least one), never receipts for the
+  snapshot's cluster. Without the fence, the old site, back up, forms its
   cluster again and two forges write.
 - After a restore or a PostgreSQL failover, `forgejo cluster reconcile` lists
   the differences between the table and SQL. `--apply` rebuilds the rows that
@@ -482,8 +486,9 @@ Watch, Custom, Releases on GitHub, or the tags of
 - A push must reach a majority of the nodes, objects included, within
   `HOOK_TIMEOUT` less ten seconds (fifty seconds by default). A very large
   push over a slow link may be refused; its shipment goes on in the
-  background for five minutes, and a retry skips the members that already
-  hold its objects. Raise `HOOK_TIMEOUT` for larger pushes, up to the
+  background for five minutes, or until the request's own deadline when
+  that is later, and a retry skips the members that already hold its
+  objects. Raise `HOOK_TIMEOUT` for larger pushes, up to the
   30 minutes a member gives one incoming pack. A first large
   repository goes through `forgejo cluster import`, which has its own
   30-minute budget, like `reconcile`, `objects backfill` and
