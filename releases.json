@@ -146,6 +146,12 @@
       "prerelease": true
     },
     {
+      "version": "18.0.0-dev-raft.31",
+      "upstream": "18.0.0-dev",
+      "url": "https://github.com/kodflow/forgejo-raft/releases/tag/v18.0.0-dev-raft.31",
+      "prerelease": true
+    },
+    {
       "version": "18.0.0-dev-raft.4",
       "upstream": "18.0.0-dev",
       "url": "https://github.com/kodflow/forgejo-raft/releases/tag/v18.0.0-dev-raft.4",
