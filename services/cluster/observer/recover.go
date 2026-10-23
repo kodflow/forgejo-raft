@@ -251,7 +251,7 @@ func (a *Archive) RestoreFiles(name string, roots map[string]string) (int, error
 			}
 			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+		if err := mkdirAllDurable(filepath.Dir(dst), 0o750); err != nil {
 			return i, err
 		}
 		src, err := os.Open(a.store.blobPath(f.SHA256))
@@ -380,7 +380,7 @@ func (a *Archive) RestorePG(name, pgdata string, opt PGOptions) error {
 		if entries, err := os.ReadDir(d); err == nil && len(entries) > 0 {
 			return fmt.Errorf("%s is not empty", d)
 		}
-		if err := os.MkdirAll(d, 0o700); err != nil {
+		if err := mkdirAllDurable(d, 0o700); err != nil {
 			return err
 		}
 	}

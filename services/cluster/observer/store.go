@@ -335,6 +335,35 @@ func syncParents(path, root string) error {
 	}
 }
 
+// mkdirAllDurable creates dir and its missing parents, then syncs the
+// directory holding each one it created, deepest first, up to the first
+// that existed: syncing a directory does not make its own name durable in
+// its parent.
+func mkdirAllDurable(dir string, perm os.FileMode) error {
+	dir = filepath.Clean(dir)
+	var created []string
+	for d := dir; ; d = filepath.Dir(d) {
+		if _, err := os.Lstat(d); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		created = append(created, d)
+		if d == filepath.Dir(d) {
+			break
+		}
+	}
+	if err := os.MkdirAll(dir, perm); err != nil {
+		return err
+	}
+	for _, d := range created {
+		if err := syncPath(filepath.Dir(d)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // WriteFileDurable replaces path with b, synced, through a rename whose
 // directory is synced.
 func WriteFileDurable(path string, b []byte) error { return writeAtomic(path, b, true) }
