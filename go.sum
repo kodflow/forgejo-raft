@@ -473,11 +473,11 @@ github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51/go.mod h1:C
 github.com/kisielk/errcheck v1.5.0/go.mod h1:pFxgyoBC7bSaBwPgfKdkLd5X25qrDl4LWUI2bnpBCr8=
 github.com/kisielk/gotool v1.0.0/go.mod h1:XhKaO+MFFWcvkIS/tQcRk01m1F5IRFswLeQ+oQHNcck=
 github.com/kitsunium/sdk v0.20.0 h1:KZ7+QyOFWxXSk9wie+Q7frSfRVkdRNiB+I4Uo/Zv9Wk=
-github.com/kitsunium/sdk/internal v0.0.0-20261023084429-60c961201ab2 h1:VEr2PH1v4gGAwvDc+/tk8XPdb8BTD7l362DQo3XpETE=
-github.com/kitsunium/sdk/internal v0.0.0-20261023084429-60c961201ab2/go.mod h1:S/BR+fJNN36afHl+LVnnrOOYvbzZ1UgKQPsg/hG6snA=
+github.com/kitsunium/sdk/internal v0.0.0-20261023141025-d0736c6840dd h1:urRl1iWWTMJYW3F4gj4Bfp/xFTZcHzBI3KyNzwYADH4=
+github.com/kitsunium/sdk/internal v0.0.0-20261023141025-d0736c6840dd/go.mod h1:S/BR+fJNN36afHl+LVnnrOOYvbzZ1UgKQPsg/hG6snA=
 github.com/kitsunium/sdk/pkg v0.18.0 h1:T8w/YV9DlkIZ+vLxCuSckGB/LxnPvstfddOe/hty9BI=
-github.com/kitsunium/sdk/pkg/v1/app v0.0.0-20261023084429-60c961201ab2 h1:7tlourQkZcVshP9sFawhbmEdlHtymjwQIGlRC9Ws0dM=
-github.com/kitsunium/sdk/pkg/v1/app v0.0.0-20261023084429-60c961201ab2/go.mod h1:lYsTwKOBKx6XJYScLi/rZQdiWgrALuYGXglzK63XUf4=
+github.com/kitsunium/sdk/pkg/v1/app v0.0.0-20261023141025-d0736c6840dd h1:O9QR92/7oaAArqBQSHERROmRyGFn/0Ehyxrb0/Gip0I=
+github.com/kitsunium/sdk/pkg/v1/app v0.0.0-20261023141025-d0736c6840dd/go.mod h1:lYsTwKOBKx6XJYScLi/rZQdiWgrALuYGXglzK63XUf4=
 github.com/kitsunium/sdk/pkg/v1/clock v0.1.2 h1:k0RtxY5wizyo4DlM1KPGyuYN+E/XTnuA4XLo0s/npms=
 github.com/kitsunium/sdk/pkg/v1/clock v0.1.2/go.mod h1:TbcRuhoJc9nYRJ04zbv1z9PjjEE8dFkoqL8eqli++lQ=
 github.com/kitsunium/sdk/pkg/v1/errs v0.2.4 h1:b6csJEc17loZRdileBGQlhhqw4ONfOHP7siKuVBy6TY=
