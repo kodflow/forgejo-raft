@@ -5,6 +5,7 @@ package observer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -129,13 +130,18 @@ func (o *Observer) prune(ctx context.Context) error {
 		if a.State != StateProtected || a.Name == last.Name || !a.Verified.Before(cut) {
 			continue
 		}
+		// The refs go before the directory: a manifest that is gone is an
+		// earlier prune stopped after it, before the state was saved, and
+		// what is left of the directory goes the same way (#61).
 		m, err := o.store.ReadManifest(a.Name)
-		if err != nil {
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		for repo := range m.Repos {
-			if err := o.store.git.dropRefs(ctx, o.store.git.dir(repo), a.Name); err != nil {
-				return err
+		if m != nil {
+			for repo := range m.Repos {
+				if err := o.store.git.dropRefs(ctx, o.store.git.dir(repo), a.Name); err != nil {
+					return err
+				}
 			}
 		}
 		if err := os.RemoveAll(o.store.path("checkpoints", a.Name)); err != nil {
@@ -143,12 +149,14 @@ func (o *Observer) prune(ctx context.Context) error {
 		}
 		a.State = StatePruned
 		changed = true
+		// Each checkpoint let go is saved at once: a stop in the next one
+		// never leaves this one marked protected without its directory.
+		if err := o.store.saveState(o.state); err != nil {
+			return err
+		}
 	}
 	if !changed {
 		return nil
-	}
-	if err := o.store.saveState(o.state); err != nil {
-		return err
 	}
 	return o.pruneData()
 }

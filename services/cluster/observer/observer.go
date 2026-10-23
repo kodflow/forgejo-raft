@@ -576,6 +576,17 @@ func (o *Observer) ingest(ctx context.Context, leader string, cp clusterhook.Exp
 	if err := validCheckpoint(cp); err != nil {
 		return err
 	}
+	// A checkpoint published by a pass stopped before it saved the state
+	// is this one again, whole: it is taken into the state, never refused
+	// as a fork (#61). Another description of it still is.
+	if pm, err := o.store.ReadManifest(cp.Name); err == nil {
+		if checkpointDigest(pm.Checkpoint) != checkpointDigest(cp) {
+			return fmt.Errorf("%w: %s is already published with another description", ErrImmutable, cp.Name)
+		}
+		return o.adopt(cp, pm)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	stage := o.store.path("staging", cp.Name)
 	defer func() {
 		if err != nil {
@@ -648,6 +659,21 @@ func (o *Observer) ingest(ctx context.Context, leader string, cp clusterhook.Exp
 	if err := o.store.publish(cp.Name); err != nil {
 		return err
 	}
+	return o.record(cp, m)
+}
+
+// adopt takes into the state a checkpoint found published: its directory
+// is synced again, since the pass that renamed it may have stopped before.
+func (o *Observer) adopt(cp clusterhook.ExportCheckpoint, m *Manifest) error {
+	if err := syncDir(o.store.path("checkpoints")); err != nil {
+		return err
+	}
+	log.Warn("cluster observer: checkpoint %s was published by a pass that did not record it; taken as is", cp.Name)
+	return o.record(cp, m)
+}
+
+// record records a published checkpoint as verified.
+func (o *Observer) record(cp clusterhook.ExportCheckpoint, m *Manifest) error {
 	o.state.Checkpoints = append(o.state.Checkpoints, Accepted{
 		Name: cp.Name, Index: cp.Index, Term: cp.Term, Root: cp.Root, Time: cp.Time, State: StateVerified,
 		Verified: m.Verified, Digest: checkpointDigest(cp),
