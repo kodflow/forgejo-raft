@@ -64,6 +64,10 @@ type projector struct {
 	// objects are fetched outside the pass (#137): the pass skips it, and
 	// moves no directory of it, until the fetch ended.
 	fetching map[string]context.CancelFunc
+	// retrying holds the fetches in flight that retry a repository whose
+	// last projection or fetch failed: they hold a slot without the
+	// assurance of progress a first attempt has (#160).
+	retrying map[string]bool
 	// queued holds the repositories whose missing objects wait for a fetch
 	// slot, all maxFetches taken by other repositories' (#151).
 	queued map[string]bool
@@ -78,7 +82,7 @@ func newProjector(root string, table *reftable.Table, reg *registry) *projector 
 		root: root, table: table, registry: reg,
 		dirty: map[string]uint64{}, watermark: map[string]uint64{},
 		fenced: true, pendingFirst: map[string]bool{}, failures: map[string]string{}, deletedAt: map[string]uint64{},
-		fetching: map[string]context.CancelFunc{}, queued: map[string]bool{},
+		fetching: map[string]context.CancelFunc{}, retrying: map[string]bool{}, queued: map[string]bool{},
 		wake: make(chan struct{}, 1),
 	}
 	table.OnChange(p.onChange)
@@ -173,6 +177,7 @@ func (p *projector) refence() {
 	p.watermark = map[string]uint64{}
 	p.failures = map[string]string{}
 	p.queued = map[string]bool{}
+	p.retrying = map[string]bool{}
 	p.mu.Unlock()
 }
 
@@ -414,13 +419,27 @@ func (p *projector) isFetching(repo string) bool {
 // dirty, queued, and the next pass tries again. When the fetch succeeds, a pass is
 // woken to project repo with its objects here; a failure is recorded as
 // the projection's, and retried at the next tick.
+//
+// A retry of a repository whose last attempt failed leaves a slot to each
+// queued repository that did not fail: the retries come back at every tick
+// and, ahead in the pass's order, took every freed slot again, while a
+// healthy repository behind them waited for good (#160).
 func (p *projector) startFetch(base context.Context, repo, dir string, missing []string) {
 	p.mu.Lock()
 	if _, ok := p.fetching[repo]; ok || p.fenced {
 		p.mu.Unlock()
 		return
 	}
-	if len(p.fetching) >= maxFetches {
+	retry := p.failures[repo] != ""
+	reserved := 0
+	if retry {
+		for q := range p.queued {
+			if q != repo && p.failures[q] == "" {
+				reserved++
+			}
+		}
+	}
+	if len(p.fetching)+reserved >= maxFetches {
 		p.queued[repo] = true
 		p.mu.Unlock()
 		return
@@ -428,6 +447,9 @@ func (p *projector) startFetch(base context.Context, repo, dir string, missing [
 	delete(p.queued, repo)
 	ctx, cancel := context.WithTimeout(base, projectBudget)
 	p.fetching[repo] = cancel
+	if retry {
+		p.retrying[repo] = true
+	}
 	p.fetches.Add(1)
 	p.mu.Unlock()
 	go func() {
@@ -436,6 +458,7 @@ func (p *projector) startFetch(base context.Context, repo, dir string, missing [
 		cancel()
 		p.mu.Lock()
 		delete(p.fetching, repo)
+		delete(p.retrying, repo)
 		if err != nil {
 			p.failures[repo] = fmt.Sprintf("fetching %d missing objects: %v", len(missing), err)
 		}
@@ -455,11 +478,28 @@ func (p *projector) startFetch(base context.Context, repo, dir string, missing [
 // fetch slot is taken by other repositories' fetches while its own
 // objects wait for one (#151), and its own last projection did not fail.
 // The consumer does not count that wait against the repository (#137).
+// A wait for a slot counts only while a first attempt holds one: slots
+// held by retries of failed fetches alone, which may fail or stall again
+// for as long as projectBudget each time, free none for certain, and a
+// wait behind them is bounded as the repository's own (#160).
 func (p *projector) WaitsBehind(repo string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	behind := p.current != "" && p.current != repo || p.queued[repo]
-	return behind && p.failures[repo] == ""
+	if p.failures[repo] != "" {
+		return false
+	}
+	if p.current != "" && p.current != repo {
+		return true
+	}
+	if !p.queued[repo] {
+		return false
+	}
+	for r := range p.fetching {
+		if r != repo && !p.retrying[r] {
+			return true
+		}
+	}
+	return false
 }
 
 // projectedKeys refuses to turn into a path a key, or a rename's source,
