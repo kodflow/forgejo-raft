@@ -41,7 +41,7 @@ func TestHuntR4ProveSnapKeyEscape(t *testing.T) {
 
 	// The projector's own guard, for a key that would come another way.
 	for _, key := range []string{"../raft-data", "../tls", "/abs.git"} {
-		require.Error(t, p.project(t.Context(), key), key)
+		require.Error(t, p.project(t.Context(), t.Context(), key), key)
 	}
 	assert.FileExists(t, filepath.Join(witness, "log.000001"), "the projector removed a directory outside the repository root")
 	assert.FileExists(t, filepath.Join(moved, "node.key"), "the projector moved a directory from outside the repository root")
