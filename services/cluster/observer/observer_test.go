@@ -444,7 +444,7 @@ func TestObserverTakesANewBaseAfterAGap(t *testing.T) {
 	c.push("alice/demo.git", "refs/heads/main", c.commit("lost"))
 	c.pg.switchWAL()
 	for name := range c.pg.archive {
-		if !o.store.haveWAL(name) && !strings.HasSuffix(name, ".history") {
+		if !o.store.haveWAL(c.pg.sysid, name) && !strings.HasSuffix(name, ".history") {
 			delete(c.pg.archive, name)
 		}
 	}
@@ -561,6 +561,7 @@ func TestHuntR8ProveObserverDotDotWipesStore(t *testing.T) {
 			require.NoError(t, os.MkdirAll(cfg.Dir, 0o700))
 			o, err := New(cfg)
 			require.NoError(t, err)
+			defer o.Close()
 			seed(t, c, o)
 			require.NoError(t, o.Step(ctx))
 			protected := o.State().Checkpoints[0].Name
@@ -590,8 +591,10 @@ func TestHuntR8ProveObserverDotDotWipesStore(t *testing.T) {
 				_, err := os.Stat(p)
 				require.NoError(t, err, "%s survives", p)
 			}
+			o.Close()
 			reopened, err := New(o.cfg)
 			require.NoError(t, err)
+			defer reopened.Close()
 			assert.Equal(t, o.State().Lineage, reopened.State().Lineage)
 			assert.Len(t, reopened.State().Checkpoints, 1)
 		})

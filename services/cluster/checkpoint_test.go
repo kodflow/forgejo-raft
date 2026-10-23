@@ -371,6 +371,17 @@ func TestStoredFilesSkipTheTemporaryDirectory(t *testing.T) {
 		got = append(got, f.Storage+":"+f.Path)
 	}
 	assert.Equal(t, []string{"attachments:kept", "lfs:ab/cd/obj", "lfs:x/tmp/kept"}, got)
+	// An attachment's path does not name it: its digest is listed, and
+	// read again once it changed (#106).
+	assert.Equal(t, sha256Hex([]byte("1")), files[0].SHA256)
+	assert.Empty(t, files[1].SHA256)
+	require.NoError(t, os.WriteFile(filepath.Join(other, "kept"), []byte("2"), 0o644))
+	require.NoError(t, os.Chtimes(filepath.Join(other, "kept"), time.Now(), time.Now().Add(time.Hour)))
+	files, err = listStoredFiles(map[string]*setting.Storage{
+		StorageAttachments: {Type: setting.LocalStorageType, Path: other, TemporaryPath: filepath.Join(other, "elsewhere")},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, sha256Hex([]byte("2")), files[0].SHA256)
 }
 
 // A lineage whose identity sorts before the old one's keeps its newest

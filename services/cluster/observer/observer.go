@@ -25,6 +25,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -88,7 +91,15 @@ type Observer struct {
 	uncovered int
 	// stepStarted is when the running pass began, zero between passes.
 	stepStarted time.Time
+	// lock holds the directory for this process.
+	lock *os.File
 }
+
+// The files of the observer directory that coordinate its processes.
+const (
+	lockFile   = "observer.lock"
+	acceptFile = "ACCEPT"
+)
 
 // viewTimeout bounds one member's answer to the view request.
 const viewTimeout = time.Minute
@@ -103,6 +114,9 @@ var (
 	ErrHookFailing = errors.New("SNAPSHOT_HOOK_FAILING")
 	ErrQuota       = errors.New("STAGING_QUOTA_REACHED")
 )
+
+// ErrBusy is an observer directory another process holds.
+var ErrBusy = errors.New("another process runs the observer on this directory")
 
 // New opens an observer's directory.
 func New(cfg Config) (*Observer, error) {
@@ -125,19 +139,71 @@ func New(cfg Config) (*Observer, error) {
 		return nil, errors.New("no endpoint")
 	}
 	st := newStore(cfg.Dir, cfg.Git)
+	// The lock comes before staging is cleaned: a second process never
+	// removes what the running one is ingesting (#86).
+	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
+		return nil, err
+	}
+	lock, err := lockDir(st.path(lockFile))
+	if err != nil {
+		if errors.Is(err, ErrBusy) {
+			return nil, fmt.Errorf("%w: %s", ErrBusy, cfg.Dir)
+		}
+		return nil, err
+	}
 	if err := st.init(); err != nil {
+		lock.Close()
 		return nil, err
 	}
 	state, err := st.loadState()
 	if err != nil {
+		lock.Close()
 		return nil, err
 	}
-	o := &Observer{cfg: cfg, store: st, state: state}
+	o := &Observer{cfg: cfg, store: st, state: state, lock: lock}
 	for slot := range cfg.Endpoints {
 		o.slots = append(o.slots, slot)
 	}
 	sort.Strings(o.slots)
 	return o, nil
+}
+
+// Close releases the observer's directory.
+func (o *Observer) Close() {
+	if o.lock != nil {
+		o.lock.Close()
+		o.lock = nil
+	}
+}
+
+// RequestAccept asks the observer that runs on dir to accept lineage at its
+// next pass: `observe accept` while the service runs, which holds the
+// directory and keeps its state in memory (#86).
+func RequestAccept(dir, lineage string) error {
+	return writeAtomic(filepath.Join(dir, acceptFile), []byte(lineage+"\n"), true)
+}
+
+// acceptRequested applies an accept another process asked for, once: the
+// request goes whether it was granted or not, and a refusal ends the pass.
+func (o *Observer) acceptRequested() error {
+	path := o.store.path(acceptFile)
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	if err := syncDir(o.cfg.Dir); err != nil {
+		return err
+	}
+	if err := o.Accept(strings.TrimSpace(string(b))); err != nil {
+		return fmt.Errorf("the accept asked by `forgejo cluster observe accept`: %w", err)
+	}
+	return nil
 }
 
 // State returns a copy of the observer's state.
@@ -182,6 +248,9 @@ func (o *Observer) Run(ctx context.Context, interval time.Duration) {
 // Step runs one pass: the pending hooks, the leader's view, the log, the
 // newest new checkpoint.
 func (o *Observer) Step(ctx context.Context) error {
+	if err := o.acceptRequested(); err != nil {
+		return err
+	}
 	if q := o.state.Quarantine; q != nil {
 		return fmt.Errorf("%w since %s: %s; see `forgejo cluster observe status`", ErrQuarantined, q.At.Format(time.RFC3339), q.Reason)
 	}
@@ -210,7 +279,8 @@ func (o *Observer) Step(ctx context.Context) error {
 		return o.prune(ctx)
 	}
 	if err := o.ingest(ctx, slot, cp, view.Voters); err != nil {
-		if errors.Is(err, ErrImmutable) {
+		// A pass stopped or timed out is never taken for a fork.
+		if errors.Is(err, ErrImmutable) && ctx.Err() == nil {
 			return o.quarantineFor(fmt.Sprintf("checkpoint %s: %v", cp.Name, err), "")
 		}
 		return fmt.Errorf("checkpoint %s: %w", cp.Name, err)
@@ -576,6 +646,17 @@ func (o *Observer) ingest(ctx context.Context, leader string, cp clusterhook.Exp
 	if err := validCheckpoint(cp); err != nil {
 		return err
 	}
+	// A checkpoint published by a pass stopped before it saved the state
+	// is this one again, whole: it is taken into the state, never refused
+	// as a fork (#61). Another description of it still is.
+	if pm, err := o.store.ReadManifest(cp.Name); err == nil {
+		if checkpointDigest(pm.Checkpoint) != checkpointDigest(cp) {
+			return fmt.Errorf("%w: %s is already published with another description", ErrImmutable, cp.Name)
+		}
+		return o.adopt(cp, pm)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	stage := o.store.path("staging", cp.Name)
 	defer func() {
 		if err != nil {
@@ -641,13 +722,28 @@ func (o *Observer) ingest(ctx context.Context, leader string, cp clusterhook.Exp
 		if len(rm.Refs) == 0 {
 			continue
 		}
-		if err := o.store.git.createRefs(ctx, o.store.git.dir(repo), cp.Name, rm.Refs); err != nil {
+		if err := o.store.git.createRefs(ctx, o.store.git.dirFor(repo, rm.Format), cp.Name, rm.Refs); err != nil {
 			return err
 		}
 	}
 	if err := o.store.publish(cp.Name); err != nil {
 		return err
 	}
+	return o.record(cp, m)
+}
+
+// adopt takes into the state a checkpoint found published: its directory
+// is synced again, since the pass that renamed it may have stopped before.
+func (o *Observer) adopt(cp clusterhook.ExportCheckpoint, m *Manifest) error {
+	if err := syncDir(o.store.path("checkpoints")); err != nil {
+		return err
+	}
+	log.Warn("cluster observer: checkpoint %s was published by a pass that did not record it; taken as is", cp.Name)
+	return o.record(cp, m)
+}
+
+// record records a published checkpoint as verified.
+func (o *Observer) record(cp clusterhook.ExportCheckpoint, m *Manifest) error {
 	o.state.Checkpoints = append(o.state.Checkpoints, Accepted{
 		Name: cp.Name, Index: cp.Index, Term: cp.Term, Root: cp.Root, Time: cp.Time, State: StateVerified,
 		Verified: m.Verified, Digest: checkpointDigest(cp),
@@ -729,9 +825,12 @@ func (o *Observer) fetchObjects(ctx context.Context, leader string, cp clusterho
 			wants = append(wants, s)
 		}
 		sort.Strings(wants)
+		// The previous checkpoint's values are haves only in the same
+		// object format: a repository recreated in the other one shares
+		// nothing with them (#84).
 		var prevRefs []string
-		if prev != nil {
-			for _, s := range prev.Repos[repo].Refs {
+		if prm, ok := prev.repo(repo); ok && storeFormat(prm.Format) == storeFormat(rm.Format) {
+			for _, s := range prm.Refs {
 				prevRefs = append(prevRefs, s)
 			}
 		}
@@ -805,6 +904,9 @@ func (o *Observer) fetchFiles(ctx context.Context, leader string, cp clusterhook
 	if fm.Checkpoint != cp.Name {
 		return fmt.Errorf("the files manifest is %s's", fm.Checkpoint)
 	}
+	// A file whose digest is known, listed or named by its path, is reused
+	// by that digest alone. Only a leader that predates listed digests
+	// leaves an attachment reused by path and size (#106).
 	known := map[string]string{}
 	if m.Previous != "" {
 		if prev, err := o.store.ReadManifest(m.Previous); err == nil {
@@ -814,11 +916,19 @@ func (o *Observer) fetchFiles(ctx context.Context, leader string, cp clusterhook
 		}
 	}
 	for _, f := range fm.Files {
-		if sum, ok := known[fmt.Sprintf("%s/%s/%d", f.Storage, f.Path, f.Size)]; ok && o.store.haveBlob(sum) {
+		want, err := expectedDigest(f)
+		if err != nil {
+			return fmt.Errorf("%s/%s: %w", f.Storage, f.Path, err)
+		}
+		sum, ok := want, want != ""
+		if !ok {
+			sum, ok = known[fmt.Sprintf("%s/%s/%d", f.Storage, f.Path, f.Size)]
+		}
+		if ok && o.store.haveBlob(sum) {
 			m.Files = append(m.Files, FileBlob{FileEntry: f, SHA256: sum})
 			continue
 		}
-		sum, err := o.fetchBlob(ctx, leader, f)
+		sum, err = o.fetchBlob(ctx, leader, f, want)
 		if err != nil {
 			return fmt.Errorf("%s/%s: %w", f.Storage, f.Path, err)
 		}
@@ -829,9 +939,33 @@ func (o *Observer) fetchFiles(ctx context.Context, leader string, cp clusterhook
 	return nil
 }
 
-// fetchBlob stores one file by its digest. An LFS object's path is its
-// digest split in three, which must match.
-func (o *Observer) fetchBlob(ctx context.Context, leader string, f clusterhook.FileEntry) (string, error) {
+var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// expectedDigest is the digest a stored file must have, "" when nothing
+// names it: an LFS object's path is its digest split in three, a package
+// blob's last component is its digest, an attachment's is listed by the
+// leader (#106). A file of the packages storage not named so is taken as
+// it comes.
+func expectedDigest(f clusterhook.FileEntry) (string, error) {
+	var want string
+	switch {
+	case f.SHA256 != "":
+		want = f.SHA256
+	case f.Storage == "lfs":
+		want = strings.ReplaceAll(f.Path, "/", "")
+	case f.Storage == "packages" && digestPattern.MatchString(path.Base(f.Path)):
+		want = path.Base(f.Path)
+	default:
+		return "", nil
+	}
+	if !digestPattern.MatchString(want) {
+		return "", fmt.Errorf("%q is not a SHA-256 digest", want)
+	}
+	return want, nil
+}
+
+// fetchBlob stores one file by its digest, which must be want when known.
+func (o *Observer) fetchBlob(ctx context.Context, leader string, f clusterhook.FileEntry, want string) (string, error) {
 	var errs []error
 	for _, slot := range append([]string{leader}, o.slots...) {
 		body, err := call(ctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportFile, Observer: o.cfg.Name, Storage: f.Storage, Name: f.Path}, nil)
@@ -847,8 +981,8 @@ func (o *Observer) fetchBlob(ctx context.Context, leader string, f clusterhook.F
 		if err == nil && n != f.Size {
 			err = fmt.Errorf("%d bytes, not %d", n, f.Size)
 		}
-		if err == nil && f.Storage == "lfs" && strings.ReplaceAll(f.Path, "/", "") != sum {
-			err = fmt.Errorf("the LFS object's digest is %s", sum)
+		if err == nil && want != "" && want != sum {
+			err = fmt.Errorf("the file's digest is %s, not %s", sum, want)
 		}
 		if err == nil {
 			err = o.keepBlob(tmp, sum)
@@ -902,10 +1036,13 @@ func (o *Observer) fetchSecrets(ctx context.Context, src Source, stage string) e
 // that restore the checkpoint. Without one, it fetches a base backup when
 // none could ever reach it, and the checkpoint waits for a later one.
 func (o *Observer) coverPG(ctx context.Context, leader string, cp clusterhook.ExportCheckpoint, target LSN) (Coverage, error) {
-	if err := o.fetchWAL(ctx, leader); err != nil {
+	if err := o.fetchWAL(ctx, leader, cp); err != nil {
 		return Coverage{}, err
 	}
-	cov, err := Cover(o.state.Bases, cp.SystemID, target, cp.Timeline, cp.WALSegmentSize, o.store.haveWAL, o.store.history, o.store.abandoned())
+	sysid := cp.SystemID
+	have := func(name string) bool { return o.store.haveWAL(sysid, name) }
+	history := func(tli uint32) ([]Switch, error) { return o.store.history(sysid, tli) }
+	cov, err := Cover(o.state.Bases, sysid, target, cp.Timeline, cp.WALSegmentSize, have, history, o.store.abandoned(sysid))
 	if err == nil {
 		o.uncovered = 0
 		return cov, nil
@@ -943,67 +1080,154 @@ func (o *Observer) needsBase(sysid string) bool {
 	return newest.IsZero() || o.cfg.Now().Sub(newest) > o.cfg.BaseEvery
 }
 
-func (o *Observer) fetchWAL(ctx context.Context, leader string) error {
-	var files []clusterhook.WALFile
-	var err error
-	for _, slot := range append([]string{leader}, o.slots...) {
-		var body io.ReadCloser
-		body, err = call(ctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportWALList, Observer: o.cfg.Name, Name: o.store.lastSegment()}, &files)
-		if err == nil {
-			body.Close()
-			break
+// walSource is a member that lists a WAL file, and what it lists.
+type walSource struct {
+	slot string
+	file clusterhook.WALFile
+}
+
+// fetchWAL brings the archive up to date from every member: only the
+// PostgreSQL primary's archive advances, and its host need not be the Raft
+// leader. The lists are merged, and each file is taken from a member that
+// lists it, the leader first (#57).
+func (o *Observer) fetchWAL(ctx context.Context, leader string, cp clusterhook.ExportCheckpoint) error {
+	if !sysidPattern.MatchString(cp.SystemID) {
+		return fmt.Errorf("invalid system identifier %q", cp.SystemID)
+	}
+	listed := map[string][]walSource{}
+	var errs []error
+	answered := false
+	for _, slot := range o.leaderFirst(leader) {
+		var files []clusterhook.WALFile
+		body, err := call(ctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportWALList, Observer: o.cfg.Name, Name: o.store.lastSegment(cp.SystemID)}, &files)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", slot, err))
+			continue
+		}
+		body.Close()
+		answered = true
+		for _, f := range files {
+			// The name comes from a member: it becomes a path under the
+			// archive only once it is a WAL file's name.
+			if !ValidWALName(f.Name) {
+				return fmt.Errorf("a member listed an invalid WAL name %q", f.Name)
+			}
+			listed[f.Name] = append(listed[f.Name], walSource{slot: slot, file: f})
 		}
 	}
+	if !answered {
+		return errors.Join(errs...)
+	}
+	names := make([]string, 0, len(listed))
+	for name := range listed {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if err := os.MkdirAll(o.store.walDir(cp.SystemID), 0o700); err != nil {
+		return err
+	}
+	// Nothing past the checkpoint's position is taken: a name a member
+	// plants ahead of it never stands for a segment not yet written, and
+	// the cursor never passes the confirmed position (#105).
+	target, err := ParseLSN(cp.LSN)
 	if err != nil {
 		return err
 	}
-	for _, f := range files {
-		// The name comes from a member: it becomes a path under the
-		// archive only once it is a WAL file's name.
-		if !ValidWALName(f.Name) {
-			return fmt.Errorf("a member listed an invalid WAL name %q", f.Name)
-		}
-		if o.store.haveWAL(f.Name) {
-			// A timeline history held with other bytes is a timeline
-			// number another history reused: segments under that number
-			// are not the ones this archive holds, and a restore would
-			// replay the wrong history.
-			if f.SHA256 != "" && strings.HasSuffix(f.Name, ".history") {
-				held, err := fileSHA256(o.store.walPath(f.Name))
-				if err != nil {
-					return fmt.Errorf("WAL %s: %w", f.Name, err)
-				}
-				if held != f.SHA256 {
-					return o.quarantineFor(fmt.Sprintf("timeline history %s is held with other bytes than the cluster's: a timeline was reused", f.Name), o.state.Lineage)
-				}
-			}
+	final := finalSegment(target, cp.WALSegmentSize)
+	for _, name := range names {
+		if tli, segno, ok := parseSegment(name, cp.WALSegmentSize); ok && (tli > cp.Timeline || segno > final) {
 			continue
 		}
-		if f.Size > o.cfg.MaxArtifact {
-			continue
-		}
-		body, err := call(ctx, o.cfg.Endpoints[leader], &clusterhook.ExportRequest{Op: clusterhook.OpExportWAL, Observer: o.cfg.Name, Name: f.Name}, nil)
-		if err != nil {
+		if err := o.fetchWALFile(ctx, cp, name, listed[name]); err != nil {
 			return err
-		}
-		n, sum, err := writeStream(o.store.walPath(f.Name), body, f.Size, !strings.HasSuffix(f.Name, ".history"))
-		body.Close()
-		if err != nil {
-			return fmt.Errorf("WAL %s: %w", f.Name, err)
-		}
-		if n != f.Size {
-			os.Remove(o.store.walPath(f.Name))
-			return fmt.Errorf("WAL %s: %d bytes, not %d", f.Name, n, f.Size)
-		}
-		if f.SHA256 != "" && sum != f.SHA256 {
-			os.Remove(o.store.walPath(f.Name))
-			return fmt.Errorf("WAL %s: the bytes do not match the listed digest", f.Name)
 		}
 	}
 	return nil
 }
 
-func (o *Observer) fetchBase(ctx context.Context, leader string) error {
+// leaderFirst is every endpoint, the leader first.
+func (o *Observer) leaderFirst(leader string) []string {
+	out := []string{leader}
+	for _, slot := range o.slots {
+		if slot != leader {
+			out = append(out, slot)
+		}
+	}
+	return out
+}
+
+// fetchWALFile takes one listed WAL file from the first member that serves
+// bytes matching what it listed.
+func (o *Observer) fetchWALFile(ctx context.Context, cp clusterhook.ExportCheckpoint, name string, srcs []walSource) error {
+	if o.store.haveWAL(cp.SystemID, name) {
+		// A timeline history held with other bytes is a timeline number
+		// another history reused: segments under that number are not the
+		// ones this archive holds, and a restore would replay the wrong
+		// history.
+		if !strings.HasSuffix(name, ".history") {
+			return nil
+		}
+		for _, src := range srcs {
+			if src.file.SHA256 == "" {
+				continue
+			}
+			held, err := fileSHA256(o.store.walPath(cp.SystemID, name))
+			if err != nil {
+				return fmt.Errorf("WAL %s: %w", name, err)
+			}
+			if held != src.file.SHA256 {
+				return o.quarantineFor(fmt.Sprintf("timeline history %s is held with other bytes than the cluster's: a timeline was reused", name), o.state.Lineage)
+			}
+		}
+		return nil
+	}
+	var errs []error
+	for _, src := range srcs {
+		f := src.file
+		if f.Size > o.cfg.MaxArtifact {
+			continue
+		}
+		body, err := call(ctx, o.cfg.Endpoints[src.slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportWAL, Observer: o.cfg.Name, Name: name}, nil)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", src.slot, err))
+			continue
+		}
+		path := o.store.newWALPath(cp.SystemID, name)
+		// A segment is checked against its name and the checkpoint's
+		// system before it takes the name.
+		br := bufio.NewReaderSize(body, walHeaderSize)
+		head, _ := br.Peek(walHeaderSize)
+		err = checkSegmentHeader(head, name, cp.SystemID, cp.WALSegmentSize)
+		var n int64
+		var sum string
+		if err == nil {
+			n, sum, err = writeStream(path, br, f.Size, !strings.HasSuffix(name, ".history"))
+			if err != nil {
+				path = ""
+			}
+		}
+		body.Close()
+		if err == nil && n != f.Size {
+			err = fmt.Errorf("%d bytes, not %d", n, f.Size)
+		}
+		if err == nil && f.SHA256 != "" && sum != f.SHA256 {
+			err = errors.New("the bytes do not match the listed digest")
+		}
+		if err == nil {
+			return nil
+		}
+		if path != "" {
+			os.Remove(path)
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", src.slot, err))
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("WAL %s: %w", name, errors.Join(errs...))
+}
+
+func (o *Observer) fetchBase(ctx context.Context, leader string) (err error) {
 	body, err := call(ctx, o.cfg.Endpoints[leader], &clusterhook.ExportRequest{Op: clusterhook.OpExportPGBase, Observer: o.cfg.Name}, nil)
 	if err != nil {
 		return err
@@ -1014,17 +1238,24 @@ func (o *Observer) fetchBase(ctx context.Context, leader string) error {
 	// still sorts after the first, instead of failing on the rename.
 	label := o.cfg.Now().UTC().Format("20060102T150405Z")
 	for i, first := 1, label; ; i++ {
-		_, err := os.Stat(o.store.path("pg", "base", label))
-		if errors.Is(err, os.ErrNotExist) {
-			break
-		}
+		free, err := o.freeLabel(label)
 		if err != nil {
 			// A storage failure is reported, never taken for a used label.
 			return fmt.Errorf("base backup label %s: %w", label, err)
 		}
+		if free {
+			break
+		}
 		label = fmt.Sprintf("%s-%02d", first, i)
 	}
 	stage := o.store.path("pg", "staging", label)
+	// A base refused leaves nothing in staging: a tar left there would
+	// count against the quota until a restart (#112).
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(stage)
+		}
+	}()
 	if err := os.MkdirAll(stage, 0o700); err != nil {
 		return err
 	}
@@ -1058,7 +1289,63 @@ func (o *Observer) fetchBase(ctx context.Context, leader string) error {
 	}
 	o.state.Bases = append(o.state.Bases, info)
 	log.Info("cluster observer: base backup %s at %s on timeline %d (%d bytes)", label, info.Start, info.Timeline, n)
-	return o.store.saveState(o.state)
+	if err := o.store.saveState(o.state); err != nil {
+		return err
+	}
+	return o.dropIdleBases(label)
+}
+
+// dropIdleBases removes the base backups no published checkpoint restores
+// from, but newest: a base taken because the older ones cover nothing
+// replaces them, instead of piling up beside them (#57).
+func (o *Observer) dropIdleBases(newest string) error {
+	used := map[string]bool{newest: true}
+	for _, name := range o.store.Published() {
+		m, err := o.store.ReadManifest(name)
+		if err != nil {
+			// A manifest that does not read keeps every base.
+			return nil
+		}
+		used[m.PG.Base.Label] = true
+	}
+	var kept []BaseInfo
+	var drop []string
+	for _, b := range o.state.Bases {
+		if used[b.Label] {
+			kept = append(kept, b)
+		} else {
+			drop = append(drop, b.Label)
+		}
+	}
+	if len(drop) == 0 {
+		return nil
+	}
+	o.state.Bases = kept
+	if err := o.store.saveState(o.state); err != nil {
+		return err
+	}
+	for _, label := range drop {
+		if err := os.RemoveAll(o.store.path("pg", "base", label)); err != nil {
+			return err
+		}
+		log.Info("cluster observer: base backup %s let go: no checkpoint restores from it", label)
+	}
+	return nil
+}
+
+// freeLabel reports whether no base backup, published or in staging, has
+// label.
+func (o *Observer) freeLabel(label string) (bool, error) {
+	for _, dir := range []string{"base", "staging"} {
+		_, err := os.Stat(o.store.path("pg", dir, label))
+		if err == nil {
+			return false, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // ---- protection ----

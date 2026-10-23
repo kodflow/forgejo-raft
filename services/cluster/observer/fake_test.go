@@ -65,6 +65,12 @@ type fakeCluster struct {
 	calls []string
 	// down are the members that do not answer.
 	down map[string]bool
+	// legacyFiles lists attachments without their digest, as a leader
+	// that predates it.
+	legacyFiles bool
+	// walFrom, when set, are the members whose archive holds the WAL: the
+	// PostgreSQL primary's host; the others list nothing.
+	walFrom map[string]bool
 	// tamper may rewrite an answer before it is sent.
 	tamper func(slot string, req *clusterhook.ExportRequest, data []byte) []byte
 }
@@ -159,6 +165,13 @@ func (c *fakeCluster) storeFile(content string) string {
 	return path
 }
 
+// storeAttachment adds or replaces an attachment, named by its path.
+func (c *fakeCluster) storeAttachment(path, content string) {
+	c.mu.Lock()
+	c.files["attachments/"+path] = []byte(content)
+	c.mu.Unlock()
+}
+
 // checkpoint takes one checkpoint, as the coordinator does: the barrier,
 // the table at it, PostgreSQL's position and restore point, the WAL
 // switch, the artifacts, the position entry.
@@ -181,7 +194,11 @@ func (c *fakeCluster) checkpoint() reftable.CheckpointRecord {
 	var files []clusterhook.FileEntry
 	for k, v := range c.files {
 		storage, path, _ := strings.Cut(k, "/")
-		files = append(files, clusterhook.FileEntry{Storage: storage, Path: path, Size: int64(len(v))})
+		f := clusterhook.FileEntry{Storage: storage, Path: path, Size: int64(len(v))}
+		if storage == "attachments" && !c.legacyFiles {
+			f.SHA256 = digest(v)
+		}
+		files = append(files, f)
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	manifest, _ := json.Marshal(clusterhook.FilesManifest{Checkpoint: name, Files: files})
@@ -346,14 +363,14 @@ func (c *fakeCluster) serve(slot string, req *clusterhook.ExportRequest) ([]byte
 	case clusterhook.OpExportPGBase:
 		return nil, c.pg.baseBackup(), nil
 	case clusterhook.OpExportWALList:
-		var out []clusterhook.WALFile
+		out := []clusterhook.WALFile{}
+		if c.walFrom != nil && !c.walFrom[slot] {
+			b, _ := json.Marshal(out)
+			return b, nil, nil
+		}
 		for name, b := range c.pg.archive {
 			if name > req.Name || strings.HasSuffix(name, ".history") {
-				wf := clusterhook.WALFile{Name: name, Size: int64(len(b))}
-				if strings.HasSuffix(name, ".history") {
-					wf.SHA256 = digest(b)
-				}
-				out = append(out, wf)
+				out = append(out, clusterhook.WALFile{Name: name, Size: int64(len(b)), SHA256: digest(b)})
 			}
 		}
 		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -361,6 +378,9 @@ func (c *fakeCluster) serve(slot string, req *clusterhook.ExportRequest) ([]byte
 		return b, nil, nil
 	case clusterhook.OpExportWAL:
 		b, ok := c.pg.archive[req.Name]
+		if c.walFrom != nil && !c.walFrom[slot] {
+			ok = false
+		}
 		if !ok {
 			return nil, nil, &clusterhook.ExportError{Code: clusterhook.CodeUnavailable}
 		}
@@ -423,6 +443,7 @@ func (p *fakePG) switchWAL() {
 	seg := uint64(p.insert) / fakeSegSize
 	start := LSN(seg * fakeSegSize)
 	var buf bytes.Buffer
+	buf.Write(p.segmentHeader(p.tli, start))
 	for _, r := range p.records {
 		if LSN(r.LSN) >= start && LSN(r.LSN) < start+fakeSegSize {
 			b, _ := json.Marshal(r)
@@ -431,6 +452,22 @@ func (p *fakePG) switchWAL() {
 	}
 	p.archive[SegmentName(p.tli, start, fakeSegSize)] = buf.Bytes()
 	p.insert = LSN((seg + 1) * fakeSegSize)
+}
+
+// segmentHeader is the long page header a segment opens with.
+func (p *fakePG) segmentHeader(tli uint32, start LSN) []byte {
+	h := make([]byte, walHeaderSize)
+	le := binary.LittleEndian
+	le.PutUint16(h, 0xd118)
+	le.PutUint16(h[2:], xlpLongHeader)
+	le.PutUint32(h[walHeaderTLI:], tli)
+	le.PutUint64(h[walHeaderAddr:], uint64(start))
+	var id uint64
+	fmt.Sscan(p.sysid, &id)
+	le.PutUint64(h[walHeaderSysID:], id)
+	le.PutUint32(h[walHeaderSeg:], fakeSegSize)
+	le.PutUint32(h[walHeaderBlck:], walPageSize)
+	return h
 }
 
 // failover promotes a standby: a new timeline from the current position.
@@ -516,7 +553,9 @@ func replay(t *testing.T, o *Observer, m *Manifest) map[string]string {
 	start, _ := ParseLSN(m.PG.Base.Start)
 	target, _ := ParseLSN(m.Checkpoint.LSN)
 	for _, seg := range m.PG.Segments {
-		r, err := o.store.OpenWAL(seg)
+		r, err := o.store.OpenWAL(m.Checkpoint.SystemID, seg)
+		require.NoError(t, err, seg)
+		_, err = io.ReadFull(r, make([]byte, walHeaderSize))
 		require.NoError(t, err, seg)
 		var recs []walRecord
 		sc := bufio.NewScanner(r)
@@ -559,6 +598,7 @@ func newTestObserver(t *testing.T, c *fakeCluster, h *hookLog) *Observer {
 		StagingQuota: 1 << 30,
 	})
 	require.NoError(t, err)
+	t.Cleanup(o.Close)
 	return o
 }
 

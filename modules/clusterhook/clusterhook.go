@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -317,12 +318,20 @@ func ServerBudget() time.Duration {
 // repositories, which a hook's budget cannot.
 const AdminTimeout = 30 * time.Minute
 
+// ExportTimeout bounds an observer's export call, a stream included: a
+// base backup of a large database runs for hours, as long as the
+// observer's pass, whose default it is (#111).
+const ExportTimeout = 6 * time.Hour
+
 // Budget is what the replicator allows itself for one request: the hook's
-// budget for the push path, the operator's for the rest.
+// budget for the push path, the export's for an observer's call, the
+// operator's for the rest.
 func Budget(op string) time.Duration {
-	switch op {
-	case OpPrepared, OpCommitted, OpAborted, OpRegister, OpStatus, OpFresh, OpReadable:
+	switch {
+	case slices.Contains([]string{OpPrepared, OpCommitted, OpAborted, OpRegister, OpStatus, OpFresh, OpReadable}, op):
 		return ServerBudget()
+	case IsExportOp(op):
+		return ExportTimeout - 10*time.Second
 	default:
 		return AdminTimeout - 10*time.Second
 	}

@@ -134,8 +134,12 @@ only, after a commit confirmed by a quorum; a member that does not lead
 answers `NOT_LEADER` with the leader's slot and its own term. The
 checkpoint's artifacts come from the leader that wrote them. Packs (bounded
 to ref values), WAL files, stored files and base backups come from any
-member, and the observer checks them by digest against what the leader told
-it.
+member. The observer checks packs with git against the refs of the leader's
+table; a WAL file against the digest the member that lists it gives, and a
+segment's page header against the checkpoint's system, start and sizes,
+never taking a segment past the checkpoint's position; a stored file against
+its digest: an LFS object's or a package blob's path names it, and the
+leader's files manifest lists an attachment's.
 
 ## On the observer
 
@@ -178,7 +182,9 @@ followed off the pinned endpoints. Then:
   `staging/`, and verifies it: the table at B by the digest the position
   carries and the root the barrier recorded; the packs of every live ref
   through `git index-pack --strict`, and their whole closure; the stored files
-  by digest (an LFS object by its id); the secrets bundle, opened with the
+  by digest (an LFS object or a package blob by its id, an attachment by the
+  digest the files manifest lists), reused from an earlier checkpoint by that
+  digest only; the secrets bundle, opened with the
   observer's key and kept sealed; and PostgreSQL, covered by a base backup
   that starts before L and contiguous WAL from its start to L on the
   timeline path to the checkpoint's timeline, histories included. A position
@@ -217,7 +223,12 @@ ingestion until a human acts, the accepted checkpoints untouched:
 `forgejo cluster observe status` says why. `forgejo cluster observe accept
 <lineage>` ends the quarantine: naming the new lineage, the observer follows
 it; naming the current one after a fork, it restarts its log from its newest
-checkpoint. The first lineage the observer meets is its trust root; check it
+checkpoint. Beside the running service, which holds the directory, the
+command leaves the request in the directory (`ACCEPT`) and the service takes
+it at its next pass; `observe status` then shows the quarantine gone, or why
+the accept was refused. No restart is needed. One process at a time holds an
+observer directory (`observer.lock`): `observe once` beside the service is
+refused. The first lineage the observer meets is its trust root; check it
 against a member's `forgejo cluster status` (`lineage`).
 
 ### Integrity is not authenticity
@@ -344,3 +355,8 @@ key and the new lineage (`observe accept`).
   SDK draft `ImportObserved` will keep the lineage chain).
 - The SQL a web request writes beside a push is reconciled after a
   recovery, not fenced.
+- One export call, a base backup included, may run for 6 hours at most
+  (`ExportTimeout`, the default length of an observer's pass): past it, the
+  member's node stops the stream and the observer sees a failed call, never
+  a short one taken for complete. A base backup that cannot cross the link
+  in that time never completes.

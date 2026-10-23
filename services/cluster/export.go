@@ -40,8 +40,11 @@ import (
 // leader alone, which confirms its commit with a quorum before answering;
 // a member that does not lead answers NOT_LEADER with the leader's slot,
 // which an observer follows only to an endpoint it pins. Packs, WAL and
-// files come from any member: the observer checks them by digest against
-// what the leader told it.
+// files come from any member: the observer checks packs with git against
+// the refs the leader's artifact names, a WAL file against the digest its
+// member lists and, for a segment, its header against the checkpoint's
+// system, and a stored file against its digest, which its path names or
+// the leader's files manifest lists.
 
 // exportSide is the PostgreSQL and archive side of the export; tests
 // replace its parts.
@@ -68,6 +71,9 @@ const logBatchBytes = 4 << 20
 
 // walListMax bounds the names of one export-wal-list answer.
 const walListMax = 4096
+
+// walListBytes bounds what one export-wal-list answer reads to digest.
+const walListBytes = 1 << 30
 
 // serveExport answers one export call on conn: the answer's head, then
 // for a stream its bytes.
@@ -100,14 +106,26 @@ func (r *Replicator) serveExport(ctx context.Context, conn net.Conn, req *cluste
 		head(clusterhook.ExportAnswer{OK: true, Data: data})
 		return
 	}
-	if !head(clusterhook.ExportAnswer{OK: true, Stream: true, Data: data}) {
+	if !head(clusterhook.ExportAnswer{OK: true, Stream: true, Data: data, Framed: req.Framed}) {
 		return
 	}
-	if err := stream(ctx, w); err != nil {
-		// The head is gone: the observer sees a stream that does not
-		// verify, and discards it.
-		log.Warn("cluster export: %s: %v", req.Op, err)
+	if !req.Framed {
+		if err := stream(ctx, w); err != nil {
+			// The head is gone: the observer sees a stream that does not
+			// verify, and discards it.
+			log.Warn("cluster export: %s: %v", req.Op, err)
+		}
+		return
 	}
+	// Framed, a failure reaches the export command, which exits non-zero:
+	// the observer never takes a stream cut short for its end (#111).
+	fw := clusterhook.FrameWriter{W: w}
+	if err := stream(ctx, fw); err != nil {
+		log.Warn("cluster export: %s: %v", req.Op, err)
+		_ = fw.Fail(err)
+		return
+	}
+	_ = fw.End()
 }
 
 type streamFunc func(ctx context.Context, w io.Writer) error
@@ -426,19 +444,32 @@ func (x exportSide) walList(after string) ([]clusterhook.WALFile, error) {
 		if err != nil {
 			continue
 		}
-		wf := clusterhook.WALFile{Name: e.Name(), Size: info.Size()}
-		if strings.HasSuffix(e.Name(), ".history") {
-			if wf.SHA256, err = fileDigest(filepath.Join(x.archiveDir, e.Name())); err != nil {
-				return nil, err
-			}
-		}
-		out = append(out, wf)
+		out = append(out, clusterhook.WALFile{Name: e.Name(), Size: info.Size()})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	if len(out) > walListMax {
 		out = out[:walListMax]
 	}
-	return out, nil
+	// Every file is listed with its digest, which the observer checks the
+	// bytes it takes against, from whichever member serves them (#105).
+	// Reading them is bounded per answer: the rest is listed at the next
+	// call, from the observer's new cursor. Histories are always listed.
+	var listed []clusterhook.WALFile
+	var read int64
+	for _, wf := range out {
+		history := strings.HasSuffix(wf.Name, ".history")
+		if !history && read > 0 && read+wf.Size > walListBytes {
+			continue
+		}
+		sum, err := fileDigest(filepath.Join(x.archiveDir, wf.Name))
+		if err != nil {
+			return nil, err
+		}
+		wf.SHA256 = sum
+		read += wf.Size
+		listed = append(listed, wf)
+	}
+	return listed, nil
 }
 
 func (x exportSide) walFile(name string) (streamFunc, error) {

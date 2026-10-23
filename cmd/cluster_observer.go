@@ -79,7 +79,8 @@ func runClusterExport(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("%q is not an export op", req.Op)
 	}
 	req.Observer = c.String("observer")
-	ctx, cancel := context.WithTimeout(ctx, clusterhook.AdminTimeout)
+	// A base backup runs as long as the node's export budget allows.
+	ctx, cancel := context.WithTimeout(ctx, clusterhook.ExportTimeout)
 	defer cancel()
 	ans, body, err := clusterhook.CallExport(ctx, setting.Cluster.HookSocket, &req)
 	if err != nil {
@@ -192,6 +193,7 @@ func runClusterObserve(once bool) cli.ActionFunc {
 		if err != nil {
 			return err
 		}
+		defer o.Close()
 		if once {
 			return o.Step(ctx)
 		}
@@ -246,14 +248,29 @@ func runClusterObserveStatus(_ context.Context, c *cli.Command) error {
 	return err
 }
 
+// runClusterObserveAccept ends a quarantine. Beside the running service,
+// which holds the directory and its state in memory, it leaves the request
+// for the service's next pass instead.
 func runClusterObserveAccept(_ context.Context, c *cli.Command) error {
 	o, err := newObserverFromSettings()
-	if err != nil {
+	busy := errors.Is(err, observer.ErrBusy)
+	if err != nil && !busy {
 		return err
 	}
 	if err := confirmTyped(c, "the lineage", c.Args().First()); err != nil {
+		if o != nil {
+			o.Close()
+		}
 		return err
 	}
+	if busy {
+		if err := observer.RequestAccept(setting.Cluster.Observer.Dir, c.Args().First()); err != nil {
+			return err
+		}
+		fmt.Fprintln(c.Root().Writer, "The running observer takes the accept at its next pass; `forgejo cluster observe status` shows the outcome.")
+		return nil
+	}
+	defer o.Close()
 	return o.Accept(c.Args().First())
 }
 

@@ -104,7 +104,7 @@ func (a *Archive) Check(ctx context.Context, name string) error {
 		return fmt.Errorf("the base backup %s is missing or altered", m.PG.Base.Label)
 	}
 	for _, w := range append(append([]string(nil), m.PG.Segments...), m.PG.History...) {
-		if !a.store.haveWAL(w) {
+		if !a.store.haveWAL(m.Checkpoint.SystemID, w) {
 			return fmt.Errorf("the WAL file %s is missing", w)
 		}
 	}
@@ -117,7 +117,7 @@ func (a *Archive) Check(ctx context.Context, name string) error {
 		if len(rm.Refs) == 0 {
 			continue
 		}
-		refs, err := a.store.git.refs(ctx, a.store.git.dir(repo), name)
+		refs, err := a.store.git.refs(ctx, a.store.git.dirFor(repo, rm.Format), name)
 		if err != nil || len(refs) != len(rm.Refs) {
 			return fmt.Errorf("the refs of %s are missing", repo)
 		}
@@ -414,7 +414,7 @@ func (a *Archive) RestorePG(name, pgdata string, opt PGOptions) error {
 	// checkpoint's path: the promotion takes the newest timeline it finds
 	// plus one, and a number the old system used after the checkpoint is
 	// never taken again, so its segments are never mistaken for ours.
-	wals, err := a.store.histories()
+	wals, err := a.store.histories(m.Checkpoint.SystemID)
 	if err != nil {
 		return err
 	}
@@ -424,7 +424,7 @@ func (a *Archive) RestorePG(name, pgdata string, opt PGOptions) error {
 		}
 	}
 	for _, w := range append(wals, m.PG.Segments...) {
-		r, err := a.store.OpenWAL(w)
+		r, err := a.store.OpenWAL(m.Checkpoint.SystemID, w)
 		if err != nil {
 			return fmt.Errorf("WAL %s: %w", w, err)
 		}

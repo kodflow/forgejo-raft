@@ -386,3 +386,19 @@ func TestRecoverVerifiesEmptyRepositories(t *testing.T) {
 	require.ErrorContains(t, err, "alice/empty.git")
 	assert.NotContains(t, err.Error(), "bob/none.git", "a repository the checkpoint holds nothing of")
 }
+
+// An attachment SQL names and the restored storage lacks stops the
+// verification, as an LFS object does (#90).
+func TestStoredPresentNamesTheMissingFile(t *testing.T) {
+	root := t.TempDir()
+	uuid := "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+	rel := func(k string) string { return k[:1] + "/" + k[1:2] + "/" + k }
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "a", "0"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "a", "0", uuid), []byte("x"), 0o600))
+	n, err := storedPresent("attachment", root, []string{uuid, ""}, rel)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	gone := "b1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+	_, err = storedPresent("attachment", root, []string{uuid, gone}, rel)
+	require.ErrorContains(t, err, "the attachment "+gone+" is in SQL and not in the restored storage")
+}

@@ -152,3 +152,23 @@ func TestScanBaseTarReadsTheManifestEnd(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "0/3000138", info.End)
 }
+
+// A position in the last page of its segment is covered only with the
+// next segment, where the record that starts at it may end (#89).
+func TestCoverReadsTheRecordAtThePositionWhole(t *testing.T) {
+	const seg = 16 << 20
+	held := map[string]bool{"000000010000000000000002": true}
+	have := func(n string) bool { return held[n] }
+	bases := []BaseInfo{{Label: "b1", Start: "0/2000028", Timeline: 1, SystemID: "42"}}
+
+	cov, err := Cover(bases, "42", LSN(3*seg-walPageSize-1), 1, seg, have, nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"000000010000000000000002"}, cov.Segments)
+
+	_, err = Cover(bases, "42", LSN(3*seg-0x50), 1, seg, have, nil, nil)
+	require.ErrorIs(t, err, ErrNoCoverage)
+	held["000000010000000000000003"] = true
+	cov, err = Cover(bases, "42", LSN(3*seg-0x50), 1, seg, have, nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"000000010000000000000002", "000000010000000000000003"}, cov.Segments)
+}
