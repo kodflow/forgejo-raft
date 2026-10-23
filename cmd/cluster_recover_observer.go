@@ -645,6 +645,23 @@ func checkPromoted(ctx context.Context, m *observer.Manifest) error {
 	return nil
 }
 
+// storedPresent checks that the file of every key SQL names is in the
+// restored storage root, at rel(key); a key too short to name a file is
+// passed over.
+func storedPresent(what, root string, keys []string, rel func(string) string) (int, error) {
+	n := 0
+	for _, k := range keys {
+		if len(k) < 5 {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel(k)))); err != nil {
+			return n, fmt.Errorf("the %s %s is in SQL and not in the restored storage", what, k)
+		}
+		n++
+	}
+	return n, nil
+}
+
 // verifyRecovered checks what the recovery restored, then revokes every
 // token: a recovered forge trusts none it held.
 func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Write([]byte) (int, error) }) error {
@@ -687,21 +704,34 @@ func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Wri
 		return err
 	}
 
-	if setting.LFS.Storage != nil && setting.LFS.Storage.Type == setting.LocalStorageType {
-		objs, err := e.Query("SELECT DISTINCT oid FROM lfs_meta_object")
+	// Every stored file SQL names is in the restored storage: an LFS
+	// object, and also an attachment and a package blob, whose absence
+	// would otherwise pass in silence (#90).
+	for _, sf := range []struct {
+		what, query, column string
+		storage             *setting.Storage
+		rel                 func(string) string
+	}{
+		{"LFS object", "SELECT DISTINCT oid FROM lfs_meta_object", "oid", setting.LFS.Storage, func(k string) string { return k[:2] + "/" + k[2:4] + "/" + k[4:] }},
+		{"attachment", "SELECT uuid FROM attachment", "uuid", setting.Attachment.Storage, func(k string) string { return k[:1] + "/" + k[1:2] + "/" + k }},
+		{"package blob", "SELECT hash_sha256 FROM package_blob", "hash_sha256", setting.Packages.Storage, func(k string) string { return k[:2] + "/" + k[2:4] + "/" + k }},
+	} {
+		if sf.storage == nil || sf.storage.Type != setting.LocalStorageType {
+			continue
+		}
+		rows, err := e.Query(sf.query)
 		if err != nil {
 			return err
 		}
-		for _, o := range objs {
-			oid := string(o["oid"])
-			if len(oid) < 5 {
-				continue
-			}
-			if _, err := os.Stat(filepath.Join(setting.LFS.Storage.Path, oid[:2], oid[2:4], oid[4:])); err != nil {
-				return fmt.Errorf("the LFS object %s is in SQL and not in the restored storage", oid)
-			}
+		keys := make([]string, 0, len(rows))
+		for _, r := range rows {
+			keys = append(keys, string(r[sf.column]))
 		}
-		fmt.Fprintf(w, "verified: %d LFS objects present\n", len(objs))
+		n, err := storedPresent(sf.what, sf.storage.Path, keys, sf.rel)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(w, "verified: %d %ss present\n", n, sf.what)
 	}
 
 	var tfs []*auth_model.TwoFactor
