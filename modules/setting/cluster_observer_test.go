@@ -37,6 +37,12 @@ func TestObserverSettingsRefuseListeners(t *testing.T) {
 	assert.Equal(t, "nas-paris", Cluster.Observer.Name)
 	assert.Equal(t, "forgejo-export@192.0.2.2:22", Cluster.Observer.Endpoints["node-b"])
 	assert.Equal(t, 15*time.Second, Cluster.Observer.PollInterval)
+	assert.Equal(t, 30*time.Minute, Cluster.Observer.ExportSilence)
+	loadClusterSection(t, observerNode+"OBSERVER_EXPORT_SILENCE = 2h\n")
+	require.NoError(t, Cluster.ConfigError)
+	assert.Equal(t, 2*time.Hour, Cluster.Observer.ExportSilence)
+	loadClusterSection(t, observerNode+"OBSERVER_EXPORT_SILENCE = 10s\n")
+	require.ErrorContains(t, Cluster.ConfigError, "OBSERVER_EXPORT_SILENCE")
 
 	for _, line := range []string{
 		"LISTEN_ADDR = 192.0.2.9:7480",
