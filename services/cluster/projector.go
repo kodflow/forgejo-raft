@@ -893,7 +893,16 @@ func (p *projector) setAsideStale(repo, dir string) error {
 // setAsideStale, it is moved under staleDirName, never removed.
 func (p *projector) setAsideInvalid(repo, dir string, at uint64) error {
 	st, err := os.Stat(dir)
-	if err != nil || validRepoDir(dir) || p.registry.busy(repo) || time.Since(st.ModTime()) <= max(p.registry.ttl, staleLockAge) {
+	if err != nil {
+		return nil
+	}
+	invalid, err := invalidRepoDir(dir)
+	if err != nil {
+		// A repository that cannot be validated now may be sound: it is
+		// never moved on that, and the projection reports it.
+		return fmt.Errorf("validating the directory of %s: %w", repo, err)
+	}
+	if !invalid || p.registry.busy(repo) || time.Since(st.ModTime()) <= max(p.registry.ttl, staleLockAge) {
 		return nil
 	}
 	aside := filepath.Join(p.root, staleDirName, fmt.Sprintf("%s-invalid-%d-%d", strings.ReplaceAll(repo, "/", "_"), at, time.Now().UnixNano()))
