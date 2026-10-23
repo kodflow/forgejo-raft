@@ -139,8 +139,8 @@ func (o *Observer) prune(ctx context.Context) error {
 			return err
 		}
 		if m != nil {
-			for repo := range m.Repos {
-				if err := o.store.git.dropRefs(ctx, o.store.git.dir(repo), a.Name); err != nil {
+			for repo, rm := range m.Repos {
+				if err := o.store.git.dropRefs(ctx, o.store.git.dirFor(repo, rm.Format), a.Name); err != nil {
 					return err
 				}
 			}

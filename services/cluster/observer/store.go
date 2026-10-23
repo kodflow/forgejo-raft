@@ -67,6 +67,15 @@ type Manifest struct {
 	Voters []string `json:"voters,omitempty"`
 }
 
+// repo returns a repository of the manifest, if m is one and holds it.
+func (m *Manifest) repo(key string) (RepoManifest, bool) {
+	if m == nil {
+		return RepoManifest{}, false
+	}
+	rm, ok := m.Repos[key]
+	return rm, ok
+}
+
 // ManifestSum totals what a checkpoint references.
 type ManifestSum struct {
 	Repos int   `json:"repos"`

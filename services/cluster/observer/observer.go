@@ -722,7 +722,7 @@ func (o *Observer) ingest(ctx context.Context, leader string, cp clusterhook.Exp
 		if len(rm.Refs) == 0 {
 			continue
 		}
-		if err := o.store.git.createRefs(ctx, o.store.git.dir(repo), cp.Name, rm.Refs); err != nil {
+		if err := o.store.git.createRefs(ctx, o.store.git.dirFor(repo, rm.Format), cp.Name, rm.Refs); err != nil {
 			return err
 		}
 	}
@@ -825,9 +825,12 @@ func (o *Observer) fetchObjects(ctx context.Context, leader string, cp clusterho
 			wants = append(wants, s)
 		}
 		sort.Strings(wants)
+		// The previous checkpoint's values are haves only in the same
+		// object format: a repository recreated in the other one shares
+		// nothing with them (#84).
 		var prevRefs []string
-		if prev != nil {
-			for _, s := range prev.Repos[repo].Refs {
+		if prm, ok := prev.repo(repo); ok && storeFormat(prm.Format) == storeFormat(rm.Format) {
+			for _, s := range prm.Refs {
 				prevRefs = append(prevRefs, s)
 			}
 		}

@@ -117,7 +117,7 @@ func (a *Archive) Check(ctx context.Context, name string) error {
 		if len(rm.Refs) == 0 {
 			continue
 		}
-		refs, err := a.store.git.refs(ctx, a.store.git.dir(repo), name)
+		refs, err := a.store.git.refs(ctx, a.store.git.dirFor(repo, rm.Format), name)
 		if err != nil || len(refs) != len(rm.Refs) {
 			return fmt.Errorf("the refs of %s are missing", repo)
 		}

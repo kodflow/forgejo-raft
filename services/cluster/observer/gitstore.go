@@ -41,6 +41,47 @@ func RefNamespace(checkpoint string) string { return "refs/observer/" + checkpoi
 
 func (g gitStore) dir(repo string) string { return filepath.Join(g.root, filepath.FromSlash(repo)) }
 
+// storeFormat is an object format as a store names it: sha1 when unset.
+func storeFormat(format string) string {
+	if format == "" {
+		return "sha1"
+	}
+	return format
+}
+
+// formatOf reads the object format of an existing store, "" without one.
+func formatOf(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, "config"))
+	if err != nil {
+		if _, serr := os.Stat(filepath.Join(dir, "HEAD")); serr != nil {
+			return ""
+		}
+		return "sha1"
+	}
+	for line := range strings.SplitSeq(string(b), "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if ok && strings.EqualFold(strings.TrimSpace(k), "objectformat") {
+			return strings.ToLower(strings.TrimSpace(v))
+		}
+	}
+	return "sha1"
+}
+
+// dirFor is the store of a repository in one object format. The store
+// under the key alone holds the format the key was first seen in; a
+// repository recreated, or renamed to that key, in the other format has
+// its own store under .<format>/, so neither is ever mixed into the other
+// and older checkpoints keep reading theirs (#84).
+func (g gitStore) dirFor(repo, format string) string {
+	format = storeFormat(format)
+	legacy := g.dir(repo)
+	switch formatOf(legacy) {
+	case "", format:
+		return legacy
+	}
+	return filepath.Join(g.root, "."+format, filepath.FromSlash(repo))
+}
+
 func (g gitStore) run(ctx context.Context, dir string, stdin io.Reader, args ...string) (string, error) {
 	var out, errb bytes.Buffer
 	cmd := exec.CommandContext(ctx, g.git, append([]string{"-c", "core.hooksPath=/dev/null"}, args...)...)
@@ -63,15 +104,13 @@ func (g gitStore) run(ctx context.Context, dir string, stdin io.Reader, args ...
 
 // ensure creates a repository's store with the object format of its refs.
 func (g gitStore) ensure(ctx context.Context, repo, format string) (string, error) {
-	dir := g.dir(repo)
+	format = storeFormat(format)
+	dir := g.dirFor(repo, format)
 	if _, err := os.Stat(filepath.Join(dir, "HEAD")); err == nil {
 		return dir, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return "", err
-	}
-	if format == "" {
-		format = "sha1"
 	}
 	if _, err := g.run(ctx, filepath.Dir(dir), nil, "init", "-q", "--bare", "--object-format="+format, dir); err != nil {
 		return "", err
@@ -292,7 +331,7 @@ func (g gitStore) Materialize(ctx context.Context, repo, checkpoint, target, for
 	// A repository without refs has nothing to fetch, and no store here.
 	if fetch {
 		ns := RefNamespace(checkpoint)
-		if _, err := g.run(ctx, target, nil, "-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-tags", "--no-write-fetch-head", g.dir(repo), "+"+ns+"refs/*:refs/*"); err != nil {
+		if _, err := g.run(ctx, target, nil, "-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-tags", "--no-write-fetch-head", g.dirFor(repo, format), "+"+ns+"refs/*:refs/*"); err != nil {
 			return err
 		}
 	}
