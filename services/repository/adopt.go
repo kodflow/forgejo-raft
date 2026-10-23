@@ -54,6 +54,16 @@ func AdoptRepository(ctx context.Context, doer, u *user_model.User, opts CreateR
 		IsEmpty:                         !opts.AutoInit,
 	}
 
+	// In a cluster, the adopted repository's ID goes into the replicated
+	// table during the transaction that commits its row: both fall on the
+	// same side of a checkpoint (#167). Taken before the transaction opens,
+	// never inside it: the checkpoint's exclusive cut would wait on it.
+	releaseCut, err := clusterhook.HoldCut(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseCut()
+
 	if err := db.WithTx(ctx, func(ctx context.Context) error {
 		repoPath := repo_model.RepoPath(u.Name, repo.Name)
 		isExist, err := util.IsExist(repoPath)
@@ -106,6 +116,7 @@ func AdoptRepository(ctx context.Context, doer, u *user_model.User, opts CreateR
 	}); err != nil {
 		return nil, err
 	}
+	releaseCut()
 
 	notify_service.AdoptRepository(ctx, doer, u, repo)
 
