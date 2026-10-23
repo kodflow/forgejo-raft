@@ -393,9 +393,10 @@ type Report struct {
 	BootstrapPending bool
 	HardTerm         uint64
 	LastIndex        uint64
-	// LastTerm is the term of the entry at LastIndex: with it, the key a
-	// Recover's survivor is chosen by, (LastTerm, LastIndex) in that order,
-	// never HardTerm, the term of the last vote.
+	// LastTerm is the term of the entry at LastIndex, or of the newest
+	// snapshot when it holds LastIndex: with it, the key a Recover's
+	// survivor is chosen by, (LastTerm, LastIndex) in that order, never
+	// HardTerm, the term of the last vote.
 	LastTerm    uint64
 	Snapshot    *SnapshotMeta
 	Quarantined bool
