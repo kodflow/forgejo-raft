@@ -182,6 +182,24 @@ func TestRecoverProbesTheOldMembers(t *testing.T) {
 	require.NoError(t, run("--old-peer", "node-c="+ln.Addr().String(), "--force-old-members-answer"))
 	ln.Close()
 	require.NoError(t, run("--old-peer", "node-c="+ln.Addr().String()), "every old member silent")
+	// An --old-peer for a slot PEERS names too is asked as well, never in
+	// its place: the seed address may still answer (CodeRabbit on #30).
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln2.Close()
+	go func() {
+		for {
+			c, err := ln2.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	func() {
+		defer test.MockVariableValue(&setting.Cluster.Peers, map[string]string{"node-a": "127.0.0.1:1", "node-b": ln2.Addr().String()})()
+		require.ErrorContains(t, run("--old-peer", "node-b=127.0.0.1:2"), "old member answers")
+	}()
 
 	defer test.MockVariableValue(&setting.Cluster.Peers, map[string]string{})()
 	require.ErrorContains(t, run(), "no old member to probe")
