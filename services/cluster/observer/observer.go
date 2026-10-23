@@ -1037,64 +1037,119 @@ func (o *Observer) needsBase(sysid string) bool {
 	return newest.IsZero() || o.cfg.Now().Sub(newest) > o.cfg.BaseEvery
 }
 
+// walSource is a member that lists a WAL file, and what it lists.
+type walSource struct {
+	slot string
+	file clusterhook.WALFile
+}
+
+// fetchWAL brings the archive up to date from every member: only the
+// PostgreSQL primary's archive advances, and its host need not be the Raft
+// leader. The lists are merged, and each file is taken from a member that
+// lists it, the leader first (#57).
 func (o *Observer) fetchWAL(ctx context.Context, leader string) error {
-	var files []clusterhook.WALFile
-	var err error
-	for _, slot := range append([]string{leader}, o.slots...) {
-		var body io.ReadCloser
-		body, err = call(ctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportWALList, Observer: o.cfg.Name, Name: o.store.lastSegment()}, &files)
-		if err == nil {
-			body.Close()
-			break
-		}
-	}
-	if err != nil {
-		return err
-	}
-	for _, f := range files {
-		// The name comes from a member: it becomes a path under the
-		// archive only once it is a WAL file's name.
-		if !ValidWALName(f.Name) {
-			return fmt.Errorf("a member listed an invalid WAL name %q", f.Name)
-		}
-		if o.store.haveWAL(f.Name) {
-			// A timeline history held with other bytes is a timeline
-			// number another history reused: segments under that number
-			// are not the ones this archive holds, and a restore would
-			// replay the wrong history.
-			if f.SHA256 != "" && strings.HasSuffix(f.Name, ".history") {
-				held, err := fileSHA256(o.store.walPath(f.Name))
-				if err != nil {
-					return fmt.Errorf("WAL %s: %w", f.Name, err)
-				}
-				if held != f.SHA256 {
-					return o.quarantineFor(fmt.Sprintf("timeline history %s is held with other bytes than the cluster's: a timeline was reused", f.Name), o.state.Lineage)
-				}
-			}
-			continue
-		}
-		if f.Size > o.cfg.MaxArtifact {
-			continue
-		}
-		body, err := call(ctx, o.cfg.Endpoints[leader], &clusterhook.ExportRequest{Op: clusterhook.OpExportWAL, Observer: o.cfg.Name, Name: f.Name}, nil)
+	listed := map[string][]walSource{}
+	var errs []error
+	answered := false
+	for _, slot := range o.leaderFirst(leader) {
+		var files []clusterhook.WALFile
+		body, err := call(ctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportWALList, Observer: o.cfg.Name, Name: o.store.lastSegment()}, &files)
 		if err != nil {
-			return err
+			errs = append(errs, fmt.Errorf("%s: %w", slot, err))
+			continue
 		}
-		n, sum, err := writeStream(o.store.walPath(f.Name), body, f.Size, !strings.HasSuffix(f.Name, ".history"))
 		body.Close()
-		if err != nil {
-			return fmt.Errorf("WAL %s: %w", f.Name, err)
+		answered = true
+		for _, f := range files {
+			// The name comes from a member: it becomes a path under the
+			// archive only once it is a WAL file's name.
+			if !ValidWALName(f.Name) {
+				return fmt.Errorf("a member listed an invalid WAL name %q", f.Name)
+			}
+			listed[f.Name] = append(listed[f.Name], walSource{slot: slot, file: f})
 		}
-		if n != f.Size {
-			os.Remove(o.store.walPath(f.Name))
-			return fmt.Errorf("WAL %s: %d bytes, not %d", f.Name, n, f.Size)
-		}
-		if f.SHA256 != "" && sum != f.SHA256 {
-			os.Remove(o.store.walPath(f.Name))
-			return fmt.Errorf("WAL %s: the bytes do not match the listed digest", f.Name)
+	}
+	if !answered {
+		return errors.Join(errs...)
+	}
+	names := make([]string, 0, len(listed))
+	for name := range listed {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := o.fetchWALFile(ctx, name, listed[name]); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// leaderFirst is every endpoint, the leader first.
+func (o *Observer) leaderFirst(leader string) []string {
+	out := []string{leader}
+	for _, slot := range o.slots {
+		if slot != leader {
+			out = append(out, slot)
+		}
+	}
+	return out
+}
+
+// fetchWALFile takes one listed WAL file from the first member that serves
+// bytes matching what it listed.
+func (o *Observer) fetchWALFile(ctx context.Context, name string, srcs []walSource) error {
+	if o.store.haveWAL(name) {
+		// A timeline history held with other bytes is a timeline number
+		// another history reused: segments under that number are not the
+		// ones this archive holds, and a restore would replay the wrong
+		// history.
+		if !strings.HasSuffix(name, ".history") {
+			return nil
+		}
+		for _, src := range srcs {
+			if src.file.SHA256 == "" {
+				continue
+			}
+			held, err := fileSHA256(o.store.walPath(name))
+			if err != nil {
+				return fmt.Errorf("WAL %s: %w", name, err)
+			}
+			if held != src.file.SHA256 {
+				return o.quarantineFor(fmt.Sprintf("timeline history %s is held with other bytes than the cluster's: a timeline was reused", name), o.state.Lineage)
+			}
+		}
+		return nil
+	}
+	var errs []error
+	for _, src := range srcs {
+		f := src.file
+		if f.Size > o.cfg.MaxArtifact {
+			continue
+		}
+		body, err := call(ctx, o.cfg.Endpoints[src.slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportWAL, Observer: o.cfg.Name, Name: name}, nil)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", src.slot, err))
+			continue
+		}
+		n, sum, err := writeStream(o.store.walPath(name), body, f.Size, !strings.HasSuffix(name, ".history"))
+		body.Close()
+		if err == nil && n != f.Size {
+			err = fmt.Errorf("%d bytes, not %d", n, f.Size)
+		}
+		if err == nil && f.SHA256 != "" && sum != f.SHA256 {
+			err = errors.New("the bytes do not match the listed digest")
+		}
+		if err == nil {
+			return nil
+		}
+		os.Remove(o.store.walPath(name))
+		errs = append(errs, fmt.Errorf("%s: %w", src.slot, err))
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("WAL %s: %w", name, errors.Join(errs...))
 }
 
 func (o *Observer) fetchBase(ctx context.Context, leader string) (err error) {
@@ -1159,7 +1214,48 @@ func (o *Observer) fetchBase(ctx context.Context, leader string) (err error) {
 	}
 	o.state.Bases = append(o.state.Bases, info)
 	log.Info("cluster observer: base backup %s at %s on timeline %d (%d bytes)", label, info.Start, info.Timeline, n)
-	return o.store.saveState(o.state)
+	if err := o.store.saveState(o.state); err != nil {
+		return err
+	}
+	return o.dropIdleBases(label)
+}
+
+// dropIdleBases removes the base backups no published checkpoint restores
+// from, but newest: a base taken because the older ones cover nothing
+// replaces them, instead of piling up beside them (#57).
+func (o *Observer) dropIdleBases(newest string) error {
+	used := map[string]bool{newest: true}
+	for _, name := range o.store.Published() {
+		m, err := o.store.ReadManifest(name)
+		if err != nil {
+			// A manifest that does not read keeps every base.
+			return nil
+		}
+		used[m.PG.Base.Label] = true
+	}
+	var kept []BaseInfo
+	var drop []string
+	for _, b := range o.state.Bases {
+		if used[b.Label] {
+			kept = append(kept, b)
+		} else {
+			drop = append(drop, b.Label)
+		}
+	}
+	if len(drop) == 0 {
+		return nil
+	}
+	o.state.Bases = kept
+	if err := o.store.saveState(o.state); err != nil {
+		return err
+	}
+	for _, label := range drop {
+		if err := os.RemoveAll(o.store.path("pg", "base", label)); err != nil {
+			return err
+		}
+		log.Info("cluster observer: base backup %s let go: no checkpoint restores from it", label)
+	}
+	return nil
 }
 
 // freeLabel reports whether no base backup, published or in staging, has

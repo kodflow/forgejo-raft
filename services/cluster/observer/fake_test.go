@@ -65,6 +65,9 @@ type fakeCluster struct {
 	calls []string
 	// down are the members that do not answer.
 	down map[string]bool
+	// walFrom, when set, are the members whose archive holds the WAL: the
+	// PostgreSQL primary's host; the others list nothing.
+	walFrom map[string]bool
 	// tamper may rewrite an answer before it is sent.
 	tamper func(slot string, req *clusterhook.ExportRequest, data []byte) []byte
 }
@@ -346,7 +349,11 @@ func (c *fakeCluster) serve(slot string, req *clusterhook.ExportRequest) ([]byte
 	case clusterhook.OpExportPGBase:
 		return nil, c.pg.baseBackup(), nil
 	case clusterhook.OpExportWALList:
-		var out []clusterhook.WALFile
+		out := []clusterhook.WALFile{}
+		if c.walFrom != nil && !c.walFrom[slot] {
+			b, _ := json.Marshal(out)
+			return b, nil, nil
+		}
 		for name, b := range c.pg.archive {
 			if name > req.Name || strings.HasSuffix(name, ".history") {
 				wf := clusterhook.WALFile{Name: name, Size: int64(len(b))}
@@ -361,6 +368,9 @@ func (c *fakeCluster) serve(slot string, req *clusterhook.ExportRequest) ([]byte
 		return b, nil, nil
 	case clusterhook.OpExportWAL:
 		b, ok := c.pg.archive[req.Name]
+		if c.walFrom != nil && !c.walFrom[slot] {
+			ok = false
+		}
 		if !ok {
 			return nil, nil, &clusterhook.ExportError{Code: clusterhook.CodeUnavailable}
 		}
