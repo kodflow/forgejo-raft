@@ -70,54 +70,79 @@ func cutDB() (*sql.DB, error) {
 	return cutPool.db, cutPool.err
 }
 
-func (p pgCut) begin() (*sql.Tx, error) {
+// begin opens the hold's transaction within ctx, and returns the function
+// that ends it, once.
+//
+// The transaction lives as long as the hold, not as the caller's context:
+// database/sql rolls back a transaction whose context ends. Its context is
+// one of its own, which the caller's ends only until the transaction is
+// open: the coordinator takes the cut under the leader's fence, and a
+// PostgreSQL that no longer answers the leader held every write of the
+// leader until the kernel gave up connecting, at every period (#152).
+func (p pgCut) begin(ctx context.Context) (*sql.Tx, func(), error) {
 	sqlDB, err := p.db()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	// The transaction lives as long as the hold, not as the caller's
-	// context: database/sql rolls back a transaction whose context ends.
-	tx, err := sqlDB.BeginTx(context.Background(), nil)
+	txCtx, cancel := context.WithCancel(context.Background())
+	stop := context.AfterFunc(ctx, cancel)
+	tx, err := sqlDB.BeginTx(txCtx, nil)
+	if err == nil {
+		// It stays idle while the operation it covers runs: a server-wide
+		// idle_in_transaction_session_timeout would end it, and drop the
+		// cut, under the operation.
+		if _, err = tx.ExecContext(ctx, "SET LOCAL idle_in_transaction_session_timeout = 0"); err != nil {
+			_ = tx.Rollback()
+		}
+	}
+	if !stop() {
+		// ctx ended: the transaction, if open, is rolled back or about to
+		// be, and a failure is ctx's own.
+		if err == nil {
+			_ = tx.Rollback()
+		}
+		err = context.Cause(ctx)
+	}
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, nil, err
 	}
-	// It stays idle while the operation it covers runs: a server-wide
-	// idle_in_transaction_session_timeout would end it, and drop the
-	// cut, under the operation.
-	if _, err := tx.Exec("SET LOCAL idle_in_transaction_session_timeout = 0"); err != nil {
-		_ = tx.Rollback()
-		return nil, err
-	}
-	return tx, nil
+	var once sync.Once
+	return tx, func() {
+		once.Do(func() {
+			rollbackCut(tx)
+			cancel()
+		})
+	}, nil
 }
 
 func (p pgCut) Shared(ctx context.Context) (func(), error) {
-	tx, err := p.begin()
+	tx, end, err := p.begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock_shared($1)", cutLockKey); err != nil {
-		_ = tx.Rollback()
+		end()
 		return nil, err
 	}
-	return func() { rollbackCut(tx) }, nil
+	return end, nil
 }
 
 func (p pgCut) TryExclusive(ctx context.Context) (func(), bool, error) {
-	tx, err := p.begin()
+	tx, end, err := p.begin(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	var ok bool
 	if err := tx.QueryRowContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", cutLockKey).Scan(&ok); err != nil {
-		_ = tx.Rollback()
+		end()
 		return nil, false, err
 	}
 	if !ok {
-		_ = tx.Rollback()
+		end()
 		return func() {}, false, nil
 	}
-	return func() { rollbackCut(tx) }, true, nil
+	return end, true, nil
 }
 
 func rollbackCut(tx *sql.Tx) {
