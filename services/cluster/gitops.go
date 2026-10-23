@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -149,16 +150,38 @@ func writeRefs(ctx context.Context, dir string, set map[string]reftable.RefValue
 // halfway, or one whose files were never synced before a power cut,
 // leaves a directory git refuses as "not a git repository" (#42).
 func validRepoDir(dir string) bool {
+	invalid, err := invalidRepoDir(dir)
+	return err == nil && !invalid
+}
+
+// invalidRepoDir reports whether dir holds no bare repository for certain:
+// an entry git needs is missing or of the wrong kind. Any other error
+// (permission denied, an I/O error) is returned: the directory may hold a
+// sound repository that cannot be read now.
+func invalidRepoDir(dir string) (bool, error) {
 	st, err := os.Lstat(filepath.Join(dir, "HEAD"))
-	if err != nil || !st.Mode().IsRegular() || st.Size() == 0 {
-		return false
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !st.Mode().IsRegular() || st.Size() == 0 {
+		return true, nil
 	}
 	for _, d := range []string{"objects", "refs"} {
-		if st, err := os.Stat(filepath.Join(dir, d)); err != nil || !st.IsDir() {
-			return false
+		st, err := os.Stat(filepath.Join(dir, d))
+		if errors.Is(err, os.ErrNotExist) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if !st.IsDir() {
+			return true, nil
 		}
 	}
-	return true
+	return false, nil
 }
 
 // initBare creates an empty bare repository for a key the table names and
@@ -205,6 +228,16 @@ func initBare(ctx context.Context, dir, format string) error {
 	// The objects about to land here are acknowledged once their pack is
 	// synced: the directories leading to them are synced first, up to the
 	// repository root.
+	return syncRepoParents(dir)
+}
+
+// syncRepoParents makes the name of a repository's directory durable: its
+// parent and the parent's parent, the repository root, are synced. initBare
+// does it after its rename; one whose sync failed leaves the directory in
+// place, and every later user of it that vouches for it (an acknowledged
+// pack, an answer that objects are held, a first certification) does it
+// again, so the obligation survives the failure.
+func syncRepoParents(dir string) error {
 	for _, d := range []string{filepath.Dir(dir), filepath.Dir(filepath.Dir(dir))} {
 		if err := syncDirFn(d); err != nil {
 			return err

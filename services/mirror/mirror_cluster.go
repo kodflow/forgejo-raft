@@ -11,6 +11,7 @@ import (
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
+	giturl "forgejo.org/modules/git/url"
 	repo_module "forgejo.org/modules/repository"
 )
 
@@ -101,19 +102,34 @@ func ensurePullMirrorRemote(ctx context.Context, m *repo_model.Mirror) error {
 			return err
 		}
 	}
-	if !m.Repo.HasWiki() {
+	return nil
+}
+
+// wikiRemoteURL asks a remote for its wiki's address; tests replace it.
+var wikiRemoteURL = repo_module.WikiRemoteURL
+
+// ensurePullWikiRemote recreates, in a cluster, the remote of a pull
+// mirror's wiki. Its address is found by asking the remote, as the
+// migration did, so it runs only once the mirror's address passed the
+// allow and block lists again, and asks with authAddr, the address with
+// its credentials: a private wiki answers no other. The git config keeps
+// addr's form, without the password. A wiki the remote does not serve
+// keeps no remote.
+func ensurePullWikiRemote(ctx context.Context, m *repo_model.Mirror, authAddr, addr string) error {
+	if !clusterhook.Enabled() || addr == "" || !m.Repo.HasWiki() {
 		return nil
 	}
+	name := m.GetRemoteName()
 	wikiPath := m.Repo.WikiPath()
 	if cur, err := remoteURLOf(ctx, wikiPath, name); err != nil || cur != "" {
 		return err
 	}
-	// The wiki's address is found by asking the remote, as the migration
-	// did; a wiki the remote does not serve keeps no remote.
-	if wikiAddr := repo_module.WikiRemoteURL(ctx, addr); wikiAddr != "" {
-		return addPullRemote(ctx, wikiPath, name, wikiAddr)
+	found := wikiRemoteURL(ctx, authAddr)
+	suffix, ok := strings.CutPrefix(found, strings.TrimSuffix(authAddr, ".git"))
+	if found == "" || !ok {
+		return nil
 	}
-	return nil
+	return addPullRemote(ctx, wikiPath, name, strings.TrimSuffix(addr, ".git")+suffix)
 }
 
 // ensurePushMirrorRemote recreates, in a cluster, the remote of a push
@@ -130,7 +146,16 @@ func ensurePushMirrorRemote(ctx context.Context, m *repo_model.PushMirror, path 
 	}
 	addr := m.RemoteAddress
 	if isWiki {
-		if addr = repo_module.WikiRemoteURL(ctx, addr); addr == "" {
+		// The wiki's address is found by asking the remote: only once the
+		// address passed the allow and block lists again.
+		u, err := giturl.Parse(addr)
+		if err != nil {
+			return err
+		}
+		if err := recheckPushPermitted(ctx, m, u); err != nil {
+			return err
+		}
+		if addr = wikiRemoteURL(ctx, addr); addr == "" {
 			return nil
 		}
 	}

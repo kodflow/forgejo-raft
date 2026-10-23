@@ -201,7 +201,7 @@
 					<td><code>{{.Operator}}</code></td>
 					<td>{{ctx.Locale.Tr (printf "admin.cluster.op.%s" .Action)}}</td>
 					<td><code>{{.Target}}</code></td>
-					<td>{{if eq .Outcome "ok"}}<span class="ui green label">{{ctx.Locale.Tr "admin.cluster.outcome.ok"}}</span>{{else if eq .Outcome "requested"}}<span class="ui label">{{ctx.Locale.Tr "admin.cluster.outcome.requested"}}</span>{{else}}<span class="ui red label" title="{{.Detail}}">{{ctx.Locale.Tr "admin.cluster.outcome.failed"}}</span>{{end}}</td>
+					<td>{{if eq .Outcome "ok"}}<span class="ui green label">{{ctx.Locale.Tr "admin.cluster.outcome.ok"}}</span>{{else if eq .Outcome "raised"}}<span class="ui green label">{{ctx.Locale.Tr "admin.cluster.outcome.raised"}}</span>{{else if eq .Outcome "requested"}}<span class="ui label">{{ctx.Locale.Tr "admin.cluster.outcome.requested"}}</span>{{else if eq .Outcome "pending"}}<span class="ui label">{{ctx.Locale.Tr "admin.cluster.outcome.pending"}}</span>{{else}}<span class="ui red label" title="{{.Detail}}">{{ctx.Locale.Tr "admin.cluster.outcome.failed"}}</span>{{end}}</td>
 				</tr>
 			{{end}}
 			</tbody>

@@ -235,10 +235,19 @@ func (a *Archive) RestoreFiles(name string, roots map[string]string) (int, error
 	if err != nil {
 		return 0, err
 	}
+	ready := map[string]bool{}
 	for i, f := range m.Files {
 		root, ok := roots[f.Storage]
 		if !ok {
 			return i, fmt.Errorf("no local root for the %s storage", f.Storage)
+		}
+		// The root's name is made durable once per storage; below it,
+		// syncParents does it for each file.
+		if !ready[root] {
+			if err := mkdirAllDurable(root, 0o750); err != nil {
+				return i, err
+			}
+			ready[root] = true
 		}
 		clean, err := safeTarName(f.Path)
 		if err != nil || clean != f.Path {
@@ -380,7 +389,7 @@ func (a *Archive) RestorePG(name, pgdata string, opt PGOptions) error {
 		if entries, err := os.ReadDir(d); err == nil && len(entries) > 0 {
 			return fmt.Errorf("%s is not empty", d)
 		}
-		if err := os.MkdirAll(d, 0o700); err != nil {
+		if err := mkdirAllDurable(d, 0o700); err != nil {
 			return err
 		}
 	}
