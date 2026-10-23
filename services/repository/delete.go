@@ -51,6 +51,15 @@ type DeleteRepositoryOpts struct {
 // DeleteRepository deletes a repository for a user or organization.
 // make sure if you call this func to close open sessions (sqlite will otherwise get a deadlock)
 func DeleteRepositoryDirectly(ctx context.Context, repoID int64, opts DeleteRepositoryOpts) error {
+	// In a cluster, the SQL removed here and the deletion recorded in the
+	// replicated table fall on the same side of a checkpoint, and the
+	// stored files go once a checkpoint listed them (#88, #90).
+	releaseCut, err := clusterhook.HoldCut(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseCut()
+
 	repo, err := repo_model.GetRepositoryByID(ctx, repoID)
 	if err != nil {
 		return err

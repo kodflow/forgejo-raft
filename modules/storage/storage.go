@@ -156,7 +156,11 @@ func initAttachments() (err error) {
 	}
 	log.Info("Initialising Attachment storage with type: %s", setting.Attachment.Storage.Type)
 	Attachments, err = NewStorage(setting.Attachment.Storage.Type, setting.Attachment.Storage)
-	return err
+	if err != nil {
+		return err
+	}
+	Attachments = WithDeleteGate(Attachments)
+	return nil
 }
 
 func initLFS() (err error) {
@@ -167,7 +171,11 @@ func initLFS() (err error) {
 
 	log.Info("Initialising LFS storage with type: %s", setting.LFS.Storage.Type)
 	LFS, err = NewStorage(setting.LFS.Storage.Type, setting.LFS.Storage)
-	return err
+	if err != nil {
+		return err
+	}
+	LFS = WithDeleteGate(LFS)
+	return nil
 }
 
 func initRepoAvatars() (err error) {
@@ -189,7 +197,11 @@ func initPackages() (err error) {
 	}
 	log.Info("Initialising Packages storage with type: %s", setting.Packages.Storage.Type)
 	Packages, err = NewStorage(setting.Packages.Storage.Type, setting.Packages.Storage)
-	return err
+	if err != nil {
+		return err
+	}
+	Packages = WithDeleteGate(Packages)
+	return nil
 }
 
 func initActions() (err error) {

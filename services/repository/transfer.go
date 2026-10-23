@@ -67,6 +67,15 @@ func TransferOwnership(ctx context.Context, doer, newOwner *user_model.User, rep
 
 // transferOwnership transfers all corresponding repository items from old user to new one.
 func transferOwnership(ctx context.Context, doer *user_model.User, newOwnerName string, repo *repo_model.Repository) (err error) {
+	// In a cluster, the move recorded in the replicated table and the SQL
+	// committed below fall on the same side of a checkpoint (#88). It is
+	// released last, after any undo.
+	releaseCut, err := clusterhook.HoldCut(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseCut()
+
 	repoRenamed := false
 	wikiRenamed := false
 	clusterRenamed := false
@@ -329,6 +338,14 @@ func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newR
 			Name:  newRepoName,
 		}
 	}
+
+	// In a cluster, the move recorded in the replicated table and the SQL
+	// committed below fall on the same side of a checkpoint (#88).
+	releaseCut, err := clusterhook.HoldCut(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseCut()
 
 	newRepoPath := repo_model.RepoPath(repo.Owner.Name, newRepoName)
 	if err = util.Rename(repo.RepoPath(), newRepoPath); err != nil {

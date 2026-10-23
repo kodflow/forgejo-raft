@@ -34,19 +34,82 @@ type fakePG struct {
 	marks map[string]uint64
 	// foreign is what Foreign reports.
 	dbs, spcs []string
+	// cut is the advisory lock every member shares.
+	cut *memCut
 }
 
+// pgRow is a branch row written; op names a web request's own SQL
+// instead: "drop" removes repo's rows, "move" moves them to ref, "file+"
+// and "file-" add and remove the row naming the stored file repo.
 type pgRow struct {
-	lsn            uint64
-	repo, ref, sha string
+	lsn                uint64
+	op, repo, ref, sha string
 }
 
-func newFakePG() *fakePG { return &fakePG{marks: map[string]uint64{}} }
+// memCut is the cluster's cut as one in-memory lock the members share.
+// refused is signalled when a checkpoint finds it held.
+type memCut struct {
+	mu      sync.RWMutex
+	refused chan struct{}
+}
+
+func (c *memCut) Shared(ctx context.Context) (func(), error) {
+	for !c.mu.TryRLock() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	return c.mu.RUnlock, nil
+}
+
+func (c *memCut) TryExclusive(context.Context) (func(), bool, error) {
+	if !c.mu.TryLock() {
+		select {
+		case c.refused <- struct{}{}:
+		default:
+		}
+		return func() {}, false, nil
+	}
+	return c.mu.Unlock, true, nil
+}
+
+// exec commits a web request's own SQL, at the next WAL position.
+func (p *fakePG) exec(op, repo, ref string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rows = append(p.rows, pgRow{lsn: uint64(len(p.rows)) + 1, op: op, repo: repo, ref: ref})
+}
+
+// filesAt is the stored files the SQL before lsn names.
+func (p *fakePG) filesAt(lsn uint64) map[string]bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := map[string]bool{}
+	for _, r := range p.rows {
+		switch {
+		case r.lsn >= lsn:
+		case r.op == "file+":
+			out[r.repo] = true
+		case r.op == "file-":
+			delete(out, r.repo)
+		}
+	}
+	return out
+}
+
+func newFakePG() *fakePG {
+	return &fakePG{marks: map[string]uint64{}, cut: &memCut{refused: make(chan struct{}, 1)}}
+}
 
 func (p *fakePG) work(_ context.Context, evs []reftable.Event) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, ev := range evs {
+		if ev.Ref == "" {
+			continue // a move or a deletion: its SQL is the web request's
+		}
 		p.rows = append(p.rows, pgRow{lsn: uint64(len(p.rows)) + 1, repo: ev.Repo, ref: ev.Ref, sha: ev.New})
 	}
 	return nil
@@ -71,8 +134,21 @@ func (p *fakePG) stateAt(lsn uint64) map[string]string {
 	defer p.mu.Unlock()
 	out := map[string]string{}
 	for _, r := range p.rows {
-		if r.lsn < lsn {
+		if r.lsn >= lsn {
+			continue
+		}
+		switch r.op {
+		case "":
 			out[r.repo+" "+r.ref] = r.sha
+		case "drop", "move":
+			for k, v := range out {
+				if repo, ref, _ := strings.Cut(k, " "); repo == r.repo {
+					delete(out, k)
+					if r.op == "move" {
+						out[r.ref+" "+ref] = v
+					}
+				}
+			}
 		}
 	}
 	return out
@@ -88,6 +164,7 @@ func parseFakeLSN(t *testing.T, s string) uint64 {
 func withCheckpoints(t *testing.T, tc *testCluster, pg *fakePG) *coordinator {
 	for _, n := range tc.nodes {
 		n.r.consumer.work = pg.work
+		n.r.cut = pg.cut
 	}
 	leader := tc.nodes[0].r
 	c := newCoordinator(leader, time.Hour, t.TempDir(), pg)

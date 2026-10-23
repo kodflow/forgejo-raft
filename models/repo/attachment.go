@@ -12,6 +12,7 @@ import (
 	"path"
 
 	"forgejo.org/models/db"
+	"forgejo.org/modules/log"
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/storage"
 	"forgejo.org/modules/timeutil"
@@ -255,7 +256,19 @@ func DeleteAttachments(ctx context.Context, attachments []*Attachment, remove bo
 		return 0, err
 	}
 
-	if remove {
+	if remove && db.InTransaction(ctx) {
+		// The files go once the rows are gone for good: removed before
+		// the commit, they would be missing while the rows still exist,
+		// for good after a rollback, and from a cluster's checkpoint
+		// whose SQL still names them (#90).
+		db.AfterTx(ctx, func() {
+			for _, a := range attachments {
+				if err := storage.Attachments.Delete(a.RelativePath()); err != nil {
+					log.Error("Deleting the file of attachment %s: %v", a.UUID, err)
+				}
+			}
+		})
+	} else if remove {
 		for i, a := range attachments {
 			if err := storage.Attachments.Delete(a.RelativePath()); err != nil {
 				return i, err

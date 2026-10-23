@@ -487,6 +487,46 @@ func OwnerRenamed(ctx context.Context, oldOwner, newOwner string) error {
 	return f(ctx, strings.ToLower(oldOwner), strings.ToLower(newOwner))
 }
 
+// ---- the checkpoint's cut ----
+
+// A checkpoint pairs the table at its barrier B with PostgreSQL at its WAL
+// position L. A deletion, a rename or a transfer writes its SQL in the
+// request, beside its replicated entry: the two must fall on the same side
+// of (B, L), or a restore finds refs the SQL does not name (#88). The
+// replicator registers a hold that a checkpoint waits for, on any member.
+var (
+	cutMu   sync.RWMutex
+	holdCut func(ctx context.Context) (func(), error)
+)
+
+// SetCutHold registers the replicator's hold of the checkpoint's cut.
+func SetCutHold(f func(ctx context.Context) (func(), error)) {
+	cutMu.Lock()
+	holdCut = f
+	cutMu.Unlock()
+}
+
+// HoldCut keeps every checkpoint of the cluster out until release is
+// called: what the caller writes to SQL and to the table in between lands
+// wholly before a checkpoint's cut or wholly after it. It waits while a
+// checkpoint holds the cut, until its stored files are listed, and is
+// called before the SQL transaction opens. Holds nest: a checkpoint takes the cut only
+// when none is held. Without a cluster it does nothing.
+func HoldCut(ctx context.Context) (func(), error) {
+	cutMu.RLock()
+	f := holdCut
+	cutMu.RUnlock()
+	if f == nil {
+		return func() {}, nil
+	}
+	release, err := f(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("waiting for the cluster's checkpoint: %w", err)
+	}
+	var once sync.Once
+	return func() { once.Do(release) }, nil
+}
+
 var mayGC func(key string) bool
 
 // SetGarbageCollectionGate registers the projector's answer to "may git gc
