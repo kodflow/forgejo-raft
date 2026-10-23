@@ -62,7 +62,7 @@ func TestAnAdoptedRepositoryIsServedUnderItsNewID(t *testing.T) {
 			s, ok := readStamp(filepath.Join(n.r.root, "alice", "lost.git"))
 			return ok && s.ID == newID
 		}, 10*time.Second, 20*time.Millisecond, n.slot)
-		assert.NoError(t, readRefusal(n, "alice/lost.git", newID), n.slot)
+		require.NoError(t, readRefusal(n, "alice/lost.git", newID), n.slot)
 		assert.Equal(t, c2, gitRef(t, n, "alice/lost.git", "refs/heads/main"), n.slot)
 	}
 }
