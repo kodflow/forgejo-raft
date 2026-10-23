@@ -312,7 +312,7 @@ func Init(ctx context.Context) error {
 	if r.auto != nil {
 		go r.autopilot(r.ctx)
 	}
-	go watchIdentity(r.ctx, id, identityPoll, func() {
+	watchIdentity(r.ctx, id, identityPoll, func() {
 		r.objects.rotate()
 		log.Info("cluster: node certificate changed on disk; object channel rotated, %d idle connections closed", rot.rotate())
 	})
