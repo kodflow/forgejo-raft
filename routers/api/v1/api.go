@@ -145,6 +145,14 @@ func repoAssignment(ctx *context.APIContext, owner *user_model.User, repoName st
 	repo.Owner = owner
 	ctx.Repo().Repository = repo
 	ctx.Repo().Owner = owner
+
+	// In a cluster, a directory that still holds another repository than
+	// the one the database describes under this name is never read under
+	// its permissions (#82): contents, raw files, archives.
+	if err := context.ClusterReadRefusal(repo); err != nil {
+		ctx.Error(http.StatusServiceUnavailable, "ClusterReadRefusal", err)
+		return
+	}
 }
 
 func userAssignment(ctx *context.APIContext, userName string) {

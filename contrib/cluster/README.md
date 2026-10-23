@@ -135,7 +135,7 @@ entries": take a checkpoint.
 | `STEP_UP_MAX_AGE` | `5m` | How long a re-authentication allows further operations. |
 | `STEP_UP_OIDC_SOURCE`, `STEP_UP_ACR` | empty | The OpenID Connect source every operator re-authenticates with, and the authentication class required. Without a source, password and TOTP apply. |
 | `STEP_UP_PASSWORD_OPERATORS` | empty | Break-glass logins that keep password and TOTP when `STEP_UP_OIDC_SOURCE` is set. |
-| `READ_AFTER_WRITE_TIMEOUT` | `2s` | How long a request waits for the node to catch up with the caller's last write, and a git request (fetch, clone, push over HTTP or SSH) with the cluster's commit index. Without a known leader a git request does not wait: it is served as the node has it, except a repository whose directory on the node still holds another repository than the one the table holds under its name (a rename or a recreation of the name not projected there yet): git over HTTP and SSH answers 503 until the node projects it. |
+| `READ_AFTER_WRITE_TIMEOUT` | `2s` | How long a request waits for the node to catch up with the caller's last write, and a git request (fetch, clone, push over HTTP or SSH) with the cluster's commit index. Without a known leader a git request does not wait: it is served as the node has it, except a repository whose directory on the node still holds another repository than the one the table holds under its name (a rename or a recreation of the name not projected there yet, or a directory the projector stamped with another repository ID than the database's, which a node cut off from the others also sees): git over HTTP and SSH, the repository's web pages and its API answer 503 until the node projects it. A directory stamped before this check, or a repository no push carrying its ID wrote yet, is judged by the table alone. |
 | `HOOK_TIMEOUT` | `1m`, between `20s` and `1h` | How long one ref transaction may take in the cluster: its objects written on a majority, then its entry committed. A push that needs longer fails with nothing written; its retry ships only the objects the peers still lack. The proxies in front of Forgejo must allow at least as long. |
 | `MAX_LOG_BYTES`, `MAX_SNAPSHOT_BYTES` | 1 GiB | Bounds of the log and of a snapshot. |
 | `ACK_MARGIN` | `1024` | How far the trimming of consumed events lags the cursor. |
@@ -510,7 +510,7 @@ Watch, Custom, Releases on GitHub, or the tags of
   lock younger than two minutes, on a ref the push deletes, cannot be told
   from git's own.
 - A deleted or renamed repository leaves its key in the replicated table
-  for good: tombstoned refs, a deletion mark, a rename mark. Each costs a
+  for good: tombstoned refs, a deletion mark, up to 16 rename marks. Each costs a
   few hundred bytes in every snapshot, and the projector's first pass
   after a restart visits every key. Purging them changes the state machine
   (a new command and payload version, every node purging at the same

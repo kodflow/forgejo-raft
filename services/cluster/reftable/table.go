@@ -115,7 +115,13 @@ type Table struct {
 	// renames finds the rename into a key before a given index (#138). No
 	// verdict reads it, so it is kept at every version.
 	renames map[string][]renameMark
-	grants  map[string]JoinGrant
+	// ids maps a key to the database ID of the repository it holds, as the
+	// newest ref transaction carrying one gave it; a rename moves it, a
+	// deletion forgets it. The projector stamps a directory with it, and a
+	// read compares it to the database's (#82). No verdict reads it, so it
+	// is kept at every version.
+	ids    map[string]int64
+	grants map[string]JoinGrant
 	// revoked maps a revoked key, 64 hex digits, to its revocation;
 	// pendingRevoke the revocations an operator asked for before the
 	// cluster could write them (AuditRevokeKey), by key.
@@ -167,6 +173,7 @@ func New() *Table {
 		deleted:       map[string]uint64{},
 		renamed:       map[string]renameMark{},
 		renames:       map[string][]renameMark{},
+		ids:           map[string]int64{},
 		grants:        map[string]JoinGrant{},
 		revoked:       map[string]RevokeKey{},
 		pendingRevoke: map[string]RevokeKey{},
@@ -329,7 +336,7 @@ func (t *Table) Reset() {
 	t.applied, t.identity = consensus.Position{}, consensus.LogIdentity{}
 	t.pending, t.checkpoints = nil, nil
 	t.payload, t.nonces, t.byNonce = 0, nil, nt.byNonce
-	t.deletions, t.departedAt, t.renames = nt.deletions, nt.departedAt, nt.renames
+	t.deletions, t.departedAt, t.renames, t.ids = nt.deletions, nt.departedAt, nt.renames, nt.ids
 	t.mu.Unlock()
 }
 
@@ -495,6 +502,9 @@ func (t *Table) applyRefTxn(e consensus.Entry, version uint8, tx *RefTxn) (Resul
 		t.pushEvent(ev)
 	}
 	r.last = e.Index
+	if tx.RepoID > 0 {
+		t.ids[tx.Repo] = tx.RepoID
+	}
 	t.keepNonce(tx.Nonce, e.Index)
 	return Result{OK: true, Revs: revs}, Change{Repos: []string{tx.Repo}}
 }
@@ -674,6 +684,7 @@ func (t *Table) applyRepoDelete(e consensus.Entry, version uint8, d *RepoDelete)
 	r.last = e.Index
 	t.deleted[d.Repo] = e.Index
 	t.deletions[d.Repo] = keepLast(t.deletions[d.Repo], e.Index)
+	delete(t.ids, d.Repo)
 	if version >= GenerationVersion {
 		t.departedAt[d.Repo] = e.Index
 		t.keepNonce(d.Nonce, e.Index)
@@ -785,6 +796,12 @@ func (t *Table) moveRepo(e consensus.Entry, fromKey, toKey string, at int64) {
 	}
 	from.last, to.last = e.Index, e.Index
 	delete(t.deleted, toKey)
+	if id, ok := t.ids[fromKey]; ok {
+		t.ids[toKey] = id
+	} else {
+		delete(t.ids, toKey)
+	}
+	delete(t.ids, fromKey)
 	t.renamed[toKey] = renameMark{From: fromKey, Index: e.Index}
 	t.renames[toKey] = keepLast(t.renames[toKey], renameMark{From: fromKey, Index: e.Index})
 	t.pushEvent(Event{Token: e.Token, Kind: EventRepoRename, Repo: toKey, RenamedFrom: fromKey, Time: at})
@@ -903,6 +920,20 @@ func (t *Table) Refs(repo string) (map[string]RefValue, uint64) {
 		}
 	}
 	return out, t.applied.Index
+}
+
+// RefsWithID is Refs with the database ID of the repository the key
+// holds at the same index, 0 when no transaction carrying one wrote it.
+func (t *Table) RefsWithID(repo string) (map[string]RefValue, int64, uint64) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := map[string]RefValue{}
+	if r := t.repos[repo]; r != nil {
+		for k, v := range r.refs {
+			out[k] = *v
+		}
+	}
+	return out, t.ids[repo], t.applied.Index
 }
 
 // RepoHash returns a repository's checksum and the index of its last change.
@@ -1206,6 +1237,9 @@ type persisted struct {
 	// Renames is absent from older snapshots: the table then knows the
 	// newest rename into each key only, as before (#138).
 	Renames map[string][]renameMark `json:"renames,omitempty"`
+	// IDs is absent from older snapshots: the keys' repository IDs are then
+	// known again from their next ref transaction (#82).
+	IDs map[string]int64 `json:"ids,omitempty"`
 }
 
 type bytesSnapshot struct{ b []byte }
@@ -1236,7 +1270,7 @@ func (t *Table) persistedLocked() *persisted {
 		Repos: make(map[string]map[string]*RefValue, len(t.repos)), Last: map[string]uint64{},
 		Events: t.events, Audit: t.audit, Deleted: t.deleted, Renamed: t.renamed, Grants: t.grants, Revoked: t.revoked, PendingRevoke: t.pendingRevoke,
 		Pending: t.pending, Checkpoints: t.checkpoints, Payload: t.payload, Nonces: t.nonces,
-		Deletions: t.deletions, DepartedAt: t.departedAt, Renames: t.renames,
+		Deletions: t.deletions, DepartedAt: t.departedAt, Renames: t.renames, IDs: t.ids,
 	}
 	for k, r := range t.repos {
 		p.Repos[k] = r.refs
@@ -1295,6 +1329,11 @@ func (p *persisted) validNames() error {
 		}
 		if err := ValidRepoKey(m.From); err != nil {
 			return refuse(fmt.Sprintf("the rename source %q", m.From), err)
+		}
+	}
+	for repo := range p.IDs {
+		if err := ValidRepoKey(repo); err != nil {
+			return refuse(fmt.Sprintf("the repository key %q", repo), err)
 		}
 	}
 	for to, marks := range p.Renames {
@@ -1374,6 +1413,9 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	if p.Renames != nil {
 		nt.renames = p.Renames
 	}
+	if p.IDs != nil {
+		nt.ids = p.IDs
+	}
 	if p.DepartedAt != nil {
 		nt.departedAt = p.DepartedAt
 	}
@@ -1401,7 +1443,7 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	t.applied, t.identity = p.Applied, p.Identity
 	t.pending, t.checkpoints = p.Pending, p.Checkpoints
 	t.payload, t.nonces, t.byNonce = nt.payload, nt.nonces, nt.byNonce
-	t.deletions, t.departedAt, t.renames = nt.deletions, nt.departedAt, nt.renames
+	t.deletions, t.departedAt, t.renames, t.ids = nt.deletions, nt.departedAt, nt.renames, nt.ids
 	if t.onChange != nil {
 		repos := make([]string, 0, len(t.repos))
 		for k := range t.repos {

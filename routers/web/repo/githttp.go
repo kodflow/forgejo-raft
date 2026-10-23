@@ -299,7 +299,7 @@ func httpBase(ctx *context.Context) *serviceHandler {
 	// A directory that still holds another repository than the one the
 	// database describes under this name is never served under its
 	// permissions.
-	if err := clusterhook.ReadRefusal(clusterhook.RepoKey(owner.Name, repo.Name, isWiki)); err != nil {
+	if err := clusterhook.ReadRefusal(clusterhook.RepoKey(owner.Name, repo.Name, isWiki), repo.ID); err != nil {
 		ctx.PlainText(http.StatusServiceUnavailable, err.Error())
 		return nil
 	}

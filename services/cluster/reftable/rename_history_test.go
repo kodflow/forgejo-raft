@@ -61,3 +61,39 @@ func TestARenameIntoAFreedKeyKeepsTheEarlierOne(t *testing.T) {
 	require.NoError(t, restored.Restore(&buf, consensus.SnapshotMeta{}))
 	check(t, restored)
 }
+
+// The table keeps the database ID of the repository each key holds: a ref
+// transaction carrying one sets it, one without leaves it, a rename moves
+// it, a deletion forgets it, and a snapshot keeps it (#82).
+func TestTheTableKeepsEachKeysRepositoryID(t *testing.T) {
+	h := newHarness(t)
+	id := func(tbl *Table, repo string) int64 { _, id, _ := tbl.RefsWithID(repo); return id }
+	require.True(t, h.apply(KindRefTxn, push("o/a.git", RefUpdate{Ref: "refs/heads/main", New: sha1A})).OK)
+	assert.EqualValues(t, 7, id(h.table, "o/a.git"))
+	noID := push("o/a.git", RefUpdate{Ref: "refs/heads/x", New: sha1B})
+	noID.RepoID = 0
+	require.True(t, h.apply(KindRefTxn, noID).OK)
+	assert.EqualValues(t, 7, id(h.table, "o/a.git"), "a transaction without an ID leaves it")
+
+	require.True(t, h.apply(KindRepoRename, &RepoRename{From: "o/a.git", To: "o/b.git"}).OK)
+	assert.Zero(t, id(h.table, "o/a.git"), "the rename took the repository away")
+	assert.EqualValues(t, 7, id(h.table, "o/b.git"))
+
+	again := push("o/a.git", RefUpdate{Ref: "refs/heads/main", New: sha1C, ExpectRev: 2})
+	again.RepoID = 9
+	require.True(t, h.apply(KindRefTxn, again).OK, "a new repository under the freed name")
+	assert.EqualValues(t, 9, id(h.table, "o/a.git"))
+
+	snap, err := h.table.Snapshot()
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+	restored := New()
+	require.NoError(t, restored.Restore(&buf, consensus.SnapshotMeta{}))
+	assert.EqualValues(t, 9, id(restored, "o/a.git"))
+	assert.EqualValues(t, 7, id(restored, "o/b.git"))
+
+	require.True(t, h.apply(KindRepoDelete, &RepoDelete{Repo: "o/b.git"}).OK)
+	assert.Zero(t, id(h.table, "o/b.git"), "a deletion forgets it")
+}
