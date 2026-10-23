@@ -869,7 +869,12 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		// out again. Its branch rows, webhooks and CI must not land there.
 		return fmt.Errorf("repository ID %d is %s/%s, which the event's %s does not lead to: the ID was reused; run `forgejo cluster reconcile`", first.RepoID, repo.OwnerName, repo.Name, first.Repo)
 	}
-	u, err := user_model.GetUserByID(ctx, first.PusherID)
+	u, err := getPusher(ctx, first.PusherID)
+	if err != nil && !user_model.IsErrUserNotExist(err) {
+		// Retried, never passed over: the lookup PushUpdatesNow repeats
+		// checks only that the account exists, not that it pushed.
+		return fmt.Errorf("looking up the pusher %d of %s at %d: %w", first.PusherID, first.Repo, first.Token.Index, err)
+	}
 	if err == nil && pusherReissued(ctx, u, first) {
 		// The same loss reissues user IDs: another account now holds the
 		// pusher's ID, and must not be credited with the push.
@@ -983,6 +988,9 @@ func tagGone(ctx context.Context, repo *repo_model.Repository, opt *repo_module.
 	}
 	return !gitRepo.IsTagExist(name), nil
 }
+
+// getPusher looks up the account holding a pusher's ID; tests replace it.
+var getPusher = user_model.GetUserByID
 
 // pusherClockSkew bounds the clock difference between the node that
 // proposed a push and the one that created its pusher's account.
