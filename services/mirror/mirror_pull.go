@@ -336,6 +336,18 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 		return nil, false
 	}
 
+	// The wiki's remote is found by asking the remote host: only now that
+	// its address passed the lists again, and with its credentials.
+	if sanitized, err := m.SanitizedRemoteAddress(); err != nil {
+		log.Error("SyncMirrors [repo: %-v]: SanitizedRemoteAddress: %v", m.Repo, err)
+		return nil, false
+	} else if has, addr := sanitized.Get(); has {
+		if err := ensurePullWikiRemote(ctx, m, remoteURL.URL.String(), addr); err != nil {
+			log.Error("SyncMirrors [repo: %-v]: failed to recreate the wiki mirror's remote: %v", m.Repo, err)
+			return nil, false
+		}
+	}
+
 	cmd := git.NewCommand(ctx)
 
 	// Setup credential helper to authenticate the fetch; needs to occur before the `fetch` arg.

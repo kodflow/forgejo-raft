@@ -299,6 +299,11 @@ func runPushSync(ctx context.Context, m *repo_model.PushMirror) error {
 	}
 
 	if m.Repo.HasWiki() {
+		// A node that lacks the wiki's remote recreates it first: checked
+		// for below, a missing remote would skip the wiki for good.
+		if err := ensurePushMirrorRemote(ctx, m, m.Repo.WikiPath(), true); err != nil {
+			log.Error("SyncPushMirror [repo: %-v]: recreating the remote of the wiki's push mirror: %v", m.Repo, err)
+		}
 		_, err := git.GetRemoteAddress(ctx, m.Repo.WikiPath(), m.RemoteName)
 		if err == nil {
 			err := performPush(m.Repo, true)
