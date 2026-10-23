@@ -64,6 +64,9 @@ type projector struct {
 	// objects are fetched outside the pass (#137): the pass skips it, and
 	// moves no directory of it, until the fetch ended.
 	fetching map[string]context.CancelFunc
+	// queued holds the repositories whose missing objects wait for a fetch
+	// slot, all maxFetches taken by other repositories' (#151).
+	queued map[string]bool
 	// fetches counts the fetches in flight, for refence.
 	fetches sync.WaitGroup
 	wake    chan struct{}
@@ -75,8 +78,8 @@ func newProjector(root string, table *reftable.Table, reg *registry) *projector 
 		root: root, table: table, registry: reg,
 		dirty: map[string]uint64{}, watermark: map[string]uint64{},
 		fenced: true, pendingFirst: map[string]bool{}, failures: map[string]string{}, deletedAt: map[string]uint64{},
-		fetching: map[string]context.CancelFunc{},
-		wake:     make(chan struct{}, 1),
+		fetching: map[string]context.CancelFunc{}, queued: map[string]bool{},
+		wake: make(chan struct{}, 1),
 	}
 	table.OnChange(p.onChange)
 	return p
@@ -169,6 +172,7 @@ func (p *projector) refence() {
 	p.dirty = map[string]uint64{}
 	p.watermark = map[string]uint64{}
 	p.failures = map[string]string{}
+	p.queued = map[string]bool{}
 	p.mu.Unlock()
 }
 
@@ -407,15 +411,21 @@ func (p *projector) isFetching(repo string) bool {
 
 // startFetch fetches repo's missing objects beside the pass, at most
 // maxFetches at once and one per repository; past the bound, repo stays
-// dirty and the next pass tries again. When the fetch succeeds, a pass is
+// dirty, queued, and the next pass tries again. When the fetch succeeds, a pass is
 // woken to project repo with its objects here; a failure is recorded as
 // the projection's, and retried at the next tick.
 func (p *projector) startFetch(base context.Context, repo, dir string, missing []string) {
 	p.mu.Lock()
-	if _, ok := p.fetching[repo]; ok || p.fenced || len(p.fetching) >= maxFetches {
+	if _, ok := p.fetching[repo]; ok || p.fenced {
 		p.mu.Unlock()
 		return
 	}
+	if len(p.fetching) >= maxFetches {
+		p.queued[repo] = true
+		p.mu.Unlock()
+		return
+	}
+	delete(p.queued, repo)
 	ctx, cancel := context.WithTimeout(base, projectBudget)
 	p.fetching[repo] = cancel
 	p.fetches.Add(1)
@@ -441,13 +451,15 @@ func (p *projector) startFetch(base context.Context, repo, dir string, missing [
 }
 
 // WaitsBehind reports whether a repository's projection waits behind
-// another repository's in the serial pass: the pass projects another one
-// now, and the repository's own last projection did not fail. The
-// consumer does not count that wait against the repository (#137).
+// other repositories': the serial pass projects another one now, or every
+// fetch slot is taken by other repositories' fetches while its own
+// objects wait for one (#151), and its own last projection did not fail.
+// The consumer does not count that wait against the repository (#137).
 func (p *projector) WaitsBehind(repo string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.current != "" && p.current != repo && p.failures[repo] == ""
+	behind := p.current != "" && p.current != repo || p.queued[repo]
+	return behind && p.failures[repo] == ""
 }
 
 // projectedKeys refuses to turn into a path a key, or a rename's source,
@@ -726,6 +738,7 @@ func (p *projector) certify(repo string, at uint64, stampErr error) {
 	}
 	delete(p.pendingFirst, repo)
 	delete(p.failures, repo)
+	delete(p.queued, repo)
 	p.mu.Unlock()
 }
 

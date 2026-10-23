@@ -281,3 +281,39 @@ func TestAFailedFetchWaitsForTheNextTick(t *testing.T) {
 	b.p.refence()
 	assert.EqualValues(t, 1, calls.Load(), "a failed fetch is not retried before the next tick")
 }
+
+// A repository whose missing objects wait for a fetch slot, every one
+// taken by other repositories' long transfers, waits behind them: the
+// consumer counted that wait against its own stall bound, parked it, then
+// the next one (#151). Once it has its slot, it waits on its own fetch.
+func TestAWaitForAFetchSlotIsAWaitBehindTheOthers(t *testing.T) {
+	t.Parallel()
+	keys := []string{"o/r1.git", "o/r2.git", "o/r3.git", "o/r4.git", "o/r5.git"}
+	b := newFetchBench(t, keys...)
+	gates := make([]chan struct{}, 0, len(keys))
+	for _, k := range keys {
+		gates = append(gates, b.hold(k))
+	}
+	b.p.unfence()
+	defer b.p.refence()
+	b.p.pass(t.Context())
+	require.False(t, b.p.isFetching("o/r5.git"), "no slot left for r5")
+	require.Zero(t, b.p.Projected("o/r5.git"))
+	assert.True(t, b.p.WaitsBehind("o/r5.git"), "r5 waits behind the other repositories' fetches")
+	assert.False(t, b.p.WaitsBehind("o/r1.git"), "r1 waits on its own fetch")
+
+	close(gates[0])
+	require.Eventually(t, func() bool {
+		b.p.pass(t.Context())
+		return b.p.isFetching("o/r5.git")
+	}, 10*time.Second, 10*time.Millisecond, "r5 has a slot once r1's fetch ended")
+	assert.False(t, b.p.WaitsBehind("o/r5.git"), "r5 waits on its own fetch")
+	for _, g := range gates[1:] {
+		close(g)
+	}
+	require.Eventually(t, func() bool {
+		b.p.pass(t.Context())
+		return b.p.Projected("o/r5.git") > 0
+	}, 10*time.Second, 10*time.Millisecond)
+	assert.False(t, b.p.WaitsBehind("o/r5.git"))
+}
