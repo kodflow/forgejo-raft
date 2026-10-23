@@ -238,7 +238,7 @@ func Cover(bases []BaseInfo, sysid string, target LSN, tli uint32, segSize int64
 		var segs []string
 		missing := ""
 		seg := uint64(segSize)
-		for n := uint64(start) / seg; n <= uint64(target)/seg; n++ {
+		for n := uint64(start) / seg; n <= finalSegment(target, segSize); n++ {
 			end := LSN((n + 1) * seg)
 			name := SegmentName(path.timelineFor(end), LSN(n*seg), segSize)
 			if !have(name) {
@@ -259,6 +259,23 @@ func Cover(bases []BaseInfo, sysid string, target LSN, tli uint32, segSize int64
 		return Coverage{Base: b, Segments: segs, History: histFiles}, nil
 	}
 	return Coverage{}, lastErr
+}
+
+// walPageSize is a WAL page, XLOG_BLCKSZ.
+const walPageSize = 8192
+
+// finalSegment is the number of the last segment a recovery to target reads.
+// With recovery_target_inclusive off, PostgreSQL stops at the first record
+// that starts at target or after, which it reads whole first: the restore
+// point Mark creates there. Started in the last page of its segment, that
+// record may end in the next one, which SwitchWAL then archives (#89).
+func finalSegment(target LSN, segSize int64) uint64 {
+	seg := uint64(segSize)
+	last := uint64(target) / seg
+	if seg-uint64(target)%seg <= walPageSize {
+		last++
+	}
+	return last
 }
 
 // ---- base backups ----
