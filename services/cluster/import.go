@@ -119,7 +119,11 @@ func (r *Replicator) importRepo(ctx context.Context, key string) (int, error) {
 				return total, err
 			}
 		}
-		data, err := reftable.EncodeVersion(r.table.WriteVersion(), reftable.KindRefTxn, tx)
+		v := r.table.WriteVersion()
+		// An empty repository is imported as HEAD alone, the creation git
+		// init would have written (reftable.InitVersion).
+		tx.Init = v >= reftable.InitVersion && initsRepo(ctx, dir, tx.Updates)
+		data, err := reftable.EncodeVersion(v, reftable.KindRefTxn, tx)
 		if err != nil {
 			return total, err
 		}

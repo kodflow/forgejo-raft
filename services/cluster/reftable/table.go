@@ -354,7 +354,7 @@ func (t *Table) applyRefTxn(e consensus.Entry, version uint8, tx *RefTxn) (Resul
 		return refuse("repository: %v", err), Change{}
 	}
 	if version >= GenerationVersion {
-		if why := t.generationRefuses(tx); why != "" {
+		if why := t.generationRefuses(tx, version); why != "" {
 			return refuse("%s", why), Change{}
 		}
 	} else if version >= 2 && tx.Push {
@@ -503,17 +503,20 @@ func (t *Table) applyRefTxn(e consensus.Entry, version uint8, tx *RefTxn) (Resul
 // prepared against the old repository landed in the new one (#91). A
 // transaction read before the key's repository left it is refused now,
 // a creation aside, as is one of another object format than the key's
-// live refs.
-func (t *Table) generationRefuses(tx *RefTxn) string {
+// live refs. From InitVersion a creation is git init's HEAD only: a change
+// of the default branch run in the directory of a deleted repository the
+// projector had not removed yet brought the key back (#136).
+func (t *Table) generationRefuses(tx *RefTxn, version uint8) string {
 	_, deleted := t.deleted[tx.Repo]
 	to, moved := t.movedAwayLocked(tx.Repo)
-	if (deleted || moved) && !creates(tx) {
+	creation := creates(tx) && (version < InitVersion || tx.Init)
+	if (deleted || moved) && !creation {
 		if deleted {
 			return fmt.Sprintf("the repository %s was deleted", tx.Repo)
 		}
 		return fmt.Sprintf("the repository %s was renamed to %s", tx.Repo, to)
 	}
-	if at := max(t.deleted[tx.Repo], t.departedAt[tx.Repo]); tx.ReadAt != 0 && tx.ReadAt < at && !creates(tx) {
+	if at := max(t.deleted[tx.Repo], t.departedAt[tx.Repo]); tx.ReadAt != 0 && tx.ReadAt < at && !creation {
 		return fmt.Sprintf("the transaction was read at %d, before the repository %s was deleted or renamed away at %d: retry", tx.ReadAt, tx.Repo, at)
 	}
 	if r := t.repos[tx.Repo]; r != nil {
