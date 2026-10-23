@@ -463,17 +463,28 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 	}
 
 	if m.Repo.HasWiki() {
+		// The wiki's remote holds no password, as the repository's: the
+		// same credential helper authenticates its update.
+		updateWiki := func() error {
+			cmd := git.NewCommand(ctx)
+			_, cleanup, err := cmd.AddAuthCredentialHelperForRemote(remoteURL.URL.String())
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			return cmd.AddArguments("remote", "update", "--prune").AddDynamicArguments(m.GetRemoteName()).
+				SetDescription(fmt.Sprintf("Mirror.runSync Wiki: %s ", m.Repo.FullName())).
+				Run(&git.RunOpts{
+					Timeout: timeout,
+					Dir:     wikiPath,
+					Stdout:  &stdoutBuilder,
+					Stderr:  &stderrBuilder,
+				})
+		}
 		log.Trace("SyncMirrors [repo: %-v Wiki]: running git remote update...", m.Repo)
 		stderrBuilder.Reset()
 		stdoutBuilder.Reset()
-		if err := git.NewCommand(ctx, "remote", "update", "--prune").AddDynamicArguments(m.GetRemoteName()).
-			SetDescription(fmt.Sprintf("Mirror.runSync Wiki: %s ", m.Repo.FullName())).
-			Run(&git.RunOpts{
-				Timeout: timeout,
-				Dir:     wikiPath,
-				Stdout:  &stdoutBuilder,
-				Stderr:  &stderrBuilder,
-			}); err != nil {
+		if err := updateWiki(); err != nil {
 			stdout := stdoutBuilder.String()
 			stderr := stderrBuilder.String()
 
@@ -493,14 +504,7 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 					stderrBuilder.Reset()
 					stdoutBuilder.Reset()
 
-					if err = git.NewCommand(ctx, "remote", "update", "--prune").AddDynamicArguments(m.GetRemoteName()).
-						SetDescription(fmt.Sprintf("Mirror.runSync Wiki: %s ", m.Repo.FullName())).
-						Run(&git.RunOpts{
-							Timeout: timeout,
-							Dir:     wikiPath,
-							Stdout:  &stdoutBuilder,
-							Stderr:  &stderrBuilder,
-						}); err != nil {
+					if err = updateWiki(); err != nil {
 						stdout := stdoutBuilder.String()
 						stderr := stderrBuilder.String()
 						stderrMessage = util.SanitizeCredentialURLs(stderr)

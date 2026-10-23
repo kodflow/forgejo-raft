@@ -155,6 +155,16 @@ func TestRecoverSyncsWhatItRestores(t *testing.T) {
 	assert.True(t, synced[made], "the directory naming the storage root the restore created")
 	assert.True(t, synced[filepath.Join(made, "made")])
 
+	// A retry after a failed attempt finds the directories that attempt
+	// created, whose names may not be durable: they are synced all the same.
+	retried := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(retried, "left", "lfs"), 0o750))
+	clear(synced)
+	_, err = a.RestoreFiles(cp.Name(), map[string]string{"lfs": filepath.Join(retried, "left", "lfs")})
+	require.NoError(t, err)
+	assert.True(t, synced[retried], "the directory naming one a failed attempt left")
+	assert.True(t, synced[filepath.Join(retried, "left")])
+
 	root := t.TempDir()
 	_, err = a.RestoreRepos(ctx, cp.Name(), root)
 	require.NoError(t, err)

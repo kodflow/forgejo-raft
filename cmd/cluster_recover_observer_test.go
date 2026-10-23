@@ -432,6 +432,16 @@ func TestRecoverResumeEmptiesOnlyTheDirectoriesItBegan(t *testing.T) {
 	assert.Equal(t, []string{pg, rd}, emptied)
 	assert.NoFileExists(t, filepath.Join(pg, "PG_VERSION"))
 
+	// A directory that cannot be read is not empty: never recorded.
+	locked := filepath.Join(base, "locked")
+	require.NoError(t, os.MkdirAll(locked, 0o700))
+	require.NoError(t, os.Chmod(locked, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	if os.Geteuid() != 0 {
+		_, err = preparePGTargets(&recoverProgress{}, []string{locked, rd}, begin)
+		require.ErrorContains(t, err, "inspecting")
+	}
+
 	// A progress file of an older binary names no directory: refused.
 	legacy := &recoverProgress{Begun: []string{stepPG}}
 	_, err = preparePGTargets(legacy, []string{other, rd}, begin)

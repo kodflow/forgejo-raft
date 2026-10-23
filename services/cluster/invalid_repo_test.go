@@ -131,3 +131,18 @@ func TestADirectoryThatCannotBeValidatedIsLeftAlone(t *testing.T) {
 	assert.DirExists(t, dir)
 	assert.True(t, validRepoDir(dir))
 }
+
+// A directory whose own stat fails for another reason than its absence is
+// reported, never taken for an absent one (CodeRabbit on #140).
+func TestADirectoryThatCannotBeStattedIsReported(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root stats under a directory without the search permission")
+	}
+	tc := newTestCluster(t, "node-a")
+	n := tc.nodes[0]
+	owner := filepath.Join(n.r.root, "o")
+	require.NoError(t, os.MkdirAll(filepath.Join(owner, "x.git"), 0o755))
+	require.NoError(t, os.Chmod(owner, 0o600))
+	t.Cleanup(func() { _ = os.Chmod(owner, 0o755) })
+	require.Error(t, n.r.projector.setAsideInvalid("o/x.git", filepath.Join(owner, "x.git"), 1))
+}

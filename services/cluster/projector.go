@@ -900,8 +900,11 @@ func (p *projector) setAsideStale(repo, dir string) error {
 // setAsideStale, it is moved under staleDirName, never removed.
 func (p *projector) setAsideInvalid(repo, dir string, at uint64) error {
 	st, err := os.Stat(dir)
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspecting the directory of %s: %w", repo, err)
 	}
 	invalid, err := invalidRepoDir(dir)
 	if err != nil {

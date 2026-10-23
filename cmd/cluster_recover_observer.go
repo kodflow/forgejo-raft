@@ -549,7 +549,13 @@ func preparePGTargets(prog *recoverProgress, targets []string, begin func(string
 	}
 	if !prog.begun(step) {
 		for _, d := range abs {
-			if entries, err := os.ReadDir(d); err == nil && len(entries) > 0 {
+			entries, err := os.ReadDir(d)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				// Unreadable is not empty: recorded, it would be wiped by a
+				// resumed run once readable again.
+				return nil, fmt.Errorf("inspecting %s: %w", d, err)
+			}
+			if len(entries) > 0 {
 				return nil, fmt.Errorf("%s is not empty", d)
 			}
 		}
