@@ -126,7 +126,7 @@ func (r *Replicator) Handle(ctx context.Context, req *clusterhook.Request) *clus
 	case clusterhook.OpPrepared:
 		return r.prepared(ctx, req)
 	case clusterhook.OpReadable:
-		if err := r.ReadRefusal(req.Repo); err != nil {
+		if err := r.ReadRefusal(req.Repo, req.RepoID); err != nil {
 			return fail(err)
 		}
 		return &clusterhook.Response{OK: true}

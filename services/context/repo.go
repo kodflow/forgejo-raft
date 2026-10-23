@@ -27,6 +27,7 @@ import (
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/cache"
 	"forgejo.org/modules/card"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	code_indexer "forgejo.org/modules/indexer/code"
@@ -456,6 +457,20 @@ func RepoIDAssignment() func(ctx *Context) {
 	}
 }
 
+// ClusterReadRefusal says why this node of a cluster must not read the
+// directories of repo or of its wiki now, or nil: one still holds another
+// repository than repo, a rename or a recreation of the name not projected
+// here yet, or a directory stamped with another ID (#82). Without a
+// cluster it returns nil.
+func ClusterReadRefusal(repo *repo_model.Repository) error {
+	for _, wiki := range []bool{false, true} {
+		if err := clusterhook.ReadRefusal(clusterhook.RepoKey(repo.OwnerName, repo.Name, wiki), repo.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // RepoAssignment returns a middleware to handle repository assignment
 func RepoAssignment(ctx *Context) context.CancelFunc {
 	if _, repoAssignmentOnce := ctx.Data["repoAssignmentExecuted"]; repoAssignmentOnce {
@@ -687,6 +702,14 @@ func RepoAssignment(ctx *Context) context.CancelFunc {
 		if !isHomeOrSettings {
 			ctx.Redirect(ctx.Repo.RepoLink)
 		}
+		return nil
+	}
+
+	// In a cluster, a directory that still holds another repository than
+	// the one the database describes under this name is never read under
+	// its permissions (#82): pages, raw files, archives.
+	if err := ClusterReadRefusal(repo); err != nil {
+		ctx.PlainText(http.StatusServiceUnavailable, err.Error())
 		return nil
 	}
 

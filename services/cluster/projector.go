@@ -480,7 +480,7 @@ func (p *projector) project(base, ctx context.Context, repo string) error {
 		return err
 	}
 	dir := filepath.Join(p.root, filepath.FromSlash(repo))
-	refs, at := p.table.Refs(repo)
+	refs, id, at := p.table.RefsWithID(repo)
 	withRenamedAway(p.table, repo, refs)
 
 	if _, deleted := p.table.Deleted(repo); deleted {
@@ -618,7 +618,7 @@ func (p *projector) project(base, ctx context.Context, repo string) error {
 			verr = errors.New("git does not match the table after projection")
 			return
 		}
-		p.certify(repo, at, writeStamp(dir, repo, at, reftable.ProjectionDigest(want)))
+		p.certify(repo, at, writeStamp(dir, repo, id, at, reftable.ProjectionDigest(want)))
 	})
 	return verr
 }
@@ -734,9 +734,13 @@ func (p *projector) certify(repo string, at uint64, stampErr error) {
 // carries a stale stamp, which the start-up reconciliation reprojects anyway.
 // A directory moves with its stamp, so the key it names is what the
 // directory holds: the repository certified under that key at that
-// watermark. Stamps written before the key was recorded name none.
+// watermark. Stamps written before the key was recorded name none. ID is
+// the database ID of that repository, as the table held it at the
+// watermark: 0 when no transaction carrying one wrote it, or in a stamp
+// written before it was recorded.
 type stamp struct {
 	Repo      string `json:"repo,omitempty"`
+	ID        int64  `json:"id,omitempty"`
 	Watermark uint64 `json:"watermark"`
 	Digest    string `json:"digest"`
 	Written   int64  `json:"written"`
@@ -745,8 +749,8 @@ type stamp struct {
 const stampName = "forgejo-cluster-stamp"
 
 // writeStamp records the projection AFTER the refs, through a rename.
-func writeStamp(dir, repo string, at uint64, digest reftable.Sum) error {
-	b, err := json.Marshal(stamp{Repo: repo, Watermark: at, Digest: digest.String(), Written: time.Now().Unix()})
+func writeStamp(dir, repo string, id int64, at uint64, digest reftable.Sum) error {
+	b, err := json.Marshal(stamp{Repo: repo, ID: id, Watermark: at, Digest: digest.String(), Written: time.Now().Unix()})
 	if err != nil {
 		return err
 	}
@@ -1145,6 +1149,20 @@ func (p *projector) awaitsRename(repo string) bool {
 	return p.holdsRenamed(filepath.Join(p.root, filepath.FromSlash(from)), from, to, renIdx)
 }
 
+// holdsAnotherID reports whether repo's directory holds, by its stamp,
+// another repository than the one the database gives repoID: a node that
+// never applied a rename or a deletion followed by a recreation of the
+// name (cut off from the others, the database still shared) knows nothing
+// of it in its table, but the new repository has a new ID (#82). A stamp
+// or a caller without an ID is not judged.
+func (p *projector) holdsAnotherID(repo string, repoID int64) bool {
+	if repoID <= 0 {
+		return false
+	}
+	s, known := readStamp(filepath.Join(p.root, filepath.FromSlash(repo)))
+	return known && s.ID > 0 && s.ID != repoID
+}
+
 // servesAnother reports whether repo's directory holds, by its stamp,
 // another repository than the one the table holds under repo: the stamp
 // names a key that is not repo nor one renamed into it before its
@@ -1165,8 +1183,8 @@ func (p *projector) servesAnother(repo string) bool {
 		// certified yet: the same repository.
 		key, before := repo, uint64(math.MaxUint64)
 		for range renameLineageDepth {
-			from, idx, ok := p.table.RenamedFrom(key)
-			if !ok || idx >= before {
+			from, idx, ok := p.table.RenamedFromBefore(key, before)
+			if !ok {
 				break
 			}
 			if from == s.Repo && s.Watermark < idx {

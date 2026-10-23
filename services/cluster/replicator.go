@@ -601,13 +601,19 @@ func (r *Replicator) WaitFresh(ctx context.Context, repo string) bool {
 // another repository than the one the table holds under the key (#82): a
 // repository renamed away, or the previous one under a name a rename took,
 // not projected here yet. Served, its history would be read under the
-// database's permissions of the repository that now has the name.
-func (r *Replicator) ReadRefusal(repo string) error {
+// database's permissions of the repository that now has the name. repoID
+// is the database's ID of that repository, 0 when the caller has none: a
+// directory stamped with another ID holds another repository, also on a
+// node whose table never learnt of the rename or the deletion.
+func (r *Replicator) ReadRefusal(repo string, repoID int64) error {
 	if reftable.ValidRepoKey(repo) != nil {
 		return nil
 	}
 	if r.projector.servesAnother(repo) {
 		return fmt.Errorf("this node of the cluster has not projected the last rename of %s yet; retry shortly or through another node", repo)
+	}
+	if r.projector.holdsAnotherID(repo, repoID) {
+		return fmt.Errorf("this node of the cluster still holds another repository under %s than repository %d; retry shortly or through another node", repo, repoID)
 	}
 	return nil
 }

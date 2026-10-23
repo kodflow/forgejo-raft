@@ -530,12 +530,12 @@ func WaitWrites(ctx context.Context, c *Collector) bool {
 
 var (
 	waitFresh  func(ctx context.Context, key string) bool
-	readRefuse func(key string) error
+	readRefuse func(key string, repoID int64) error
 )
 
 // SetReadGuard registers the replicator's check of a repository's
 // directory before it is read.
-func SetReadGuard(f func(key string) error) {
+func SetReadGuard(f func(key string, repoID int64) error) {
 	lifecycleMu.Lock()
 	readRefuse = f
 	lifecycleMu.Unlock()
@@ -544,16 +544,17 @@ func SetReadGuard(f func(key string) error) {
 // ReadRefusal says why this node must not serve the repository's directory
 // now, or nil: the directory still holds another repository than the one
 // the table holds under the key (a rename or a recreation of the name not
-// projected here yet), which the database's permissions do not describe.
-// Without a cluster it returns nil.
-func ReadRefusal(key string) error {
+// projected here yet, or a directory stamped with another repository ID
+// than repoID, the database's), which the database's permissions do not
+// describe. repoID 0 compares no ID. Without a cluster it returns nil.
+func ReadRefusal(key string, repoID int64) error {
 	lifecycleMu.RLock()
 	f := readRefuse
 	lifecycleMu.RUnlock()
 	if f == nil {
 		return nil
 	}
-	return f(key)
+	return f(key, repoID)
 }
 
 // SetFreshWaiter registers the replicator's wait for a repository to be

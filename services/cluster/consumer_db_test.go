@@ -6,6 +6,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -129,7 +130,13 @@ func TestEventLeadsToFollowsLaterRenames(t *testing.T) {
 		"dave/y.git": {"dave/z.git", 40},
 		"dave/z.git": {"dave/y.git", 30},
 	}
-	rf := func(k string) (string, uint64, bool) { m, ok := marks[k]; return m.from, m.idx, ok }
+	rf := func(k string, before uint64) (string, uint64, bool) {
+		m, ok := marks[k]
+		if !ok || m.idx >= before {
+			return "", 0, false
+		}
+		return m.from, m.idx, true
+	}
 	at := func(repo string, i uint64) reftable.Event {
 		return reftable.Event{Repo: repo, Token: consensus.Token{Index: i}}
 	}
@@ -141,6 +148,45 @@ func TestEventLeadsToFollowsLaterRenames(t *testing.T) {
 	assert.False(t, eventLeadsTo(at("alice/lost.git", 5), "bob/c.git", rf))
 	assert.False(t, eventLeadsTo(at("alice/a.git", 5), "bob/c.git", nil))
 	assert.False(t, eventLeadsTo(at("dave/q.git", 1), "dave/y.git", rf), "a rename and its undo do not loop")
+}
+
+// a.git renamed to b.git at 2, b.git to c.git at 3, then x.git renamed to
+// the freed b.git at 5: an event of a.git at 1 still leads to c.git. The
+// newest rename into b.git hid the first one, and the push was refused as
+// a reused ID, then parked for good (#138).
+func TestEventLeadsToThroughAKeyTakenAgain(t *testing.T) {
+	tbl := reftable.New()
+	var index uint64
+	apply := func(kind reftable.Kind, body any) {
+		data, err := reftable.Encode(kind, body)
+		require.NoError(t, err)
+		index++
+		res := tbl.Apply(consensus.Entry{
+			Term: 1, Index: index, Kind: consensus.EntryCommand, Version: reftable.PayloadVersion, Data: data,
+			Token: consensus.Token{Cluster: consensus.ClusterID{1}, Epoch: 1, Term: 1, Index: index},
+		}).(reftable.Result)
+		require.True(t, res.OK, res.Reason)
+	}
+	ref := func(repo, sha string) *reftable.RefTxn {
+		return &reftable.RefTxn{
+			Repo: repo, RepoID: 7, Format: "sha1", PusherID: 3, Time: 42,
+			Updates: []reftable.RefUpdate{{Ref: "refs/heads/main", New: sha}},
+		}
+	}
+	apply(reftable.KindRefTxn, ref("o/a.git", strings.Repeat("1", 40)))
+	apply(reftable.KindRepoRename, &reftable.RepoRename{From: "o/a.git", To: "o/b.git"})
+	apply(reftable.KindRepoRename, &reftable.RepoRename{From: "o/b.git", To: "o/c.git"})
+	apply(reftable.KindRefTxn, ref("o/x.git", strings.Repeat("2", 40)))
+	apply(reftable.KindRepoRename, &reftable.RepoRename{From: "o/x.git", To: "o/b.git"})
+
+	ev := reftable.Event{Repo: "o/a.git", Token: consensus.Token{Index: 1}}
+	assert.True(t, eventLeadsTo(ev, "o/c.git", tbl.RenamedFromBefore))
+	assert.False(t, eventLeadsTo(ev, "o/b.git", tbl.RenamedFromBefore), "o/b.git now holds o/x.git")
+	assert.True(t, eventLeadsTo(reftable.Event{Repo: "o/x.git", Token: consensus.Token{Index: 4}}, "o/b.git", tbl.RenamedFromBefore))
+	assert.False(t, deletedAfter(tbl, ev))
+	to, _, ok := tbl.RenamedAfter("o/a.git", 1)
+	require.True(t, ok)
+	assert.Equal(t, "o/b.git", to)
 }
 
 // A pusher ID that names an account created after the push was reissued:

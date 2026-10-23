@@ -864,13 +864,14 @@ func pushWork(ctx context.Context, evs []reftable.Event) error {
 	return pushWorkWith(ctx, evs, nil)
 }
 
-// renamedFromFunc is the table's RenamedFrom.
-type renamedFromFunc func(repo string) (from string, index uint64, ok bool)
+// renamedFromFunc is the table's RenamedFromBefore: the newest rename into
+// repo before index.
+type renamedFromFunc func(repo string, before uint64) (from string, index uint64, ok bool)
 
 // lifecycleTable is what the post-receive work reads of the table: the
 // renames and deletions that happened to a repository after an event.
 type lifecycleTable interface {
-	RenamedFrom(repo string) (string, uint64, bool)
+	RenamedFromBefore(repo string, before uint64) (string, uint64, bool)
 	RenamedAfter(from string, after uint64) (string, uint64, bool)
 	Deleted(repo string) (uint64, bool)
 }
@@ -878,7 +879,7 @@ type lifecycleTable interface {
 func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable) error {
 	var renamedFrom renamedFromFunc
 	if tbl != nil {
-		renamedFrom = tbl.RenamedFrom
+		renamedFrom = tbl.RenamedFromBefore
 	}
 	first := evs[0]
 	if first.Kind != reftable.EventRef || first.IsWiki {
@@ -1066,15 +1067,17 @@ func pusherReissued(ctx context.Context, u *user_model.User, ev reftable.Event) 
 
 // eventLeadsTo reports whether the repository an event was written for is
 // the one now keyed key: the same key, or a key it was renamed to after the
-// event, following the table's renames backwards. Each step must go back
-// in the log, so a rename and its undo cannot loop.
+// event, following the table's renames backwards. Each step goes back in
+// the log, to the newest rename into the key before the previous step, so
+// a rename and its undo cannot loop, and a key another rename took again
+// later still leads to the earlier one (#138).
 func eventLeadsTo(ev reftable.Event, key string, renamedFrom renamedFromFunc) bool {
 	at := uint64(1<<64 - 1)
 	for key != ev.Repo {
 		if renamedFrom == nil {
 			return false
 		}
-		from, idx, ok := renamedFrom(key)
+		from, idx, ok := renamedFrom(key, at)
 		if !ok || idx <= ev.Token.Index || idx >= at {
 			return false
 		}

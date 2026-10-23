@@ -103,6 +103,12 @@ func FindUserProfileReadme(ctx *context.Context, doer *user_model.User) (profile
 		if profileDbRepo.IsFork || profileDbRepo.IsPrivate {
 			return nil, nil, nil, nil, func() {}
 		}
+		// In a cluster, a directory that still holds another repository is
+		// not read under this one's permissions (#82).
+		if err := context.ClusterReadRefusal(profileDbRepo); err != nil {
+			log.Warn("FindUserProfileReadme: %v", err)
+			return nil, nil, nil, nil, func() {}
+		}
 		perm, err := access_model.GetUserRepoPermission(ctx, profileDbRepo, doer)
 		if err == nil && !profileDbRepo.IsEmpty && perm.CanRead(unit.TypeCode) {
 			if profileGitRepo, err = gitrepo.OpenRepository(ctx, profileDbRepo); err != nil {

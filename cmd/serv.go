@@ -387,7 +387,7 @@ func runServ(ctx context.Context, c *cli.Command) error {
 		// explicit refusal stops git: a replicator too old to know the
 		// question answers an error).
 		rctx, rcancel := context.WithTimeout(ctx, 10*time.Second)
-		resp, err = clusterhook.Call(rctx, setting.Cluster.HookSocket, &clusterhook.Request{Op: clusterhook.OpReadable, Repo: key})
+		resp, err = clusterhook.Call(rctx, setting.Cluster.HookSocket, &clusterhook.Request{Op: clusterhook.OpReadable, Repo: key, RepoID: results.RepoID})
 		rcancel()
 		if err == nil && !resp.OK && !strings.Contains(resp.Message, "unknown operation") {
 			return fail(ctx, resp.Message, "")
