@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,16 +34,28 @@ type SSHSource struct {
 	addr string
 	cfg  *ssh.ClientConfig
 	// idle is how long the connection may stay silent once the handshake
-	// is done: a member that accepts and then stops talking is dropped,
-	// never waited for.
+	// is done: a member whose sshd stops talking is dropped, never waited
+	// for. The observer sends a keepalive every quarter of it, which a
+	// live sshd answers even while the forced command writes nothing.
 	idle time.Duration
+	// silence is how long the export itself may send no data while the
+	// observer waits for it: an export stuck behind a live sshd, which
+	// keeps answering the keepalives, is dropped after it.
+	silence time.Duration
 }
 
-// sshIdleTimeout is how long an export may send nothing.
+// sshIdleTimeout is how long the member's sshd may send nothing, not even
+// a keepalive reply.
 const sshIdleTimeout = 2 * time.Minute
 
-// NewSSHSource builds the source of target, user@host:port.
-func NewSSHSource(target, keyFile, knownHostsFile string) (*SSHSource, error) {
+// sshExportSilence is the default bound on an export sending no data,
+// [cluster] OBSERVER_EXPORT_SILENCE: long enough for the pack-objects of a
+// big repository to count and compress before its first byte (#139).
+const sshExportSilence = 30 * time.Minute
+
+// NewSSHSource builds the source of target, user@host:port. silence bounds
+// how long an export may send no data; zero means sshExportSilence.
+func NewSSHSource(target, keyFile, knownHostsFile string, silence time.Duration) (*SSHSource, error) {
 	user, addr, ok := strings.Cut(target, "@")
 	if !ok {
 		return nil, fmt.Errorf("%q is not user@host:port", target)
@@ -59,10 +72,13 @@ func NewSSHSource(target, keyFile, knownHostsFile string) (*SSHSource, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the pinned host keys: %w", err)
 	}
+	if silence <= 0 {
+		silence = sshExportSilence
+	}
 	return &SSHSource{addr: addr, cfg: &ssh.ClientConfig{
 		User: user, Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		HostKeyCallback: hostKeys, Timeout: 15 * time.Second,
-	}, idle: sshIdleTimeout}, nil
+	}, idle: sshIdleTimeout, silence: silence}, nil
 }
 
 // Export runs one export call.
@@ -88,10 +104,13 @@ func (s *SSHSource) Export(ctx context.Context, req *clusterhook.ExportRequest) 
 	}
 	ic.setIdle(s.idle)
 	client := ssh.NewClient(sc, chans, reqs)
-	closeAll := func() {
+	quit := make(chan struct{})
+	closeAll := sync.OnceFunc(func() {
+		close(quit)
 		stop()
 		client.Close()
-	}
+	})
+	go keepAlive(client, s.idle/4, quit)
 	sess, err := client.NewSession()
 	if err != nil {
 		closeAll()
@@ -120,7 +139,8 @@ func (s *SSHSource) Export(ctx context.Context, req *clusterhook.ExportRequest) 
 		closeAll()
 		return nil, nil, err
 	}
-	br := bufio.NewReader(stdout)
+	quiet := newSilenceReader(stdout, s.silence, closeAll)
+	br := bufio.NewReader(quiet)
 	line, err := clusterhook.ReadExportHead(br, clusterhook.MaxExportHead)
 	if err != nil {
 		closeAll()
@@ -131,8 +151,62 @@ func (s *SSHSource) Export(ctx context.Context, req *clusterhook.ExportRequest) 
 		closeAll()
 		return nil, nil, fmt.Errorf("the export's answer: %w", err)
 	}
-	return &ans, &sessionBody{Reader: br, sess: sess, done: closeAll}, nil
+	return &ans, &sessionBody{Reader: br, sess: sess, done: func() {
+		quiet.stop()
+		closeAll()
+	}}, nil
 }
+
+// keepAlive sends a keepalive@openssh.com global request every interval
+// until quit: OpenSSH answers it even while the forced command is silent,
+// and the answer, being read, pushes the connection's idle deadline. A
+// write alone never does, so a peer that stops answering is still dropped.
+func keepAlive(client *ssh.Client, interval time.Duration, quit <-chan struct{}) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-quit:
+			return
+		case <-t.C:
+			if _, _, err := client.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// silenceReader cuts the session when one read waits longer than d for the
+// export's data. Only the wait counts, never the time the caller spends
+// between two reads.
+type silenceReader struct {
+	r     io.Reader
+	d     time.Duration
+	t     *time.Timer
+	fired atomic.Bool
+}
+
+func newSilenceReader(r io.Reader, d time.Duration, cut func()) *silenceReader {
+	s := &silenceReader{r: r, d: d}
+	s.t = time.AfterFunc(d, func() {
+		s.fired.Store(true)
+		cut()
+	})
+	s.t.Stop()
+	return s
+}
+
+func (s *silenceReader) Read(p []byte) (int, error) {
+	s.t.Reset(s.d)
+	n, err := s.r.Read(p)
+	s.t.Stop()
+	if s.fired.Load() {
+		return n, fmt.Errorf("the export sent nothing for %s", s.d)
+	}
+	return n, err
+}
+
+func (s *silenceReader) stop() { s.t.Stop() }
 
 // sessionBody is a stream's body: closing it ends the session, and a
 // stream cut short reads as an error, not as an end.
@@ -166,8 +240,10 @@ func (b *sessionBody) Close() error {
 	return nil
 }
 
-// idleConn bounds every read and write: each one moves the deadline idle
-// ahead, never past hard when the caller's context has a deadline.
+// idleConn bounds every read and write: each read moves the read deadline
+// idle ahead, each write the write deadline, never past hard when the
+// caller's context has a deadline. A write never pushes the read deadline:
+// keepalives sent to a dead peer must not keep it alive.
 type idleConn struct {
 	net.Conn
 	idle atomic.Int64
@@ -182,20 +258,20 @@ func newIdleConn(c net.Conn, idle time.Duration) *idleConn {
 
 func (c *idleConn) setIdle(d time.Duration) { c.idle.Store(int64(d)) }
 
-func (c *idleConn) push() {
+func (c *idleConn) deadline() time.Time {
 	dl := time.Now().Add(time.Duration(c.idle.Load()))
 	if !c.hard.IsZero() && c.hard.Before(dl) {
 		dl = c.hard
 	}
-	_ = c.SetDeadline(dl)
+	return dl
 }
 
 func (c *idleConn) Read(p []byte) (int, error) {
-	c.push()
+	_ = c.SetReadDeadline(c.deadline())
 	return c.Conn.Read(p)
 }
 
 func (c *idleConn) Write(p []byte) (int, error) {
-	c.push()
+	_ = c.SetWriteDeadline(c.deadline())
 	return c.Conn.Write(p)
 }
