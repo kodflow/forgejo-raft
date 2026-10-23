@@ -5,13 +5,19 @@ package kitsunium
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
 )
 
 func TestMain(m *testing.M) {
 	// The engine's boot-scoped marker directory, which a runner cannot
-	// create at its Linux default, /run/kitsunium-consensus.
-	RuntimeDir = filepath.Join(os.TempDir(), "kitsunium-consensus")
-	os.Exit(m.Run())
+	// create at its Linux default, /run/kitsunium-consensus: one of this
+	// binary's own, removed after the suite.
+	dir, err := os.MkdirTemp("", "kitsunium-consensus-")
+	if err != nil {
+		panic(err)
+	}
+	RuntimeDir = dir
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
 }
