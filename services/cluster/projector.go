@@ -135,15 +135,23 @@ func (p *projector) unfence() {
 // refence puts the start-up fence back and waits for a pass in flight,
 // before the table is emptied for a rejoin under a new id (#41): no pass
 // may project a table that replays from its start.
+//
+// The state is cleared once that pass ended, which may still have
+// certified a watermark or recorded a failure of the old table. deletedAt
+// stays: a snapshot the new table installs replays no deletion, and a
+// directory a deletion left here is set aside, never reused.
 func (p *projector) refence() {
 	p.mu.Lock()
 	p.fenced = true
-	p.pendingFirst = map[string]bool{}
-	p.dirty = map[string]uint64{}
-	p.watermark = map[string]uint64{}
 	p.mu.Unlock()
 	p.passMu.Lock()
 	defer p.passMu.Unlock()
+	p.mu.Lock()
+	p.pendingFirst = map[string]bool{}
+	p.dirty = map[string]uint64{}
+	p.watermark = map[string]uint64{}
+	p.failures = map[string]string{}
+	p.mu.Unlock()
 }
 
 // Fenced reports whether the start-up fence still holds.
