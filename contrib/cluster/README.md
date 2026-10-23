@@ -387,8 +387,10 @@ These commands run with the server stopped, on the data directory.
   repository did not change since the index given, and SQL, read last, still
   has no row for it. The decision, its operator and its reason are in the
   audit.
-- A deletion is two entries, the wiki's first: when the repository's is lost,
-  the repository stays an orphan as above, with its wiki. A wiki left alive
+- A deletion is two entries, the wiki's first, the repository's only once the
+  wiki's committed. When the wiki's is lost, both stay; when the repository's
+  is, the repository stays without its wiki. Either way it is an orphan as
+  above. A wiki left alive
   by an older deletion beside a repository created again under the name
   belongs to the deleted one, and every node refuses the new repository while
   it stays. `reconcile` reports it (`"kind": "wiki"`), and only it is deleted
