@@ -168,7 +168,7 @@ func (o *Observer) prune(ctx context.Context) error {
 func (o *Observer) pruneData() error {
 	bases, blobs := map[string]bool{}, map[string]bool{}
 	minSeg := map[string]uint64{}
-	keep := func(sysid string, start string, segSize int64) {
+	keep := func(sysid, start string, segSize int64) {
 		l, err := ParseLSN(start)
 		if err != nil || segSize <= 0 {
 			return

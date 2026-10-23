@@ -53,8 +53,8 @@ func TestStopDuringCreateRefsIsNoFork(t *testing.T) {
 	}()
 	err := o.Step(ctx)
 	require.Error(t, err)
-	assert.NotErrorIs(t, err, ErrQuarantined)
-	assert.NotErrorIs(t, err, ErrImmutable)
+	require.NotErrorIs(t, err, ErrQuarantined)
+	require.NotErrorIs(t, err, ErrImmutable)
 	require.Nil(t, o.State().Quarantine)
 	o.store.git.git = real
 	require.NoError(t, o.Step(context.Background()))
@@ -72,8 +72,8 @@ func TestCreateRefsFailureIsNotImmutable(t *testing.T) {
 	o.store.git.git = gitWrapper(t, "    echo 'fatal: No space left on device' >&2\n    exit 128")
 	err := o.Step(context.Background())
 	require.Error(t, err)
-	assert.NotErrorIs(t, err, ErrImmutable)
-	assert.NotErrorIs(t, err, ErrQuarantined)
+	require.NotErrorIs(t, err, ErrImmutable)
+	require.NotErrorIs(t, err, ErrQuarantined)
 	o.store.git.git = real
 	require.NoError(t, o.Step(context.Background()))
 	assert.Len(t, o.State().Checkpoints, 1)
