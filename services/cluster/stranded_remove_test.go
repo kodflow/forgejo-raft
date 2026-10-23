@@ -102,6 +102,41 @@ func TestRemoveOfASilentVoterIsNotRefusedForAnotherSilentOne(t *testing.T) {
 	assert.Zero(t, Rank(leader.Engine().Membership(), idB))
 }
 
+// The removal of a learner that answers is not held while a voter listed
+// before the leader is silent: a learner vouches for no voter, and the
+// engine's guard admits it as well since kitsunium/sdk#614. The removal of
+// a voter that answers there stays refused (kitsunium/sdk#603).
+func TestRemovableAdmitsAnAnsweringLearnerWhileAVoterIsStranded(t *testing.T) {
+	t.Parallel()
+	mem, rs := NewForTesting(t.TempDir(), "node-a", "node-b", "node-c", "node-d", "node-e")
+	leader := rs[3]
+	mem.SetLeader(leader.Engine().(*memraft.Node))
+	mem.SetDown(rs[0].Engine().(*memraft.Node), true)
+	idB, idE := slotID(t, leader, "node-b"), slotID(t, leader, "node-e")
+	eng := learnerView{Engine: leader.Engine(), learner: idE}
+	require.NoError(t, leader.removable(eng, idE))
+	require.ErrorIs(t, leader.removable(eng, idB), consensus.ErrMembershipInvalid)
+}
+
+// learnerView reports one member as a learner in the engine's membership.
+type learnerView struct {
+	consensus.Engine
+	learner consensus.NodeID
+}
+
+func (l learnerView) Membership() consensus.Membership {
+	m := l.Engine.Membership()
+	members := make([]consensus.Member, len(m.Members))
+	copy(members, m.Members)
+	for i := range members {
+		if members[i].ID == l.learner {
+			members[i].Voter = false
+		}
+	}
+	m.Members = members
+	return m
+}
+
 // SaveSnapshot of the engine returns at its context's end while a write to
 // the writer already blocked goes on, on a goroutine of the engine's
 // (kitsunium/sdk#601). The file it wrote into is closed and removed: the
