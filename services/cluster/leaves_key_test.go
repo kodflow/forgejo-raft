@@ -40,6 +40,11 @@ func TestObjectsAreNotAcknowledgedIntoADirectoryAboutToBeSetAside(t *testing.T) 
 	lag.r.projector.refence()
 	require.NoError(t, os.RemoveAll(filepath.Join(origin.r.root, "s", "b.git")))
 	require.NoError(t, origin.r.proposeRepoDelete(t.Context(), "s/b.git", 1))
+	// As Forgejo, which renames once the deletion is done: node-a's own
+	// projector removes s/b.git's directory, which must not be the one
+	// renamed in.
+	deleted, _ := origin.r.table.Deleted("s/b.git")
+	require.Eventually(t, func() bool { return origin.r.projector.Projected("s/b.git") >= deleted }, 10*time.Second, 10*time.Millisecond)
 	renameOn(t, origin, "s/a.git", "s/b.git")
 	require.Eventually(t, func() bool {
 		f, _, ok := lag.r.table.RenamedFrom("s/b.git")

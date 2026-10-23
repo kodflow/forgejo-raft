@@ -47,6 +47,8 @@ permissions:
 
 env:
   TAGS: sqlite sqlite_unlock_notify
+  # The tests of services/cluster race-l-z runs; checks skips them.
+  SECOND_HALF: ^Test[L-Z]
   SCOPE: >-
     ./services/cluster/...
     ./routers/web/admin/
@@ -56,8 +58,15 @@ env:
     ./modules/clusterhook/
     ./models/cluster/
 
+# The race tests of services/cluster alone came close to their 20 minute
+# bound, so that package runs in two halves, split by the first letter of
+# the test's name after "Test": checks runs the others and every other
+# package, race-l-z the tests from TestL to TestZ, in parallel. A new test
+# lands in one half by its name, never in none. cluster-checks, the job
+# name the ruleset requires, only gathers the two verdicts: it is green
+# when both are.
 jobs:
-  cluster-checks:
+  checks:
     runs-on: ubuntu-latest
     # The race tests alone are bounded at 20 minutes.
     timeout-minutes: 30
@@ -85,10 +94,15 @@ jobs:
           # shellcheck disable=SC2086 # the scope is a list of packages
           go vet -tags "$TAGS" $SCOPE
 
-      - name: Race tests of the cluster scope
+      - name: Race tests of the cluster scope, but TestL to TestZ of services/cluster
         run: |
+          # Every package of the scope but services/cluster itself, then
+          # services/cluster without the half race-l-z runs.
           # shellcheck disable=SC2086 # the scope is a list of packages
-          go test -race -timeout 20m -count=1 -tags "$TAGS" $SCOPE
+          others=$(go list -tags "$TAGS" $SCOPE | grep -vx 'forgejo.org/services/cluster')
+          # shellcheck disable=SC2086 # a list of packages
+          go test -race -timeout 20m -count=1 -tags "$TAGS" $others
+          go test -race -timeout 20m -count=1 -tags "$TAGS" -skip "$SECOND_HALF" ./services/cluster
 
       # The baseline is computed here, not by the action's only-new-issues:
       # that one fetches the pull request's patch from the API, which GitHub
@@ -142,3 +156,37 @@ jobs:
             ./services/webhook/
             ./modules/clusterhook/
             ./models/cluster/
+
+  race-l-z:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Race tests TestL to TestZ of services/cluster
+        run: go test -race -timeout 20m -count=1 -tags "$TAGS" -run "$SECOND_HALF" ./services/cluster
+
+  # The status the ruleset on forgejo requires: renaming it, or letting it
+  # go unreported, blocks every merge. A half cancelled leaves it skipped,
+  # which blocks too.
+  cluster-checks:
+    needs: [checks, race-l-z]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Both halves are green
+        env:
+          CHECKS: ${{ needs.checks.result }}
+          RACE_L_Z: ${{ needs.race-l-z.result }}
+        run: |
+          echo "checks: $CHECKS, race-l-z: $RACE_L_Z"
+          test "$CHECKS" = success && test "$RACE_L_Z" = success
