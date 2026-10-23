@@ -224,6 +224,9 @@ type PushOptions struct {
 	Timeout              time.Duration
 	PrivateKeyPath       string
 	ProhibitHTTPRedirect bool
+	// CredentialURL, an address with a password, authenticates the push
+	// through a credential helper, never on the command line.
+	CredentialURL string
 }
 
 // Push pushs local commits to given remote branch.
@@ -232,6 +235,13 @@ func Push(ctx context.Context, repoPath string, opts PushOptions) error {
 
 	if opts.ProhibitHTTPRedirect {
 		cmd.AddArguments("-c", "http.followRedirects=false")
+	}
+	if opts.CredentialURL != "" {
+		_, cleanup, err := cmd.AddAuthCredentialHelperForRemote(opts.CredentialURL)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
 	}
 
 	cmd.AddArguments("push")

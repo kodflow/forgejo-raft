@@ -525,11 +525,13 @@ Watch, Custom, Releases on GitHub, or the tags of
   512, whatever their number.
 - A mirror's remote is a node's git config, which the cluster does not
   replicate: a node that lacks it recreates it from the database before
-  each mirror operation. The database keeps no password of a push
-  mirror: one authenticated by a password in its address pushes only
-  from the node that created it, one authenticated by an SSH key from
-  every node. `forgejo doctor` never removes a push mirror in a cluster
-  because one node lacks its remote.
+  each mirror operation, without any password. The database keeps a
+  mirror's password encrypted, and every node passes it to git through a
+  credential helper, never through its git config. A push mirror created
+  before this release has its password stored by the node that created
+  it, at its first sync there; until then it pushes from that node only.
+  `forgejo doctor` never removes a push mirror in a cluster because one
+  node lacks its remote.
 - A ref name must be valid UTF-8. git accepts other bytes, which the
   replicated table, in JSON, cannot carry unchanged.
 - The object channel accepts what Forgejo accepts on a push: the fsck

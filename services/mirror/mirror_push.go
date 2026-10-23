@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -34,6 +35,13 @@ var stripExitStatus = regexp.MustCompile(`exit status \d+ - `)
 var AddPushMirrorRemote = addPushMirrorRemote
 
 func addPushMirrorRemote(ctx context.Context, m *repo_model.PushMirror, addr string) error {
+	// The password is kept encrypted, for the nodes of a cluster that
+	// recreate the remote without it.
+	if u, err := url.Parse(addr); err == nil && hasPassword(u) {
+		if err := m.SetEncryptedRemoteAddress(ctx, addr); err != nil {
+			return err
+		}
+	}
 	if err := addPushRemoteAndConfig(ctx, m, addr, m.Repo.RepoPath()); err != nil {
 		return err
 	}
@@ -221,6 +229,16 @@ func runPushSync(ctx context.Context, m *repo_model.PushMirror) error {
 			return util.SanitizeErrorCredentialURLs(err)
 		}
 
+		credURL, err := pushCredentialURL(ctx, m, remoteURL, isWiki)
+		if err != nil {
+			log.Error("SyncPushMirror [repo: %-v]: the push mirror's credentials: %v", m.Repo, err)
+			return errors.New("Unexpected error")
+		}
+		lfsURL := remoteURL.String()
+		if credURL != "" {
+			lfsURL = credURL
+		}
+
 		if setting.LFS.StartServer && !useSSHAuthentication {
 			log.Trace("SyncMirrors [repo: %-v]: syncing LFS objects...", m.Repo)
 
@@ -236,7 +254,7 @@ func runPushSync(ctx context.Context, m *repo_model.PushMirror) error {
 			}
 			defer gitRepo.Close()
 
-			endpoint := lfs.DetermineEndpoint(remoteURL.String(), "")
+			endpoint := lfs.DetermineEndpoint(lfsURL, "")
 			lfsClient := lfs.NewClient(endpoint, migrations_allowlist.NewMigrationHTTPTransport())
 			if err := pushAllLFSObjects(ctx, gitRepo, lfsClient); err != nil {
 				return util.SanitizeErrorCredentialURLs(err)
@@ -282,6 +300,7 @@ func runPushSync(ctx context.Context, m *repo_model.PushMirror) error {
 			Mirror:         true,
 			Timeout:        timeout,
 			PrivateKeyPath: privateKeyPath,
+			CredentialURL:  credURL,
 			// The remote URL passed IsPushMirrorURLAllowed, but any redirection URL may not. Prohibit redirects in
 			// order to protect against SSRF risks.
 			ProhibitHTTPRedirect: true,
