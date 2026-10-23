@@ -207,11 +207,11 @@ func (driver) Inspect(dir string) (consensus.Report, error) {
 			Cluster: consensus.ClusterID(r.Stamp.Log.Cluster), Node: consensus.NodeID(r.Stamp.ID),
 			Incarnation: consensus.Incarnation(r.Stamp.Incarnation), Slot: r.Stamp.Slot,
 			Joining: r.Stamp.State == sdk.StampJoining, BootstrapPending: r.Stamp.State == sdk.StampBootstrapPending,
-			HardTerm: r.HardState.Term, LastIndex: r.Last,
+			HardTerm: r.HardState.Term, LastIndex: r.Last, LastTerm: r.LastTerm,
 			Quarantined: r.Quarantine != "", Markers: r.Markers,
 		}
 		out.Detail = append(out.Detail, fmt.Sprintf("stamp state %d, epoch %d", r.Stamp.State, r.Stamp.Log.Epoch),
-			fmt.Sprintf("log %d..%d", r.First, r.Last))
+			fmt.Sprintf("log %d..%d, last term %d", r.First, r.Last, r.LastTerm))
 		if r.Quarantine != "" {
 			out.Detail = append(out.Detail, "quarantine: "+r.Quarantine)
 		}
@@ -464,6 +464,7 @@ const (
 	healthHasLeader
 	healthQuorumReachable
 	healthStopped
+	healthSnapshotNearLimit
 )
 
 const (
@@ -482,6 +483,7 @@ func (e *Engine) Health() consensus.Health {
 		Ready: h.Flags.Has(healthReady), Role: role(st.Role), LeaderKnown: h.Flags.Has(healthHasLeader),
 		QuorumReachable: h.Flags.Has(healthQuorumReachable), Stopped: h.Flags.Has(healthStopped), Identity: identity(st.Log), ContractGen: st.Timing.Generation,
 		ClusterVersion: st.Versions.Cluster, FailureTolerance: h.FailureTolerance, ApplyLagEntries: h.ApplyLagEntries,
+		SnapshotBytes: h.SnapshotBytes, SnapshotLimit: h.SnapshotLimit, SnapshotNearLimit: h.Flags.Has(healthSnapshotNearLimit),
 	}
 	if h.StopReason.Err != nil {
 		out.StopReason = h.StopReason.Err.Error()

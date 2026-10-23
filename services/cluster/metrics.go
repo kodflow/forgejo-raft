@@ -77,6 +77,7 @@ type collector struct {
 	refused, fsFree                                                  *prometheus.Desc
 	consumerStalled                                                  *prometheus.Desc
 	expected, voters                                                 *prometheus.Desc
+	snapshotBytes, snapshotLimit                                     *prometheus.Desc
 }
 
 // NewCollector returns the replicator's collector. It reads the running
@@ -110,6 +111,8 @@ func NewCollector() prometheus.Collector {
 		fsFree:          d("fs_free_bytes", "Free bytes of a filesystem the node depends on besides the consensus data directory, which the engine reports.", "fs"),
 		expected:        d("expected_nodes", "[cluster] EXPECTED_NODES; 0 in the manual mode."),
 		voters:          d("voters", "Voting members of the committed membership, as this node sees it."),
+		snapshotBytes:   d("snapshot_bytes", "Size of the newest consensus snapshot the node holds; 0 with none."),
+		snapshotLimit:   d("snapshot_limit_bytes", "Size a snapshot cut is held to: MAX_SNAPSHOT_BYTES, or the smallest a member announces. Past it the cuts are refused."),
 	}
 }
 
@@ -118,7 +121,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 		c.role, c.term, c.commit, c.applied, c.tolerance, c.hasLeader, c.ready, c.fenced,
 		c.reposPending, c.reposFailing, c.eventsPending, c.eventBytes, c.consumerLag, c.txns, c.certExpiry, c.applyLag,
 		c.peerLag, c.peerUnreachable, c.peerLastContact, c.refused, c.fsFree, c.consumerStalled,
-		c.expected, c.voters,
+		c.expected, c.voters, c.snapshotBytes, c.snapshotLimit,
 	} {
 		ch <- d
 	}
@@ -211,6 +214,8 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	g(c.tolerance, float64(h.FailureTolerance))
 	g(c.hasLeader, b2f(h.LeaderKnown))
 	g(c.applyLag, float64(h.ApplyLagEntries))
+	g(c.snapshotBytes, float64(h.SnapshotBytes))
+	g(c.snapshotLimit, float64(h.SnapshotLimit))
 	g(c.voters, float64(eng.Membership().Voters()))
 	if r.auto != nil {
 		g(c.expected, float64(r.auto.expected))

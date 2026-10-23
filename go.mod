@@ -67,8 +67,8 @@ require (
 	github.com/jhillyerd/enmime/v2 v2.2.0
 	github.com/json-iterator/go v1.1.12
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
-	github.com/kitsunium/sdk/pkg/v1/app v0.13.2
-	github.com/kitsunium/sdk/pkg/v1/observe v0.4.0
+	github.com/kitsunium/sdk/pkg/v1/app v0.15.1
+	github.com/kitsunium/sdk/pkg/v1/observe v0.4.1
 	github.com/klauspost/compress v1.20.3
 	github.com/markbates/goth v1.82.0
 	github.com/mattn/go-isatty v0.0.24
@@ -199,7 +199,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/jonboulle/clockwork v0.5.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
-	github.com/kitsunium/sdk/internal v0.23.2 // indirect
+	github.com/kitsunium/sdk/internal v0.25.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
@@ -267,3 +267,9 @@ replace github.com/mholt/archiver/v3 => code.forgejo.org/forgejo/archiver/v3 v3.
 replace github.com/gliderlabs/ssh => code.forgejo.org/forgejo/ssh v0.0.0-20241211213324-5fc306ca0616
 
 replace git.sr.ht/~mariusor/go-xsd-duration => code.forgejo.org/forgejo/go-xsd-duration v0.0.0-20220703122237-02e73435a078
+
+// Lots S1 to S3 of the Raft (kitsunium/sdk#570, merge 98f6943d): to be
+// replaced by the first SDK tag that contains 98f6943d.
+replace github.com/kitsunium/sdk/internal => github.com/kitsunium/sdk/internal v0.0.0-20261023080148-98f6943dbe4d
+
+replace github.com/kitsunium/sdk/pkg/v1/app => github.com/kitsunium/sdk/pkg/v1/app v0.0.0-20261023080148-98f6943dbe4d
