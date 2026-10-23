@@ -60,8 +60,14 @@ type projector struct {
 	// removed its directory: a key revived meanwhile by a rename finds the
 	// deleted repository's directory still there.
 	deletedAt map[string]uint64
-	wake      chan struct{}
-	waiters   []chan struct{}
+	// fetching holds the cancellation of each repository whose missing
+	// objects are fetched outside the pass (#137): the pass skips it, and
+	// moves no directory of it, until the fetch ended.
+	fetching map[string]context.CancelFunc
+	// fetches counts the fetches in flight, for refence.
+	fetches sync.WaitGroup
+	wake    chan struct{}
+	waiters []chan struct{}
 }
 
 func newProjector(root string, table *reftable.Table, reg *registry) *projector {
@@ -69,7 +75,8 @@ func newProjector(root string, table *reftable.Table, reg *registry) *projector 
 		root: root, table: table, registry: reg,
 		dirty: map[string]uint64{}, watermark: map[string]uint64{},
 		fenced: true, pendingFirst: map[string]bool{}, failures: map[string]string{}, deletedAt: map[string]uint64{},
-		wake: make(chan struct{}, 1),
+		fetching: map[string]context.CancelFunc{},
+		wake:     make(chan struct{}, 1),
 	}
 	table.OnChange(p.onChange)
 	return p
@@ -136,7 +143,9 @@ func (p *projector) unfence() {
 
 // refence puts the start-up fence back and waits for a pass in flight,
 // before the table is emptied for a rejoin under a new id (#41): no pass
-// may project a table that replays from its start.
+// may project a table that replays from its start. The fetches the passes
+// started are cancelled and waited for too, so none records a failure of
+// the old table.
 //
 // The state is cleared once that pass ended, which may still have
 // certified a watermark or recorded a failure of the old table. deletedAt
@@ -148,6 +157,13 @@ func (p *projector) refence() {
 	p.mu.Unlock()
 	p.passMu.Lock()
 	defer p.passMu.Unlock()
+	// No pass runs and none starts while fenced: no fetch starts either.
+	p.mu.Lock()
+	for _, cancel := range p.fetching {
+		cancel()
+	}
+	p.mu.Unlock()
+	p.fetches.Wait()
 	p.mu.Lock()
 	p.pendingFirst = map[string]bool{}
 	p.dirty = map[string]uint64{}
@@ -297,11 +313,18 @@ func (p *projector) run(ctx context.Context) {
 	}
 }
 
-// projectBudget bounds the projection of one repository in a pass: the
-// pass is serial, and a repository whose git or whose members stall must
-// not hold every other one behind it. The object channel cuts a stalled
-// transfer much sooner (objectIdle).
+// projectBudget bounds the projection of one repository in a pass, and
+// the fetch of its missing objects: a repository whose git or whose
+// members stall must not hold it for good. The object channel cuts a
+// stalled transfer much sooner (objectIdle).
 var projectBudget = time.Hour
+
+// maxFetches bounds the fetches of missing objects in flight at once. The
+// pass itself stays serial, the order of the directory moves of chained
+// renames depends on it; only the fetch, the long part (several gigabytes
+// behind a slow member), runs beside it, so one repository's transfer does
+// not freeze the derivation of every other one (#137).
+var maxFetches = 4
 
 // pass projects every dirty repository once.
 func (p *projector) pass(ctx context.Context) {
@@ -344,7 +367,7 @@ func (p *projector) pass(ctx context.Context) {
 		p.current = repo
 		p.mu.Unlock()
 		pctx, cancel := context.WithTimeout(ctx, projectBudget)
-		err := p.project(pctx, repo)
+		err := p.project(ctx, pctx, repo)
 		cancel()
 		p.mu.Lock()
 		p.current = ""
@@ -357,6 +380,64 @@ func (p *projector) pass(ctx context.Context) {
 		}
 	}
 	p.notifyWaiters()
+}
+
+// awaitsFetch reports whether a fetch of repo's objects is in flight. A
+// repository deleted meanwhile needs none of them: its fetch is cancelled,
+// and the next pass removes its directory once the fetch ended.
+func (p *projector) awaitsFetch(repo string) bool {
+	p.mu.Lock()
+	cancel, ok := p.fetching[repo]
+	p.mu.Unlock()
+	if ok {
+		if _, deleted := p.table.Deleted(repo); deleted {
+			cancel()
+		}
+	}
+	return ok
+}
+
+// isFetching reports whether a fetch of repo's objects is in flight.
+func (p *projector) isFetching(repo string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.fetching[repo]
+	return ok
+}
+
+// startFetch fetches repo's missing objects beside the pass, at most
+// maxFetches at once and one per repository; past the bound, repo stays
+// dirty and the next pass tries again. When the fetch succeeds, a pass is
+// woken to project repo with its objects here; a failure is recorded as
+// the projection's, and retried at the next tick.
+func (p *projector) startFetch(base context.Context, repo, dir string, missing []string) {
+	p.mu.Lock()
+	if _, ok := p.fetching[repo]; ok || p.fenced || len(p.fetching) >= maxFetches {
+		p.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithTimeout(base, projectBudget)
+	p.fetching[repo] = cancel
+	p.fetches.Add(1)
+	p.mu.Unlock()
+	go func() {
+		defer p.fetches.Done()
+		err := p.fetch(ctx, repo, dir, missing)
+		cancel()
+		p.mu.Lock()
+		delete(p.fetching, repo)
+		if err != nil {
+			p.failures[repo] = fmt.Sprintf("fetching %d missing objects: %v", len(missing), err)
+		}
+		p.mu.Unlock()
+		if err != nil {
+			// Retried at the next tick, as a failed projection is: woken
+			// now, a fetch that fails at once would spin the pass.
+			log.Warn("cluster: projecting %s: fetching %d missing objects: %v", repo, len(missing), err)
+			return
+		}
+		p.signal()
+	}()
 }
 
 // WaitsBehind reports whether a repository's projection waits behind
@@ -385,10 +466,15 @@ func projectedKeys(table *reftable.Table, repo string) error {
 	return nil
 }
 
-// project makes one repository match the table, then certifies it.
-func (p *projector) project(ctx context.Context, repo string) error {
+// project makes one repository match the table, then certifies it. Its
+// missing objects are fetched outside the pass, under base: the
+// repository is projected again once they are here.
+func (p *projector) project(base, ctx context.Context, repo string) error {
 	if p.registry.inFlight(repo) {
 		return nil // retried at the next pass, once git is done
+	}
+	if p.awaitsFetch(repo) {
+		return nil // retried at the next pass, once the fetch ended
 	}
 	if err := projectedKeys(p.table, repo); err != nil {
 		return err
@@ -424,10 +510,11 @@ func (p *projector) project(ctx context.Context, repo string) error {
 		if first, firstIdx, ok := p.liveRename(repo); ok {
 			from, to, renIdx := p.renameSource(repo, first, firstIdx)
 			src := filepath.Join(p.root, filepath.FromSlash(from))
-			if p.registry.inFlight(from) {
-				// A git process still writes under the old key: moving its
-				// directory now would land its write under the new name,
-				// outside the table. The move waits for the next pass.
+			if p.registry.inFlight(from) || p.isFetching(from) {
+				// A git process still writes under the old key, or a fetch
+				// of its objects: moving its directory now would land its
+				// write under the new name, outside the table, or fail the
+				// fetch. The move waits for the next pass.
 				return nil
 			}
 			if p.holdsRenamed(src, from, to, renIdx) {
@@ -491,9 +578,8 @@ func (p *projector) project(ctx context.Context, repo string) error {
 			if p.fetch == nil {
 				return fmt.Errorf("%d objects missing and no object channel", len(missing))
 			}
-			if err := p.fetch(ctx, repo, dir, missing); err != nil {
-				return fmt.Errorf("fetching %d missing objects: %w", len(missing), err)
-			}
+			p.startFetch(base, repo, dir, missing)
+			return nil
 		}
 	}
 	if len(set) > 0 || len(del) > 0 {
