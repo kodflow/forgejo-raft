@@ -175,6 +175,10 @@ type FileEntry struct {
 	Storage string `json:"storage"`
 	Path    string `json:"path"`
 	Size    int64  `json:"size"`
+	// SHA256 is the file's digest, for a file whose path does not name it
+	// (an attachment); bound to the log through the manifest's digest. A
+	// leader that predates it lists none (#106).
+	SHA256 string `json:"sha256,omitempty"`
 }
 
 // FilesManifest lists the files present at a checkpoint's fence.

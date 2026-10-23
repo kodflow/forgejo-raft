@@ -138,7 +138,8 @@ member. The observer checks packs with git against the refs of the leader's
 table; a WAL file against the digest the member that lists it gives, and a
 segment's page header against the checkpoint's system, start and sizes,
 never taking a segment past the checkpoint's position; a stored file against
-what the leader's files manifest lists.
+its digest: an LFS object's or a package blob's path names it, and the
+leader's files manifest lists an attachment's.
 
 ## On the observer
 
@@ -181,7 +182,9 @@ followed off the pinned endpoints. Then:
   `staging/`, and verifies it: the table at B by the digest the position
   carries and the root the barrier recorded; the packs of every live ref
   through `git index-pack --strict`, and their whole closure; the stored files
-  by digest (an LFS object by its id); the secrets bundle, opened with the
+  by digest (an LFS object or a package blob by its id, an attachment by the
+  digest the files manifest lists), reused from an earlier checkpoint by that
+  digest only; the secrets bundle, opened with the
   observer's key and kept sealed; and PostgreSQL, covered by a base backup
   that starts before L and contiguous WAL from its start to L on the
   timeline path to the checkpoint's timeline, histories included. A position

@@ -25,7 +25,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -899,6 +901,9 @@ func (o *Observer) fetchFiles(ctx context.Context, leader string, cp clusterhook
 	if fm.Checkpoint != cp.Name {
 		return fmt.Errorf("the files manifest is %s's", fm.Checkpoint)
 	}
+	// A file whose digest is known, listed or named by its path, is reused
+	// by that digest alone. Only a leader that predates listed digests
+	// leaves an attachment reused by path and size (#106).
 	known := map[string]string{}
 	if m.Previous != "" {
 		if prev, err := o.store.ReadManifest(m.Previous); err == nil {
@@ -908,11 +913,19 @@ func (o *Observer) fetchFiles(ctx context.Context, leader string, cp clusterhook
 		}
 	}
 	for _, f := range fm.Files {
-		if sum, ok := known[fmt.Sprintf("%s/%s/%d", f.Storage, f.Path, f.Size)]; ok && o.store.haveBlob(sum) {
+		want, err := expectedDigest(f)
+		if err != nil {
+			return fmt.Errorf("%s/%s: %w", f.Storage, f.Path, err)
+		}
+		sum, ok := want, want != ""
+		if !ok {
+			sum, ok = known[fmt.Sprintf("%s/%s/%d", f.Storage, f.Path, f.Size)]
+		}
+		if ok && o.store.haveBlob(sum) {
 			m.Files = append(m.Files, FileBlob{FileEntry: f, SHA256: sum})
 			continue
 		}
-		sum, err := o.fetchBlob(ctx, leader, f)
+		sum, err = o.fetchBlob(ctx, leader, f, want)
 		if err != nil {
 			return fmt.Errorf("%s/%s: %w", f.Storage, f.Path, err)
 		}
@@ -923,9 +936,33 @@ func (o *Observer) fetchFiles(ctx context.Context, leader string, cp clusterhook
 	return nil
 }
 
-// fetchBlob stores one file by its digest. An LFS object's path is its
-// digest split in three, which must match.
-func (o *Observer) fetchBlob(ctx context.Context, leader string, f clusterhook.FileEntry) (string, error) {
+var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// expectedDigest is the digest a stored file must have, "" when nothing
+// names it: an LFS object's path is its digest split in three, a package
+// blob's last component is its digest, an attachment's is listed by the
+// leader (#106). A file of the packages storage not named so is taken as
+// it comes.
+func expectedDigest(f clusterhook.FileEntry) (string, error) {
+	var want string
+	switch {
+	case f.SHA256 != "":
+		want = f.SHA256
+	case f.Storage == "lfs":
+		want = strings.ReplaceAll(f.Path, "/", "")
+	case f.Storage == "packages" && digestPattern.MatchString(path.Base(f.Path)):
+		want = path.Base(f.Path)
+	default:
+		return "", nil
+	}
+	if !digestPattern.MatchString(want) {
+		return "", fmt.Errorf("%q is not a SHA-256 digest", want)
+	}
+	return want, nil
+}
+
+// fetchBlob stores one file by its digest, which must be want when known.
+func (o *Observer) fetchBlob(ctx context.Context, leader string, f clusterhook.FileEntry, want string) (string, error) {
 	var errs []error
 	for _, slot := range append([]string{leader}, o.slots...) {
 		body, err := call(ctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportFile, Observer: o.cfg.Name, Storage: f.Storage, Name: f.Path}, nil)
@@ -941,8 +978,8 @@ func (o *Observer) fetchBlob(ctx context.Context, leader string, f clusterhook.F
 		if err == nil && n != f.Size {
 			err = fmt.Errorf("%d bytes, not %d", n, f.Size)
 		}
-		if err == nil && f.Storage == "lfs" && strings.ReplaceAll(f.Path, "/", "") != sum {
-			err = fmt.Errorf("the LFS object's digest is %s", sum)
+		if err == nil && want != "" && want != sum {
+			err = fmt.Errorf("the file's digest is %s, not %s", sum, want)
 		}
 		if err == nil {
 			err = o.keepBlob(tmp, sum)

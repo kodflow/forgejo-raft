@@ -599,12 +599,58 @@ func storedFiles() ([]clusterhook.FileEntry, error) {
 	return listStoredFiles(sts)
 }
 
+// digestCache keeps the digests of stored files by path, size and
+// modification time: a checkpoint reads again only what changed since the
+// one before.
+type digestCache struct {
+	mu   sync.Mutex
+	sums map[string]digestEntry
+}
+
+type digestEntry struct {
+	size  int64
+	mtime int64
+	sum   string
+}
+
+var storedDigests = &digestCache{sums: map[string]digestEntry{}}
+
+func (c *digestCache) of(path string, info fs.FileInfo) (string, error) {
+	c.mu.Lock()
+	e, ok := c.sums[path]
+	c.mu.Unlock()
+	if ok && e.size == info.Size() && e.mtime == info.ModTime().UnixNano() {
+		return e.sum, nil
+	}
+	sum, err := fileDigest(path)
+	if err != nil {
+		return "", err
+	}
+	c.mu.Lock()
+	c.sums[path] = digestEntry{size: info.Size(), mtime: info.ModTime().UnixNano(), sum: sum}
+	c.mu.Unlock()
+	return sum, nil
+}
+
+// keep forgets the files a listing did not see: they are gone.
+func (c *digestCache) keep(seen map[string]bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for p := range c.sums {
+		if !seen[p] {
+			delete(c.sums, p)
+		}
+	}
+}
+
 // listStoredFiles walks each storage root. An upload in flight lives in
 // the storage's temporary directory until it is renamed: listing it would
 // name a file that is gone, or partial, when an observer asks for it, and
 // fail the whole checkpoint.
 func listStoredFiles(roots map[string]*setting.Storage) ([]clusterhook.FileEntry, error) {
 	var out []clusterhook.FileEntry
+	seen := map[string]bool{}
+	defer storedDigests.keep(seen)
 	for name, st := range roots {
 		root, tmp := st.Path, storageTemporaryPath(st)
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -628,7 +674,16 @@ func listStoredFiles(roots map[string]*setting.Storage) ([]clusterhook.FileEntry
 			if err != nil {
 				return err
 			}
-			out = append(out, clusterhook.FileEntry{Storage: name, Path: filepath.ToSlash(rel), Size: info.Size()})
+			e := clusterhook.FileEntry{Storage: name, Path: filepath.ToSlash(rel), Size: info.Size()}
+			// An LFS object's or a package blob's path is its digest; an
+			// attachment's is not, and its digest is listed (#106).
+			if name == StorageAttachments {
+				if e.SHA256, err = storedDigests.of(path, info); err != nil {
+					return err
+				}
+				seen[path] = true
+			}
+			out = append(out, e)
 			return nil
 		})
 		if err != nil {

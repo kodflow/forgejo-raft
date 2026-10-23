@@ -43,7 +43,8 @@ import (
 // files come from any member: the observer checks packs with git against
 // the refs the leader's artifact names, a WAL file against the digest its
 // member lists and, for a segment, its header against the checkpoint's
-// system, and a stored file against the size the leader's manifest lists.
+// system, and a stored file against its digest, which its path names or
+// the leader's files manifest lists.
 
 // exportSide is the PostgreSQL and archive side of the export; tests
 // replace its parts.

@@ -65,6 +65,9 @@ type fakeCluster struct {
 	calls []string
 	// down are the members that do not answer.
 	down map[string]bool
+	// legacyFiles lists attachments without their digest, as a leader
+	// that predates it.
+	legacyFiles bool
 	// walFrom, when set, are the members whose archive holds the WAL: the
 	// PostgreSQL primary's host; the others list nothing.
 	walFrom map[string]bool
@@ -162,6 +165,13 @@ func (c *fakeCluster) storeFile(content string) string {
 	return path
 }
 
+// storeAttachment adds or replaces an attachment, named by its path.
+func (c *fakeCluster) storeAttachment(path, content string) {
+	c.mu.Lock()
+	c.files["attachments/"+path] = []byte(content)
+	c.mu.Unlock()
+}
+
 // checkpoint takes one checkpoint, as the coordinator does: the barrier,
 // the table at it, PostgreSQL's position and restore point, the WAL
 // switch, the artifacts, the position entry.
@@ -184,7 +194,11 @@ func (c *fakeCluster) checkpoint() reftable.CheckpointRecord {
 	var files []clusterhook.FileEntry
 	for k, v := range c.files {
 		storage, path, _ := strings.Cut(k, "/")
-		files = append(files, clusterhook.FileEntry{Storage: storage, Path: path, Size: int64(len(v))})
+		f := clusterhook.FileEntry{Storage: storage, Path: path, Size: int64(len(v))}
+		if storage == "attachments" && !c.legacyFiles {
+			f.SHA256 = digest(v)
+		}
+		files = append(files, f)
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	manifest, _ := json.Marshal(clusterhook.FilesManifest{Checkpoint: name, Files: files})
