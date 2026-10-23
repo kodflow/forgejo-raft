@@ -80,6 +80,10 @@ func TestEngineMetricsReachPrometheus(t *testing.T) {
 		_, _, err := nodes[leader].Propose(ctx, []byte("x"))
 		require.NoError(t, err)
 	}
+	// The size a cut is held to reaches Forgejo's health, far from it here.
+	h := Wrap(nodes[leader], "a").Health()
+	assert.Equal(t, int64(1<<30), h.SnapshotLimit)
+	assert.False(t, h.SnapshotNearLimit)
 	reg := prometheus.NewRegistry()
 	lm := meters[leader]
 	require.NoError(t, reg.Register(engineCollector{meter: func() sdkmetrics.FullMeter { return lm }}))

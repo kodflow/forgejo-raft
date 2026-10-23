@@ -687,6 +687,9 @@ func runClusterStatus(ctx context.Context, c *cli.Command) error {
 	for _, a := range v.Alarms {
 		fmt.Fprintf(w, "  alarm %d %s %v\n", a.ID, a.Kind, a.Nodes)
 	}
+	if v.SnapshotNearLimit {
+		fmt.Fprintf(w, "  snapshot %d bytes, near its limit of %d: raise [cluster] MAX_SNAPSHOT_BYTES on every member before the cuts are refused\n", v.SnapshotBytes, v.SnapshotLimit)
+	}
 	// What a joining node puts in [cluster] PEER_PINS to trust these members.
 	var pins []string
 	for _, m := range v.Members {

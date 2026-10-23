@@ -248,7 +248,7 @@ func TestSelfJoinOverTCPTrustsOnlyPinnedMembers(t *testing.T) {
 	open := func(slot string) (*part, sdk.NodeID, sdk.Incarnation, [32]byte) {
 		file, spki := pki.issue(t, cluster.String(), slot)
 		p := &part{r: newReplicator(t.TempDir(), newRegistry(time.Second, 8, 64))}
-		dd, err := sdk.NewDataDir(filepath.Join(t.TempDir(), "data"))
+		dd, err := sdk.NewDataDirWith(filepath.Join(t.TempDir(), "data"), sdk.DataDirOptions{RuntimeDir: kitsunium.RuntimeDir})
 		require.NoError(t, err)
 		p.dd = dd
 		tr, err := sdk.NewTCPTransportFromPEM(file, file, pki.caFile, &sdk.TransportConfig{ListenAddress: "127.0.0.1:0"})

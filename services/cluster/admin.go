@@ -124,9 +124,14 @@ type View struct {
 	EventQueueMax   int64
 	EventQueueAlarm bool
 	ApplyLagEntries uint64
-	Lag             []RepoLag
-	Audit           []reftable.AuditRecord
-	Started         time.Time
+	// SnapshotBytes is the newest consensus snapshot's size, SnapshotLimit
+	// the size its cuts are held to; SnapshotNearLimit past four fifths.
+	SnapshotBytes     int64
+	SnapshotLimit     int64
+	SnapshotNearLimit bool
+	Lag               []RepoLag
+	Audit             []reftable.AuditRecord
+	Started           time.Time
 	// ExpectedNodes is [cluster] EXPECTED_NODES, 0 in the manual mode, and
 	// VoterTarget the voters the rule wants with the members present.
 	ExpectedNodes int
@@ -183,6 +188,7 @@ func (r *Replicator) View(ctx context.Context) View {
 	v.PayloadVersion, v.PayloadMax = r.table.WriteVersion(), reftable.PayloadVersion
 	v.FailureTolerance, v.QuorumReachable, v.Stopped, v.StopReason = h.FailureTolerance, h.QuorumReachable, h.Stopped, h.StopReason
 	v.ApplyLagEntries = h.ApplyLagEntries
+	v.SnapshotBytes, v.SnapshotLimit, v.SnapshotNearLimit = h.SnapshotBytes, h.SnapshotLimit, h.SnapshotNearLimit
 	for _, a := range h.Alarms {
 		av := AlarmView{ID: uint64(a.ID), Kind: a.Kind}
 		for _, n := range a.Nodes {

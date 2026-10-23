@@ -405,6 +405,8 @@ type leaderlessEngine struct{ consensus.Engine }
 
 func (leaderlessEngine) Health() consensus.Health { return consensus.Health{} }
 
+func (leaderlessEngine) Status() consensus.Status { return consensus.Status{} }
+
 func (leaderlessEngine) Barrier(ctx context.Context) (consensus.Token, error) {
 	<-ctx.Done()
 	return consensus.Token{}, ctx.Err()

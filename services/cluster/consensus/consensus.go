@@ -261,6 +261,13 @@ type Health struct {
 	Identity       LogIdentity
 	ContractGen    uint64
 	ClusterVersion uint32
+	// SnapshotBytes is the size of the newest snapshot the node holds, and
+	// SnapshotLimit the size a cut is held to now: MAX_SNAPSHOT_BYTES, or
+	// the smallest a member announces. SnapshotNearLimit is set past four
+	// fifths of it, before the cuts are refused (R2-30).
+	SnapshotBytes     int64
+	SnapshotLimit     int64
+	SnapshotNearLimit bool
 }
 
 // Precondition names what a clearing or raising operation acts on, scoped by
@@ -386,8 +393,12 @@ type Report struct {
 	BootstrapPending bool
 	HardTerm         uint64
 	LastIndex        uint64
-	Snapshot         *SnapshotMeta
-	Quarantined      bool
+	// LastTerm is the term of the entry at LastIndex: with it, the key a
+	// Recover's survivor is chosen by, (LastTerm, LastIndex) in that order,
+	// never HardTerm, the term of the last vote.
+	LastTerm    uint64
+	Snapshot    *SnapshotMeta
+	Quarantined bool
 	// Markers names the stop markers of the directory, which only an
 	// operator clears: STOP-RECOVER for a Recover interrupted before it
 	// completed.

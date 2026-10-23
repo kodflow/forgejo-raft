@@ -52,4 +52,5 @@ func TestAnInterruptedBootstrapIsReportedAndResumes(t *testing.T) {
 	assert.False(t, rep.BootstrapPending)
 	assert.False(t, rep.Joining)
 	assert.Equal(t, uint64(1), rep.LastIndex, "the founding entry")
+	assert.Equal(t, uint64(1), rep.LastTerm, "the founding entry's term, the key of a Recover's survivor with LastIndex")
 }
