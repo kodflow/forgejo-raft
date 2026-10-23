@@ -46,11 +46,15 @@ import (
 // SQL committed after step 4 is past L, whatever entry it derives from.
 // Followers' pushes are ordered after B by the log, and their SQL is held
 // by the consumer. A deletion, a rename or a transfer writes its own SQL
-// beside its entry, on any member: it holds the cluster's cut across
-// both, which the coordinator takes with the fence (cut.go), so both fall
-// on one side of (B, L). What else a web request writes to SQL beside a
-// push is reconciled after a Recover (doctor, pull request heads). Nothing
-// here waits on an observer.
+// beside its entry, on any member, and a creation, a fork or a generation
+// from a template writes a repository's refs inside the transaction of its
+// row: each holds the cluster's cut across both, which the coordinator
+// takes with the fence (cut.go), so both fall on one side of (B, L). The
+// branch rows a mirror's synchronisation or a migration writes long after
+// their refs derive from the refs, and a Recover derives them again (#159).
+// What else a web request writes to SQL beside a push is reconciled after
+// a Recover (doctor, pull request heads). Nothing here waits on an
+// observer.
 
 // readToCommitBound is how long the position may take to commit once read:
 // a checkpoint that exceeds it is discarded and taken again.
@@ -90,8 +94,9 @@ type coordinator struct {
 	interval time.Duration
 	dir      string
 	wal      walSource
-	// files lists the stored files after the fence; tests replace it.
-	files func() ([]clusterhook.FileEntry, error)
+	// files lists the stored files after the fence, under the cut; their
+	// digests are read once it is released. Tests replace it.
+	files func() (*storedListing, error)
 	now   func() time.Time
 	// backup records the backup cursor; tests replace it.
 	backup func(ctx context.Context, name string, next cluster_model.Cursor) error
@@ -274,15 +279,23 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 	// would otherwise freeze the leader's writers for its whole length.
 	// The cut is still held: no stored file is deleted until the walk
 	// ends, so the list holds every file the SQL at L names (#90), plus
-	// files added since, which a restore ignores.
+	// files added since, which a restore ignores. The digests of the
+	// attachments are read once the cut is released: the cut guarantees
+	// the files are listed, not how long they take to read, and a first
+	// checkpoint on a new leader reads every one of them (#161).
 	release()
-	files, err := c.files()
+	listing, err := c.files()
 	unlockCut()
 	if err != nil {
 		return reftable.CheckpointRecord{}, fmt.Errorf("listing the stored files: %w", err)
 	}
-	// The bound counts from the end of the walk: its length depends on the
-	// storage, not on the cluster, and must not discard every checkpoint.
+	files, err := listing.digest()
+	if err != nil {
+		return reftable.CheckpointRecord{}, fmt.Errorf("reading the stored files' digests: %w", err)
+	}
+	// The bound counts from the end of the walk and of the digests: their
+	// length depends on the storage, not on the cluster, and must not
+	// discard every checkpoint.
 	listedAt := c.now()
 	if err := c.wal.SwitchWAL(ctx); err != nil {
 		log.Warn("cluster checkpoint: switching the WAL segment: %v", err)
@@ -627,7 +640,7 @@ func storageTemporaryPath(st *setting.Storage) string {
 }
 
 // storedFiles lists every stored file, by storage and relative path.
-func storedFiles() ([]clusterhook.FileEntry, error) {
+func storedFiles() (*storedListing, error) {
 	sts, err := storageConfigs()
 	if err != nil {
 		return nil, err
@@ -651,21 +664,21 @@ type digestEntry struct {
 
 var storedDigests = &digestCache{sums: map[string]digestEntry{}}
 
-func (c *digestCache) of(path string, info fs.FileInfo) (string, error) {
+// cached is the digest kept for a file still of this size and time.
+func (c *digestCache) cached(path string, info fs.FileInfo) (string, bool) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	e, ok := c.sums[path]
-	c.mu.Unlock()
-	if ok && e.size == info.Size() && e.mtime == info.ModTime().UnixNano() {
-		return e.sum, nil
+	if !ok || e.size != info.Size() || e.mtime != info.ModTime().UnixNano() {
+		return "", false
 	}
-	sum, err := fileDigest(path)
-	if err != nil {
-		return "", err
-	}
+	return e.sum, true
+}
+
+func (c *digestCache) put(path string, info fs.FileInfo, sum string) {
 	c.mu.Lock()
 	c.sums[path] = digestEntry{size: info.Size(), mtime: info.ModTime().UnixNano(), sum: sum}
 	c.mu.Unlock()
-	return sum, nil
 }
 
 // keep forgets the files a listing did not see: they are gone.
@@ -679,14 +692,101 @@ func (c *digestCache) keep(seen map[string]bool) {
 	}
 }
 
+// storedListing is the stored files as a walk found them. The digests of
+// the attachments the cache did not hold are read by digest, after the
+// walk and outside the checkpoint's cut (#161).
+type storedListing struct {
+	files   []clusterhook.FileEntry
+	pending []pendingDigest
+	// seen is every attachment listed, which the cache keeps.
+	seen map[string]bool
+	// read reads one file's digest; tests replace it.
+	read func(path string) (string, error)
+}
+
+// pendingDigest is an attachment whose digest is still to be read: the
+// file at path, as the walk found it, listed at files[at].
+type pendingDigest struct {
+	at   int
+	path string
+	info fs.FileInfo
+}
+
+// digest reads the digests the walk left out, and returns the files. A
+// file is read only if it is still the one the walk listed: one gone or
+// changed since fails the checkpoint, which the next period takes again,
+// the digests read so far cached. The cut no longer holds the deletions
+// back, and a file the SQL at L names may have gone meanwhile: listing it
+// without its digest would leave the observer to take it as it comes, and
+// leaving it out would lose it.
+func (l *storedListing) digest() ([]clusterhook.FileEntry, error) {
+	if l == nil {
+		return nil, nil
+	}
+	read := l.read
+	if read == nil {
+		read = fileDigest
+	}
+	var errs []error
+	for _, p := range l.pending {
+		sum, err := l.readListed(p, read)
+		if err != nil {
+			f := l.files[p.at]
+			errs = append(errs, fmt.Errorf("%s/%s: %w", f.Storage, f.Path, err))
+			continue
+		}
+		storedDigests.put(p.path, p.info, sum)
+		l.files[p.at].SHA256 = sum
+	}
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+	storedDigests.keep(l.seen)
+	return l.files, nil
+}
+
+func (l *storedListing) readListed(p pendingDigest, read func(string) (string, error)) (string, error) {
+	unchanged := func() error {
+		info, err := os.Stat(p.path)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return errors.New("listed, and gone before its digest was read")
+		case err != nil:
+			return err
+		case info.Size() != p.info.Size() || !info.ModTime().Equal(p.info.ModTime()):
+			return errors.New("listed, and changed before its digest was read")
+		}
+		return nil
+	}
+	if err := unchanged(); err != nil {
+		return "", err
+	}
+	sum, err := read(p.path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", errors.New("listed, and gone before its digest was read")
+		}
+		return "", err
+	}
+	// Read whole, and still the file listed: the digest is its own.
+	if err := unchanged(); err != nil {
+		return "", err
+	}
+	return sum, nil
+}
+
 // listStoredFiles walks each storage root. An upload in flight lives in
 // the storage's temporary directory until it is renamed: listing it would
 // name a file that is gone, or partial, when an observer asks for it, and
-// fail the whole checkpoint.
-func listStoredFiles(roots map[string]*setting.Storage) ([]clusterhook.FileEntry, error) {
-	var out []clusterhook.FileEntry
-	seen := map[string]bool{}
-	defer storedDigests.keep(seen)
+// fail the whole checkpoint. It reads no file: an attachment's digest is
+// taken from the cache, or left to the listing's digest.
+func listStoredFiles(roots map[string]*setting.Storage) (*storedListing, error) {
+	type listed struct {
+		e    clusterhook.FileEntry
+		path string
+		info fs.FileInfo
+	}
+	var found []listed
 	for name, st := range roots {
 		root, tmp := st.Path, storageTemporaryPath(st)
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -710,27 +810,33 @@ func listStoredFiles(roots map[string]*setting.Storage) ([]clusterhook.FileEntry
 			if err != nil {
 				return err
 			}
-			e := clusterhook.FileEntry{Storage: name, Path: filepath.ToSlash(rel), Size: info.Size()}
-			// An LFS object's or a package blob's path is its digest; an
-			// attachment's is not, and its digest is listed (#106).
-			if name == StorageAttachments {
-				if e.SHA256, err = storedDigests.of(path, info); err != nil {
-					return err
-				}
-				seen[path] = true
-			}
-			out = append(out, e)
+			found = append(found, listed{clusterhook.FileEntry{Storage: name, Path: filepath.ToSlash(rel), Size: info.Size()}, path, info})
 			return nil
 		})
 		if err != nil {
 			return nil, err
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Storage != out[j].Storage {
-			return out[i].Storage < out[j].Storage
+	sort.Slice(found, func(i, j int) bool {
+		if found[i].e.Storage != found[j].e.Storage {
+			return found[i].e.Storage < found[j].e.Storage
 		}
-		return out[i].Path < out[j].Path
+		return found[i].e.Path < found[j].e.Path
 	})
-	return out, nil
+	l := &storedListing{files: make([]clusterhook.FileEntry, len(found)), seen: map[string]bool{}}
+	for i, f := range found {
+		l.files[i] = f.e
+		// An LFS object's or a package blob's path is its digest; an
+		// attachment's is not, and its digest is listed (#106).
+		if f.e.Storage != StorageAttachments {
+			continue
+		}
+		l.seen[f.path] = true
+		if sum, ok := storedDigests.cached(f.path, f.info); ok {
+			l.files[i].SHA256 = sum
+			continue
+		}
+		l.pending = append(l.pending, pendingDigest{at: i, path: f.path, info: f.info})
+	}
+	return l, nil
 }

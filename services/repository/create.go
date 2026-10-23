@@ -248,6 +248,16 @@ func CreateRepositoryDirectly(ctx context.Context, doer, u *user_model.User, opt
 	// failed creation then removes it, from the cluster's table too.
 	initialized := false
 
+	// In a cluster, an initialised repository's refs go into the
+	// replicated table during the transaction that commits its row: both
+	// fall on the same side of a checkpoint, the removal of a failed
+	// creation included (#159).
+	releaseCut, err := clusterhook.HoldCut(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseCut()
+
 	if err := db.WithTx(ctx, func(ctx context.Context) error {
 		if err := repo_module.CreateRepositoryByExample(ctx, doer, u, repo, false, false); err != nil {
 			return err

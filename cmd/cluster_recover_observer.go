@@ -24,9 +24,13 @@ import (
 	cluster_model "forgejo.org/models/cluster"
 	"forgejo.org/models/db"
 	gitea_migrations_model "forgejo.org/models/gitea_migrations"
+	repo_model "forgejo.org/models/repo"
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/generate"
+	"forgejo.org/modules/git"
+	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/json"
+	repo_module "forgejo.org/modules/repository"
 	"forgejo.org/modules/setting"
 	"forgejo.org/services/cluster"
 	"forgejo.org/services/cluster/consensus"
@@ -321,9 +325,14 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		}
 	}
 
-	// 6. Verify the import: refs and SQL rows match, every LFS object is
-	// here, every 2FA secret opens; then every token is revoked.
+	// 6. Verify the import: refs and SQL rows match, the rows that derive
+	// from the refs derived again, every LFS object is here, every 2FA
+	// secret opens; then every token is revoked.
 	if !prog.done(stepVerify) {
+		// Deriving branch rows reads the restored repositories with git.
+		if err := git.InitSimple(ctx); err != nil {
+			return err
+		}
 		if err := verifyRecovered(ctx, m, w); err != nil {
 			return err
 		}
@@ -699,21 +708,20 @@ func storedPresent(what, root string, keys []string, rel func(string) string) (i
 	return n, nil
 }
 
-// verifyRecovered checks what the recovery restored, then revokes every
-// token: a recovered forge trusts none it held.
-func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Write([]byte) (int, error) }) error {
-	e := db.GetEngine(ctx)
-	rows, err := e.Query(`SELECT r.owner_name AS owner, r.lower_name AS repo, b.name AS branch, b.commit_id AS sha
+// branchMismatch compares the branch rows of SQL with the refs/heads of
+// the checkpoint, and returns what differs, the repositories it differs
+// in, and how many branches the refs hold.
+func branchMismatch(ctx context.Context, m *observer.Manifest) (mismatch []string, repos map[string]bool, refs int, err error) {
+	rows, err := db.GetEngine(ctx).Query(`SELECT r.owner_name AS owner, r.lower_name AS repo, b.name AS branch, b.commit_id AS sha
 		FROM branch b JOIN repository r ON r.id = b.repo_id WHERE b.is_deleted = ?`, false)
 	if err != nil {
-		return err
+		return nil, nil, 0, err
 	}
 	sql := map[string]string{}
 	for _, r := range rows {
 		sql[strings.ToLower(string(r["owner"]))+"/"+string(r["repo"])+".git refs/heads/"+string(r["branch"])] = string(r["sha"])
 	}
-	var mismatch []string
-	refs := 0
+	repos = map[string]bool{}
 	for repo, rm := range m.Repos {
 		if strings.HasSuffix(repo, ".wiki.git") {
 			continue
@@ -726,17 +734,99 @@ func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Wri
 			key := repo + " " + ref
 			if sql[key] != sha {
 				mismatch = append(mismatch, fmt.Sprintf("%s: refs %s, SQL %q", key, sha, sql[key]))
+				repos[repo] = true
 			}
 			delete(sql, key)
 		}
 	}
 	for key := range sql {
 		mismatch = append(mismatch, key+": in SQL, not in the refs")
+		repo, _, _ := strings.Cut(key, " ")
+		repos[repo] = true
+	}
+	sort.Strings(mismatch)
+	return mismatch, repos, refs, nil
+}
+
+// verifyBranches checks that the branch rows of SQL at L are the refs at
+// B. Some rows are written long after the refs they describe, by no
+// operation that holds the cut: a mirror's synchronisation writes them
+// after its fetch and its LFS objects, a migration after its clone and its
+// wiki, and the consumer derives none from a push it parked (#159). Those
+// rows derive from the refs: the branches of a repository SQL holds and
+// the checkpoint restored are synchronised with its restored refs, as the
+// mirror or the migration would have done, and the comparison runs again.
+// What does not derive from the refs is still refused: refs of a
+// repository SQL does not hold, rows of a repository the checkpoint does
+// not hold, which a deletion, a rename, a transfer or a creation cut in
+// two leaves (#88).
+func verifyBranches(ctx context.Context, m *observer.Manifest, w interface{ Write([]byte) (int, error) }) error {
+	mismatch, repos, refs, err := branchMismatch(ctx, m)
+	if err != nil {
+		return err
+	}
+	if len(mismatch) > 0 {
+		keys := make([]string, 0, len(repos))
+		for repo := range repos {
+			keys = append(keys, repo)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			done, err := syncRestoredBranches(ctx, key)
+			if err != nil {
+				return fmt.Errorf("deriving the branch rows of %s from its restored refs: %w", key, err)
+			}
+			if done {
+				fmt.Fprintf(w, "reconciled: %s, its branch rows derived from its restored refs\n", key)
+			}
+		}
+		if mismatch, _, refs, err = branchMismatch(ctx, m); err != nil {
+			return err
+		}
 	}
 	if len(mismatch) > 0 {
 		return fmt.Errorf("the refs and the SQL rows differ at the checkpoint:\n  %s", strings.Join(mismatch, "\n  "))
 	}
 	fmt.Fprintf(w, "verified: %d branches, refs and SQL rows match\n", refs)
+	return nil
+}
+
+// syncRestoredBranches derives the branch rows of key, owner/name.git,
+// from its restored refs, when SQL holds the repository and the checkpoint
+// restored it; false when either is missing.
+func syncRestoredBranches(ctx context.Context, key string) (bool, error) {
+	owner, name, ok := strings.Cut(strings.TrimSuffix(key, ".git"), "/")
+	if !ok {
+		return false, nil
+	}
+	repo, err := repo_model.GetRepositoryByOwnerAndName(ctx, owner, name)
+	if repo_model.IsErrRepoNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if _, err := os.Stat(filepath.Join(repo.RepoPath(), "HEAD")); err != nil {
+		return false, nil
+	}
+	gitRepo, err := gitrepo.OpenRepository(ctx, repo)
+	if err != nil {
+		return false, err
+	}
+	defer gitRepo.Close()
+	if _, err := repo_module.SyncRepoBranchesWithRepo(ctx, repo, gitRepo, 0); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// verifyRecovered checks what the recovery restored, then revokes every
+// token: a recovered forge trusts none it held.
+func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Write([]byte) (int, error) }) error {
+	e := db.GetEngine(ctx)
+	if err := verifyBranches(ctx, m, w); err != nil {
+		return err
+	}
 	if err := verifyRestoredRepos(ctx, m, setting.RepoRootPath, w); err != nil {
 		return err
 	}

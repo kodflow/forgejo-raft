@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"forgejo.org/modules/clusterhook"
+	"forgejo.org/modules/json"
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/storage"
 	"forgejo.org/services/cluster/consensus"
@@ -236,7 +237,7 @@ func TestCheckpointListsEveryFileTheSQLAtLNames(t *testing.T) {
 			r := tc.nodes[tt.node].r
 			storage.SetDeleteGate(r.gateDelete)
 			t.Cleanup(func() { storage.SetDeleteGate(nil) })
-			coord.files = func() ([]clusterhook.FileEntry, error) {
+			coord.files = func() (*storedListing, error) {
 				// A walk that takes its time on a large storage.
 				time.Sleep(300 * time.Millisecond)
 				return listStoredFiles(map[string]*setting.Storage{tt.storage: cfg})
@@ -272,4 +273,116 @@ func TestCheckpointListsEveryFileTheSQLAtLNames(t *testing.T) {
 			assert.Contains(t, string(b), `"`+tt.path+`"`, "checkpoint %s at L=%s: files.json misses a file the SQL at L names", rec.Name(), rec.LSN)
 		})
 	}
+}
+
+// attachmentsAt is an attachments storage holding files, by path.
+func attachmentsAt(t *testing.T, files map[string]string) *setting.Storage {
+	t.Helper()
+	cfg := &setting.Storage{Type: setting.LocalStorageType, Path: t.TempDir()}
+	for p, content := range files {
+		require.NoError(t, os.MkdirAll(filepath.Join(cfg.Path, filepath.Dir(p)), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(cfg.Path, p), []byte(content), 0o644))
+	}
+	return cfg
+}
+
+// The digests of the attachments are read once the cut is released: a
+// first checkpoint on a new leader reads every attachment, and a deletion,
+// a rename, a transfer or the deletion of a stored file on any member
+// does not wait for it (#161).
+func TestCheckpointReadsTheDigestsOutsideTheCut(t *testing.T) {
+	// Not in parallel: the digests' cache is the process's, and a
+	// checkpoint forgets what its listing did not see.
+	ctx := context.Background()
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	pg := newFakePG()
+	coord := withCheckpoints(t, tc, pg)
+	cfg := attachmentsAt(t, map[string]string{"a/b/ab000001": "release binary", "c/d/cd000002": "another one"})
+	follower := tc.nodes[1].r
+	var reads []string
+	var held []error
+	coord.files = func() (*storedListing, error) {
+		l, err := listStoredFiles(map[string]*setting.Storage{StorageAttachments: cfg})
+		if l != nil {
+			l.read = func(path string) (string, error) {
+				// A deletion on a follower takes the cut while the
+				// digest is read, without waiting.
+				hctx, cancel := context.WithTimeout(ctx, time.Second)
+				defer cancel()
+				release, err := follower.holdCut(hctx)
+				if err == nil {
+					release()
+				}
+				held = append(held, err)
+				reads = append(reads, filepath.Base(path))
+				return fileDigest(path)
+			}
+		}
+		return l, err
+	}
+	rec, err := coord.take(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"ab000001", "cd000002"}, reads, "every attachment the cache did not hold is read")
+	for _, err := range held {
+		require.NoError(t, err, "the cut was held while the digests were read")
+	}
+	b, err := os.ReadFile(filepath.Join(coord.dir, rec.Name(), "files.json"))
+	require.NoError(t, err)
+	var fm clusterhook.FilesManifest
+	require.NoError(t, json.Unmarshal(b, &fm))
+	require.Len(t, fm.Files, 2)
+	assert.Equal(t, sha256Hex([]byte("release binary")), fm.Files[0].SHA256)
+	assert.Equal(t, sha256Hex([]byte("another one")), fm.Files[1].SHA256)
+
+	// The next checkpoint reads nothing again.
+	reads = nil
+	_, err = coord.take(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, reads, "the digests are cached")
+}
+
+// An attachment listed and deleted before its digest is read fails the
+// checkpoint: the SQL at L may name it, and a manifest without its digest
+// or without it would not restore it. The digests read are kept, and the
+// next period's checkpoint, which no longer lists it, closes (#161).
+func TestCheckpointRetriesAnAttachmentGoneBeforeItsDigest(t *testing.T) {
+	// Not in parallel: the digests' cache is the process's, and a
+	// checkpoint forgets what its listing did not see.
+	ctx := context.Background()
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	pg := newFakePG()
+	coord := withCheckpoints(t, tc, pg)
+	cfg := attachmentsAt(t, map[string]string{"a/b/ab000003": "kept", "c/d/cd000004": "deleted meanwhile"})
+	local, err := storage.NewLocalStorage(ctx, cfg)
+	require.NoError(t, err)
+	follower := tc.nodes[1].r
+	reads := 0
+	deleteOnRead := true
+	coord.files = func() (*storedListing, error) {
+		l, err := listStoredFiles(map[string]*setting.Storage{StorageAttachments: cfg})
+		if l != nil {
+			l.read = func(path string) (string, error) {
+				reads++
+				if deleteOnRead {
+					deleteOnRead = false
+					// The deletion of the other attachment, on a follower,
+					// through the deletion gate: it does not wait.
+					require.NoError(t, follower.gateDelete(func() error { return local.Delete("c/d/cd000004") }))
+				}
+				return fileDigest(path)
+			}
+		}
+		return l, err
+	}
+	_, err = coord.take(ctx)
+	require.ErrorContains(t, err, "cd000004: listed, and gone before its digest was read")
+	assert.Equal(t, 1, reads)
+
+	rec, err := coord.take(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, reads, "the digest read by the failed checkpoint is kept")
+	b, err := os.ReadFile(filepath.Join(coord.dir, rec.Name(), "files.json"))
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "ab000003")
+	assert.NotContains(t, string(b), "cd000004")
 }

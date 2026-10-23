@@ -113,6 +113,17 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 		}
 	}
 
+	// In a cluster, the fork's refs go into the replicated table during
+	// the transaction that commits its repository row: both fall on the
+	// same side of a checkpoint, the removal of an abandoned fork
+	// included, or a restore finds refs SQL does not name (#159). It is
+	// released last, after any undo.
+	releaseCut, err := clusterhook.HoldCut(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseCut()
+
 	needsRollbackInPanic := true
 	defer func() {
 		panicErr := recover()

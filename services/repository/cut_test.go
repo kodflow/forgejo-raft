@@ -6,14 +6,18 @@ package repository
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"forgejo.org/models/db"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unittest"
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/clusterhook"
+	"forgejo.org/modules/queue"
 	"forgejo.org/modules/storage"
 	"forgejo.org/services/feed"
 
@@ -113,4 +117,68 @@ func TestLifecycleHoldsTheCheckpointCut(t *testing.T) {
 		assert.Contains(t, l.events, "moved org3/repo3.git->user2/repo3.git held=1")
 		assert.Zero(t, l.heldNow())
 	})
+}
+
+// holdSpan records, when the cut is taken and when it is released, whether
+// the repository owner/name has its row and its directory.
+func holdSpan(t *testing.T, owner, name string) *cutLog {
+	l := &cutLog{}
+	state := func() string {
+		row, err := db.GetEngine(db.DefaultContext).Where("owner_name = ? AND lower_name = ?", owner, name).Exist(&repo_model.Repository{})
+		require.NoError(t, err)
+		_, statErr := os.Stat(filepath.Join(repo_model.RepoPath(owner, name), "HEAD"))
+		return fmt.Sprintf("row=%v dir=%v", row, statErr == nil)
+	}
+	clusterhook.SetCutHold(func(ctx context.Context) (func(), error) {
+		l.add("hold %s", state())
+		release, _ := l.hold(ctx)
+		return func() {
+			l.add("release %s", state())
+			release()
+		}, nil
+	})
+	t.Cleanup(func() { clusterhook.SetCutHold(nil) })
+	return l
+}
+
+// A fork, a creation and a generation from a template write the
+// repository's refs and commit its row in one SQL transaction: they hold
+// the checkpoint's cut from before the refs until the row committed, so a
+// checkpoint has both or neither (#159).
+func TestCreationsHoldTheCheckpointCut(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	t.Cleanup(func() { unittest.PrepareTestEnv(t) })
+	// The notifications of the fork and of the generation are delivered
+	// before the fixtures come back: delivered after, they would name
+	// repositories gone, and hold the queue back for the next tests.
+	t.Cleanup(func() { queue.GetManager().FlushAll(db.DefaultContext, 10*time.Second) })
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+
+	for _, tt := range []struct {
+		name, repo string
+		create     func() error
+	}{
+		{"fork", "fork-under-cut", func() error {
+			base := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 10})
+			require.NoError(t, base.LoadOwner(db.DefaultContext))
+			_, err := ForkRepositoryAndUpdates(db.DefaultContext, doer, doer, ForkRepoOptions{BaseRepo: base, Name: "fork-under-cut"})
+			return err
+		}},
+		{"creation", "created-under-cut", func() error {
+			_, err := CreateRepositoryDirectly(db.DefaultContext, doer, doer, CreateRepoOptions{Name: "created-under-cut"})
+			return err
+		}},
+		{"generation", "generated-under-cut", func() error {
+			tmpl := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 44})
+			_, err := GenerateRepository(db.DefaultContext, doer, doer, tmpl, GenerateRepoOptions{Name: "generated-under-cut", GitContent: true})
+			return err
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			l := holdSpan(t, "user2", tt.repo)
+			require.NoError(t, tt.create())
+			assert.Equal(t, []string{"hold row=false dir=false", "release row=true dir=true"}, l.events)
+			assert.Zero(t, l.heldNow(), "released once done")
+		})
+	}
 }

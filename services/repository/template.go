@@ -12,6 +12,7 @@ import (
 	issues_model "forgejo.org/models/issues"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/log"
 	notify_service "forgejo.org/services/notify"
 )
@@ -76,6 +77,14 @@ func GenerateRepository(ctx context.Context, doer, owner *user_model.User, templ
 	// failed generation then removes it, from the cluster's table too,
 	// as a failed creation does (#102).
 	initialized := false
+
+	// The generated refs and the repository's row fall on the same side
+	// of a checkpoint, as a creation's do (#159).
+	releaseCut, err := clusterhook.HoldCut(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseCut()
 	if err = db.WithTx(ctx, func(ctx context.Context) error {
 		generateRepo, err = generateRepository(ctx, doer, owner, templateRepo, opts)
 		// A repository is returned once its directory was found absent and
