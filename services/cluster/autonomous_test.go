@@ -286,9 +286,10 @@ func TestObjectChannelRefusesARevokedKey(t *testing.T) {
 		}
 	}
 	require.NoError(t, r.RaisePayloadVersion(context.Background(), "op"))
-	_, deferred, err := r.revokeMember(context.Background(), r.Engine(), OperatorFor(1), idB)
-	require.NoError(t, err)
-	require.False(t, deferred)
+	// An operator's Remove writes it once the member left; one admitted by a
+	// member whose table lagged still holds it (#70).
+	require.NoError(t, r.writeRevocation(context.Background(), reftable.RevokeKey{SPKI: hex.EncodeToString(keyB[:]), Slot: "node-b", Operator: string(OperatorFor(1)), Time: 1}))
+	require.Positive(t, Rank(r.Engine().Membership(), idB))
 	_, err = oc.admit(peer{Slot: "node-b", SPKI: keyB})
 	require.ErrorContains(t, err, "revoked")
 }

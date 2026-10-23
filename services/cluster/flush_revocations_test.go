@@ -52,6 +52,13 @@ func (e *followerEngine) WaitApplied(_ context.Context, tok consensus.Token) err
 	return nil
 }
 
+// Barrier stands for the leader's: everything proposed so far is committed.
+func (e *followerEngine) Barrier(context.Context) (consensus.Token, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return consensus.Token{Cluster: consensus.ClusterID{0x47}, Epoch: 1, Term: 1, Index: e.index}, nil
+}
+
 func (e *followerEngine) Membership() consensus.Membership { return consensus.Membership{} }
 
 // A raise proposed from a follower returns once the leader applied it: the
