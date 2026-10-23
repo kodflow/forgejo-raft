@@ -14,9 +14,11 @@ import (
 	"forgejo.org/models/unittest"
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/git"
+	"forgejo.org/services/cluster/reftable"
 	repo_service "forgejo.org/services/repository"
 	wiki_service "forgejo.org/services/wiki"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -102,13 +104,20 @@ func TestAWikiCreatedAgainAfterDeleteWikiData(t *testing.T) {
 		t.Errorf("creating the wiki again after Delete wiki data fails: %v", err)
 	}
 	for _, n := range tc.nodes {
-		v, ok := n.r.table.Get(wiki, branch)
-		if ok && v.Live() {
-			anc := git.NewCommand(ctx, "merge-base", "--is-ancestor").AddDynamicArguments(oldSHA, v.SHA)
-			_, _, aerr := anc.RunStdString(&git.RunOpts{Dir: filepath.Join(n.r.root, filepath.FromSlash(wiki))})
-			if v.SHA == oldSHA || aerr == nil {
-				t.Errorf("%s: the table's wiki %s = %s still holds the deleted history (old %s)", n.slot, branch, v.SHA, oldSHA)
-			}
+		// Every member holds the new wiki, in the table and in git: a
+		// member left without it would skip the history check below.
+		var v reftable.RefValue
+		if !assert.Eventually(t, func() bool {
+			var ok bool
+			v, ok = n.r.table.Get(wiki, branch)
+			return ok && v.Live() && dirExists(n, wiki) && gitRef(t, n, wiki, branch) == v.SHA
+		}, 10*time.Second, 20*time.Millisecond, "%s: the wiki created again is live and projected", n.slot) {
+			continue
+		}
+		anc := git.NewCommand(ctx, "merge-base", "--is-ancestor").AddDynamicArguments(oldSHA, v.SHA)
+		_, _, aerr := anc.RunStdString(&git.RunOpts{Dir: filepath.Join(n.r.root, filepath.FromSlash(wiki))})
+		if v.SHA == oldSHA || aerr == nil {
+			t.Errorf("%s: the table's wiki %s = %s still holds the deleted history (old %s)", n.slot, branch, v.SHA, oldSHA)
 		}
 	}
 }
