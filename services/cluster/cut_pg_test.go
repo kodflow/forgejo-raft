@@ -20,7 +20,8 @@ import (
 // holds nest, a checkpoint is refused while one is held, a hold waits
 // while a checkpoint holds the cut, and a hold whose context ends gives
 // up. It runs when FORGEJO_CLUSTER_TEST_PGSQL names a database, for
-// example postgres://postgres:postgres@127.0.0.1:5432/postgres.
+// example postgres://postgres:postgres@127.0.0.1:5432/postgres; it
+// changes that database's idle_in_transaction_session_timeout for a while.
 func TestCutOnPostgreSQL(t *testing.T) {
 	dsn := os.Getenv("FORGEJO_CLUSTER_TEST_PGSQL")
 	if dsn == "" {
@@ -35,11 +36,31 @@ func TestCutOnPostgreSQL(t *testing.T) {
 	a, b := member(), member()
 	ctx := context.Background()
 
+	// A hold outlives an idle_in_transaction_session_timeout set on the
+	// server: the operation it covers may take longer.
+	release, err := a.Shared(ctx)
+	require.NoError(t, err)
+	sqlDB, err := b.db()
+	require.NoError(t, err)
+	_, err = sqlDB.Exec("ALTER DATABASE postgres SET idle_in_transaction_session_timeout = '100ms'")
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = sqlDB.Exec("ALTER DATABASE postgres RESET idle_in_transaction_session_timeout") })
+	release()
+	sqlDB.SetMaxIdleConns(0) // new sessions read the new default
+	a = member()
+	idle, err := a.Shared(ctx)
+	require.NoError(t, err)
+	time.Sleep(300 * time.Millisecond)
+	_, ok, err := b.TryExclusive(ctx)
+	require.NoError(t, err)
+	assert.False(t, ok, "the idle hold still holds the cut")
+	idle()
+
 	r1, err := a.Shared(ctx)
 	require.NoError(t, err)
 	r2, err := b.Shared(ctx)
 	require.NoError(t, err, "holds on two members nest")
-	_, ok, err := b.TryExclusive(ctx)
+	_, ok, err = b.TryExclusive(ctx)
 	require.NoError(t, err)
 	assert.False(t, ok, "a checkpoint is refused while an operation holds the cut")
 	r1()

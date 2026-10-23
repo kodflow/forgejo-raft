@@ -77,7 +77,18 @@ func (p pgCut) begin() (*sql.Tx, error) {
 	}
 	// The transaction lives as long as the hold, not as the caller's
 	// context: database/sql rolls back a transaction whose context ends.
-	return sqlDB.BeginTx(context.Background(), nil)
+	tx, err := sqlDB.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, err
+	}
+	// It stays idle while the operation it covers runs: a server-wide
+	// idle_in_transaction_session_timeout would end it, and drop the
+	// cut, under the operation.
+	if _, err := tx.Exec("SET LOCAL idle_in_transaction_session_timeout = 0"); err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	return tx, nil
 }
 
 func (p pgCut) Shared(ctx context.Context) (func(), error) {
