@@ -54,6 +54,8 @@ type projector struct {
 	// grace were reported.
 	graceLogged bool
 	failures    map[string]string
+	// current is the repository the pass projects now, "" between them.
+	current string
 	// deletedAt holds the index of a repository's deletion until this node
 	// removed its directory: a key revived meanwhile by a rename finds the
 	// deleted repository's directory still there.
@@ -330,17 +332,33 @@ func (p *projector) pass(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		p.mu.Lock()
+		p.current = repo
+		p.mu.Unlock()
 		pctx, cancel := context.WithTimeout(ctx, projectBudget)
 		err := p.project(pctx, repo)
 		cancel()
+		p.mu.Lock()
+		p.current = ""
+		if err != nil {
+			p.failures[repo] = err.Error()
+		}
+		p.mu.Unlock()
 		if err != nil {
 			log.Warn("cluster: projecting %s: %v", repo, err)
-			p.mu.Lock()
-			p.failures[repo] = err.Error()
-			p.mu.Unlock()
 		}
 	}
 	p.notifyWaiters()
+}
+
+// WaitsBehind reports whether a repository's projection waits behind
+// another repository's in the serial pass: the pass projects another one
+// now, and the repository's own last projection did not fail. The
+// consumer does not count that wait against the repository (#137).
+func (p *projector) WaitsBehind(repo string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.current != "" && p.current != repo && p.failures[repo] == ""
 }
 
 // projectedKeys refuses to turn into a path a key, or a rename's source,

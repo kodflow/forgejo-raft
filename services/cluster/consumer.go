@@ -104,7 +104,14 @@ type consumer struct {
 		index uint64
 		repo  string
 		since time.Time
+		// waited is how long the repository waited for its own
+		// projection; last is when it was last counted.
+		waited time.Duration
+		last   time.Time
 	}
+	// waitsBehind reports a repository whose projection waits behind
+	// another repository's in the projector's serial pass; nil in tests.
+	waitsBehind func(repo string) bool
 }
 
 // projectionStallBound is how long the dispatcher waits for a repository
@@ -137,6 +144,7 @@ func newConsumer(r *Replicator) *consumer {
 		cursor:  cluster_model.GetCursor, advance: cluster_model.AdvanceCursor, tx: batchTx, inTx: db.InTransaction,
 		events:      r.table.Events,
 		projectedAt: r.projector.Projected,
+		waitsBehind: r.projector.WaitsBehind,
 		lineageNow: func() string {
 			_, id := r.table.Applied()
 			return id.String()
@@ -207,6 +215,8 @@ func (c *consumer) projected(evs []reftable.Event) bool {
 		}
 	}
 	idx := evs[0].Token.Index
+	// Read outside c.mu: it takes the projector's lock.
+	behind := waiting != "" && c.waitsBehind != nil && c.waitsBehind(waiting)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if waiting == "" {
@@ -223,11 +233,21 @@ func (c *consumer) projected(evs []reftable.Event) bool {
 		c.reasons[idx] = fmt.Sprintf("%s is still not projected; parked behind its stalled event", waiting)
 		return true
 	}
+	now := time.Now()
 	if c.stall.index != idx || c.stall.repo != waiting {
-		c.stall.index, c.stall.repo, c.stall.since = idx, waiting, time.Now()
+		c.stall.index, c.stall.repo, c.stall.since = idx, waiting, now
+		c.stall.waited, c.stall.last = 0, now
 		return false
 	}
-	if time.Since(c.stall.since) < projectionStallBound {
+	// The bound is the time the repository waited for its own projection:
+	// one behind another repository's long projection in the serial pass
+	// is not stalled, and parking it, then each one behind it, a bound
+	// each, parked healthy repositories (#137).
+	if !behind {
+		c.stall.waited += now.Sub(c.stall.last)
+	}
+	c.stall.last = now
+	if c.stall.waited < projectionStallBound {
 		return false
 	}
 	log.Error("cluster consumer: %s is still not projected at %d after %s; parking its event", waiting, idx, projectionStallBound)
