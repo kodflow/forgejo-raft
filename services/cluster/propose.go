@@ -802,12 +802,20 @@ func (r *Replicator) RaisePayloadVersion(ctx context.Context, op consensus.Opera
 	if err != nil {
 		return err
 	}
-	_, result, err := r.proposeCommand(ctx, data, func() bool { return r.table.WriteVersion() >= reftable.PayloadVersion })
+	tok, result, err := r.proposeCommand(ctx, data, func() bool { return r.table.WriteVersion() >= reftable.PayloadVersion })
 	if err != nil {
 		return err
 	}
 	if !result.OK {
 		return fmt.Errorf("the cluster refused it: %s", result.Reason)
+	}
+	// A proposal forwarded from a follower returns once the leader applied
+	// it: what follows the raise here, the pending revocations' flush,
+	// reads this node's table.
+	if eng := r.Engine(); eng != nil {
+		if err := eng.WaitApplied(ctx, tok); err != nil {
+			return fmt.Errorf("the payload version is raised, but this node did not apply it yet: %w", err)
+		}
 	}
 	return nil
 }
