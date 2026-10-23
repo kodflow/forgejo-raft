@@ -375,6 +375,52 @@ func TestRecoverEmptiesWhatItBegan(t *testing.T) {
 	assert.False(t, p.done(stepPG))
 }
 
+// A resumed step empties only the directories it recorded when it began:
+// a rerun naming another --pgdata or --pg-restore-dir, populated, is
+// refused, and that directory keeps what it holds (CodeRabbit on #121).
+func TestRecoverResumeEmptiesOnlyTheDirectoriesItBegan(t *testing.T) {
+	base := t.TempDir()
+	pg, rd, other := filepath.Join(base, "pg"), filepath.Join(base, "wal"), filepath.Join(base, "other")
+	for _, d := range []string{pg, rd, other} {
+		require.NoError(t, os.MkdirAll(d, 0o700))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(other, "keep"), []byte("data"), 0o600))
+	prog := &recoverProgress{}
+	var recorded []string
+	begin := func(step string, targets []string) error {
+		prog.Begun = append(prog.Begun, step)
+		prog.BegunTargets = map[string][]string{step: targets}
+		recorded = targets
+		return nil
+	}
+	_, err := preparePGTargets(prog, []string{other, rd}, begin)
+	require.ErrorContains(t, err, "is not empty")
+	assert.Empty(t, prog.Begun)
+
+	emptied, err := preparePGTargets(prog, []string{pg, rd}, begin)
+	require.NoError(t, err)
+	assert.Nil(t, emptied)
+	assert.Equal(t, []string{pg, rd}, recorded)
+	require.NoError(t, os.WriteFile(filepath.Join(pg, "PG_VERSION"), []byte("18"), 0o600))
+
+	// The rerun names another data directory: refused, nothing removed.
+	_, err = preparePGTargets(prog, []string{other, rd}, begin)
+	require.ErrorContains(t, err, "run it again with the same directories")
+	assert.FileExists(t, filepath.Join(other, "keep"))
+	assert.FileExists(t, filepath.Join(pg, "PG_VERSION"))
+
+	emptied, err = preparePGTargets(prog, []string{pg, rd}, begin)
+	require.NoError(t, err)
+	assert.Equal(t, []string{pg, rd}, emptied)
+	assert.NoFileExists(t, filepath.Join(pg, "PG_VERSION"))
+
+	// A progress file of an older binary names no directory: refused.
+	legacy := &recoverProgress{Begun: []string{stepPG}}
+	_, err = preparePGTargets(legacy, []string{other, rd}, begin)
+	require.ErrorContains(t, err, "did not record its directories")
+	assert.FileExists(t, filepath.Join(other, "keep"))
+}
+
 // The recovery's verification fails when a repository of the checkpoint,
 // an empty one included, has no restored directory (#114).
 func TestRecoverVerifiesEmptyRepositories(t *testing.T) {

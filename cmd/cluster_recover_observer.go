@@ -62,8 +62,11 @@ type recoverProgress struct {
 	Done       []string `json:"done"`
 	// Begun are the steps that started writing into a target they found
 	// empty: an interrupted one empties it again before it is replayed.
-	Begun   []string  `json:"begun,omitempty"`
-	Started time.Time `json:"started"`
+	Begun []string `json:"begun,omitempty"`
+	// BegunTargets are the directories each begun step found empty, the
+	// only ones a resumed run may empty again.
+	BegunTargets map[string][]string `json:"begun_targets,omitempty"`
+	Started      time.Time           `json:"started"`
 }
 
 func (p *recoverProgress) done(step string) bool { return slices.Contains(p.Done, step) }
@@ -133,8 +136,12 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		fmt.Fprintf(w, "done: %s\n", step)
 		return observer.WriteFileDurable(filepath.Join(out, progressFile), b)
 	}
-	begin := func(step string) error {
+	begin := func(step string, targets []string) error {
 		prog.Begun = append(prog.Begun, step)
+		if prog.BegunTargets == nil {
+			prog.BegunTargets = map[string][]string{}
+		}
+		prog.BegunTargets[step] = targets
 		b, _ := json.MarshalIndent(prog, "", "  ")
 		return observer.WriteFileDurable(filepath.Join(out, progressFile), b)
 	}
@@ -213,21 +220,12 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 	if !prog.done(stepPG) {
 		// The data directory and the restore directory are emptied again
 		// only when this recovery found them empty and began writing them.
-		targets := []string{c.String("pgdata"), restoreDir}
-		if prog.begun(stepPG) {
-			if err := emptyDirs(targets...); err != nil {
-				return err
-			}
-			fmt.Fprintf(w, "resuming: %s emptied of what the interrupted run wrote\n", strings.Join(targets, " and "))
-		} else {
-			for _, d := range targets {
-				if entries, err := os.ReadDir(d); err == nil && len(entries) > 0 {
-					return fmt.Errorf("%s is not empty", d)
-				}
-			}
-			if err := begin(stepPG); err != nil {
-				return err
-			}
+		resumed, err := preparePGTargets(prog, []string{c.String("pgdata"), restoreDir}, begin)
+		if err != nil {
+			return err
+		}
+		if resumed != nil {
+			fmt.Fprintf(w, "resuming: %s emptied of what the interrupted run wrote\n", strings.Join(resumed, " and "))
 		}
 		if err := archive.RestorePG(name, c.String("pgdata"), opt); err != nil {
 			return err
@@ -534,6 +532,39 @@ func runPGCtl(ctx context.Context, ctl, pgdata, action string) error {
 // system is the checkpoint's, it left recovery, and promoted past the
 // checkpoint's timeline, which PostgreSQL does only once the target is
 // reached (an unreached target stops it instead).
+// preparePGTargets readies the directories step 3 writes. A step not begun
+// yet requires them empty and records them, durably, before it writes. A
+// begun one empties again only the directories it recorded, and refuses
+// others: a mistyped flag on the rerun must not wipe a directory the
+// interrupted run never wrote. It returns the directories it emptied.
+func preparePGTargets(prog *recoverProgress, targets []string, begin func(string, []string) error) ([]string, error) {
+	step := stepPG
+	abs := make([]string, 0, len(targets))
+	for _, d := range targets {
+		a, err := filepath.Abs(d)
+		if err != nil {
+			return nil, err
+		}
+		abs = append(abs, a)
+	}
+	if !prog.begun(step) {
+		for _, d := range abs {
+			if entries, err := os.ReadDir(d); err == nil && len(entries) > 0 {
+				return nil, fmt.Errorf("%s is not empty", d)
+			}
+		}
+		return nil, begin(step, abs)
+	}
+	recorded, ok := prog.BegunTargets[step]
+	if !ok {
+		return nil, fmt.Errorf("the interrupted step %s did not record its directories (an older binary): empty %s yourself if it wrote them, and remove %s from begun in %s", step, strings.Join(abs, " and "), step, progressFile)
+	}
+	if !slices.Equal(recorded, abs) {
+		return nil, fmt.Errorf("the interrupted step %s wrote %s, not %s: run it again with the same directories", step, strings.Join(recorded, " and "), strings.Join(abs, " and "))
+	}
+	return abs, emptyDirs(abs...)
+}
+
 // emptyDirs removes what each directory holds, keeping the directory: a
 // data directory may be a mount point.
 func emptyDirs(dirs ...string) error {
