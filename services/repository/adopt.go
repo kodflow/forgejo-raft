@@ -9,12 +9,14 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"forgejo.org/models/db"
 	git_model "forgejo.org/models/git"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/container"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
@@ -102,9 +104,54 @@ func AdoptRepository(ctx context.Context, doer, u *user_model.User, opts CreateR
 		return nil, err
 	}
 
+	if err := bindAdoptedID(ctx, repo); err != nil {
+		return nil, err
+	}
+
 	notify_service.AdoptRepository(ctx, doer, u, repo)
 
 	return repo, nil
+}
+
+// bindAdoptedID gives the cluster the database ID of an adopted repository,
+// and of its wiki when there is one. A directory the cluster replicated
+// keeps the ID of the row it was written under, in the table and in every
+// node's stamp, until a write carries another; reads and pushes are
+// refused while the stamp names another ID than the database's (#82). The
+// adoption's own writes carry none: a repository whose row SQL lost
+// (failover, restore), adopted as `forgejo cluster reconcile` prescribes,
+// was refused on every node for good (#150). HEAD is written again as it
+// is, under the new ID, once the row is committed for the cluster's
+// consumer to find. Without a cluster it does nothing.
+func bindAdoptedID(ctx context.Context, repo *repo_model.Repository) error {
+	if !clusterhook.Enabled() {
+		return nil
+	}
+	for _, wiki := range []bool{false, true} {
+		dir := repo.RepoPath()
+		if wiki {
+			dir = repo.WikiPath()
+		}
+		if isDir, err := util.IsDir(dir); err != nil {
+			return fmt.Errorf("bindAdoptedID: %w", err)
+		} else if !isDir {
+			continue
+		}
+		head, _, err := git.NewCommand(ctx, "symbolic-ref", "HEAD").RunStdString(&git.RunOpts{Dir: dir})
+		if err != nil {
+			return fmt.Errorf("bindAdoptedID(git symbolic-ref HEAD): %s: %w", dir, err)
+		}
+		env := append(os.Environ(),
+			repo_module.EnvRepoID+"="+strconv.FormatInt(repo.ID, 10),
+			repo_module.EnvRepoIsWiki+"="+strconv.FormatBool(wiki),
+		)
+		if _, _, err := git.NewCommand(ctx, "symbolic-ref", "HEAD").AddDynamicArguments(strings.TrimSpace(head)).
+			SetDescription(fmt.Sprintf("bindAdoptedID(git symbolic-ref HEAD): %s", dir)).
+			RunStdString(&git.RunOpts{Dir: dir, Env: env}); err != nil {
+			return fmt.Errorf("the repository was adopted, but the cluster did not take its ID %d for %s, which stays refused: %w", repo.ID, dir, err)
+		}
+	}
+	return nil
 }
 
 func adoptRepository(ctx context.Context, repoPath string, repo *repo_model.Repository, defaultBranch string) (err error) {

@@ -366,6 +366,10 @@ These commands run with the server stopped, on the data directory.
   member kept are the repository's ONLY copy: restore it. Recreate its owner
   if SQL lost it too, then adopt the repository (Site administration >
   Repositories > Unadopted, or `POST /api/v1/admin/unadopted/{owner}/{repo}`).
+  The adoption writes the repository's HEAD, and its wiki's, again under the
+  new row's ID, which every member then binds to the directory: every node
+  refuses to serve a directory stamped with another ID than the database's,
+  and the lost row's ID stays in the stamps until a write carries the new one.
   Never use "delete unadopted" in a cluster: it removes one node's files and
   the projector brings them back. "Delete all repositories missing their Git
   files" and "Reinitialize all missing Git repositories" are not offered in
