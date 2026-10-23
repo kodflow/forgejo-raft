@@ -234,7 +234,11 @@ for w in 1 2; do
   dco exec -d -u 0 forgejo-r sh -c 'cd /etc/s6/gitea && . ./setup >/dev/null && exec su-exec git /usr/local/bin/gitea cluster witness serve --dir "$1" --listen "$2"' -- "/data/witness-$w" "127.0.0.1:748$((w + 1))"
   WKEY[w]="$KEY"
 done
-sleep 1
+# Detached, each server may take more than a second to listen: any HTTP
+# answer means it serves.
+for w in 1 2; do
+  wait_for 30 "witness $w serving" dco exec -T forgejo-r curl -s -o /dev/null "http://127.0.0.1:748$((w + 1))/v1/status"
+done
 dco exec -T -u 0 forgejo-r sh -c 'mkdir -p /data/receipts && chown git:git /data/receipts'
 echo "$VOTERS" | tr ',' '\n' | while IFS= read -r v; do
   for w in 1 2; do
