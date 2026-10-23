@@ -12,9 +12,15 @@
 # - sync/upstream is only ever pushed fast-forward. Once its last PR is
 #   merged it is an ancestor of `forgejo` and starts again from there; while a
 #   PR is still open, `forgejo` is merged into it first, then upstream.
-# - On a conflict, or when upstream changes .github/workflows (a push the
-#   GITHUB_TOKEN may not make, and where this repository's workflows live),
-#   the run fails and pushes nothing.
+# - A conflict in go.mod or go.sum alone is resolved three ways by
+#   .github/scripts/gomodmerge (this fork's lines kept, upstream's bumps
+#   taken), then go mod tidy rebuilds go.sum and every package must still
+#   load. Git merges go.mod line by line, so an upstream bump next to a line
+#   this fork added stopped the sync from 2026-10-19.
+# - On any other conflict, a replace both sides changed differently, or when
+#   upstream changes .github/workflows (a push the GITHUB_TOKEN may not make,
+#   and where this repository's workflows live), the run fails and pushes
+#   nothing.
 #
 # Tokens. A push or a PR made with the GITHUB_TOKEN starts no workflow, so
 # post-commit and cluster-checks would never report on the PR and auto-merge
@@ -67,6 +73,12 @@ jobs:
           # push starts the PR's checks.
           token: ${{ secrets.SYNC_TOKEN || github.token }}
 
+      # gomodmerge and go mod tidy, for a go.mod or go.sum conflict.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
       - name: Merge upstream into sync/upstream
         id: merge
         run: |
@@ -74,6 +86,34 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch --no-tags origin "+refs/heads/$SYNC_BRANCH:refs/remotes/origin/$SYNC_BRANCH" 2>/dev/null || true
+
+          # Settles a merge whose only conflicts are go.mod and go.sum; any
+          # other conflicted path, or a failing step, leaves it to a human.
+          resolve_gomod() {
+            local f mod=false sum=false tmp
+            while IFS= read -r f; do
+              case "$f" in
+                go.mod) mod=true ;;
+                go.sum) sum=true ;;
+                *) return 1 ;;
+              esac
+            done < <(git diff --name-only --diff-filter=U)
+            tmp="$(mktemp -d)"
+            if [ "$mod" = true ]; then
+              git show :1:go.mod > "$tmp/base" &&
+                git show :2:go.mod > "$tmp/ours" &&
+                git show :3:go.mod > "$tmp/theirs" &&
+                (cd .github/scripts/gomodmerge &&
+                  go run . "$tmp/base" "$tmp/ours" "$tmp/theirs") > "$tmp/go.mod" &&
+                cp "$tmp/go.mod" go.mod || return 1
+            fi
+            if [ "$sum" = true ]; then
+              # Both sides' checksums; tidy keeps only what the graph needs.
+              { git show :2:go.sum; git show :3:go.sum; } | sort -u > go.sum || return 1
+            fi
+            go mod tidy && go list -deps ./... > /dev/null && git add go.mod go.sum
+          }
+
           git remote add upstream "$UPSTREAM_URL"
           git fetch --no-tags upstream "$UPSTREAM_BRANCH"
           up="$(git rev-parse FETCH_HEAD)"
@@ -106,10 +146,14 @@ jobs:
               exit 1
             fi
             if ! git merge --no-edit --no-ff -m "Merge upstream forgejo/forgejo@${up:0:12}" "$up"; then
-              echo "::error::upstream does not merge cleanly into $SYNC_BRANCH; nothing was pushed. Conflicted files:"
-              git diff --name-only --diff-filter=U
-              git merge --abort
-              exit 1
+              if ! resolve_gomod; then
+                echo "::error::upstream does not merge cleanly into $SYNC_BRANCH; nothing was pushed. Conflicted files:"
+                git diff --name-only --diff-filter=U
+                git merge --abort
+                exit 1
+              fi
+              git commit --no-edit -q
+              echo "go.mod and go.sum merged three ways and tidied"
             fi
             echo "merged $(git rev-list --count "$mb..$up") upstream commits, up to ${up:0:12}"
           fi
