@@ -14,7 +14,9 @@
 //     changed the same one differently: that is a real conflict, and the
 //     command fails;
 //   - the go and toolchain directives take the higher version when both
-//     sides moved them, and a toolchain no newer than go is dropped.
+//     sides moved them, and a toolchain no newer than go is dropped;
+//   - a change THEIRS made to any other directive (exclude, retract, tool,
+//     godebug, ignore) is not merged: the command fails.
 //
 // The result still has to go through go mod tidy, which also rebuilds go.sum.
 package main
@@ -66,6 +68,9 @@ func Merge(base, ours, theirs []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if others(t) != others(b) {
+		return nil, errors.New("upstream changed an exclude, retract, tool, godebug or ignore directive: merge by hand")
+	}
 	if err := mergeGo(b, o, t); err != nil {
 		return nil, err
 	}
@@ -77,6 +82,27 @@ func Merge(base, ours, theirs []byte) ([]byte, error) {
 	}
 	o.Cleanup()
 	return modfile.Format(o.Syntax), nil
+}
+
+// others renders the directives Merge does not handle, in file order.
+func others(f *modfile.File) string {
+	var s strings.Builder
+	for _, e := range f.Exclude {
+		fmt.Fprintln(&s, "exclude", e.Mod)
+	}
+	for _, r := range f.Retract {
+		fmt.Fprintln(&s, "retract", r.Low, r.High, r.Rationale)
+	}
+	for _, t := range f.Tool {
+		fmt.Fprintln(&s, "tool", t.Path)
+	}
+	for _, g := range f.Godebug {
+		fmt.Fprintln(&s, "godebug", g.Key, g.Value)
+	}
+	for _, i := range f.Ignore {
+		fmt.Fprintln(&s, "ignore", i.Path)
+	}
+	return s.String()
 }
 
 func goVersion(f *modfile.File) string {

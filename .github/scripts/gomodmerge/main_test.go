@@ -104,6 +104,21 @@ func TestMergeReplaceChangedOnBothSides(t *testing.T) {
 	}
 }
 
+func TestMergeOtherDirectiveChangedUpstream(t *testing.T) {
+	for _, extra := range []string{
+		"exclude example.com/a v1.0.1\n",
+		"retract v0.1.0\n",
+		"tool example.com/a/cmd\n",
+		"godebug default=go1.21\n",
+		"ignore ./node_modules\n",
+	} {
+		_, err := Merge([]byte(base), []byte(ours), []byte(theirs+extra))
+		if err == nil || !strings.Contains(err.Error(), "directive") {
+			t.Errorf("%q added upstream: want a directive error, got %v", extra, err)
+		}
+	}
+}
+
 func TestMergeUnparsable(t *testing.T) {
 	if _, err := Merge([]byte(base), []byte("<<<<<<< HEAD\n"), []byte(theirs)); err == nil {
 		t.Fatal("want a parse error")
