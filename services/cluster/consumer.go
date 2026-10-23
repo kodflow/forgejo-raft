@@ -466,8 +466,12 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 		}
 	}
 	parked := 0
+	// ran says the callback reached its end: only then can an error come
+	// from the COMMIT, whose outcome committedAnyway settles. An error of
+	// the work rolled back, whatever another dispatcher committed since.
+	ran := false
 	err := c.tx(ctx, func(ctx context.Context) error {
-		parked = 0
+		parked, ran = 0, false
 		start := 0
 		for i := 1; i <= len(batch); i++ {
 			// One group per pusher too: the work attributes its branch rows to
@@ -526,13 +530,17 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 		if err := c.stillInTx(ctx); err != nil {
 			return err
 		}
-		return c.advance(ctx, cursorName(lineage), *cur, next)
+		if err := c.advance(ctx, cursorName(lineage), *cur, next); err != nil {
+			return err
+		}
+		ran = true
+		return nil
 	})
 	if err != nil {
 		if errors.Is(err, cluster_model.ErrCursorMoved) {
 			return nil // another dispatcher moved it; its work stands, ours rolled back
 		}
-		if !c.committedAnyway(ctx, lineage, next, err) {
+		if !ran || !c.committedAnyway(ctx, lineage, next, err) {
 			dispatchFailuresTotal.Inc()
 			return err
 		}
@@ -659,7 +667,9 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 			continue
 		}
 		wctx, effects := clusterhook.WithAfterCommit(ctx)
+		ran := false
 		err := c.tx(wctx, func(ctx context.Context) error {
+			ran = false
 			if err := c.work(ctx, evs); err != nil {
 				return err
 			}
@@ -668,12 +678,19 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 			}
 			// Another retrier that applied the entry first removed its
 			// rows: this transaction, work included, rolls back.
-			return c.unpark(ctx, lineage, index, len(entry))
+			if err := c.unpark(ctx, lineage, index, len(entry)); err != nil {
+				return err
+			}
+			ran = true
+			return nil
 		})
 		if errors.Is(err, cluster_model.ErrParkedGone) {
 			continue
 		}
-		if err != nil && c.parkedGone(ctx, lineage, index, err) {
+		// Only an error after the callback's end may hide a COMMIT that
+		// landed: one of the work rolled back, even when another retrier
+		// removed the rows meanwhile.
+		if err != nil && ran && c.parkedGone(ctx, lineage, index, err) {
 			err = nil
 		}
 		if err != nil {
