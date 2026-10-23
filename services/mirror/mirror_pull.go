@@ -357,7 +357,20 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 
 	stdoutBuilder := strings.Builder{}
 	stderrBuilder := strings.Builder{}
-	if err := cmd.
+	// In a cluster, a sync that updates more refs than one transaction
+	// takes is written by batches (#134).
+	batched, err := syncInBatches(ctx, m, remoteURL.URL.String(), repoPath, m.EnablePrune, true, timeout, envs, &stderrBuilder)
+	if err != nil {
+		log.Error("SyncMirrors [repo: %-v]: failed to update mirror repository by batches: %v", m.Repo, err)
+		desc := fmt.Sprintf("Failed to update mirror repository '%s' by batches: %s", repoPath, util.SanitizeCredentialURLs(err.Error()))
+		if err = system_model.CreateRepositoryNotice(desc); err != nil {
+			log.Error("CreateRepositoryNotice: %v", err)
+		}
+		return nil, false
+	}
+	if batched {
+		log.Info("SyncMirrors [repo: %-v]: the sync updated more refs than the cluster takes in one transaction; written by batches", m.Repo)
+	} else if err := cmd.
 		SetDescription(fmt.Sprintf("Mirror.runSync: %s", m.Repo.FullName())).
 		Run(&git.RunOpts{
 			Timeout: timeout,
@@ -454,7 +467,18 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 		log.Trace("SyncMirrors [repo: %-v Wiki]: running git remote update...", m.Repo)
 		stderrBuilder.Reset()
 		stdoutBuilder.Reset()
-		if err := git.NewCommand(ctx, "remote", "update", "--prune").AddDynamicArguments(m.GetRemoteName()).
+		batched, err := syncInBatches(ctx, m, "", wikiPath, true, false, timeout, nil, &stderrBuilder)
+		if err != nil {
+			log.Error("SyncMirrors [repo: %-v Wiki]: failed to update mirror wiki repository by batches: %v", m.Repo, err)
+			desc := fmt.Sprintf("Failed to update mirror repository wiki '%s' by batches: %s", wikiPath, util.SanitizeCredentialURLs(err.Error()))
+			if err = system_model.CreateRepositoryNotice(desc); err != nil {
+				log.Error("CreateRepositoryNotice: %v", err)
+			}
+			return nil, false
+		}
+		if batched {
+			log.Info("SyncMirrors [repo: %-v Wiki]: written by batches", m.Repo)
+		} else if err := git.NewCommand(ctx, "remote", "update", "--prune").AddDynamicArguments(m.GetRemoteName()).
 			SetDescription(fmt.Sprintf("Mirror.runSync Wiki: %s ", m.Repo.FullName())).
 			Run(&git.RunOpts{
 				Timeout: timeout,
