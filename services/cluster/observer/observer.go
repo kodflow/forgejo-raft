@@ -28,6 +28,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -1105,13 +1106,15 @@ func (o *Observer) fetchWAL(ctx context.Context, leader string, cp clusterhook.E
 			continue
 		}
 		body.Close()
+		// The name comes from a member: it becomes a path under the
+		// archive only once it is a WAL file's name. A member that lists
+		// another name is passed over whole, the others still serve.
+		if i := slices.IndexFunc(files, func(f clusterhook.WALFile) bool { return !ValidWALName(f.Name) }); i >= 0 {
+			errs = append(errs, fmt.Errorf("%s listed an invalid WAL name %q", slot, files[i].Name))
+			continue
+		}
 		answered = true
 		for _, f := range files {
-			// The name comes from a member: it becomes a path under the
-			// archive only once it is a WAL file's name.
-			if !ValidWALName(f.Name) {
-				return fmt.Errorf("a member listed an invalid WAL name %q", f.Name)
-			}
 			listed[f.Name] = append(listed[f.Name], walSource{slot: slot, file: f})
 		}
 	}

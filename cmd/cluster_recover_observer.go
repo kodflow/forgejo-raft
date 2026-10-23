@@ -705,7 +705,8 @@ func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Wri
 	}
 
 	// Every stored file SQL names is in the restored storage: an LFS
-	// object, and also an attachment and a package blob, whose absence
+	// object, and also an attachment (but a link to an external URL, which
+	// has no file) and a package blob, whose absence
 	// would otherwise pass in silence (#90).
 	for _, sf := range []struct {
 		what, query, column string
@@ -713,7 +714,7 @@ func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Wri
 		rel                 func(string) string
 	}{
 		{"LFS object", "SELECT DISTINCT oid FROM lfs_meta_object", "oid", setting.LFS.Storage, func(k string) string { return k[:2] + "/" + k[2:4] + "/" + k[4:] }},
-		{"attachment", "SELECT uuid FROM attachment", "uuid", setting.Attachment.Storage, func(k string) string { return k[:1] + "/" + k[1:2] + "/" + k }},
+		{"attachment", "SELECT uuid FROM attachment WHERE external_url IS NULL OR external_url = ''", "uuid", setting.Attachment.Storage, func(k string) string { return k[:1] + "/" + k[1:2] + "/" + k }},
 		{"package blob", "SELECT hash_sha256 FROM package_blob", "hash_sha256", setting.Packages.Storage, func(k string) string { return k[:2] + "/" + k[2:4] + "/" + k }},
 	} {
 		if sf.storage == nil || sf.storage.Type != setting.LocalStorageType {
