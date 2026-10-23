@@ -37,6 +37,31 @@ func TestRepoRenamedAndItsUndo(t *testing.T) {
 	assert.Equal(t, [][2]string{{"bob/demo.git", "alice/demo.git"}, {"bob/demo.wiki.git", "alice/demo.wiki.git"}}, calls[1])
 }
 
+// A repository's deletion is two entries. The wiki's goes first, and the
+// repository's only once it committed: the wiki's lost after the
+// repository's left it alive beside the deleted repository, which no
+// reconcile offered and which refused every repository created again under
+// the name (#163).
+func TestRepoDeletedDeletesTheWikiFirst(t *testing.T) {
+	var calls []string
+	refuseWiki := true
+	SetRepoLifecycle(func(_ context.Context, key string, _ int64) error {
+		calls = append(calls, key)
+		if refuseWiki && strings.HasSuffix(key, ".wiki.git") {
+			return errors.New("no quorum")
+		}
+		return nil
+	}, nil)
+	defer SetRepoLifecycle(nil, nil)
+
+	require.Error(t, RepoDeleted(context.Background(), "Alice", "Demo", 41))
+	assert.Equal(t, []string{"alice/demo.wiki.git"}, calls, "the repository is kept alive, an orphan reconcile reports")
+
+	calls, refuseWiki = nil, false
+	require.NoError(t, RepoDeleted(context.Background(), "Alice", "Demo", 41))
+	assert.Equal(t, []string{"alice/demo.wiki.git", "alice/demo.git"}, calls)
+}
+
 // The push path keeps the hook's budget; an operator's command gets its own.
 func TestBudgetPerOperation(t *testing.T) {
 	assert.Equal(t, ServerBudget(), Budget(OpPrepared))

@@ -99,12 +99,11 @@ func AdoptRepository(ctx context.Context, doer, u *user_model.User, opts CreateR
 			log.Error("CreateRepository(git update-server-info) in %v: Stdout: %s\nError: %v", repo, stdout, err)
 			return fmt.Errorf("CreateRepository(git update-server-info): %w", err)
 		}
-		return nil
+		// Last, inside the transaction: when the cluster does not take the
+		// ID, the row is rolled back with it and the repository stays
+		// unadopted, to adopt again (#162).
+		return bindAdoptedID(ctx, repo)
 	}); err != nil {
-		return nil, err
-	}
-
-	if err := bindAdoptedID(ctx, repo); err != nil {
 		return nil, err
 	}
 
@@ -121,8 +120,16 @@ func AdoptRepository(ctx context.Context, doer, u *user_model.User, opts CreateR
 // adoption's own writes carry none: a repository whose row SQL lost
 // (failover, restore), adopted as `forgejo cluster reconcile` prescribes,
 // was refused on every node for good (#150). HEAD is written again as it
-// is, under the new ID, once the row is committed for the cluster's
-// consumer to find. Without a cluster it does nothing.
+// is, under the new ID, before the row is committed: a write the cluster
+// refuses or does not answer (no quorum, a leader change, which often
+// follows the failover) rolls the row back, and the repository stays
+// unadopted, offered for adoption again. Committed first, the row left
+// the repository refused on every node, no longer unadopted, with nothing
+// left to bind it but its deletion (#162). A transaction that fails after
+// the write leaves the stamps on an ID no row holds: the repository is
+// unadopted, and its next adoption binds the next ID. The write carries
+// no pusher, so the consumer derives nothing from it. Without a cluster
+// it does nothing.
 func bindAdoptedID(ctx context.Context, repo *repo_model.Repository) error {
 	if !clusterhook.Enabled() {
 		return nil
@@ -148,7 +155,7 @@ func bindAdoptedID(ctx context.Context, repo *repo_model.Repository) error {
 		if _, _, err := git.NewCommand(ctx, "symbolic-ref", "HEAD").AddDynamicArguments(strings.TrimSpace(head)).
 			SetDescription(fmt.Sprintf("bindAdoptedID(git symbolic-ref HEAD): %s", dir)).
 			RunStdString(&git.RunOpts{Dir: dir, Env: env}); err != nil {
-			return fmt.Errorf("the repository was adopted, but the cluster did not take its ID %d for %s, which stays refused: %w", repo.ID, dir, err)
+			return fmt.Errorf("the cluster did not take the ID %d for %s: the adoption is rolled back, adopt the repository again once the cluster has a leader: %w", repo.ID, dir, err)
 		}
 	}
 	return nil

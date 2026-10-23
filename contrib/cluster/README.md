@@ -370,6 +370,10 @@ These commands run with the server stopped, on the data directory.
   new row's ID, which every member then binds to the directory: every node
   refuses to serve a directory stamped with another ID than the database's,
   and the lost row's ID stays in the stamps until a write carries the new one.
+  That write is part of the adoption: when the cluster refuses it or does not
+  answer (no quorum, a leader change), the adoption fails and is rolled back,
+  and the repository stays in the unadopted list, to adopt again once the
+  cluster has a leader.
   Never use "delete unadopted" in a cluster: it removes one node's files and
   the projector brings them back. "Delete all repositories missing their Git
   files" and "Reinitialize all missing Git repositories" are not offered in
@@ -383,6 +387,15 @@ These commands run with the server stopped, on the data directory.
   repository did not change since the index given, and SQL, read last, still
   has no row for it. The decision, its operator and its reason are in the
   audit.
+- A deletion is two entries, the wiki's first, the repository's only once the
+  wiki's committed. When the wiki's is lost, both stay; when the repository's
+  is, the repository stays without its wiki. Either way it is an orphan as
+  above. A wiki left alive
+  by an older deletion beside a repository created again under the name
+  belongs to the deleted one, and every node refuses the new repository while
+  it stays. `reconcile` reports it (`"kind": "wiki"`), and only it is deleted
+  by `forgejo cluster reconcile --delete-orphan <owner>/<repo>.wiki --expect-index <index> --reason "..."`,
+  refused when it is the wiki of the repository SQL has.
 - `forgejo cluster recover --from-observer <checkpoint> ...` rebuilds a
   cluster from an observer's protected checkpoint, every member lost
   ([observer.md](observer.md)). It needs the same `--fenced` receipts of

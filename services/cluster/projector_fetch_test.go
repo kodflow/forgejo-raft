@@ -317,3 +317,71 @@ func TestAWaitForAFetchSlotIsAWaitBehindTheOthers(t *testing.T) {
 	}, 10*time.Second, 10*time.Millisecond)
 	assert.False(t, b.p.WaitsBehind("o/r5.git"))
 }
+
+// Four repositories whose fetches fail, then hang, at every retry came back
+// at each tick ahead of a healthy one in the pass's order and took every
+// freed slot again: the healthy one stayed queued, its wait never counted
+// (#151), and the consumer waited behind it for good (#160). A retry now
+// leaves a slot to a queued repository that did not fail.
+func TestRetriedFetchesLeaveASlotToAHealthyRepository(t *testing.T) {
+	t.Parallel()
+	failing := []string{"o/a1.git", "o/a2.git", "o/a3.git", "o/a4.git"}
+	b := newFetchBench(t, append(append([]string{}, failing...), "o/z.git")...)
+	first := make(chan struct{})
+	var calls atomic.Int64
+	healthy := b.fetch
+	b.p.fetch = func(ctx context.Context, repo, dir string, missing []string) error {
+		if repo == "o/z.git" {
+			return healthy(ctx, repo, dir, missing)
+		}
+		if calls.Add(1) <= int64(len(failing)) {
+			select {
+			case <-first:
+			case <-ctx.Done():
+			}
+			return errors.New("the member holding them does not answer")
+		}
+		<-ctx.Done() // the retry hangs until projectBudget
+		return ctx.Err()
+	}
+	b.p.unfence()
+	defer b.p.refence()
+	// First attempts: every slot taken, z waits behind them (#151).
+	b.p.pass(t.Context())
+	require.False(t, b.p.isFetching("o/z.git"))
+	require.True(t, b.p.WaitsBehind("o/z.git"), "z waits behind first attempts")
+	close(first)
+	require.Eventually(t, func() bool {
+		b.p.mu.Lock()
+		defer b.p.mu.Unlock()
+		return len(b.p.fetching) == 0 && len(b.p.failures) == len(failing)
+	}, 10*time.Second, 10*time.Millisecond)
+
+	// The retries come back first in the pass's order, and hang.
+	require.Eventually(t, func() bool {
+		b.p.pass(t.Context())
+		return b.p.Projected("o/z.git") > 0
+	}, 10*time.Second, 10*time.Millisecond, "z has a slot although the retries come first")
+	assert.Greater(t, calls.Load(), int64(len(failing)), "the failed repositories were retried")
+}
+
+// A repository queued while every slot is held by retries of failed
+// fetches, each of which may fail or hang again for projectBudget, waits
+// for nothing certain: its wait counts against its own bound (#160). A
+// first attempt among the holders is a wait behind the others (#151).
+func TestAWaitBehindRetriesAloneCounts(t *testing.T) {
+	t.Parallel()
+	p := newProjector(t.TempDir(), reftable.New(), newRegistry(time.Minute, 1, 1))
+	p.mu.Lock()
+	for _, r := range []string{"o/a1.git", "o/a2.git", "o/a3.git", "o/a4.git"} {
+		p.fetching[r] = func() {}
+		p.retrying[r] = true
+	}
+	p.queued["o/z.git"] = true
+	p.mu.Unlock()
+	assert.False(t, p.WaitsBehind("o/z.git"), "slots held by retries alone")
+	p.mu.Lock()
+	delete(p.retrying, "o/a1.git")
+	p.mu.Unlock()
+	assert.True(t, p.WaitsBehind("o/z.git"), "a first attempt holds a slot")
+}
