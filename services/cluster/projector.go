@@ -407,9 +407,9 @@ func (p *projector) isFetching(repo string) bool {
 
 // startFetch fetches repo's missing objects beside the pass, at most
 // maxFetches at once and one per repository; past the bound, repo stays
-// dirty and the next pass tries again. When the fetch ends, a pass is
+// dirty and the next pass tries again. When the fetch succeeds, a pass is
 // woken to project repo with its objects here; a failure is recorded as
-// the projection's.
+// the projection's, and retried at the next tick.
 func (p *projector) startFetch(base context.Context, repo, dir string, missing []string) {
 	p.mu.Lock()
 	if _, ok := p.fetching[repo]; ok || p.fenced || len(p.fetching) >= maxFetches {
@@ -431,7 +431,10 @@ func (p *projector) startFetch(base context.Context, repo, dir string, missing [
 		}
 		p.mu.Unlock()
 		if err != nil {
+			// Retried at the next tick, as a failed projection is: woken
+			// now, a fetch that fails at once would spin the pass.
 			log.Warn("cluster: projecting %s: fetching %d missing objects: %v", repo, len(missing), err)
+			return
 		}
 		p.signal()
 	}()

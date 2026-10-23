@@ -5,6 +5,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -251,4 +252,32 @@ func TestADeletionCancelsTheFetch(t *testing.T) {
 	}, 10*time.Second, 10*time.Millisecond)
 	deleted, _ := b.p.table.Deleted("o/r.git")
 	assert.GreaterOrEqual(t, b.p.Projected("o/r.git"), deleted)
+}
+
+// A fetch that fails at once (no member answers, the object channel
+// refused) must not wake the pass: woken, it projected the repository
+// again at once, which failed again, a hot loop where a failed projection
+// waits for the next tick.
+func TestAFailedFetchWaitsForTheNextTick(t *testing.T) {
+	t.Parallel()
+	b := newFetchBench(t, "o/r.git")
+	var calls atomic.Int64
+	b.p.fetch = func(context.Context, string, string, []string) error {
+		calls.Add(1)
+		return errors.New("no member holds them")
+	}
+	b.p.unfence()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.p.run(ctx)
+	}()
+	b.p.signal()
+	require.Eventually(t, func() bool { return calls.Load() >= 1 }, 5*time.Second, time.Millisecond)
+	time.Sleep(time.Second) // under the 2 s tick
+	cancel()
+	<-done
+	b.p.refence()
+	assert.EqualValues(t, 1, calls.Load(), "a failed fetch is not retried before the next tick")
 }
