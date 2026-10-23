@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -150,13 +151,27 @@ func (r *Replicator) Reconcile(ctx context.Context, apply bool) ([]Mismatch, err
 		}
 		if wiki, ok := strings.CutSuffix(key, ".wiki.git"); ok {
 			// A wiki is reconciled with its repository, or alone when the
-			// table holds no repository key for it.
-			if main := wiki + ".git"; !inTable[main] {
+			// table holds no live repository key for it: a deletion whose
+			// wiki entry was lost left it alive beside the deleted
+			// repository (#163).
+			main := wiki + ".git"
+			if _, deleted := r.table.Deleted(main); !inTable[main] || deleted {
 				if known, err := repoKnownInDB(ctx, main); err == nil && !known {
 					if m, ok := r.reconcileOrphan(main, orphans); ok {
 						out = append(out, m)
 					}
+					continue
 				}
+			}
+			stale, last, err := r.staleWiki(ctx, key)
+			if err != nil {
+				return out, err
+			}
+			if stale {
+				out = append(out, Mismatch{
+					Repo: key, Category: RepoLifecycle, Kind: "wiki", Action: actionStaleWiki,
+					Index: last, Since: r.markOrphan(key, last, orphans),
+				})
 			}
 			continue
 		}
@@ -259,8 +274,18 @@ func (r *Replicator) reconcileOrphan(key string, seen map[string]bool) (Mismatch
 	if len(live) == 0 {
 		return Mismatch{}, false
 	}
+	return Mismatch{
+		Repo: key, Category: RepoLifecycle, Action: actionOrphan,
+		Index: last, Since: r.markOrphan(key, last, seen),
+	}, true
+}
+
+// markOrphan returns since when this node's reconcile saw key unchanged at
+// last, and marks key seen in this pass.
+func (r *Replicator) markOrphan(key string, last uint64, seen map[string]bool) string {
 	seen[key] = true
 	r.orphansMu.Lock()
+	defer r.orphansMu.Unlock()
 	if r.orphans == nil {
 		r.orphans = map[string]orphanMark{}
 	}
@@ -269,11 +294,40 @@ func (r *Replicator) reconcileOrphan(key string, seen map[string]bool) (Mismatch
 		mark = orphanMark{last: last, since: time.Now()}
 		r.orphans[key] = mark
 	}
-	r.orphansMu.Unlock()
-	return Mismatch{
-		Repo: key, Category: RepoLifecycle, Action: actionOrphan,
-		Index: last, Since: mark.since.UTC().Format(time.RFC3339),
-	}, true
+	return mark.since.UTC().Format(time.RFC3339)
+}
+
+// actionStaleWiki is what the operator does with a wiki the table holds
+// alive under the name of a repository SQL has, which belongs to another.
+const actionStaleWiki = "the table holds this wiki alive, and it belongs to a deleted repository, not to the repository SQL has under the name: the deletion of the wiki was not recorded. Every node refuses the repository while it stays. Delete it, explicitly: `forgejo cluster reconcile --delete-orphan <owner>/<repo>.wiki --expect-index <index> --reason \"...\"`"
+
+// staleWiki reports whether the wiki key holds, alive, the wiki of another
+// repository than the one SQL has under its name, and the index of its
+// last change: one whose repository key was deleted after it, or that was
+// written under another repository ID than SQL's and than its repository
+// key's (#163). A wiki and its repository that both keep a lost row's ID
+// are the repository SQL lost, restored by adoption, not a stale wiki. It
+// reports false when SQL has no row for the name: reconcileOrphan covers
+// it.
+func (r *Replicator) staleWiki(ctx context.Context, wikiKey string) (bool, uint64, error) {
+	refs, wikiID, _ := r.table.RefsWithID(wikiKey)
+	if _, deleted := r.table.Deleted(wikiKey); deleted || !anyLive(refs) {
+		return false, 0, nil
+	}
+	_, last := r.table.RepoHash(wikiKey)
+	main := strings.TrimSuffix(wikiKey, ".wiki.git") + ".git"
+	repo, err := lookupRepo(ctx, reftable.Event{Repo: main})
+	if repo_model.IsErrRepoNotExist(err) {
+		return false, last, nil
+	}
+	if err != nil {
+		return false, last, err
+	}
+	if d, ok := r.table.DeletedBefore(main, math.MaxUint64); ok && d > last {
+		return true, last, nil
+	}
+	_, mainID, _ := r.table.RefsWithID(main)
+	return wikiID > 0 && wikiID != repo.ID && mainID != wikiID, last, nil
 }
 
 // orphanKeys returns the keys of a repository and its wiki that hold a
@@ -315,7 +369,8 @@ func (r *Replicator) DeleteOrphan(ctx context.Context, op consensus.Operator, re
 	if strings.TrimSpace(reason) == "" {
 		return nil, errors.New("a reason is required: it is kept in the audit")
 	}
-	key := strings.ToLower(strings.TrimSuffix(strings.TrimSuffix(repo, ".git"), ".wiki")) + ".git"
+	base, wikiOnly := strings.CutSuffix(strings.ToLower(strings.TrimSuffix(repo, ".git")), ".wiki")
+	key := base + ".git"
 	if err := reftable.ValidRepoKey(key); err != nil {
 		return nil, fmt.Errorf("repository %q: %w", repo, err)
 	}
@@ -324,6 +379,9 @@ func (r *Replicator) DeleteOrphan(ctx context.Context, op consensus.Operator, re
 	}
 	if _, err := r.confirm(ctx); err != nil {
 		return nil, fmt.Errorf("this node's table could not be confirmed current (%w): nothing is deleted", err)
+	}
+	if wikiOnly {
+		return r.deleteStaleWiki(ctx, op, base+".wiki.git", expect, reason)
 	}
 	live, last := r.orphanKeys(key)
 	if len(live) == 0 {
@@ -349,6 +407,44 @@ func (r *Replicator) DeleteOrphan(ctx context.Context, op consensus.Operator, re
 	}
 	log.Warn("cluster: %s deleted %s, which SQL does not know, at index %d: %s", op, strings.Join(live, ", "), last, reason)
 	r.audit(ctx, op, Operation{Action: ActionDeleteOrphan, Target: key}, "deleted", fmt.Sprintf("%s (index %d)", reason, last))
+	return res, nil
+}
+
+// deleteStaleWiki is DeleteOrphan of a wiki alone, `<owner>/<repo>.wiki`:
+// one the table holds alive while SQL has no row for its repository, or
+// one staleWiki reports, the wiki of a deleted repository under the name
+// of another (#163). SQL is read last, after the table was confirmed
+// current. The repository's key is never touched.
+func (r *Replicator) deleteStaleWiki(ctx context.Context, op consensus.Operator, wikiKey string, expect uint64, reason string) (*OrphanDeletion, error) {
+	main := strings.TrimSuffix(wikiKey, ".wiki.git") + ".git"
+	refs, _ := r.table.Refs(wikiKey)
+	if _, deleted := r.table.Deleted(wikiKey); deleted || !anyLive(refs) {
+		return nil, fmt.Errorf("the table holds nothing alive under %s: nothing is deleted", wikiKey)
+	}
+	if _, last := r.table.RepoHash(wikiKey); last != expect {
+		return nil, fmt.Errorf("%s changed at index %d, after the index %d given: run `forgejo cluster reconcile` again; nothing is deleted", wikiKey, last, expect)
+	}
+	stale, last, err := r.staleWiki(ctx, wikiKey)
+	if err != nil {
+		return nil, fmt.Errorf("reading SQL: %w; nothing is deleted", err)
+	}
+	if !stale {
+		known, err := repoKnownInDB(ctx, main)
+		if err != nil {
+			return nil, fmt.Errorf("reading SQL: %w; nothing is deleted", err)
+		}
+		if known {
+			return nil, fmt.Errorf("%s is the wiki of the repository SQL has under the name: it is no orphan; nothing is deleted", wikiKey)
+		}
+	}
+	res := &OrphanDeletion{Index: last}
+	if err := r.proposeRepoDelete(ctx, wikiKey, 0); err != nil {
+		r.audit(ctx, op, Operation{Action: ActionDeleteOrphan, Target: wikiKey}, "failed", fmt.Sprintf("%s (index %d): %v", reason, last, err))
+		return res, fmt.Errorf("deleting %s: %w", wikiKey, err)
+	}
+	res.Deleted = append(res.Deleted, wikiKey)
+	log.Warn("cluster: %s deleted %s, which no repository SQL has owns, at index %d: %s", op, wikiKey, last, reason)
+	r.audit(ctx, op, Operation{Action: ActionDeleteOrphan, Target: wikiKey}, "deleted", fmt.Sprintf("%s (index %d)", reason, last))
 	return res, nil
 }
 

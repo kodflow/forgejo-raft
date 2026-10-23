@@ -387,6 +387,13 @@ These commands run with the server stopped, on the data directory.
   repository did not change since the index given, and SQL, read last, still
   has no row for it. The decision, its operator and its reason are in the
   audit.
+- A deletion is two entries, the wiki's first: when the repository's is lost,
+  the repository stays an orphan as above, with its wiki. A wiki left alive
+  by an older deletion beside a repository created again under the name
+  belongs to the deleted one, and every node refuses the new repository while
+  it stays. `reconcile` reports it (`"kind": "wiki"`), and only it is deleted
+  by `forgejo cluster reconcile --delete-orphan <owner>/<repo>.wiki --expect-index <index> --reason "..."`,
+  refused when it is the wiki of the repository SQL has.
 - `forgejo cluster recover --from-observer <checkpoint> ...` rebuilds a
   cluster from an observer's protected checkpoint, every member lost
   ([observer.md](observer.md)). It needs the same `--fenced` receipts of

@@ -395,7 +395,12 @@ func RepoKey(owner, name string, wiki bool) string {
 }
 
 // RepoDeleted records the deletion of a repository and its wiki, after
-// Forgejo removed them locally.
+// Forgejo removed them locally. They are two entries, the wiki's first,
+// and the repository's only once the wiki's committed: a wiki left alive
+// beside a deleted repository was offered by no reconcile, and refused,
+// under its old repository ID, every repository created again under the
+// name (#163). The repository left alive instead is an orphan reconcile
+// reports, which `reconcile --delete-orphan` deletes with its wiki.
 func RepoDeleted(ctx context.Context, owner, name string, repoID int64) error {
 	lifecycleMu.RLock()
 	f := onDeleted
@@ -403,7 +408,10 @@ func RepoDeleted(ctx context.Context, owner, name string, repoID int64) error {
 	if f == nil {
 		return nil
 	}
-	return errors.Join(f(ctx, RepoKey(owner, name, false), repoID), f(ctx, RepoKey(owner, name, true), repoID))
+	if err := f(ctx, RepoKey(owner, name, true), repoID); err != nil {
+		return err
+	}
+	return f(ctx, RepoKey(owner, name, false), repoID)
 }
 
 // WikiDeleted records the deletion of a repository's wiki alone, before
