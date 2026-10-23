@@ -182,3 +182,25 @@ func TestCreationsHoldTheCheckpointCut(t *testing.T) {
 		})
 	}
 }
+
+// An adoption commits the repository's row and binds its ID in the
+// cluster's table in one SQL transaction: it holds the checkpoint's cut
+// from before the transaction until the row committed, so a checkpoint has
+// the row and the ID together, or neither (#167).
+func TestAdoptionHoldsTheCheckpointCut(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	t.Cleanup(func() { unittest.PrepareTestEnv(t) })
+	t.Cleanup(func() { queue.GetManager().FlushAll(db.DefaultContext, 10*time.Second) })
+	require.NoError(t, unittest.CopyDir(
+		"../../modules/git/tests/repos/repo1_bare",
+		repo_model.RepoPath("user2", "adopted-under-cut"),
+	))
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 1})
+	owner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+
+	l := holdSpan(t, "user2", "adopted-under-cut")
+	_, err := AdoptRepository(db.DefaultContext, doer, owner, CreateRepoOptions{Name: "adopted-under-cut"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"hold row=false dir=true", "release row=true dir=true"}, l.events)
+	assert.Zero(t, l.heldNow(), "released once done")
+}
