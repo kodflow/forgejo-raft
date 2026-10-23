@@ -24,6 +24,11 @@ type ParkedEvent struct {
 	// Seq is the event's place among the events of its entry.
 	Seq  int    `xorm:"NOT NULL DEFAULT 0 UNIQUE(lineage_index_seq)"`
 	Repo string `xorm:"VARCHAR(255) NOT NULL INDEX"`
+	// RepoID is the repository's id when the event carries one: the order
+	// of a repository's work is held by its id, which a rename keeps and a
+	// new repository under the same name does not share (#133). Zero on a
+	// row parked before the column existed, which is held by its key.
+	RepoID int64 `xorm:"NOT NULL DEFAULT 0 INDEX"`
 	// Event is the event, as the table encodes it.
 	Event       string             `xorm:"LONGTEXT NOT NULL"`
 	Reason      string             `xorm:"TEXT"`
@@ -54,8 +59,14 @@ func ParkEvents(ctx context.Context, rows []*ParkedEvent) error {
 
 // RepoHasParked reports whether a repository has a parked event: its later
 // events are parked behind it, so the post-receive work keeps its order.
-func RepoHasParked(ctx context.Context, repo string) (bool, error) {
-	return db.GetEngine(ctx).Where("repo = ?", repo).Exist(new(ParkedEvent))
+// A repository is its id when known, whatever name it had when its event
+// was parked; a row without an id, and a repository without one, fall
+// back to the key (#133).
+func RepoHasParked(ctx context.Context, repo string, repoID int64) (bool, error) {
+	if repoID == 0 {
+		return db.GetEngine(ctx).Where("repo = ?", repo).Exist(new(ParkedEvent))
+	}
+	return db.GetEngine(ctx).Where("repo_id = ? OR (repo_id = 0 AND repo = ?)", repoID, repo).Exist(new(ParkedEvent))
 }
 
 // ListParked returns every parked event, oldest first: in the order they

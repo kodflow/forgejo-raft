@@ -37,11 +37,11 @@ func (p *memParked) park(_ context.Context, rows []*cluster_model.ParkedEvent) e
 	return nil
 }
 
-func (p *memParked) hasParked(_ context.Context, repo string) (bool, error) {
+func (p *memParked) hasParked(_ context.Context, repo string, repoID int64) (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, r := range p.rows {
-		if r.Repo == repo {
+		if repoID != 0 && r.RepoID == repoID || (repoID == 0 || r.RepoID == 0) && r.Repo == repo {
 			return true, nil
 		}
 	}

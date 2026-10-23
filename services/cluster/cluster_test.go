@@ -184,6 +184,25 @@ type testCluster struct {
 	// loops counts the background goroutines, which close waits for so
 	// none writes into a directory being removed.
 	loops sync.WaitGroup
+	// repoIDs gives each key its own repository id, in the order of its
+	// first push, from 1: the consumer tells repositories by id (#133).
+	repoIDsMu sync.Mutex
+	repoIDs   map[string]int64
+}
+
+// repoID is the repository id of a key.
+func (tc *testCluster) repoID(repo string) int64 {
+	tc.repoIDsMu.Lock()
+	defer tc.repoIDsMu.Unlock()
+	if tc.repoIDs == nil {
+		tc.repoIDs = map[string]int64{}
+	}
+	id, ok := tc.repoIDs[repo]
+	if !ok {
+		id = int64(len(tc.repoIDs) + 1)
+		tc.repoIDs[repo] = id
+	}
+	return id
 }
 
 func newTestCluster(t *testing.T, slots ...string) *testCluster {
@@ -316,7 +335,7 @@ func (tc *testCluster) pushViaWithin(budget time.Duration, n *testNode, work, re
 	run(t, dir, "update-ref", "-d", "refs/tmp/incoming")
 	nonce := clusterhook.NewNonce()
 	req := &clusterhook.Request{
-		Op: clusterhook.OpPrepared, Nonce: nonce, GitDir: dir, RepoID: 1, PusherID: 2,
+		Op: clusterhook.OpPrepared, Nonce: nonce, GitDir: dir, RepoID: tc.repoID(repo), PusherID: 2,
 		Lines: []clusterhook.Line{{Old: old, New: sha, Ref: ref}},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
