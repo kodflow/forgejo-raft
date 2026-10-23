@@ -279,6 +279,12 @@ func CreateRepositoryDirectly(ctx context.Context, doer, u *user_model.User, opt
 			}
 		}
 
+		// A name the cluster cannot take yet is refused before git init
+		// writes a directory under it (#54).
+		if err := clusterhook.CheckRepoKey(u.Name, repo.Name); err != nil {
+			return fmt.Errorf("the cluster cannot take the repository %s/%s: %w", u.Name, repo.Name, err)
+		}
+
 		initialized = true
 		if err = initRepository(ctx, repoPath, doer, repo, opts); err != nil {
 			return fmt.Errorf("initRepository: %w", err)

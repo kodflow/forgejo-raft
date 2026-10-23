@@ -63,9 +63,11 @@ type objectChannel struct {
 	// carry; nil uses the member's pinned SPKI. Tests whose consensus
 	// transport authenticates with other keys set it.
 	pinOf func(m consensus.Member) [32]byte
-	// hello answers GET /v1/hello to any node of the cluster; nil outside
-	// the autonomous mode, where the path is a member's like the others.
-	hello func() hello
+	// hello answers GET /v1/hello to any node of the cluster in the
+	// autonomous mode; outside it, to a member only (helloMembersOnly),
+	// which asks before raising the payload version (#50).
+	hello            func() hello
+	helloMembersOnly bool
 
 	mu      sync.Mutex
 	clients map[string]*http.Client
@@ -125,6 +127,12 @@ func (oc *objectChannel) handler() http.Handler {
 			return
 		}
 		p, err := peerFromChain(leaf)
+		if err == nil && r.Method == http.MethodGet && r.URL.Path == helloPath && oc.hello != nil && oc.helloMembersOnly {
+			if _, err := oc.admit(p); err != nil {
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
+			}
+		}
 		if err == nil && r.Method == http.MethodGet && r.URL.Path == helloPath && oc.hello != nil {
 			// A node of the cluster, member or not yet, asks who this one
 			// is: the autonomous mode's discovery. The chain was verified

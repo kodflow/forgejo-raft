@@ -391,7 +391,15 @@ func (r *Replicator) operate(ctx context.Context, eng consensus.Engine, op conse
 		// autopilot's does, since a member on an older binary stops on the
 		// first entry of the new version, and two of three lose the
 		// quorum (#50).
-		if r.auto != nil && !everyMemberApplies(eng.Membership(), eng.Status().ID, r.auto.round(ctx), r.trustedAnswer) {
+		// Outside it, every member answers a member that asks: an older
+		// binary does not, and the raise waits for it all the same.
+		var seen []hello
+		if r.auto != nil {
+			seen = r.auto.round(ctx)
+		} else {
+			seen = r.askMembers(ctx, eng.Membership(), eng.Status().ID)
+		}
+		if !everyMemberApplies(eng.Membership(), eng.Status().ID, seen, r.trustedAnswer) {
 			return fmt.Errorf("some member did not answer, or runs a binary that does not apply payload version %d: the version is not raised", reftable.PayloadVersion)
 		}
 		if err := r.RaisePayloadVersion(ctx, op); err != nil {
@@ -576,9 +584,12 @@ func (r *Replicator) grantJoin(ctx context.Context, op consensus.Operator, targe
 }
 
 // bindGrant replaces an unbound grant with the same grant bound to spki.
+// From reftable.GenerationVersion Apply refuses it once another member
+// bound the same grant to another key: two joiners admitted at once under
+// one grant, the second is refused (#70).
 func (r *Replicator) bindGrant(ctx context.Context, g reftable.JoinGrant, spki [32]byte) error {
 	g.SPKI = hex.EncodeToString(spki[:])
-	data, err := reftable.Encode(reftable.KindJoinGrant, &g)
+	data, err := reftable.EncodeVersion(r.table.WriteVersion(), reftable.KindJoinGrant, &g)
 	if err != nil {
 		return err
 	}

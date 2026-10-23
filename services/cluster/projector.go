@@ -395,7 +395,7 @@ func (p *projector) project(ctx context.Context, repo string) error {
 		return err
 	}
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) && !p.passesOn(repo, want) {
-		if first, firstIdx, ok := p.table.RenamedFrom(repo); ok {
+		if first, firstIdx, ok := p.liveRename(repo); ok {
 			from, to, renIdx := p.renameSource(repo, first, firstIdx)
 			src := filepath.Join(p.root, filepath.FromSlash(from))
 			if p.registry.inFlight(from) {
@@ -642,15 +642,46 @@ func writeStamp(dir, repo string, at uint64, digest reftable.Sum) error {
 // this node certified it before index. known is false when the stamp names
 // no key: absent, unreadable, or written by an older binary.
 func heldBefore(dir, key string, index uint64) (held, known bool) {
+	s, known := readStamp(dir)
+	return known && s.Repo == key && s.Watermark < index, known
+}
+
+// readStamp reads dir's stamp; false when it names no key.
+func readStamp(dir string) (stamp, bool) {
 	b, err := os.ReadFile(filepath.Join(dir, stampName))
 	if err != nil {
-		return false, false
+		return stamp{}, false
 	}
 	var s stamp
 	if json.Unmarshal(b, &s) != nil || s.Repo == "" {
-		return false, false
+		return stamp{}, false
 	}
-	return s.Repo == key && s.Watermark < index, true
+	return s, true
+}
+
+// liveRename is the table's RenamedFrom, unless repo was deleted since that
+// rename: the repository the rename brought is gone, and a repository
+// created anew under the key owes nothing to the rename's source. A node
+// behind the log would otherwise move the source's directory, the deleted
+// repository's, under the live key (#98).
+func (p *projector) liveRename(repo string) (string, uint64, bool) {
+	from, renIdx, ok := p.table.RenamedFrom(repo)
+	if !ok {
+		return "", 0, false
+	}
+	if at, deleted := p.table.DeletedBefore(repo, math.MaxUint64); deleted && at > renIdx {
+		return "", 0, false
+	}
+	return from, renIdx, true
+}
+
+// departed is the newest index at which the repository under repo was
+// deleted, kept after the key was written again; a directory certified
+// under repo before it holds the deleted repository. A rename away is not
+// a departure here: the chain of renames may come back to repo, and a
+// directory left behind is setAsideLeftBehind's (#43).
+func (p *projector) departed(repo string) (uint64, bool) {
+	return p.table.DeletedBefore(repo, math.MaxUint64)
 }
 
 // Verify compares a repository's git state with the table under the
@@ -699,8 +730,12 @@ func (p *projector) holdsRenamed(src, from, to string, renIdx uint64) bool {
 	if _, err := os.Stat(src); err != nil {
 		return false
 	}
-	if held, known := heldBefore(src, from, renIdx); known {
-		return held
+	if s, known := readStamp(src); known {
+		// The rename moved the repository from held since its last
+		// deletion before the rename: a directory certified before that
+		// deletion holds the deleted one (#98).
+		del, _ := p.table.DeletedBefore(from, renIdx)
+		return s.Repo == from && s.Watermark < renIdx && (del == 0 || s.Watermark >= del)
 	}
 	moved, ok := p.table.MovedAway(from)
 	return ok && moved == to
@@ -739,6 +774,11 @@ func (p *projector) movesOn(repo, dir string) bool {
 	if _, deleted := p.table.Deleted(z); deleted {
 		return false
 	}
+	if at, deleted := p.table.DeletedBefore(z, math.MaxUint64); deleted && at > zIdx {
+		// Z was deleted since, and maybe taken again: the repository this
+		// directory holds is gone (#98).
+		return false
+	}
 	if _, err := os.Stat(filepath.Join(p.root, filepath.FromSlash(z))); !errors.Is(err, os.ErrNotExist) {
 		// Z's directory may be the previous repository under that name,
 		// which Z's projection sets aside before this one moves in: only a
@@ -770,12 +810,33 @@ func (p *projector) movesOn(repo, dir string) bool {
 // rename's source directory is still here: on the node that served the
 // rename, Forgejo already moved the source in, and the directory is the
 // right one.
+//
+// A directory whose keyed stamp predates the key's last deletion holds a
+// repository that left the key, which a node behind the log did not
+// remove: it is set aside too, before
+// a repository created anew under the key is projected into it, its
+// deleted objects kept and served, its object format maybe another (#52,
+// #98).
 func (p *projector) setAsideStale(repo, dir string) error {
 	p.mu.Lock()
 	delIdx, pending := p.deletedAt[repo]
 	delete(p.deletedAt, repo)
 	p.mu.Unlock()
-	from, renIdx, renamed := p.table.RenamedFrom(repo)
+	if s, known := readStamp(dir); known && s.Repo == repo {
+		if at, left := p.departed(repo); left && s.Watermark < at {
+			if err := p.setAside(dir, repo, at); err != nil {
+				if pending {
+					p.mu.Lock()
+					p.deletedAt[repo] = delIdx
+					p.mu.Unlock()
+				}
+				return err
+			}
+			log.Warn("cluster: %s holds the repository certified under it at %d, which was deleted at %d: that directory is set aside", repo, s.Watermark, at)
+			return nil
+		}
+	}
+	from, renIdx, renamed := p.liveRename(repo)
 	if !renamed {
 		return nil
 	}
@@ -802,10 +863,7 @@ func (p *projector) setAsideStale(repo, dir string) error {
 		mark = renIdx
 	}
 	aside := filepath.Join(p.root, staleDirName, fmt.Sprintf("%s-%d", strings.ReplaceAll(repo, "/", "_"), mark))
-	if err := os.MkdirAll(filepath.Dir(aside), 0o700); err != nil {
-		return err
-	}
-	if err := os.Rename(dir, aside); err != nil {
+	if err := p.setAside(dir, repo, mark); err != nil {
 		if pending {
 			p.mu.Lock()
 			p.deletedAt[repo] = delIdx
@@ -997,4 +1055,17 @@ func (p *projector) servesAnother(repo string) bool {
 		return true
 	}
 	return false
+}
+
+// setAside moves dir, which holds a repository repo must not reuse, under
+// staleDirName, named after repo and mark; it never removes it.
+func (p *projector) setAside(dir, repo string, mark uint64) error {
+	aside := filepath.Join(p.root, staleDirName, fmt.Sprintf("%s-%d", strings.ReplaceAll(repo, "/", "_"), mark))
+	if err := os.MkdirAll(filepath.Dir(aside), 0o700); err != nil {
+		return err
+	}
+	if _, err := os.Stat(aside); err == nil {
+		aside = fmt.Sprintf("%s-%d", aside, time.Now().UnixNano())
+	}
+	return os.Rename(dir, aside)
 }

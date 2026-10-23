@@ -299,10 +299,13 @@ func (e errStaleCreate) Error() string {
 // Forgejo's own updates without an old value (update-ref, a forced
 // rewrite) carry no pusher and keep their meaning.
 func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook.Request) (*reftable.RefTxn, []string, error) {
+	// Read before the revisions: Apply refuses the transaction when the
+	// repository left the key after this index (reftable.RefTxn.ReadAt).
+	read, _ := r.table.Applied()
 	tx := &reftable.RefTxn{
 		Repo: repo, RepoID: req.RepoID, PusherID: req.PusherID, PusherName: req.PusherName, Time: time.Now().UnixNano(),
 		Nonce: clusterhook.TxnNonce(req.Nonce, req.Lines), Trigger: req.Trigger, PRID: req.PRID, IsWiki: req.IsWiki, PushOptions: req.PushOptions,
-		Push: req.PusherID != 0,
+		Push: req.PusherID != 0, ReadAt: read.Index,
 	}
 	var refs []string
 	for _, l := range req.Lines {
@@ -635,8 +638,24 @@ func (r *Replicator) finished(req *clusterhook.Request) {
 // proposeRepoDelete tombstones a deleted repository's refs; every member's
 // projector then removes it.
 func (r *Replicator) proposeRepoDelete(ctx context.Context, key string, repoID int64) error {
-	return r.proposeLifecycle(ctx, reftable.KindRepoDelete, &reftable.RepoDelete{Repo: key, RepoID: repoID, Time: time.Now().UnixNano()},
-		func() bool { _, deleted := r.table.Deleted(key); return deleted })
+	v := r.table.WriteVersion()
+	d := &reftable.RepoDelete{Repo: key, RepoID: repoID, Time: time.Now().UnixNano()}
+	landed := func() bool { _, deleted := r.table.Deleted(key); return deleted }
+	if v >= reftable.GenerationVersion {
+		d.Nonce = clusterhook.NewNonce()
+		landed = r.nonceLanded(d.Nonce)
+	}
+	return r.proposeLifecycle(ctx, v, reftable.KindRepoDelete, d, landed)
+}
+
+// nonceLanded is the landed test of a lifecycle command written at
+// reftable.GenerationVersion: its own nonce among the committed ones. A
+// state of the table cannot tell THIS command from an older one: after a
+// round trip a to b and back, b's rename mark already names a, and a third
+// a to b whose outcome was unknown read as committed when nothing was
+// (#74).
+func (r *Replicator) nonceLanded(nonce string) func() bool {
+	return func() bool { _, ok := r.table.CommittedNonce(nonce); return ok }
 }
 
 // proposeRepoRename moves a repository's refs to its new key; every
@@ -648,22 +667,34 @@ func (r *Replicator) proposeRepoRename(ctx context.Context, from, to string) err
 // proposeRepoMoves moves several repositories in ONE entry, all or none: a
 // repository and its wiki, or an owner's repositories.
 func (r *Replicator) proposeRepoMoves(ctx context.Context, moves [][2]string) error {
+	return r.proposeMoves(ctx, moves, [2]string{})
+}
+
+// proposeMoves is proposeRepoMoves; owner names an owner's rename, old and
+// new names, which Apply checks from reftable.GenerationVersion.
+func (r *Replicator) proposeMoves(ctx context.Context, moves [][2]string, owner [2]string) error {
 	if len(moves) == 0 {
 		return nil
 	}
+	v := r.table.WriteVersion()
 	rn := &reftable.RepoRename{From: moves[0][0], To: moves[0][1], Time: time.Now().UnixNano(), Also: moves[1:]}
-	return r.proposeLifecycle(ctx, reftable.KindRepoRename, rn, func() bool {
+	landed := func() bool {
 		for _, m := range moves {
 			if f, _, ok := r.table.RenamedFrom(m[1]); !ok || f != m[0] {
 				return false
 			}
 		}
 		return true
-	})
+	}
+	if v >= reftable.GenerationVersion {
+		rn.Nonce, rn.Owner = clusterhook.NewNonce(), owner
+		landed = r.nonceLanded(rn.Nonce)
+	}
+	return r.proposeLifecycle(ctx, v, reftable.KindRepoRename, rn, landed)
 }
 
-func (r *Replicator) proposeLifecycle(ctx context.Context, kind reftable.Kind, body any, landed func() bool) error {
-	data, err := reftable.Encode(kind, body)
+func (r *Replicator) proposeLifecycle(ctx context.Context, v uint8, kind reftable.Kind, body any, landed func() bool) error {
+	data, err := reftable.EncodeVersion(v, kind, body)
 	if err != nil {
 		return err
 	}
@@ -724,8 +755,19 @@ func (r *Replicator) resolveLanded(ctx context.Context, landed func() bool) (boo
 
 // proposeOwnerRename moves every repository the table holds under an owner
 // in one entry: they all move, or none does and Forgejo moves the directory
-// back.
+// back. The list is read once this node applied a commit boundary a quorum
+// confirmed: a node behind the log would leave a repository created just
+// before under the old owner, while the database renamed it (#56). From
+// reftable.GenerationVersion, Apply also refuses a list that misses one.
 func (r *Replicator) proposeOwnerRename(ctx context.Context, oldOwner, newOwner string) error {
+	if r.Engine() != nil {
+		cctx, cancel := context.WithTimeout(ctx, lifecycleResolveBudget)
+		_, err := r.confirm(cctx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("the cluster did not record it: this node could not confirm it applied the log: %w", err)
+		}
+	}
 	prefix := oldOwner + "/"
 	var moves [][2]string
 	for _, key := range r.table.Repos() {
@@ -737,7 +779,7 @@ func (r *Replicator) proposeOwnerRename(ctx context.Context, oldOwner, newOwner 
 		}
 		moves = append(moves, [2]string{key, newOwner + "/" + strings.TrimPrefix(key, prefix)})
 	}
-	return r.proposeRepoMoves(ctx, moves)
+	return r.proposeMoves(ctx, moves, [2]string{oldOwner, newOwner})
 }
 
 // RaisePayloadVersion makes the cluster write reftable.PayloadVersion from

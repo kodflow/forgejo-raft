@@ -41,6 +41,8 @@ type Replicator struct {
 	projector *projector
 	objects   *objectChannel
 	consumer  *consumer
+	// memberProbe replaces the object channel's hello probe in tests.
+	memberProbe func(ctx context.Context, consensusAddr, slot string) (hello, error)
 
 	mu     sync.RWMutex
 	engine consensus.Engine
@@ -206,6 +208,8 @@ func Init(ctx context.Context) error {
 		r.auto.revoked = r.keyRevoked
 		r.objects.hello = r.helloOf
 		r.writerHook = registeredWriterHook()
+	} else {
+		r.objects.hello, r.objects.helloMembersOnly = r.memberHello, true
 	}
 	if len(setting.Cluster.ObjectPeers) > 0 {
 		peers := setting.Cluster.ObjectPeers
@@ -280,6 +284,7 @@ func Init(ctx context.Context) error {
 	clusterhook.SetEnabled(true)
 	clusterhook.SetRepoLifecycle(r.proposeRepoDelete, r.proposeRepoMoves)
 	clusterhook.SetOwnerLifecycle(r.proposeOwnerRename)
+	clusterhook.SetKeyCheck(r.writableKey)
 	clusterhook.SetGarbageCollectionGate(r.projector.MayCollectGarbage)
 	clusterhook.SetWriteWaiter(r.waitWrites)
 	clusterhook.SetFreshWaiter(r.WaitFresh)
@@ -469,10 +474,25 @@ func (r *Replicator) repoKey(gitDir string) (string, error) {
 		return "", fmt.Errorf("%s is outside the repository root", gitDir)
 	}
 	key := filepath.ToSlash(rel)
-	if err := reftable.ValidRepoKey(key); err != nil {
+	// A key the cluster cannot write yet (a name that starts with a dot,
+	// before reftable.GenerationVersion) is refused here, before git
+	// writes anything.
+	if err := reftable.ValidRepoKeyAt(key, r.table.WriteVersion()); err != nil {
 		return "", err
 	}
 	return key, nil
+}
+
+// writableKey reports whether the cluster takes a repository under key at
+// the payload version it writes now.
+func (r *Replicator) writableKey(key string) error {
+	if err := reftable.ValidRepoKeyAt(key, r.table.WriteVersion()); err != nil {
+		if reftable.ValidRepoKey(key) == nil {
+			return fmt.Errorf("%w; the cluster takes such a name once its payload version is raised to %d", err, reftable.GenerationVersion)
+		}
+		return err
+	}
+	return nil
 }
 
 // ---- read-after-write ----

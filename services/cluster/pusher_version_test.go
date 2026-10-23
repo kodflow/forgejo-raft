@@ -78,7 +78,7 @@ func TestPusherNameWaitsForEveryMember(t *testing.T) {
 
 	require.NoError(t, tc.nodes[1].r.RaisePayloadVersion(context.Background(), "op"))
 	for _, nd := range tc.nodes {
-		require.Eventually(t, func() bool { return nd.r.table.WriteVersion() == reftable.PusherVersion }, 10*time.Second, 10*time.Millisecond, nd.slot)
+		require.Eventually(t, func() bool { return nd.r.table.WriteVersion() >= reftable.PusherVersion }, 10*time.Second, 10*time.Millisecond, nd.slot)
 	}
 	named("refs/heads/after", zero, c2)
 	settle("refs/heads/after")
