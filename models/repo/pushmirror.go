@@ -15,6 +15,7 @@ import (
 	giturl "forgejo.org/modules/git/url"
 	"forgejo.org/modules/keying"
 	"forgejo.org/modules/log"
+	"forgejo.org/modules/optional"
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/timeutil"
 	"forgejo.org/modules/util"
@@ -37,6 +38,11 @@ type PushMirror struct {
 	// A keypair formatted in OpenSSH format.
 	PublicKey  string `xorm:"VARCHAR(100)"`
 	PrivateKey []byte `xorm:"BLOB"`
+
+	// The address with its password, encrypted, when it has one. A node
+	// that lacks the remote recreates it without the password, which the
+	// push passes through a credential helper.
+	EncryptedRemoteAddress []byte `xorm:"BLOB NULL"`
 
 	SyncOnCommit   bool `xorm:"NOT NULL DEFAULT true"`
 	Interval       time.Duration
@@ -107,6 +113,30 @@ func (m *PushMirror) SetPrivatekey(ctx context.Context, privateKey []byte) error
 // Privatekey retrieves the encrypted private key and decrypts it.
 func (m *PushMirror) Privatekey() ([]byte, error) {
 	return keying.PushMirror.Decrypt(m.PrivateKey, keying.ColumnAndID("private_key", m.ID))
+}
+
+// SetEncryptedRemoteAddress encrypts addr, the address with its
+// credentials, and stores it in the database. The ID of the push mirror
+// must be known, so this must be done after the push mirror is inserted.
+func (m *PushMirror) SetEncryptedRemoteAddress(ctx context.Context, addr string) error {
+	m.EncryptedRemoteAddress = keying.PushMirror.Encrypt([]byte(addr), keying.ColumnAndID("encrypted_remote_address", m.ID))
+
+	_, err := db.GetEngine(ctx).ID(m.ID).Cols("encrypted_remote_address").Update(m)
+	return err
+}
+
+// DecryptRemoteAddress returns the address with its credentials, None for
+// a push mirror whose address carried no password or that predates
+// EncryptedRemoteAddress.
+func (m *PushMirror) DecryptRemoteAddress() (optional.Option[string], error) {
+	if m.EncryptedRemoteAddress == nil {
+		return optional.None[string](), nil
+	}
+	contents, err := keying.PushMirror.Decrypt(m.EncryptedRemoteAddress, keying.ColumnAndID("encrypted_remote_address", m.ID))
+	if err != nil {
+		return optional.None[string](), err
+	}
+	return optional.Some(string(contents)), nil
 }
 
 // UpdatePushMirror updates the push-mirror
