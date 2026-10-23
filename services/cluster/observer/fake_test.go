@@ -433,6 +433,7 @@ func (p *fakePG) switchWAL() {
 	seg := uint64(p.insert) / fakeSegSize
 	start := LSN(seg * fakeSegSize)
 	var buf bytes.Buffer
+	buf.Write(p.segmentHeader(p.tli, start))
 	for _, r := range p.records {
 		if LSN(r.LSN) >= start && LSN(r.LSN) < start+fakeSegSize {
 			b, _ := json.Marshal(r)
@@ -441,6 +442,22 @@ func (p *fakePG) switchWAL() {
 	}
 	p.archive[SegmentName(p.tli, start, fakeSegSize)] = buf.Bytes()
 	p.insert = LSN((seg + 1) * fakeSegSize)
+}
+
+// segmentHeader is the long page header a segment opens with.
+func (p *fakePG) segmentHeader(tli uint32, start LSN) []byte {
+	h := make([]byte, walHeaderSize)
+	le := binary.LittleEndian
+	le.PutUint16(h, 0xd118)
+	le.PutUint16(h[2:], xlpLongHeader)
+	le.PutUint32(h[walHeaderTLI:], tli)
+	le.PutUint64(h[walHeaderAddr:], uint64(start))
+	var id uint64
+	fmt.Sscan(p.sysid, &id)
+	le.PutUint64(h[walHeaderSysID:], id)
+	le.PutUint32(h[walHeaderSeg:], fakeSegSize)
+	le.PutUint32(h[walHeaderBlck:], walPageSize)
+	return h
 }
 
 // failover promotes a standby: a new timeline from the current position.
@@ -526,7 +543,9 @@ func replay(t *testing.T, o *Observer, m *Manifest) map[string]string {
 	start, _ := ParseLSN(m.PG.Base.Start)
 	target, _ := ParseLSN(m.Checkpoint.LSN)
 	for _, seg := range m.PG.Segments {
-		r, err := o.store.OpenWAL(seg)
+		r, err := o.store.OpenWAL(m.Checkpoint.SystemID, seg)
+		require.NoError(t, err, seg)
+		_, err = io.ReadFull(r, make([]byte, walHeaderSize))
 		require.NoError(t, err, seg)
 		var recs []walRecord
 		sc := bufio.NewScanner(r)

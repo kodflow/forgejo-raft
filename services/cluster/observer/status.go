@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -162,9 +163,20 @@ func (o *Observer) prune(ctx context.Context) error {
 }
 
 // pruneData removes the bases, segments and blobs no live checkpoint needs.
+// Segments are compared within their system only: an initdb restarts
+// their numbers (#60).
 func (o *Observer) pruneData() error {
 	bases, blobs := map[string]bool{}, map[string]bool{}
-	var minSeg uint64 = 1<<64 - 1
+	minSeg := map[string]uint64{}
+	keep := func(sysid string, start string, segSize int64) {
+		l, err := ParseLSN(start)
+		if err != nil || segSize <= 0 {
+			return
+		}
+		if n, ok := minSeg[sysid]; !ok || uint64(l)/uint64(segSize) < n {
+			minSeg[sysid] = uint64(l) / uint64(segSize)
+		}
+	}
 	var segSize int64
 	for _, name := range o.store.Published() {
 		m, err := o.store.ReadManifest(name)
@@ -176,9 +188,7 @@ func (o *Observer) pruneData() error {
 			blobs[f.SHA256] = true
 		}
 		segSize = m.Checkpoint.WALSegmentSize
-		if start, err := ParseLSN(m.PG.Base.Start); err == nil && uint64(start)/uint64(segSize) < minSeg {
-			minSeg = uint64(start) / uint64(segSize)
-		}
+		keep(m.Checkpoint.SystemID, m.PG.Base.Start, segSize)
 	}
 	if segSize == 0 {
 		return nil
@@ -202,20 +212,29 @@ func (o *Observer) pruneData() error {
 	}
 	o.state.Bases = kept
 	for _, b := range kept {
-		if start, err := ParseLSN(b.Start); err == nil && uint64(start)/uint64(segSize) < minSeg {
-			minSeg = uint64(start) / uint64(segSize)
-		}
+		keep(b.SystemID, b.Start, segSize)
+	}
+	// The archive written flat before #60 held one system's segments.
+	legacyMin := uint64(1<<64 - 1)
+	for _, n := range minSeg {
+		legacyMin = min(legacyMin, n)
 	}
 	entries, _ := os.ReadDir(o.store.path("pg", "wal"))
 	for _, e := range entries {
-		name, ok := strings.CutSuffix(e.Name(), ".gz")
-		if !ok {
-			continue
-		}
-		if _, segno, ok := parseSegment(name, segSize); ok && segno < minSeg {
-			_ = os.Remove(o.store.path("pg", "wal", e.Name()))
+		if e.IsDir() {
+			if !sysidPattern.MatchString(e.Name()) {
+				continue
+			}
+			n, ok := minSeg[e.Name()]
+			if !ok {
+				// No live checkpoint nor base is of this system.
+				_ = os.RemoveAll(o.store.path("pg", "wal", e.Name()))
+				continue
+			}
+			pruneSegments(o.store.path("pg", "wal", e.Name()), n, segSize)
 		}
 	}
+	pruneSegments(o.store.path("pg", "wal"), legacyMin, segSize)
 	dirs, _ := os.ReadDir(o.store.path("blobs"))
 	for _, d := range dirs {
 		files, _ := os.ReadDir(o.store.path("blobs", d.Name()))
@@ -226,6 +245,20 @@ func (o *Observer) pruneData() error {
 		}
 	}
 	return o.store.saveState(o.state)
+}
+
+// pruneSegments removes the segments of dir numbered below minSeg.
+func pruneSegments(dir string, minSeg uint64, segSize int64) {
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		name, ok := strings.CutSuffix(e.Name(), ".gz")
+		if !ok || !e.Type().IsRegular() {
+			continue
+		}
+		if _, segno, ok := parseSegment(name, segSize); ok && segno < minSeg {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 }
 
 // curve25519Base derives an X25519 public key from its private key.

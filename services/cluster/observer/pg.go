@@ -278,6 +278,57 @@ func finalSegment(target LSN, segSize int64) uint64 {
 	return last
 }
 
+// A segment opens with XLogLongPageHeaderData, in the server's byte
+// order (little-endian on amd64 and arm64): xlp_magic, xlp_info, xlp_tli,
+// xlp_pageaddr, xlp_rem_len, then xlp_sysid, xlp_seg_size and
+// xlp_xlog_blcksz.
+const (
+	walHeaderSize  = 40
+	xlpLongHeader  = 0x0002
+	walHeaderTLI   = 4
+	walHeaderAddr  = 8
+	walHeaderSysID = 24
+	walHeaderSeg   = 32
+	walHeaderBlck  = 36
+)
+
+// headerSystem is the system identifier a segment's header names.
+func headerSystem(head []byte) string {
+	if len(head) < walHeaderSize {
+		return ""
+	}
+	return strconv.FormatUint(binary.LittleEndian.Uint64(head[walHeaderSysID:]), 10)
+}
+
+// checkSegmentHeader checks that a segment's first page is the segment its
+// name says, of system sysid: a segment of another system, or bytes that
+// are no segment, are never kept under the name (#60). The page's
+// timeline may be older than the name's: a promotion copies the segment of
+// the switch onto the new timeline.
+func checkSegmentHeader(head []byte, name, sysid string, segSize int64) error {
+	tli, segno, ok := parseSegment(name, segSize)
+	if !ok {
+		return nil
+	}
+	if len(head) < walHeaderSize {
+		return fmt.Errorf("segment %s is shorter than its page header", name)
+	}
+	le := binary.LittleEndian
+	switch {
+	case le.Uint16(head[2:])&xlpLongHeader == 0:
+		return fmt.Errorf("segment %s does not open with a long page header", name)
+	case le.Uint32(head[walHeaderTLI:]) == 0 || le.Uint32(head[walHeaderTLI:]) > tli:
+		return fmt.Errorf("segment %s holds timeline %d", name, le.Uint32(head[walHeaderTLI:]))
+	case le.Uint64(head[walHeaderAddr:]) != segno*uint64(segSize):
+		return fmt.Errorf("segment %s starts at %s", name, LSN(le.Uint64(head[walHeaderAddr:])))
+	case headerSystem(head) != sysid:
+		return fmt.Errorf("segment %s belongs to system %s, not %s", name, headerSystem(head), sysid)
+	case int64(le.Uint32(head[walHeaderSeg:])) != segSize || le.Uint32(head[walHeaderBlck:]) != walPageSize:
+		return fmt.Errorf("segment %s has segments of %d bytes and pages of %d", name, le.Uint32(head[walHeaderSeg:]), le.Uint32(head[walHeaderBlck:]))
+	}
+	return nil
+}
+
 // ---- base backups ----
 
 // BaseBackupLimits bound what a base backup's tar may hold.

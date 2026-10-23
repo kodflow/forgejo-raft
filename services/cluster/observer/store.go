@@ -33,7 +33,8 @@ import (
 //	git/<owner>/<repo>.git     objects, and refs/observer/<checkpoint>/ per checkpoint
 //	blobs/<ab>/<sha256>        stored files, by digest
 //	pg/base/<label>/           base backups, as pg_basebackup wrote them
-//	pg/wal/                    the WAL archive, segments gzipped, histories as is
+//	pg/wal/<sysid>/            the WAL archive of each PostgreSQL system,
+//	                           segments gzipped, histories as is
 //	log/<lineage>.jsonl        the committed log, when the engine reads it back
 //	quarantine/                what a fork, a rollback or an unknown lineage left
 //
@@ -384,39 +385,123 @@ func writeStream(path string, r io.Reader, limit int64, gz bool) (int64, string,
 
 // ---- WAL ----
 
-func (s *store) walPath(name string) string {
+// The archive keeps each PostgreSQL system's files apart, under
+// pg/wal/<system identifier>/: an initdb restarts segment names and
+// timeline numbers, which would otherwise be taken for the old system's
+// (#60). An archive written before kept every file flat in pg/wal/; it is
+// read as a fallback, a segment there only once its header names the
+// system.
+
+var sysidPattern = regexp.MustCompile(`^[0-9]{1,20}$`)
+
+func walFileName(name string) string {
 	if strings.HasSuffix(name, ".history") {
-		return s.path("pg", "wal", name)
+		return name
 	}
-	return s.path("pg", "wal", name+".gz")
+	return name + ".gz"
 }
 
-// histories lists every timeline history the archive holds.
-func (s *store) histories() ([]string, error) {
-	entries, err := os.ReadDir(s.path("pg", "wal"))
+// walDir is the archive of one system, "" for an invalid identifier, which
+// every file operation refuses.
+func (s *store) walDir(sysid string) string {
+	if !sysidPattern.MatchString(sysid) {
+		return ""
+	}
+	return s.path("pg", "wal", sysid)
+}
+
+// newWALPath is where a WAL file of sysid is written.
+func (s *store) newWALPath(sysid, name string) string {
+	dir := s.walDir(sysid)
+	if dir == "" || !ValidWALName(name) {
+		return ""
+	}
+	return filepath.Join(dir, walFileName(name))
+}
+
+// legacyWALPath is where an archive written before #60 kept a file.
+func (s *store) legacyWALPath(name string) string {
+	if !ValidWALName(name) {
+		return ""
+	}
+	return s.path("pg", "wal", walFileName(name))
+}
+
+// walPath is the held WAL file of sysid, "" when none is held.
+func (s *store) walPath(sysid, name string) string {
+	if p := s.newWALPath(sysid, name); p != "" {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	p := s.legacyWALPath(name)
+	if p == "" {
+		return ""
+	}
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	if !strings.HasSuffix(name, ".history") && !legacySegmentOf(p, name, sysid) {
+		return ""
+	}
+	return p
+}
+
+// legacySegmentOf reports whether a segment held flat belongs to sysid.
+func legacySegmentOf(path, name, sysid string) bool {
+	if !segmentPattern.MatchString(name) {
+		// A backup history file carries no header: it is the old system's.
+		return true
+	}
+	f, err := os.Open(path)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, err
+		return false
 	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		return false
+	}
+	var head [walHeaderSize]byte
+	if _, err := io.ReadFull(zr, head[:]); err != nil {
+		return false
+	}
+	return headerSystem(head[:]) == sysid
+}
+
+// histories lists every timeline history the archive of sysid holds.
+func (s *store) histories(sysid string) ([]string, error) {
 	var out []string
-	for _, e := range entries {
-		if e.Type().IsRegular() && strings.HasSuffix(e.Name(), ".history") && ValidWALName(e.Name()) {
-			out = append(out, e.Name())
+	for _, dir := range []string{s.walDir(sysid), s.path("pg", "wal")} {
+		if dir == "" {
+			continue
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		for _, e := range entries {
+			if e.Type().IsRegular() && strings.HasSuffix(e.Name(), ".history") && ValidWALName(e.Name()) && !slices.Contains(out, e.Name()) {
+				out = append(out, e.Name())
+			}
 		}
 	}
+	sort.Strings(out)
 	return out, nil
 }
 
-func (s *store) haveWAL(name string) bool {
-	_, err := os.Stat(s.walPath(name))
-	return err == nil
-}
+func (s *store) haveWAL(sysid, name string) bool { return s.walPath(sysid, name) != "" }
 
-// OpenWAL opens a held WAL file, decompressed.
-func (s *store) OpenWAL(name string) (io.ReadCloser, error) {
-	f, err := os.Open(s.walPath(name))
+// OpenWAL opens a held WAL file of sysid, decompressed.
+func (s *store) OpenWAL(sysid, name string) (io.ReadCloser, error) {
+	p := s.walPath(sysid, name)
+	if p == "" {
+		return nil, fmt.Errorf("%s: %w", name, os.ErrNotExist)
+	}
+	f, err := os.Open(p)
 	if err != nil || strings.HasSuffix(name, ".history") {
 		return f, err
 	}
@@ -433,29 +518,27 @@ type readCloser struct {
 	io.Closer
 }
 
-func (s *store) history(tli uint32) ([]Switch, error) {
-	f, err := os.Open(s.walPath(HistoryName(tli)))
+func (s *store) history(sysid string, tli uint32) ([]Switch, error) {
+	r, err := s.OpenWAL(sysid, HistoryName(tli))
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	return ParseHistory(f)
+	defer r.Close()
+	return ParseHistory(r)
 }
 
-// abandoned lists where each timeline was left, from every history held.
-func (s *store) abandoned() []Switch {
-	entries, _ := os.ReadDir(s.path("pg", "wal"))
+// abandoned lists where each timeline of sysid was left, from every
+// history held.
+func (s *store) abandoned(sysid string) []Switch {
+	names, _ := s.histories(sysid)
 	var out []Switch
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".history") {
-			continue
-		}
-		f, err := os.Open(s.path("pg", "wal", e.Name()))
+	for _, name := range names {
+		r, err := s.OpenWAL(sysid, name)
 		if err != nil {
 			continue
 		}
-		h, err := ParseHistory(f)
-		f.Close()
+		h, err := ParseHistory(r)
+		r.Close()
 		if err == nil {
 			out = append(out, h...)
 		}
@@ -463,9 +546,25 @@ func (s *store) abandoned() []Switch {
 	return out
 }
 
-// lastSegment is the greatest segment name held, the export's cursor.
-func (s *store) lastSegment() string {
-	entries, _ := os.ReadDir(s.path("pg", "wal"))
+// lastSegment is the greatest segment name held for sysid, the export's
+// cursor; for a system whose own archive is still empty, the greatest held
+// flat, when it is that system's.
+func (s *store) lastSegment(sysid string) string {
+	if last := greatestSegment(s.walDir(sysid)); last != "" {
+		return last
+	}
+	last := greatestSegment(s.path("pg", "wal"))
+	if last == "" || !legacySegmentOf(s.legacyWALPath(last), last, sysid) {
+		return ""
+	}
+	return last
+}
+
+func greatestSegment(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	entries, _ := os.ReadDir(dir)
 	last := ""
 	for _, e := range entries {
 		if name, ok := strings.CutSuffix(e.Name(), ".gz"); ok && segmentPattern.MatchString(name) && name > last {

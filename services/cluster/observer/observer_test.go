@@ -444,7 +444,7 @@ func TestObserverTakesANewBaseAfterAGap(t *testing.T) {
 	c.push("alice/demo.git", "refs/heads/main", c.commit("lost"))
 	c.pg.switchWAL()
 	for name := range c.pg.archive {
-		if !o.store.haveWAL(name) && !strings.HasSuffix(name, ".history") {
+		if !o.store.haveWAL(c.pg.sysid, name) && !strings.HasSuffix(name, ".history") {
 			delete(c.pg.archive, name)
 		}
 	}

@@ -996,10 +996,13 @@ func (o *Observer) fetchSecrets(ctx context.Context, src Source, stage string) e
 // that restore the checkpoint. Without one, it fetches a base backup when
 // none could ever reach it, and the checkpoint waits for a later one.
 func (o *Observer) coverPG(ctx context.Context, leader string, cp clusterhook.ExportCheckpoint, target LSN) (Coverage, error) {
-	if err := o.fetchWAL(ctx, leader); err != nil {
+	if err := o.fetchWAL(ctx, leader, cp); err != nil {
 		return Coverage{}, err
 	}
-	cov, err := Cover(o.state.Bases, cp.SystemID, target, cp.Timeline, cp.WALSegmentSize, o.store.haveWAL, o.store.history, o.store.abandoned())
+	sysid := cp.SystemID
+	have := func(name string) bool { return o.store.haveWAL(sysid, name) }
+	history := func(tli uint32) ([]Switch, error) { return o.store.history(sysid, tli) }
+	cov, err := Cover(o.state.Bases, sysid, target, cp.Timeline, cp.WALSegmentSize, have, history, o.store.abandoned(sysid))
 	if err == nil {
 		o.uncovered = 0
 		return cov, nil
@@ -1047,13 +1050,16 @@ type walSource struct {
 // PostgreSQL primary's archive advances, and its host need not be the Raft
 // leader. The lists are merged, and each file is taken from a member that
 // lists it, the leader first (#57).
-func (o *Observer) fetchWAL(ctx context.Context, leader string) error {
+func (o *Observer) fetchWAL(ctx context.Context, leader string, cp clusterhook.ExportCheckpoint) error {
+	if !sysidPattern.MatchString(cp.SystemID) {
+		return fmt.Errorf("invalid system identifier %q", cp.SystemID)
+	}
 	listed := map[string][]walSource{}
 	var errs []error
 	answered := false
 	for _, slot := range o.leaderFirst(leader) {
 		var files []clusterhook.WALFile
-		body, err := call(ctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportWALList, Observer: o.cfg.Name, Name: o.store.lastSegment()}, &files)
+		body, err := call(ctx, o.cfg.Endpoints[slot], &clusterhook.ExportRequest{Op: clusterhook.OpExportWALList, Observer: o.cfg.Name, Name: o.store.lastSegment(cp.SystemID)}, &files)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", slot, err))
 			continue
@@ -1077,8 +1083,11 @@ func (o *Observer) fetchWAL(ctx context.Context, leader string) error {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	if err := os.MkdirAll(o.store.walDir(cp.SystemID), 0o700); err != nil {
+		return err
+	}
 	for _, name := range names {
-		if err := o.fetchWALFile(ctx, name, listed[name]); err != nil {
+		if err := o.fetchWALFile(ctx, cp, name, listed[name]); err != nil {
 			return err
 		}
 	}
@@ -1098,8 +1107,8 @@ func (o *Observer) leaderFirst(leader string) []string {
 
 // fetchWALFile takes one listed WAL file from the first member that serves
 // bytes matching what it listed.
-func (o *Observer) fetchWALFile(ctx context.Context, name string, srcs []walSource) error {
-	if o.store.haveWAL(name) {
+func (o *Observer) fetchWALFile(ctx context.Context, cp clusterhook.ExportCheckpoint, name string, srcs []walSource) error {
+	if o.store.haveWAL(cp.SystemID, name) {
 		// A timeline history held with other bytes is a timeline number
 		// another history reused: segments under that number are not the
 		// ones this archive holds, and a restore would replay the wrong
@@ -1111,7 +1120,7 @@ func (o *Observer) fetchWALFile(ctx context.Context, name string, srcs []walSour
 			if src.file.SHA256 == "" {
 				continue
 			}
-			held, err := fileSHA256(o.store.walPath(name))
+			held, err := fileSHA256(o.store.walPath(cp.SystemID, name))
 			if err != nil {
 				return fmt.Errorf("WAL %s: %w", name, err)
 			}
@@ -1132,7 +1141,20 @@ func (o *Observer) fetchWALFile(ctx context.Context, name string, srcs []walSour
 			errs = append(errs, fmt.Errorf("%s: %w", src.slot, err))
 			continue
 		}
-		n, sum, err := writeStream(o.store.walPath(name), body, f.Size, !strings.HasSuffix(name, ".history"))
+		path := o.store.newWALPath(cp.SystemID, name)
+		// A segment is checked against its name and the checkpoint's
+		// system before it takes the name.
+		br := bufio.NewReaderSize(body, walHeaderSize)
+		head, _ := br.Peek(walHeaderSize)
+		err = checkSegmentHeader(head, name, cp.SystemID, cp.WALSegmentSize)
+		var n int64
+		var sum string
+		if err == nil {
+			n, sum, err = writeStream(path, br, f.Size, !strings.HasSuffix(name, ".history"))
+			if err != nil {
+				path = ""
+			}
+		}
 		body.Close()
 		if err == nil && n != f.Size {
 			err = fmt.Errorf("%d bytes, not %d", n, f.Size)
@@ -1143,7 +1165,9 @@ func (o *Observer) fetchWALFile(ctx context.Context, name string, srcs []walSour
 		if err == nil {
 			return nil
 		}
-		os.Remove(o.store.walPath(name))
+		if path != "" {
+			os.Remove(path)
+		}
 		errs = append(errs, fmt.Errorf("%s: %w", src.slot, err))
 	}
 	if len(errs) == 0 {
