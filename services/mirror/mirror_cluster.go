@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -137,9 +138,8 @@ func ensurePullWikiRemote(ctx context.Context, m *repo_model.Mirror, authAddr, a
 }
 
 // ensurePushMirrorRemote recreates, in a cluster, the remote of a push
-// mirror a node lacks, from the address SQL holds. SQL keeps no password:
-// a push mirror authenticated by one pushes from the nodes that hold its
-// remote, an SSH key or an address without credentials from every node.
+// mirror a node lacks, from the address SQL holds, without its password:
+// the push passes it through a credential helper (pushCredentialURL).
 func ensurePushMirrorRemote(ctx context.Context, m *repo_model.PushMirror, path string, isWiki bool) error {
 	if !clusterhook.Enabled() || m.RemoteAddress == "" {
 		return nil
@@ -151,7 +151,9 @@ func ensurePushMirrorRemote(ctx context.Context, m *repo_model.PushMirror, path 
 	addr := m.RemoteAddress
 	if isWiki {
 		// The wiki's address is found by asking the remote: only once the
-		// address passed the allow and block lists again.
+		// address passed the allow and block lists again, and with the
+		// mirror's password, which a private wiki requires. The git
+		// config keeps the address without it.
 		u, err := giturl.Parse(addr)
 		if err != nil {
 			return err
@@ -159,11 +161,70 @@ func ensurePushMirrorRemote(ctx context.Context, m *repo_model.PushMirror, path 
 		if err := recheckPushPermitted(ctx, m, u); err != nil {
 			return err
 		}
-		if addr = wikiRemoteURL(ctx, addr); addr == "" {
+		ask, err := pushCredentialURL(ctx, m, u, true)
+		if err != nil {
+			return err
+		}
+		if ask == "" {
+			ask = addr
+		}
+		found := wikiRemoteURL(ctx, ask)
+		suffix, ok := strings.CutPrefix(found, strings.TrimSuffix(ask, ".git"))
+		if found == "" || !ok {
 			return nil
 		}
+		addr = strings.TrimSuffix(addr, ".git") + suffix
 	}
 	return addPushRemoteAndConfig(ctx, m, addr, path)
+}
+
+// hasPassword reports whether u carries a password.
+func hasPassword(u *url.URL) bool {
+	if u == nil || u.User == nil {
+		return false
+	}
+	_, ok := u.User.Password()
+	return ok
+}
+
+// pushCredentialURL returns, in a cluster, remoteURL with the credentials
+// SQL keeps for the push mirror m, for a credential helper, or "" when
+// there are none to add. A remote recreated from SQL has no password, so
+// a push mirror authenticated by one pushed only from the node that
+// created it (#79). That node's remote carries the password, as Forgejo
+// writes it: a push mirror from before EncryptedRemoteAddress has it
+// stored from there, for the other nodes. The credentials go to the host
+// they were given for only.
+func pushCredentialURL(ctx context.Context, m *repo_model.PushMirror, remoteURL *giturl.GitURL, isWiki bool) (string, error) {
+	if !clusterhook.Enabled() || remoteURL == nil || remoteURL.URL == nil {
+		return "", nil
+	}
+	if hasPassword(remoteURL.URL) {
+		if m.EncryptedRemoteAddress == nil && !isWiki {
+			if err := m.SetEncryptedRemoteAddress(ctx, remoteURL.URL.String()); err != nil {
+				return "", err
+			}
+		}
+		return "", nil
+	}
+	maybe, err := m.DecryptRemoteAddress()
+	if err != nil {
+		return "", err
+	}
+	has, addr := maybe.Get()
+	if !has {
+		return "", nil
+	}
+	stored, err := url.Parse(addr)
+	if err != nil {
+		return "", err
+	}
+	if !hasPassword(stored) || stored.Scheme != remoteURL.Scheme || !strings.EqualFold(stored.Host, remoteURL.Host) {
+		return "", nil
+	}
+	authed := *remoteURL.URL
+	authed.User = stored.User
+	return authed.String(), nil
 }
 
 // syncRefBatch bounds the refs one git command of a mirror's sync writes in
