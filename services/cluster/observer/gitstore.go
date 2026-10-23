@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
+	"time"
 )
 
 // The observer's git store: one bare repository per repository key, under
@@ -25,6 +27,9 @@ import (
 
 // ErrImmutable is a checkpoint whose refs exist with other values.
 var ErrImmutable = errors.New("an accepted checkpoint's refs exist with other values")
+
+// gitWaitDelay is how long a cancelled git is given to end.
+const gitWaitDelay = 10 * time.Second
 
 type gitStore struct {
 	root string
@@ -39,6 +44,15 @@ func (g gitStore) dir(repo string) string { return filepath.Join(g.root, filepat
 func (g gitStore) run(ctx context.Context, dir string, stdin io.Reader, args ...string) (string, error) {
 	var out, errb bytes.Buffer
 	cmd := exec.CommandContext(ctx, g.git, append([]string{"-c", "core.hooksPath=/dev/null"}, args...)...)
+	// A stop asks git to end and clean its locks first; only one that
+	// does not end in time is killed (#85).
+	cmd.Cancel = func() error {
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
+	cmd.WaitDelay = gitWaitDelay
 	cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = dir, stdin, &out, &errb
 	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
 	if err := cmd.Run(); err != nil {
@@ -129,27 +143,68 @@ func (g gitStore) refs(ctx context.Context, dir, checkpoint string) (map[string]
 	return refs, nil
 }
 
+// missingRefs compares the refs a checkpoint holds with refs and returns
+// those still to create: ErrImmutable when one is there with another value,
+// or is not one of refs. A transaction killed while it renamed its locks
+// leaves some of them, which a retry completes.
+func missingRefs(checkpoint string, have, refs map[string]string) (map[string]string, error) {
+	for name, sha := range have {
+		if refs[name] != sha {
+			return nil, fmt.Errorf("%w: %s %s", ErrImmutable, checkpoint, name)
+		}
+	}
+	missing := map[string]string{}
+	for name, sha := range refs {
+		if _, ok := have[name]; !ok {
+			missing[name] = sha
+		}
+	}
+	return missing, nil
+}
+
+// dropLocks removes the ref locks left under a checkpoint's namespace. The
+// observer is its store's only writer and creates a namespace once, before
+// the checkpoint is published: a lock there is a git killed in an earlier
+// pass, never one at work (#85).
+func (g gitStore) dropLocks(dir, checkpoint string) error {
+	if !checkpointName.MatchString(checkpoint) {
+		return fmt.Errorf("invalid checkpoint name %q", checkpoint)
+	}
+	root := filepath.Join(dir, "refs", "observer", checkpoint)
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type().IsRegular() && strings.HasSuffix(d.Name(), ".lock") {
+			return os.Remove(p)
+		}
+		return nil
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
 // createRefs creates a checkpoint's refs in one transaction of create-only
 // updates. Refs already there with the same values are a retry after a
-// crash and succeed; any other value is ErrImmutable.
+// crash and succeed; refs there with any other value are ErrImmutable.
+// A transaction that fails otherwise (a stop, a full disk) is an ordinary
+// error, which the next pass retries.
 func (g gitStore) createRefs(ctx context.Context, dir, checkpoint string, refs map[string]string) error {
 	have, err := g.refs(ctx, dir, checkpoint)
 	if err != nil {
 		return err
 	}
-	if len(have) > 0 {
-		if len(have) != len(refs) {
-			return fmt.Errorf("%w: %s holds %d refs, not %d", ErrImmutable, checkpoint, len(have), len(refs))
-		}
-		for name, sha := range refs {
-			if have[name] != sha {
-				return fmt.Errorf("%w: %s %s", ErrImmutable, checkpoint, name)
-			}
-		}
-		return nil
+	missing, err := missingRefs(checkpoint, have, refs)
+	if err != nil || len(missing) == 0 {
+		return err
 	}
-	names := make([]string, 0, len(refs))
-	for name := range refs {
+	if err := g.dropLocks(dir, checkpoint); err != nil {
+		return err
+	}
+	names := make([]string, 0, len(missing))
+	for name := range missing {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -160,7 +215,15 @@ func (g gitStore) createRefs(ctx context.Context, dir, checkpoint string, refs m
 	}
 	in.WriteString("prepare\ncommit\n")
 	if _, err := g.run(ctx, dir, strings.NewReader(in.String()), "update-ref", "--stdin"); err != nil {
-		return fmt.Errorf("%w: %v", ErrImmutable, err)
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: %w", ctx.Err(), err)
+		}
+		if have, rerr := g.refs(ctx, dir, checkpoint); rerr == nil {
+			if left, merr := missingRefs(checkpoint, have, refs); merr != nil || len(left) == 0 {
+				return merr
+			}
+		}
+		return err
 	}
 	return nil
 }

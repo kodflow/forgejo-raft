@@ -210,7 +210,8 @@ func (o *Observer) Step(ctx context.Context) error {
 		return o.prune(ctx)
 	}
 	if err := o.ingest(ctx, slot, cp, view.Voters); err != nil {
-		if errors.Is(err, ErrImmutable) {
+		// A pass stopped or timed out is never taken for a fork.
+		if errors.Is(err, ErrImmutable) && ctx.Err() == nil {
 			return o.quarantineFor(fmt.Sprintf("checkpoint %s: %v", cp.Name, err), "")
 		}
 		return fmt.Errorf("checkpoint %s: %w", cp.Name, err)
