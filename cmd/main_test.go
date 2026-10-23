@@ -24,10 +24,22 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	// The engine's boot-scoped marker directory, which a runner cannot
-	// create at its Linux default, /run/kitsunium-consensus.
-	kitsunium.RuntimeDir = filepath.Join(os.TempDir(), "kitsunium-consensus")
-	unittest.MainTest(m)
+	unittest.MainTest(m, runtimeDirOptions())
+}
+
+// runtimeDirOptions gives the engine a boot-scoped marker directory of this
+// binary's own, which a runner cannot create at its Linux default,
+// /run/kitsunium-consensus. SetUp runs only in the suite, never in the git
+// hooks that run this binary, and TearDown removes the directory.
+func runtimeDirOptions() *unittest.TestOptions {
+	return &unittest.TestOptions{
+		SetUp: func() error {
+			dir, err := os.MkdirTemp("", "kitsunium-consensus-")
+			kitsunium.RuntimeDir = dir
+			return err
+		},
+		TearDown: func() error { return os.RemoveAll(kitsunium.RuntimeDir) },
+	}
 }
 
 func makePathOutput(workPath, customPath, customConf string) string {
