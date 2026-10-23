@@ -4,15 +4,19 @@
 package mirror
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	giturl "forgejo.org/modules/git/url"
 	repo_module "forgejo.org/modules/repository"
+	"forgejo.org/services/cluster/reftable"
 )
 
 // In a cluster each node holds its own copy of a repository, and the
@@ -160,4 +164,139 @@ func ensurePushMirrorRemote(ctx context.Context, m *repo_model.PushMirror, path 
 		}
 	}
 	return addPushRemoteAndConfig(ctx, m, addr, path)
+}
+
+// syncRefBatch bounds the refs one git command of a mirror's sync writes in
+// a cluster, as the clone's batches do (services/repository).
+const syncRefBatch = 512
+
+// syncInBatches runs the fetch of a mirror's sync by batches in a cluster
+// when it must (fetchInBatches), and writes its output to out. credURL, if
+// set, authenticates the fetch as the sync's own; tags adds --tags. It is
+// false, and nothing was written, when the sync's own fetch is to run.
+func syncInBatches(ctx context.Context, m *repo_model.Mirror, credURL, dir string, prune, tags bool, timeout time.Duration, env []string, out *strings.Builder) (bool, error) {
+	if !clusterhook.Enabled() {
+		return false, nil
+	}
+	dry := git.NewCommand(ctx)
+	if credURL != "" {
+		_, cleanup, err := dry.AddAuthCredentialHelperForRemote(credURL)
+		if err != nil {
+			return false, err
+		}
+		defer cleanup()
+	}
+	dry.AddArguments("fetch", "--dry-run", "--porcelain")
+	if prune {
+		dry.AddArguments("--prune")
+	}
+	if tags {
+		dry.AddArguments("--tags")
+	}
+	dry.AddDynamicArguments(m.GetRemoteName())
+	output, batched, err := fetchInBatches(ctx, dry, dir, timeout, env)
+	out.WriteString(output)
+	return batched, err
+}
+
+// fetchInBatches runs, in a cluster, the fetch of a mirror's sync when it
+// would update more refs than the cluster takes in one transaction. git
+// 2.54 and later write a whole fetch in one transaction, which the cluster
+// refuses past reftable.MaxUpdatesPerTxn: the sync failed, and every later
+// one fetched the same refs and failed the same way (#134). dry is the
+// sync's fetch with --dry-run --porcelain, which brings the objects and
+// lists the updates without writing a ref. Past the bound, the updates are
+// written by batches of syncRefBatch, each checked against the old value
+// the fetch read, and the output is the fetch's own, so the sync reports
+// the same results; batched is false when the sync's fetch can run as is.
+func fetchInBatches(ctx context.Context, dry *git.Command, dir string, timeout time.Duration, env []string) (output string, batched bool, err error) {
+	if !clusterhook.Enabled() {
+		return "", false, nil
+	}
+	var stdout, stderr bytes.Buffer
+	if err := dry.Run(&git.RunOpts{Dir: dir, Timeout: timeout, Env: env, Stdout: &stdout, Stderr: &stderr}); err != nil {
+		// The sync's own fetch fails the same way and reports it.
+		return "", false, nil
+	}
+	updates, ok := parsePorcelainFetch(stdout.String())
+	if !ok || len(updates) <= reftable.MaxUpdatesPerTxn {
+		return "", false, nil
+	}
+	var out strings.Builder
+	for len(updates) > 0 {
+		n := min(len(updates), syncRefBatch)
+		var in bytes.Buffer
+		for _, u := range updates[:n] {
+			switch u.flag {
+			case '*':
+				fmt.Fprintf(&in, "create %s %s\n", u.ref, u.newID)
+			case '-':
+				fmt.Fprintf(&in, "delete %s %s\n", u.ref, u.oldID)
+			default:
+				fmt.Fprintf(&in, "update %s %s %s\n", u.ref, u.newID, u.oldID)
+			}
+		}
+		if _, _, err := git.NewCommand(ctx, "update-ref", "--stdin").
+			SetDescription(fmt.Sprintf("fetchInBatches(git update-ref): %s", dir)).
+			RunStdString(&git.RunOpts{Dir: dir, Timeout: timeout, Stdin: &in}); err != nil {
+			return "", true, fmt.Errorf("git update-ref: %w", err)
+		}
+		for _, u := range updates[:n] {
+			out.WriteString(u.line())
+		}
+		updates = updates[n:]
+	}
+	return out.String(), true, nil
+}
+
+// porcelainUpdate is one line of `git fetch --porcelain`.
+type porcelainUpdate struct {
+	flag              byte
+	oldID, newID, ref string
+}
+
+// line writes the update as git fetch writes it without --porcelain, for
+// parseRemoteUpdateOutput.
+func (u porcelainUpdate) line() string {
+	switch u.flag {
+	case '*':
+		return fmt.Sprintf(" * [new ref]         %s -> %s\n", u.ref, u.ref)
+	case '-':
+		return fmt.Sprintf(" - [deleted]         (none)     -> %s\n", u.ref)
+	case ' ':
+		return fmt.Sprintf("   %s..%s  %s -> %s\n", u.oldID, u.newID, u.ref, u.ref)
+	default:
+		return fmt.Sprintf(" + %s...%s %s -> %s  (forced update)\n", u.oldID, u.newID, u.ref, u.ref)
+	}
+}
+
+// parsePorcelainFetch reads `git fetch --porcelain`: "<flag> <old> <new>
+// <ref>" per line. ok is false on a rejected ref or a line it cannot read:
+// the sync's own fetch then runs and reports it.
+func parsePorcelainFetch(s string) (updates []porcelainUpdate, ok bool) {
+	sc := bufio.NewScanner(strings.NewReader(s))
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			continue
+		}
+		f := strings.SplitN(line[min(len(line), 2):], " ", 3)
+		if len(line) < 2 || line[1] != ' ' || len(f) != 3 {
+			return nil, false
+		}
+		u := porcelainUpdate{flag: line[0], oldID: f[0], newID: f[1], ref: f[2]}
+		switch u.flag {
+		case '=':
+			continue
+		case ' ', '+', '-', 't', '*':
+		default:
+			return nil, false
+		}
+		if !strings.HasPrefix(u.ref, "refs/") {
+			return nil, false
+		}
+		updates = append(updates, u)
+	}
+	return updates, sc.Err() == nil
 }

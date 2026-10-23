@@ -27,7 +27,7 @@ func TestParkedEntryUnparksOnce(t *testing.T) {
 	n, err := CountParked(ctx)
 	require.NoError(t, err)
 	assert.EqualValues(t, 3, n)
-	has, err := RepoHasParked(ctx, "o/a.git")
+	has, err := RepoHasParked(ctx, "o/a.git", 0)
 	require.NoError(t, err)
 	assert.True(t, has)
 	idx, ok, err := MinParkedIndex(ctx, "l")
@@ -55,6 +55,33 @@ func TestParkedEntryUnparksOnce(t *testing.T) {
 	require.ErrorIs(t, db.WithTx(ctx, func(ctx context.Context) error { return UnparkEntry(ctx, "l", 7, 2) }), ErrParkedGone)
 	idx, _, _ = MinParkedIndex(ctx, "l")
 	assert.EqualValues(t, 9, idx)
+}
+
+// A parked row holds its repository back by id: under its new name after
+// a rename, never a new repository that took the old name (#133). A row
+// without an id is held by its key.
+func TestRepoHasParkedByID(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ctx := db.DefaultContext
+	require.NoError(t, ParkEvents(ctx, []*ParkedEvent{
+		{Lineage: "l", LogIndex: 1, Repo: "o/x.git", RepoID: 7, Event: "{}"},
+		{Lineage: "l", LogIndex: 2, Repo: "o/old.git", Event: "{}"},
+	}))
+	for _, c := range []struct {
+		repo string
+		id   int64
+		want bool
+	}{
+		{"o/y.git", 7, true},   // renamed
+		{"o/x.git", 8, false},  // a new repository under the old name
+		{"o/x.git", 0, true},   // no id: the key
+		{"o/old.git", 9, true}, // a row without an id: the key
+		{"o/other.git", 0, false},
+	} {
+		has, err := RepoHasParked(ctx, c.repo, c.id)
+		require.NoError(t, err)
+		assert.Equal(t, c.want, has, "%s id %d", c.repo, c.id)
+	}
 }
 
 // An operator gives up a parked entry only with a reason; the event, its

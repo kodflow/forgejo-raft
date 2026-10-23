@@ -328,6 +328,22 @@ func SettingsPost(ctx *context.Context) {
 			return
 		}
 
+		// The visibility is checked before the rename: a rename is
+		// committed at once, in a cluster on every node, and a refusal
+		// after it would leave the repository renamed with its other
+		// settings unchanged (#135).
+		// Visibility of forked repository is forced sync with base repository.
+		if repo.IsFork {
+			form.Private = repo.BaseRepo.IsPrivate || repo.BaseRepo.Owner.Visibility == structs.VisibleTypePrivate
+		}
+
+		visibilityChanged := repo.IsPrivate != form.Private
+		// when ForcePrivate enabled, you could change public repo to private, but only admin users can change private to public
+		if visibilityChanged && setting.Repository.ForcePrivate && !form.Private && !ctx.Doer.IsAdmin {
+			ctx.RenderWithErr(ctx.Tr("form.repository_force_private"), tplSettingsOptions, form)
+			return
+		}
+
 		newRepoName := form.RepoName
 		// Check if repository name has been changed.
 		if repo.LowerName != strings.ToLower(newRepoName) {
@@ -371,18 +387,6 @@ func SettingsPost(ctx *context.Context) {
 		repo.Description = form.Description
 		repo.Website = form.Website
 		repo.IsTemplate = form.Template
-
-		// Visibility of forked repository is forced sync with base repository.
-		if repo.IsFork {
-			form.Private = repo.BaseRepo.IsPrivate || repo.BaseRepo.Owner.Visibility == structs.VisibleTypePrivate
-		}
-
-		visibilityChanged := repo.IsPrivate != form.Private
-		// when ForcePrivate enabled, you could change public repo to private, but only admin users can change private to public
-		if visibilityChanged && setting.Repository.ForcePrivate && !form.Private && !ctx.Doer.IsAdmin {
-			ctx.RenderWithErr(ctx.Tr("form.repository_force_private"), tplSettingsOptions, form)
-			return
-		}
 
 		repo.IsPrivate = form.Private
 		if err := repo_service.UpdateRepository(ctx, repo, visibilityChanged); err != nil {

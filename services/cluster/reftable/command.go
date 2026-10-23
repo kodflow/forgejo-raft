@@ -47,7 +47,15 @@ import (
 // to a key is not bound again to another one (#70). Every kind may be
 // written at version 5, and the table's snapshot is then written in format
 // 2, which an older binary refuses (#50).
-const PayloadVersion = 5
+//
+// Version 6 tells git init's HEAD from a change of the default branch
+// (InitVersion): both are HEAD alone, symbolic, and git gives both a zero
+// old value, but only the first may bring a deleted or renamed-away key
+// back. The proposer marks a transaction Init when the directory it runs
+// in holds no ref yet; from version 6 only such a transaction is taken for
+// a creation (#136). Below version 6 Apply ignores the field, as an older
+// binary does.
+const PayloadVersion = 6
 
 // RevokeVersion is the payload version that carries KindRevokeKey.
 const RevokeVersion = 3
@@ -59,6 +67,10 @@ const PusherVersion = 4
 // GenerationVersion is the payload version of the rules listed above
 // PayloadVersion's version 5.
 const GenerationVersion = 5
+
+// InitVersion is the payload version from which a creation is a ref
+// transaction marked Init, not any transaction of HEAD alone.
+const InitVersion = 6
 
 // MaxPusherName bounds a pusher's name, from PusherVersion: a longer one
 // is refused, on every node alike.
@@ -151,6 +163,10 @@ type RefTxn struct {
 	// repository left the key, deleted or renamed away, is refused, even
 	// once another repository took the key (#91). 0 skips the check.
 	ReadAt uint64 `json:"read,omitempty"`
+	// Init marks git init's HEAD: the transaction is HEAD alone, symbolic,
+	// in a directory that held no ref. Written and applied from InitVersion
+	// only; below it any transaction of HEAD alone is a creation.
+	Init bool `json:"init,omitempty"`
 }
 
 // Ack trims the events of a lineage up to an index, once the dispatcher read

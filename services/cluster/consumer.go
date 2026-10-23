@@ -67,7 +67,7 @@ type consumer struct {
 	durable func(ctx context.Context) (bool, string)
 	// The parked events' table; tests replace it.
 	park       func(ctx context.Context, rows []*cluster_model.ParkedEvent) error
-	hasParked  func(ctx context.Context, repo string) (bool, error)
+	hasParked  func(ctx context.Context, repo string, repoID int64) (bool, error)
 	minParked  func(ctx context.Context, lineage string) (int64, bool, error)
 	listParked func(ctx context.Context) ([]*cluster_model.ParkedEvent, error)
 	unpark     func(ctx context.Context, lineage string, index int64, want int) error
@@ -104,7 +104,14 @@ type consumer struct {
 		index uint64
 		repo  string
 		since time.Time
+		// waited is how long the repository waited for its own
+		// projection; last is when it was last counted.
+		waited time.Duration
+		last   time.Time
 	}
+	// waitsBehind reports a repository whose projection waits behind
+	// another repository's in the projector's serial pass; nil in tests.
+	waitsBehind func(repo string) bool
 }
 
 // projectionStallBound is how long the dispatcher waits for a repository
@@ -137,6 +144,7 @@ func newConsumer(r *Replicator) *consumer {
 		cursor:  cluster_model.GetCursor, advance: cluster_model.AdvanceCursor, tx: batchTx, inTx: db.InTransaction,
 		events:      r.table.Events,
 		projectedAt: r.projector.Projected,
+		waitsBehind: r.projector.WaitsBehind,
 		lineageNow: func() string {
 			_, id := r.table.Applied()
 			return id.String()
@@ -207,6 +215,8 @@ func (c *consumer) projected(evs []reftable.Event) bool {
 		}
 	}
 	idx := evs[0].Token.Index
+	// Read outside c.mu: it takes the projector's lock.
+	behind := waiting != "" && c.waitsBehind != nil && c.waitsBehind(waiting)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if waiting == "" {
@@ -223,11 +233,21 @@ func (c *consumer) projected(evs []reftable.Event) bool {
 		c.reasons[idx] = fmt.Sprintf("%s is still not projected; parked behind its stalled event", waiting)
 		return true
 	}
+	now := time.Now()
 	if c.stall.index != idx || c.stall.repo != waiting {
-		c.stall.index, c.stall.repo, c.stall.since = idx, waiting, time.Now()
+		c.stall.index, c.stall.repo, c.stall.since = idx, waiting, now
+		c.stall.waited, c.stall.last = 0, now
 		return false
 	}
-	if time.Since(c.stall.since) < projectionStallBound {
+	// The bound is the time the repository waited for its own projection:
+	// one behind another repository's long projection in the serial pass
+	// is not stalled, and parking it, then each one behind it, a bound
+	// each, parked healthy repositories (#137).
+	if !behind {
+		c.stall.waited += now.Sub(c.stall.last)
+	}
+	c.stall.last = now
+	if c.stall.waited < projectionStallBound {
 		return false
 	}
 	log.Error("cluster consumer: %s is still not projected at %d after %s; parking its event", waiting, idx, projectionStallBound)
@@ -497,7 +517,7 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 			behind := false
 			if attempts < maxAttempts && c.hasParked != nil {
 				var err error
-				if behind, err = c.hasParked(ctx, group[0].Repo); err != nil {
+				if behind, err = c.hasParked(ctx, group[0].Repo, group[0].RepoID); err != nil {
 					return err
 				}
 				if behind {
@@ -609,7 +629,7 @@ func (c *consumer) parkGroup(ctx context.Context, lineage string, group []reftab
 			return err
 		}
 		rows = append(rows, &cluster_model.ParkedEvent{
-			Lineage: lineage, LogIndex: int64(ev.Token.Index), Seq: seq[i], Repo: ev.Repo,
+			Lineage: lineage, LogIndex: int64(ev.Token.Index), Seq: seq[i], Repo: ev.Repo, RepoID: ev.RepoID,
 			Event: string(b), Reason: reason, Attempts: attempts,
 		})
 	}
@@ -631,7 +651,10 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	blocked := map[string]bool{}
+	// A repository whose entry stays parked blocks its later entries: by
+	// id when known, so a rename does not let them pass and a new
+	// repository under the old name is not held (#133).
+	blocked := map[parkedRepo]bool{}
 	applied := 0
 	now := ""
 	if c.lineageNow != nil {
@@ -645,7 +668,7 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 		entry := rows[:n]
 		rows = rows[n:]
 		lineage, index, repo := entry[0].Lineage, entry[0].LogIndex, entry[0].Repo
-		if blocked[repo] {
+		if blocked[parkedRepoOf(entry[0])] {
 			continue
 		}
 		evs := make([]reftable.Event, 0, len(entry))
@@ -657,13 +680,21 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 			}
 			evs = append(evs, ev)
 		}
+		key := parkedRepoOf(entry[0])
+		if derr == nil && key.id == 0 && len(evs) > 0 && evs[0].RepoID != 0 {
+			// A row parked before its id had a column: the event has it.
+			key = parkedRepo{id: evs[0].RepoID}
+			if blocked[key] {
+				continue
+			}
+		}
 		if derr != nil {
-			blocked[repo] = true
+			blocked[key] = true
 			_ = c.noteParked(ctx, lineage, index, "decoding the parked event: "+derr.Error())
 			continue
 		}
 		if lineage == now && c.projectedAt != nil && c.projectedAt(repo) < uint64(index) {
-			blocked[repo] = true
+			blocked[key] = true
 			continue
 		}
 		wctx, effects := clusterhook.WithAfterCommit(ctx)
@@ -694,7 +725,7 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 			err = nil
 		}
 		if err != nil {
-			blocked[repo] = true
+			blocked[key] = true
 			if nerr := c.noteParked(ctx, lineage, index, err.Error()); nerr != nil {
 				log.Warn("cluster consumer: noting the failed retry of %s at %d: %v", repo, index, nerr)
 			}
@@ -706,6 +737,20 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 		log.Info("cluster consumer: applied the parked event of %s at %d", repo, index)
 	}
 	return applied, nil
+}
+
+// parkedRepo is the repository a parked row holds back: its id when the
+// row has one, else its key.
+type parkedRepo struct {
+	id  int64
+	key string
+}
+
+func parkedRepoOf(row *cluster_model.ParkedEvent) parkedRepo {
+	if row.RepoID != 0 {
+		return parkedRepo{id: row.RepoID}
+	}
+	return parkedRepo{key: row.Repo}
 }
 
 // RetryParked retries the parked events now, as `forgejo cluster reconcile

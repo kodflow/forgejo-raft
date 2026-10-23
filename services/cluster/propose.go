@@ -350,6 +350,7 @@ func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook
 			}
 		}
 	}
+	tx.Init = initsRepo(ctx, req.GitDir, tx.Updates)
 	if tx.Format == "" {
 		// A new repository's first entry is often HEAD alone: ask git.
 		tx.Format = "sha1"
@@ -358,6 +359,28 @@ func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook
 		}
 	}
 	return tx, refs, nil
+}
+
+// initsRepo reports whether a transaction of HEAD alone is git init's:
+// git gives a change of the default branch the same zero old value, so
+// the directory tells them apart, which holds no ref before git init's
+// HEAD. A directory that cannot be read keeps the reading the table had
+// before InitVersion, a creation (#136).
+func initsRepo(ctx context.Context, gitDir string, updates []reftable.RefUpdate) bool {
+	if len(updates) == 0 {
+		return false
+	}
+	for _, u := range updates {
+		if u.Ref != "HEAD" || u.Symbolic == "" {
+			return false
+		}
+	}
+	out, err := gitRun(ctx, gitDir, nil, "for-each-ref", "--count=1", "--format=%(refname)")
+	if err != nil {
+		log.Warn("cluster: reading the refs of %s to tell git init from a change of HEAD: %v", gitDir, err)
+		return true
+	}
+	return strings.TrimSpace(out) == ""
 }
 
 // errNoLeader is what a push reads on a node whose cluster cannot commit:
@@ -476,6 +499,10 @@ func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.
 	v := r.table.WriteVersion()
 	if v < reftable.PusherVersion || tx.PusherID == 0 || len(tx.PusherName) > reftable.MaxPusherName {
 		tx.PusherName = ""
+	}
+	// Init likewise from InitVersion only.
+	if v < reftable.InitVersion {
+		tx.Init = false
 	}
 	data, err := reftable.EncodeVersion(v, reftable.KindRefTxn, tx)
 	if err != nil {

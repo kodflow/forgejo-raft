@@ -223,3 +223,60 @@ func TestStallBoundIsPerRepoNotPerEvent(t *testing.T) {
 	assert.Equal(t, []int64{1, 2, 3}, parked.indexes())
 	assert.Greater(t, retries, 1, "the parked events are retried while the head waits")
 }
+
+// A repository whose projection waits behind another repository's long
+// projection in the serial pass is not stalled: its event is not parked,
+// and the wait counts again once the pass reaches it (#137).
+func TestStallBoundNotCountedBehindAnotherProjection(t *testing.T) {
+	defer test.MockVariableValue(&projectionStallBound, 200*time.Millisecond)()
+	defer test.MockVariableValue(&parkedRetryEvery, time.Hour)()
+	store, lg, parked := newSQLStore(), &memLog{}, &memParked{}
+	lg.events = []reftable.Event{{Token: testToken(1), Kind: reftable.EventRef, Repo: "o/y.git", Ref: "refs/heads/a", PusherID: 1}}
+	var ran []string
+	c := unitConsumer(store, lg, parked, func(_ context.Context, evs []reftable.Event) error {
+		ran = append(ran, evs[0].Repo)
+		return nil
+	})
+	c.lineageNow = func() string { return testToken(1).Identity().String() }
+	var projected, behind atomic.Bool
+	behind.Store(true)
+	c.projectedAt = func(string) uint64 {
+		if projected.Load() {
+			return 1 << 62
+		}
+		return 0
+	}
+	c.waitsBehind = func(string) bool { return behind.Load() }
+
+	start := time.Now()
+	for time.Since(start) < 3*projectionStallBound {
+		_ = c.pass(context.Background())
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.Empty(t, parked.indexes(), "waiting behind another projection is no stall")
+	assert.Empty(t, ran)
+
+	// The pass reaches it and it does not project: the bound runs.
+	behind.Store(false)
+	start = time.Now()
+	for len(parked.indexes()) == 0 && time.Since(start) < 5*projectionStallBound {
+		_ = c.pass(context.Background())
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.Equal(t, []int64{1}, parked.indexes())
+	assert.GreaterOrEqual(t, time.Since(start), projectionStallBound)
+}
+
+// The projector reports a repository waiting behind the one its pass
+// projects, not the one it projects nor one whose projection failed.
+func TestProjectorWaitsBehind(t *testing.T) {
+	p := newProjector(t.TempDir(), reftable.New(), newRegistry(time.Minute, 1, 1))
+	assert.False(t, p.WaitsBehind("o/y.git"), "no pass running")
+	p.mu.Lock()
+	p.current = "o/x.git"
+	p.failures["o/z.git"] = "boom"
+	p.mu.Unlock()
+	assert.True(t, p.WaitsBehind("o/y.git"))
+	assert.False(t, p.WaitsBehind("o/x.git"))
+	assert.False(t, p.WaitsBehind("o/z.git"))
+}
