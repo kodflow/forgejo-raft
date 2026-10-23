@@ -268,16 +268,16 @@ replace github.com/gliderlabs/ssh => code.forgejo.org/forgejo/ssh v0.0.0-2024121
 
 replace git.sr.ht/~mariusor/go-xsd-duration => code.forgejo.org/forgejo/go-xsd-duration v0.0.0-20220703122237-02e73435a078
 
-// Lots S1 to S4 of the Raft (kitsunium/sdk#571) and the fixes #590 to #594
-// (kitsunium/sdk#595, merge d0736c68): to be replaced by the first SDK tag
-// that contains d0736c68. That commit's
-// go.mod files require their sibling modules at the zero version their
-// own replaces resolve, which a consumer ignores: the zero versions are
-// mapped to the tags the build selects, so the whole module graph loads.
+// Lots S1 to S4 of the Raft (kitsunium/sdk#571), the fixes #590 to #594
+// (kitsunium/sdk#595) and those of #596, #599, #605, #607 and #608 (main at
+// fde96eb7): to be replaced by the first SDK tag that contains fde96eb7.
+// That commit's go.mod files require their sibling modules at the zero
+// version their own replaces resolve, which a consumer ignores: the zero
+// versions are mapped to the tags the build selects, so the whole module graph loads.
 replace (
-	github.com/kitsunium/sdk/internal => github.com/kitsunium/sdk/internal v0.0.0-20261023141025-d0736c6840dd
+	github.com/kitsunium/sdk/internal => github.com/kitsunium/sdk/internal v0.0.0-20261023203645-fde96eb7a124
 	github.com/kitsunium/sdk/internal v0.0.0-00010101000000-000000000000 => github.com/kitsunium/sdk/internal v0.25.1
-	github.com/kitsunium/sdk/pkg/v1/app => github.com/kitsunium/sdk/pkg/v1/app v0.0.0-20261023141025-d0736c6840dd
+	github.com/kitsunium/sdk/pkg/v1/app => github.com/kitsunium/sdk/pkg/v1/app v0.0.0-20261023203645-fde96eb7a124
 	github.com/kitsunium/sdk/pkg/v1/clock v0.0.0-00010101000000-000000000000 => github.com/kitsunium/sdk/pkg/v1/clock v0.1.2
 	github.com/kitsunium/sdk/pkg/v1/crypto v0.0.0-00010101000000-000000000000 => github.com/kitsunium/sdk/pkg/v1/crypto v0.3.3
 	github.com/kitsunium/sdk/pkg/v1/data v0.0.0-00010101000000-000000000000 => github.com/kitsunium/sdk/pkg/v1/data v0.11.0
