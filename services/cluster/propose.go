@@ -749,7 +749,9 @@ func (r *Replicator) proposeLifecycle(ctx context.Context, v uint8, kind reftabl
 	if clusterhook.IsOutcomeUnresolved(err) && landed != nil {
 		if ok, rerr := r.resolveLanded(detached, landed); rerr == nil {
 			if !ok {
-				return fmt.Errorf("the cluster did not record it: not applied at a commit boundary after %w", err)
+				// Certain: a commit boundary a quorum confirmed was applied
+				// without it, so the callers move the directories back.
+				return fmt.Errorf("the cluster did not record it: not applied at a commit boundary after %v", err)
 			}
 			result, err = reftable.Result{OK: true}, nil
 		}
@@ -827,12 +829,20 @@ func (r *Replicator) RaisePayloadVersion(ctx context.Context, op consensus.Opera
 	if err != nil {
 		return err
 	}
-	_, result, err := r.proposeCommand(ctx, data, func() bool { return r.table.WriteVersion() >= reftable.PayloadVersion })
+	tok, result, err := r.proposeCommand(ctx, data, func() bool { return r.table.WriteVersion() >= reftable.PayloadVersion })
 	if err != nil {
 		return err
 	}
 	if !result.OK {
 		return fmt.Errorf("the cluster refused it: %s", result.Reason)
+	}
+	// A proposal forwarded from a follower returns once the leader applied
+	// it: what follows the raise here, the pending revocations' flush,
+	// reads this node's table.
+	if eng := r.Engine(); eng != nil {
+		if err := eng.WaitApplied(ctx, tok); err != nil {
+			return fmt.Errorf("the payload version is raised, but this node did not apply it yet: %w", err)
+		}
 	}
 	return nil
 }

@@ -53,12 +53,27 @@ func TestHuntR4ProveMirrorRemote(t *testing.T) {
 	require.NoError(t, (&repo_model.Mirror{RepoID: mirror.ID, Interval: setting.Mirror.DefaultInterval, EnablePrune: true}).InsertWithAddress(ctx, upstream))
 
 	key := owner.LowerName + "/" + mirror.LowerName + ".git"
-	require.NoError(t, git.InitRepository(ctx, filepath.Join(origin.r.root, filepath.FromSlash(key)), true, git.Sha1ObjectFormat.Name()))
-	requireLiveEverywhere(t, tc, key)
+	wikiKey := owner.LowerName + "/" + mirror.LowerName + ".wiki.git"
+	for _, k := range []string{key, wikiKey} {
+		require.NoError(t, git.InitRepository(ctx, filepath.Join(origin.r.root, filepath.FromSlash(k)), true, git.Sha1ObjectFormat.Name()))
+		requireLiveEverywhere(t, tc, k)
+	}
+	// The upstream serves a wiki with a page, which the mirror's wiki
+	// fetches and its push mirror pushes.
+	upstreamWiki := strings.TrimSuffix(upstream, ".git") + ".wiki.git"
+	run(t, filepath.Dir(upstream), "init", "-q", "--bare", upstreamWiki)
+	page := t.TempDir()
+	run(t, page, "init", "-q")
+	home := commit(t, page, "Home")
+	run(t, page, "push", "-q", upstreamWiki, home+":refs/heads/main")
 	repoDir := func(n *testNode) string { return filepath.Join(n.r.root, filepath.FromSlash(key)) }
-	remoteOn := func(n *testNode, name string) string {
-		out, _ := gitOut(t, repoDir(n), "config", "--get", "remote."+name+".url")
+	remoteIn := func(dir, name string) string {
+		out, _ := gitOut(t, dir, "config", "--get", "remote."+name+".url")
 		return out
+	}
+	remoteOn := func(n *testNode, name string) string { return remoteIn(repoDir(n), name) }
+	wikiRemoteOn := func(n *testNode, name string) string {
+		return remoteIn(filepath.Join(n.r.root, filepath.FromSlash(wikiKey)), name)
 	}
 
 	// A pull mirror syncs from a node that never held its remote.
@@ -70,6 +85,7 @@ func TestHuntR4ProveMirrorRemote(t *testing.T) {
 		assert.True(t, mirror_service.SyncPullMirror(ctx, mirror.ID), "a pull mirror syncs on %s", other.slot)
 	}()
 	assert.Equal(t, upstream, remoteOn(other, "origin"))
+	assert.Equal(t, strings.TrimSuffix(upstream, ".git")+".wiki.git", wikiRemoteOn(other, "origin"), "the wiki's remote is recreated too")
 	fetch, _ := gitOut(t, repoDir(other), "config", "--get-all", "remote.origin.fetch")
 	assert.Contains(t, fetch, "+refs/*:refs/*")
 	got, _ := gitOut(t, repoDir(other), "rev-parse", "refs/heads/master")
@@ -89,6 +105,7 @@ func TestHuntR4ProveMirrorRemote(t *testing.T) {
 	// doctor keeps its row there.
 	target := filepath.Join(t.TempDir(), "target.git")
 	run(t, filepath.Dir(target), "init", "-q", "--bare", target)
+	run(t, filepath.Dir(target), "init", "-q", "--bare", strings.TrimSuffix(target, ".git")+".wiki.git")
 	pm := &repo_model.PushMirror{RepoID: mirror.ID, RemoteName: "remote_mirror_hunt", RemoteAddress: target}
 	require.NoError(t, db.Insert(ctx, pm))
 	func() {
@@ -98,6 +115,11 @@ func TestHuntR4ProveMirrorRemote(t *testing.T) {
 		assert.True(t, mirror_service.SyncPushMirror(ctx, pm.ID), "a push mirror pushes from %s", other.slot)
 	}()
 	assert.Equal(t, target, remoteOn(other, pm.RemoteName))
+	// The wiki's remote is recreated before the check that skipped a wiki
+	// without one (CodeRabbit on #123).
+	assert.Equal(t, strings.TrimSuffix(target, ".git")+".wiki.git", wikiRemoteOn(other, pm.RemoteName))
+	wikiPushed, _ := gitOut(t, strings.TrimSuffix(target, ".git")+".wiki.git", "rev-parse", "refs/heads/main")
+	assert.Equal(t, home, wikiPushed, "the wiki is pushed too")
 	pushed, _ := gitOut(t, target, "rev-parse", "refs/heads/master")
 	assert.Equal(t, want, pushed)
 }

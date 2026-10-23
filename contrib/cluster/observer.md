@@ -42,8 +42,10 @@ cluster reconcile --apply`).
 
 A position read in one term is refused in another: if leadership changed
 during the checkpoint, another dispatcher may have written SQL past B. A
-position that takes more than 5 seconds to commit after L was read is
-discarded, and the next period takes another.
+position that takes more than 5 seconds to commit is discarded, and the
+next period takes another. The 5 seconds count from the end of the walk
+that lists the stored files, after L was read: the walk's length depends
+on the storage, not on the cluster.
 
 ## On the members
 

@@ -459,13 +459,21 @@ func checkRecoverVoters(members []consensus.Member, rep consensus.Report) error 
 }
 
 // oldPeerAddrs is what the probe asks: PEERS and every --old-peer, this
-// node's slot excepted.
+// node's slot excepted. An --old-peer for a slot PEERS names too adds its
+// address under its own key, never in place of the PEERS one: an old
+// member may still answer at either.
 func oldPeerAddrs(c *cli.Command) (map[string]string, error) {
 	addrs := map[string]string{}
 	for slot, addr := range setting.Cluster.Peers {
 		if slot != setting.Cluster.Slot {
 			addrs[slot] = addr
 		}
+	}
+	add := func(slot, addr string) {
+		if cur, ok := addrs[slot]; ok && cur != addr {
+			slot += " (--old-peer " + addr + ")"
+		}
+		addrs[slot] = addr
 	}
 	for _, f := range c.StringSlice("old-peer") {
 		slot, addr, ok := strings.Cut(f, "=")
@@ -476,7 +484,7 @@ func oldPeerAddrs(c *cli.Command) (map[string]string, error) {
 			return nil, fmt.Errorf("--old-peer %q: %w", f, err)
 		}
 		if slot != setting.Cluster.Slot {
-			addrs[slot] = addr
+			add(slot, addr)
 		}
 	}
 	return addrs, nil

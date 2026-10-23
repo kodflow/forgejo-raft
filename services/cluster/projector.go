@@ -137,15 +137,23 @@ func (p *projector) unfence() {
 // refence puts the start-up fence back and waits for a pass in flight,
 // before the table is emptied for a rejoin under a new id (#41): no pass
 // may project a table that replays from its start.
+//
+// The state is cleared once that pass ended, which may still have
+// certified a watermark or recorded a failure of the old table. deletedAt
+// stays: a snapshot the new table installs replays no deletion, and a
+// directory a deletion left here is set aside, never reused.
 func (p *projector) refence() {
 	p.mu.Lock()
 	p.fenced = true
-	p.pendingFirst = map[string]bool{}
-	p.dirty = map[string]uint64{}
-	p.watermark = map[string]uint64{}
 	p.mu.Unlock()
 	p.passMu.Lock()
 	defer p.passMu.Unlock()
+	p.mu.Lock()
+	p.pendingFirst = map[string]bool{}
+	p.dirty = map[string]uint64{}
+	p.watermark = map[string]uint64{}
+	p.failures = map[string]string{}
+	p.mu.Unlock()
 }
 
 // Fenced reports whether the start-up fence still holds.
@@ -499,6 +507,13 @@ func (p *projector) project(ctx context.Context, repo string) error {
 			if err := writeRefs(ctx, dir, set, del); err != nil {
 				return err
 			}
+		}
+	}
+	// A directory never certified may come from an init whose sync of its
+	// name failed: certified, it is vouched for, so its name is synced.
+	if _, known := readStamp(dir); !known {
+		if err := syncRepoParents(dir); err != nil {
+			return err
 		}
 	}
 	// Certification re-reads git under the registry's lock, so a native
@@ -903,7 +918,19 @@ func (p *projector) setAsideStale(repo, dir string) error {
 // setAsideStale, it is moved under staleDirName, never removed.
 func (p *projector) setAsideInvalid(repo, dir string, at uint64) error {
 	st, err := os.Stat(dir)
-	if err != nil || validRepoDir(dir) || p.registry.busy(repo) || time.Since(st.ModTime()) <= max(p.registry.ttl, staleLockAge) {
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspecting the directory of %s: %w", repo, err)
+	}
+	invalid, err := invalidRepoDir(dir)
+	if err != nil {
+		// A repository that cannot be validated now may be sound: it is
+		// never moved on that, and the projection reports it.
+		return fmt.Errorf("validating the directory of %s: %w", repo, err)
+	}
+	if !invalid || p.registry.busy(repo) || time.Since(st.ModTime()) <= max(p.registry.ttl, staleLockAge) {
 		return nil
 	}
 	aside := filepath.Join(p.root, staleDirName, fmt.Sprintf("%s-invalid-%d-%d", strings.ReplaceAll(repo, "/", "_"), at, time.Now().UnixNano()))

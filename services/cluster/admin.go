@@ -411,7 +411,11 @@ func (r *Replicator) operate(ctx context.Context, eng consensus.Engine, op conse
 		if err := r.RaisePayloadVersion(ctx, op); err != nil {
 			return err
 		}
-		r.flushRevocations(ctx)
+		// Outside the autonomous mode nothing else writes them: a failure
+		// is the operator's to see, and raising again retries it.
+		if err := r.flushRevocations(ctx); err != nil {
+			return fmt.Errorf("the payload version is raised, but a pending revocation is not written: %w", err)
+		}
 		return nil
 	}
 	if o.Action == ActionClearNoSpace {
@@ -707,10 +711,11 @@ func (r *Replicator) writeRevocation(ctx context.Context, k reftable.RevokeKey) 
 
 // flushRevocations writes the pending revocations once the cluster writes
 // reftable.RevokeVersion; before, it does nothing. The leader's autopilot
-// calls it at each pass, and a raise of the payload version right after.
-func (r *Replicator) flushRevocations(ctx context.Context) {
+// calls it at each pass, and a raise of the payload version right after,
+// which returns its error to the operator.
+func (r *Replicator) flushRevocations(ctx context.Context) error {
 	if r.table.WriteVersion() < reftable.RevokeVersion {
-		return
+		return nil
 	}
 	var held map[string]string
 	if eng := r.Engine(); eng != nil {
@@ -728,11 +733,12 @@ func (r *Replicator) flushRevocations(ctx context.Context) {
 			continue
 		}
 		if err := r.writeRevocation(ctx, k); err != nil {
-			log.Warn("cluster: writing the pending revocation of slot %s: %v; retried", k.Slot, err)
-			return
+			log.Warn("cluster: writing the pending revocation of slot %s: %v", k.Slot, err)
+			return err
 		}
 		log.Warn("cluster: the key of slot %s is revoked, the cluster now writes payload version %d", k.Slot, reftable.RevokeVersion)
 	}
+	return nil
 }
 
 // authorizeJoin is Forgejo's JoinAuthorizer (R8-09). The engine has already

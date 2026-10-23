@@ -225,6 +225,12 @@ func (oc *objectChannel) handlePush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
+	// The pack is synced; the repository's name may not be, when the init
+	// that created it failed to sync it.
+	if err := syncRepoParents(dir); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -301,6 +307,12 @@ func (oc *objectChannel) handleHave(w http.ResponseWriter, r *http.Request) {
 		if ans.Missing, err = missingObjects(r.Context(), dir, req.Wants); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		}
+		if len(ans.Missing) < len(req.Wants) {
+			if err := syncRepoParents(dir); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 	if ans.Missing == nil {

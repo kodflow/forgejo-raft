@@ -336,6 +336,18 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 		return nil, false
 	}
 
+	// The wiki's remote is found by asking the remote host: only now that
+	// its address passed the lists again, and with its credentials.
+	if sanitized, err := m.SanitizedRemoteAddress(); err != nil {
+		log.Error("SyncMirrors [repo: %-v]: SanitizedRemoteAddress: %v", m.Repo, err)
+		return nil, false
+	} else if has, addr := sanitized.Get(); has {
+		if err := ensurePullWikiRemote(ctx, m, remoteURL.URL.String(), addr); err != nil {
+			log.Error("SyncMirrors [repo: %-v]: failed to recreate the wiki mirror's remote: %v", m.Repo, err)
+			return nil, false
+		}
+	}
+
 	cmd := git.NewCommand(ctx)
 
 	// Setup credential helper to authenticate the fetch; needs to occur before the `fetch` arg.
@@ -464,10 +476,28 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 	}
 
 	if m.Repo.HasWiki() {
+		// The wiki's remote holds no password, as the repository's: the
+		// same credential helper authenticates its update.
+		updateWiki := func() error {
+			cmd := git.NewCommand(ctx)
+			_, cleanup, err := cmd.AddAuthCredentialHelperForRemote(remoteURL.URL.String())
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			return cmd.AddArguments("remote", "update", "--prune").AddDynamicArguments(m.GetRemoteName()).
+				SetDescription(fmt.Sprintf("Mirror.runSync Wiki: %s ", m.Repo.FullName())).
+				Run(&git.RunOpts{
+					Timeout: timeout,
+					Dir:     wikiPath,
+					Stdout:  &stdoutBuilder,
+					Stderr:  &stderrBuilder,
+				})
+		}
 		log.Trace("SyncMirrors [repo: %-v Wiki]: running git remote update...", m.Repo)
 		stderrBuilder.Reset()
 		stdoutBuilder.Reset()
-		batched, err := syncInBatches(ctx, m, "", wikiPath, true, false, timeout, nil, &stderrBuilder)
+		batched, err := syncInBatches(ctx, m, remoteURL.URL.String(), wikiPath, true, false, timeout, nil, &stderrBuilder)
 		if err != nil {
 			log.Error("SyncMirrors [repo: %-v Wiki]: failed to update mirror wiki repository by batches: %v", m.Repo, err)
 			desc := fmt.Sprintf("Failed to update mirror repository wiki '%s' by batches: %s", wikiPath, util.SanitizeCredentialURLs(err.Error()))
@@ -478,14 +508,7 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 		}
 		if batched {
 			log.Info("SyncMirrors [repo: %-v Wiki]: written by batches", m.Repo)
-		} else if err := git.NewCommand(ctx, "remote", "update", "--prune").AddDynamicArguments(m.GetRemoteName()).
-			SetDescription(fmt.Sprintf("Mirror.runSync Wiki: %s ", m.Repo.FullName())).
-			Run(&git.RunOpts{
-				Timeout: timeout,
-				Dir:     wikiPath,
-				Stdout:  &stdoutBuilder,
-				Stderr:  &stderrBuilder,
-			}); err != nil {
+		} else if err := updateWiki(); err != nil {
 			stdout := stdoutBuilder.String()
 			stderr := stderrBuilder.String()
 
@@ -505,14 +528,7 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 					stderrBuilder.Reset()
 					stdoutBuilder.Reset()
 
-					if err = git.NewCommand(ctx, "remote", "update", "--prune").AddDynamicArguments(m.GetRemoteName()).
-						SetDescription(fmt.Sprintf("Mirror.runSync Wiki: %s ", m.Repo.FullName())).
-						Run(&git.RunOpts{
-							Timeout: timeout,
-							Dir:     wikiPath,
-							Stdout:  &stdoutBuilder,
-							Stderr:  &stderrBuilder,
-						}); err != nil {
+					if err = updateWiki(); err != nil {
 						stdout := stdoutBuilder.String()
 						stderr := stderrBuilder.String()
 						stderrMessage = util.SanitizeCredentialURLs(stderr)

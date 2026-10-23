@@ -335,6 +335,28 @@ func syncParents(path, root string) error {
 	}
 }
 
+// mkdirAllDurable creates dir and its missing parents, then syncs the
+// directory holding each directory on the way, from dir up: syncing a
+// directory does not make its own name durable in its parent. It syncs the
+// whole chain, not only what this call created: a directory an earlier,
+// failed attempt created is found existing, and its name may not be
+// durable yet. An ancestor this process may not read was not created by
+// it, and ends the chain.
+func mkdirAllDurable(dir string, perm os.FileMode) error {
+	if err := os.MkdirAll(dir, perm); err != nil {
+		return err
+	}
+	for d := filepath.Clean(dir); d != filepath.Dir(d); d = filepath.Dir(d) {
+		if err := syncPath(filepath.Dir(d)); err != nil {
+			if errors.Is(err, os.ErrPermission) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 // WriteFileDurable replaces path with b, synced, through a rename whose
 // directory is synced.
 func WriteFileDurable(path string, b []byte) error { return writeAtomic(path, b, true) }

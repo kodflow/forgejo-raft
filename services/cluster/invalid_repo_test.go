@@ -106,3 +106,43 @@ func TestADirectoryUnderCreationIsLeftAlone(t *testing.T) {
 	require.NoError(t, n.r.projector.setAsideInvalid("o/new.git", dir, 1))
 	assert.NoDirExists(t, dir)
 }
+
+// A directory whose validation fails for another reason than a missing or
+// malformed entry (permission denied here, an I/O error elsewhere) may
+// hold a sound repository: it is left in place, never set aside, and the
+// projection reports the error (CodeRabbit on #122).
+func TestADirectoryThatCannotBeValidatedIsLeftAlone(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a directory without the search permission")
+	}
+	tc := newTestCluster(t, "node-a")
+	n := tc.nodes[0]
+	dir := filepath.Join(n.r.root, "o", "locked.git")
+	for _, d := range []string{"objects", "refs"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, d), 0o755))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644))
+	old := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(dir, old, old))
+	require.NoError(t, os.Chmod(dir, 0o200)) // writable, but nothing in it can be looked up
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	require.Error(t, n.r.projector.setAsideInvalid("o/locked.git", dir, 1))
+	require.NoError(t, os.Chmod(dir, 0o755))
+	assert.DirExists(t, dir)
+	assert.True(t, validRepoDir(dir))
+}
+
+// A directory whose own stat fails for another reason than its absence is
+// reported, never taken for an absent one (CodeRabbit on #140).
+func TestADirectoryThatCannotBeStattedIsReported(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root stats under a directory without the search permission")
+	}
+	tc := newTestCluster(t, "node-a")
+	n := tc.nodes[0]
+	owner := filepath.Join(n.r.root, "o")
+	require.NoError(t, os.MkdirAll(filepath.Join(owner, "x.git"), 0o755))
+	require.NoError(t, os.Chmod(owner, 0o600))
+	t.Cleanup(func() { _ = os.Chmod(owner, 0o755) })
+	require.Error(t, n.r.projector.setAsideInvalid("o/x.git", filepath.Join(owner, "x.git"), 1))
+}

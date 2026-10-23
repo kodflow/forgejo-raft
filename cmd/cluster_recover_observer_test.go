@@ -182,6 +182,24 @@ func TestRecoverProbesTheOldMembers(t *testing.T) {
 	require.NoError(t, run("--old-peer", "node-c="+ln.Addr().String(), "--force-old-members-answer"))
 	ln.Close()
 	require.NoError(t, run("--old-peer", "node-c="+ln.Addr().String()), "every old member silent")
+	// An --old-peer for a slot PEERS names too is asked as well, never in
+	// its place: the seed address may still answer (CodeRabbit on #30).
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln2.Close()
+	go func() {
+		for {
+			c, err := ln2.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	func() {
+		defer test.MockVariableValue(&setting.Cluster.Peers, map[string]string{"node-a": "127.0.0.1:1", "node-b": ln2.Addr().String()})()
+		require.ErrorContains(t, run("--old-peer", "node-b=127.0.0.1:2"), "old member answers")
+	}()
 
 	defer test.MockVariableValue(&setting.Cluster.Peers, map[string]string{})()
 	require.ErrorContains(t, run(), "no old member to probe")
@@ -373,6 +391,62 @@ func TestRecoverEmptiesWhatItBegan(t *testing.T) {
 	p := recoverProgress{Begun: []string{stepPG}}
 	assert.True(t, p.begun(stepPG))
 	assert.False(t, p.done(stepPG))
+}
+
+// A resumed step empties only the directories it recorded when it began:
+// a rerun naming another --pgdata or --pg-restore-dir, populated, is
+// refused, and that directory keeps what it holds (CodeRabbit on #121).
+func TestRecoverResumeEmptiesOnlyTheDirectoriesItBegan(t *testing.T) {
+	base := t.TempDir()
+	pg, rd, other := filepath.Join(base, "pg"), filepath.Join(base, "wal"), filepath.Join(base, "other")
+	for _, d := range []string{pg, rd, other} {
+		require.NoError(t, os.MkdirAll(d, 0o700))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(other, "keep"), []byte("data"), 0o600))
+	prog := &recoverProgress{}
+	var recorded []string
+	begin := func(step string, targets []string) error {
+		prog.Begun = append(prog.Begun, step)
+		prog.BegunTargets = map[string][]string{step: targets}
+		recorded = targets
+		return nil
+	}
+	_, err := preparePGTargets(prog, []string{other, rd}, begin)
+	require.ErrorContains(t, err, "is not empty")
+	assert.Empty(t, prog.Begun)
+
+	emptied, err := preparePGTargets(prog, []string{pg, rd}, begin)
+	require.NoError(t, err)
+	assert.Nil(t, emptied)
+	assert.Equal(t, []string{pg, rd}, recorded)
+	require.NoError(t, os.WriteFile(filepath.Join(pg, "PG_VERSION"), []byte("18"), 0o600))
+
+	// The rerun names another data directory: refused, nothing removed.
+	_, err = preparePGTargets(prog, []string{other, rd}, begin)
+	require.ErrorContains(t, err, "run it again with the same directories")
+	assert.FileExists(t, filepath.Join(other, "keep"))
+	assert.FileExists(t, filepath.Join(pg, "PG_VERSION"))
+
+	emptied, err = preparePGTargets(prog, []string{pg, rd}, begin)
+	require.NoError(t, err)
+	assert.Equal(t, []string{pg, rd}, emptied)
+	assert.NoFileExists(t, filepath.Join(pg, "PG_VERSION"))
+
+	// A directory that cannot be read is not empty: never recorded.
+	locked := filepath.Join(base, "locked")
+	require.NoError(t, os.MkdirAll(locked, 0o700))
+	require.NoError(t, os.Chmod(locked, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	if os.Geteuid() != 0 {
+		_, err = preparePGTargets(&recoverProgress{}, []string{locked, rd}, begin)
+		require.ErrorContains(t, err, "inspecting")
+	}
+
+	// A progress file of an older binary names no directory: refused.
+	legacy := &recoverProgress{Begun: []string{stepPG}}
+	_, err = preparePGTargets(legacy, []string{other, rd}, begin)
+	require.ErrorContains(t, err, "did not record its directories")
+	assert.FileExists(t, filepath.Join(other, "keep"))
 }
 
 // The recovery's verification fails when a repository of the checkpoint,

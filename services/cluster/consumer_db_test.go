@@ -13,6 +13,7 @@ import (
 	"forgejo.org/models/db"
 	"forgejo.org/models/unittest"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/test"
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/reftable"
 
@@ -302,4 +303,24 @@ func TestResolveParkedIsAuditedAndFreesTheTrim(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "the resolution is in the replicated audit")
+}
+
+// A failed lookup of the pusher is retried, never passed over: the lookup
+// that PushUpdatesNow repeats checks only that the account exists, not
+// that it is the one that pushed (CodeRabbit on #17 and #120).
+func TestPushWorkRetriesAFailedPusherLookup(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ctx := db.DefaultContext
+	u := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	ev := reftable.Event{
+		Token: consensus.Token{Cluster: consensus.ClusterID{9}, Epoch: 1, Term: 1, Index: 9}, Kind: reftable.EventRef, Repo: "user2/repo1.git", RepoID: 1, PusherID: 2,
+		Ref: "refs/tags/v1", New: "65f1bf27bc3bf70f64657658635e66094edbcb4d",
+		Time: time.Unix(int64(u.CreatedUnix), 0).Add(-time.Hour).UnixNano(),
+	}
+	defer test.MockVariableValue(&getPusher, func(context.Context, int64) (*user_model.User, error) {
+		return nil, errors.New("connection reset")
+	})()
+	err := pushWork(ctx, []reftable.Event{ev})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "connection reset")
 }
