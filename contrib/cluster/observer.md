@@ -157,6 +157,7 @@ OBSERVER_SECRETS_KEY_FILE = /run/observer/secrets.key
 OBSERVER_SNAPSHOT_HOOK = /usr/local/bin/observer-snapshot
 OBSERVER_POLL_INTERVAL = 15s
 OBSERVER_STAGING_QUOTA = 10737418240
+OBSERVER_EXPORT_SILENCE = 30m
 ```
 
 `ROLE = observer` refuses every key that would make the node a member:
@@ -170,6 +171,18 @@ the SSH key and the secrets key and prints the `authorized_keys` line and
 the `OBSERVER_RECIPIENTS` entry for the members. Keep both keys in an
 encrypted volume. The host keys of the members go in the pinned
 `known_hosts`: an unknown key is refused, never learnt.
+
+An export may stay silent for a long time before its first byte: the
+`git pack-objects` of a big repository counts and compresses first. The
+observer sends an SSH keepalive (`keepalive@openssh.com`) every 30 seconds,
+which the member's sshd answers even while the forced command writes
+nothing, so the connection lives as long as the sshd does. A member whose
+sshd answers nothing, keepalives included, for two minutes is dropped.
+`OBSERVER_EXPORT_SILENCE` (default `30m`, one minute at least) bounds the
+export itself: one that sends no data for that long, behind a live sshd,
+is cut, and the pass fails and is retried. Raise it if a repository's
+pack-objects takes longer before its first byte; a pass stays bounded by
+its own six hours either way.
 
 ### What a pass does
 

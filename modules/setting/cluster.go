@@ -207,6 +207,11 @@ type ObserverSettings struct {
 	// StagingQuota stops ingestion when the staging area reaches it; it
 	// never deletes a protected checkpoint.
 	StagingQuota int64
+	// ExportSilence is how long an export may send no data before the
+	// observer cuts it. Keepalives hold the SSH connection open while the
+	// member's sshd answers, so this alone bounds an export stuck behind a
+	// live sshd; it must outlast a big repository's pack-objects.
+	ExportSilence time.Duration
 }
 
 // observerRefusedKeys are what an observer may not hold: it never listens,
@@ -399,6 +404,7 @@ func loadObserver(sec ConfigSection, refused []string) error {
 		SnapshotHook:   sec.Key("OBSERVER_SNAPSHOT_HOOK").String(),
 		PollInterval:   clusterDuration(sec, "OBSERVER_POLL_INTERVAL", 15*time.Second),
 		StagingQuota:   sec.Key("OBSERVER_STAGING_QUOTA").MustInt64(10 << 30),
+		ExportSilence:  clusterDuration(sec, "OBSERVER_EXPORT_SILENCE", 30*time.Minute),
 	}
 	for _, p := range sec.Key("OBSERVER_ENDPOINTS").Strings(",") {
 		slot, addr, ok := strings.Cut(strings.TrimSpace(p), "=")
@@ -431,6 +437,9 @@ func loadObserver(sec ConfigSection, refused []string) error {
 	}
 	if o.StagingQuota <= 0 {
 		errs = append(errs, errors.New("OBSERVER_STAGING_QUOTA must be positive"))
+	}
+	if o.ExportSilence < time.Minute {
+		errs = append(errs, errors.New("OBSERVER_EXPORT_SILENCE must be one minute at least"))
 	}
 	Cluster.Observer = o
 	return errors.Join(errs...)

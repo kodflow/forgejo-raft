@@ -36,6 +36,11 @@ type sshMember struct {
 	got      clusterhook.ExportRequest
 	// mute makes the session read the request and never answer.
 	mute bool
+	// delay holds the answer back, as a long pack-objects does.
+	delay time.Duration
+	// deaf makes the member's sshd leave every global request, keepalives
+	// included, unanswered: the connection itself is dead.
+	deaf bool
 }
 
 func newSSHMember(t *testing.T, clientKey ssh.PublicKey) *sshMember {
@@ -74,7 +79,12 @@ func (m *sshMember) serve(conn net.Conn, cfg *ssh.ServerConfig) {
 	go func() {
 		for r := range reqs {
 			m.record("global:" + r.Type)
-			_ = r.Reply(false, nil)
+			m.mu.Lock()
+			deaf := m.deaf
+			m.mu.Unlock()
+			if !deaf {
+				_ = r.Reply(false, nil)
+			}
 		}
 	}()
 	for nc := range chans {
@@ -98,11 +108,12 @@ func (m *sshMember) serve(conn net.Conn, cfg *ssh.ServerConfig) {
 				line, _ := bufio.NewReader(ch).ReadBytes('\n')
 				m.mu.Lock()
 				_ = json.Unmarshal(line, &m.got)
-				mute := m.mute
+				mute, delay := m.mute, m.delay
 				m.mu.Unlock()
 				if mute {
 					select {} // the member stops talking
 				}
+				time.Sleep(delay)
 				b, _ := json.Marshal(clusterhook.ExportAnswer{OK: true, Stream: true})
 				_, _ = ch.Write(append(b, '\n'))
 				_, _ = ch.Write([]byte("the stream"))
@@ -135,7 +146,7 @@ func TestSSHSourcePinsTheHostAndAsksForNothingElse(t *testing.T) {
 
 	known := filepath.Join(dir, "known_hosts")
 	require.NoError(t, os.WriteFile(known, []byte(knownhosts.Line([]string{knownhosts.Normalize(member.addr)}, member.hostKey)+"\n"), 0o600))
-	src, err := NewSSHSource("forgejo-export@"+member.addr, keyFile, known)
+	src, err := NewSSHSource("forgejo-export@"+member.addr, keyFile, known, 0)
 	require.NoError(t, err)
 	ans, body, err := src.Export(context.Background(), &clusterhook.ExportRequest{Op: clusterhook.OpExportWAL, Name: "x"})
 	require.NoError(t, err)
@@ -155,7 +166,7 @@ func TestSSHSourcePinsTheHostAndAsksForNothingElse(t *testing.T) {
 	otherSigner, err := ssh.NewSignerFromKey(other)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(known, []byte(knownhosts.Line([]string{knownhosts.Normalize(member.addr)}, otherSigner.PublicKey())+"\n"), 0o600))
-	src, err = NewSSHSource("forgejo-export@"+member.addr, keyFile, known)
+	src, err = NewSSHSource("forgejo-export@"+member.addr, keyFile, known, 0)
 	require.NoError(t, err)
 	_, _, err = src.Export(context.Background(), &clusterhook.ExportRequest{Op: clusterhook.OpExportWAL})
 	require.Error(t, err)
@@ -223,7 +234,7 @@ func TestSSHSourceDropsASilentMember(t *testing.T) {
 	keyFile, _ := observerKey(t)
 	known := filepath.Join(t.TempDir(), "known_hosts")
 	require.NoError(t, os.WriteFile(known, nil, 0o600))
-	src, err := NewSSHSource("obs@"+ln.Addr().String(), keyFile, known)
+	src, err := NewSSHSource("obs@"+ln.Addr().String(), keyFile, known, 0)
 	require.NoError(t, err)
 	src.cfg.Timeout = 200 * time.Millisecond
 	require.Error(t, exportWithin(t, src, 10*time.Second))
@@ -239,8 +250,55 @@ func TestSSHSourceDropsAMemberThatStopsTalking(t *testing.T) {
 	member.mu.Unlock()
 	known := filepath.Join(t.TempDir(), "known_hosts")
 	require.NoError(t, os.WriteFile(known, []byte(knownhosts.Line([]string{knownhosts.Normalize(member.addr)}, member.hostKey)+"\n"), 0o600))
-	src, err := NewSSHSource("obs@"+member.addr, keyFile, known)
+	src, err := NewSSHSource("obs@"+member.addr, keyFile, known, 0)
 	require.NoError(t, err)
 	src.idle = 300 * time.Millisecond
+	src.silence = 300 * time.Millisecond
+	err = exportWithin(t, src, 10*time.Second)
+	require.ErrorContains(t, err, "sent nothing")
+}
+
+// A healthy export that sends nothing for longer than the idle deadline,
+// a big repository's pack-objects still counting, is not cut: the
+// observer's keepalives keep the connection alive while the member's
+// sshd answers them (#139).
+func TestSSHSourceKeepsASlowExportAlive(t *testing.T) {
+	keyFile, signer := observerKey(t)
+	member := newSSHMember(t, signer.PublicKey())
+	member.mu.Lock()
+	member.delay = 1500 * time.Millisecond
+	member.mu.Unlock()
+	known := filepath.Join(t.TempDir(), "known_hosts")
+	require.NoError(t, os.WriteFile(known, []byte(knownhosts.Line([]string{knownhosts.Normalize(member.addr)}, member.hostKey)+"\n"), 0o600))
+	src, err := NewSSHSource("obs@"+member.addr, keyFile, known, 0)
+	require.NoError(t, err)
+	src.idle = 300 * time.Millisecond
+	ans, body, err := src.Export(context.Background(), &clusterhook.ExportRequest{Op: clusterhook.OpExportCheckpoints})
+	require.NoError(t, err)
+	require.True(t, ans.OK && ans.Stream)
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	body.Close()
+	assert.Equal(t, "the stream", string(got))
+	member.mu.Lock()
+	assert.Contains(t, member.requests, "global:keepalive@openssh.com")
+	member.mu.Unlock()
+}
+
+// Keepalives the member never answers do not hold the connection open: a
+// dead peer is still dropped after the idle deadline, long before the
+// silence bound.
+func TestSSHSourceDropsADeadMemberDespiteKeepalives(t *testing.T) {
+	keyFile, signer := observerKey(t)
+	member := newSSHMember(t, signer.PublicKey())
+	member.mu.Lock()
+	member.mute, member.deaf = true, true
+	member.mu.Unlock()
+	known := filepath.Join(t.TempDir(), "known_hosts")
+	require.NoError(t, os.WriteFile(known, []byte(knownhosts.Line([]string{knownhosts.Normalize(member.addr)}, member.hostKey)+"\n"), 0o600))
+	src, err := NewSSHSource("obs@"+member.addr, keyFile, known, 0)
+	require.NoError(t, err)
+	src.idle = 300 * time.Millisecond
+	require.Equal(t, sshExportSilence, src.silence)
 	require.Error(t, exportWithin(t, src, 10*time.Second))
 }
