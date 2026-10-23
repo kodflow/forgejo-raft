@@ -356,11 +356,7 @@ func (c *fakeCluster) serve(slot string, req *clusterhook.ExportRequest) ([]byte
 		}
 		for name, b := range c.pg.archive {
 			if name > req.Name || strings.HasSuffix(name, ".history") {
-				wf := clusterhook.WALFile{Name: name, Size: int64(len(b))}
-				if strings.HasSuffix(name, ".history") {
-					wf.SHA256 = digest(b)
-				}
-				out = append(out, wf)
+				out = append(out, clusterhook.WALFile{Name: name, Size: int64(len(b)), SHA256: digest(b)})
 			}
 		}
 		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })

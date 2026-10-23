@@ -134,8 +134,11 @@ only, after a commit confirmed by a quorum; a member that does not lead
 answers `NOT_LEADER` with the leader's slot and its own term. The
 checkpoint's artifacts come from the leader that wrote them. Packs (bounded
 to ref values), WAL files, stored files and base backups come from any
-member, and the observer checks them by digest against what the leader told
-it.
+member. The observer checks packs with git against the refs of the leader's
+table; a WAL file against the digest the member that lists it gives, and a
+segment's page header against the checkpoint's system, start and sizes,
+never taking a segment past the checkpoint's position; a stored file against
+what the leader's files manifest lists.
 
 ## On the observer
 

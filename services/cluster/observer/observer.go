@@ -1086,7 +1086,18 @@ func (o *Observer) fetchWAL(ctx context.Context, leader string, cp clusterhook.E
 	if err := os.MkdirAll(o.store.walDir(cp.SystemID), 0o700); err != nil {
 		return err
 	}
+	// Nothing past the checkpoint's position is taken: a name a member
+	// plants ahead of it never stands for a segment not yet written, and
+	// the cursor never passes the confirmed position (#105).
+	target, err := ParseLSN(cp.LSN)
+	if err != nil {
+		return err
+	}
+	final := finalSegment(target, cp.WALSegmentSize)
 	for _, name := range names {
+		if tli, segno, ok := parseSegment(name, cp.WALSegmentSize); ok && (tli > cp.Timeline || segno > final) {
+			continue
+		}
 		if err := o.fetchWALFile(ctx, cp, name, listed[name]); err != nil {
 			return err
 		}

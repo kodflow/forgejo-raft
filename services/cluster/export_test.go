@@ -201,9 +201,9 @@ func TestExportArchiveFilesAndSecrets(t *testing.T) {
 	var files []clusterhook.WALFile
 	require.NoError(t, json.Unmarshal(data, &files))
 	assert.Equal(t, []clusterhook.WALFile{
-		{Name: "000000010000000000000002", Size: 24},
+		{Name: "000000010000000000000002", Size: 24, SHA256: sha256Hex([]byte("000000010000000000000002"))},
 		{Name: "00000002.history", Size: 16, SHA256: sha256Hex([]byte("00000002.history"))},
-	}, files, "after the name given, and every history with its digest")
+	}, files, "after the name given, and every history, each with its digest")
 	_, seg, err := exportOf(t, n, &clusterhook.ExportRequest{Op: clusterhook.OpExportWAL, Name: "00000002.history"})
 	require.NoError(t, err)
 	assert.Equal(t, "00000002.history", string(seg))
