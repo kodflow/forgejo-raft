@@ -405,6 +405,7 @@ func mapErr(err error) error {
 		{sdk.AdminPreconditionFailed, consensus.ErrAdminPrecondition},
 		{sdk.NodeIDRetired, consensus.ErrNodeIDRetired},
 		{sdk.ConsensusMisconfigured, consensus.ErrMisconfigured},
+		{sdk.VersionUnsupported, consensus.ErrVersionUnsupported},
 	}
 	for _, p := range pairs {
 		if errors.Is(err, p.sdk) {
@@ -457,7 +458,8 @@ func (e *Engine) WaitApplied(ctx context.Context, t consensus.Token) error {
 func (e *Engine) status(st sdk.StatusValue) consensus.Status {
 	out := consensus.Status{
 		ID: consensus.NodeID(st.ID), Slot: e.slot, Role: role(st.Role), Term: st.Term, Leader: consensus.NodeID(st.Leader),
-		Commit: st.Commit, Applied: st.Applied, Identity: identity(st.Log), ClusterVersion: st.Versions.Cluster,
+		Commit: st.Commit, Applied: st.Applied, Identity: identity(st.Log),
+		ClusterVersion: st.Versions.Cluster, ClusterGeneration: st.Versions.ClusterGeneration,
 	}
 	if m, ok := e.n.Membership().Member(st.ID); ok {
 		out.SPKI = m.SPKI
@@ -550,6 +552,14 @@ func (e *Engine) TransferLeadership(ctx context.Context, op consensus.Operator, 
 
 func (e *Engine) ClearNoSpace(ctx context.Context, op consensus.Operator, pre consensus.Precondition) error {
 	return mapErr(e.n.ClearNoSpace(ctx, sdk.Operator(op), sdk.PreconditionSpec{Log: sdkIdentity(pre.Identity), Alarm: sdk.AlarmID(pre.AlarmID), Generation: pre.Generation}))
+}
+
+// RaiseClusterVersion raises the engine's cluster version. The leader
+// refuses VERSION_UNSUPPORTED while a member of the configuration was not
+// heard announcing v in its term, and ADMIN_PRECONDITION_FAILED against
+// another lineage or generation.
+func (e *Engine) RaiseClusterVersion(ctx context.Context, op consensus.Operator, pre consensus.Precondition, v uint32) error {
+	return mapErr(e.n.RaiseClusterVersion(ctx, sdk.Operator(op), sdk.PreconditionSpec{Log: sdkIdentity(pre.Identity), Generation: pre.Generation}, v))
 }
 
 func (e *Engine) SaveSnapshot(ctx context.Context, op consensus.Operator, w io.Writer) (consensus.SnapshotMeta, error) {

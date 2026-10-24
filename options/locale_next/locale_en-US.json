@@ -1306,6 +1306,7 @@
 	"admin.cluster.outcome.failed": "failed",
 	"admin.cluster.op.payload-version": "Raise the payload version",
 	"admin.cluster.op.revoke-key": "Revoke a key",
+	"admin.cluster.op.raise-cluster-version": "Raise the cluster version",
 	"admin.cluster.outcome.raised": "raised",
 	"admin.cluster.outcome.pending": "pending",
 	"admin.cluster.authorize_join_placeholder": "slot, or slot:spki",

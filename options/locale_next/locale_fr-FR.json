@@ -1301,6 +1301,7 @@
 	"admin.cluster.outcome.failed": "échoué",
 	"admin.cluster.op.payload-version": "Relever la version de charge utile",
 	"admin.cluster.op.revoke-key": "Révoquer une clé",
+	"admin.cluster.op.raise-cluster-version": "Relever la version de la grappe",
 	"admin.cluster.outcome.raised": "relevée",
 	"admin.cluster.outcome.pending": "en attente",
 	"admin.cluster.authorize_join_placeholder": "emplacement, ou emplacement:spki",

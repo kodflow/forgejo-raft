@@ -34,7 +34,16 @@ type Cluster struct {
 	watchers []watcher
 	// compacted is the last index ReadCommitted no longer returns.
 	compacted uint64
+	// version and generation are the committed cluster version and its
+	// raises; speaks is the protocol a member announces, ProtocolMax unless
+	// SetProtocol said otherwise.
+	version    uint32
+	generation uint64
+	speaks     map[consensus.NodeID]uint32
 }
+
+// ProtocolMax is the highest cluster version the stand-in speaks, the SDK's.
+const ProtocolMax uint32 = 2
 
 type watcher struct {
 	n  *Node
@@ -105,6 +114,17 @@ func (c *Cluster) SetLeader(n *Node) {
 	c.leader = n.id
 	c.term++
 	c.mu.Unlock()
+}
+
+// SetProtocol makes n announce protocol v, as a member on an older binary
+// does: a raise above it is refused, as the engine refuses it.
+func (c *Cluster) SetProtocol(n *Node, v uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.speaks == nil {
+		c.speaks = map[consensus.NodeID]uint32{}
+	}
+	c.speaks[n.id] = v
 }
 
 // RaiseNoSpace raises the replicated no-space alarm.
@@ -208,7 +228,7 @@ func (c *Cluster) status(n *Node) consensus.Status {
 	return consensus.Status{
 		ID: n.id, Slot: n.slot, Role: role, Term: c.term, Leader: c.leader,
 		Commit: uint64(len(c.log)), Applied: n.applied,
-		Identity: consensus.LogIdentity{Cluster: c.id, Epoch: 1}, ClusterVersion: 1,
+		Identity: consensus.LogIdentity{Cluster: c.id, Epoch: 1}, ClusterVersion: c.version, ClusterGeneration: c.generation,
 	}
 }
 
@@ -225,7 +245,7 @@ func (n *Node) Health() consensus.Health {
 	st := c.status(n)
 	h := consensus.Health{
 		Ready: !n.down && c.quorum(), Role: st.Role, LeaderKnown: c.leader != 0, QuorumReachable: c.quorum(),
-		Identity: st.Identity, ClusterVersion: 1,
+		Identity: st.Identity, ClusterVersion: c.version,
 	}
 	up := 0
 	for _, id := range c.order {
@@ -339,6 +359,31 @@ func (n *Node) ClearNoSpace(ctx context.Context, op consensus.Operator, pre cons
 		return consensus.ErrAdminPrecondition
 	}
 	n.c.alarm = 0
+	return nil
+}
+
+// RaiseClusterVersion raises the cluster version as the engine does: on a
+// node that reaches a quorum, against the current lineage and generation,
+// once every member speaks v.
+func (n *Node) RaiseClusterVersion(ctx context.Context, op consensus.Operator, pre consensus.Precondition, v uint32) error {
+	c := n.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if n.down || n.closed || !c.quorum() {
+		return consensus.ErrNotLeader
+	}
+	if v > ProtocolMax {
+		return consensus.ErrVersionUnsupported
+	}
+	if pre.Identity != (consensus.LogIdentity{Cluster: c.id, Epoch: 1}) || pre.Generation != c.generation || v <= c.version {
+		return consensus.ErrAdminPrecondition
+	}
+	for _, m := range c.members.Members {
+		if s, ok := c.speaks[m.ID]; ok && s < v {
+			return consensus.ErrVersionUnsupported
+		}
+	}
+	c.version, c.generation = v, c.generation+1
 	return nil
 }
 

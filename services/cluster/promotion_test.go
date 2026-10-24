@@ -31,10 +31,29 @@ type leaderEngine struct {
 	// refuse is refused by Promote, as the engine refuses a learner it
 	// did not hear.
 	refuse map[consensus.NodeID]bool
+	// version is the cluster version, raises the versions asked for, and
+	// raiseErr the answer while it is set: the engine's while a member
+	// does not announce the protocol.
+	version  uint32
+	raises   []uint32
+	raiseErr error
 }
 
 func (e *leaderEngine) Status() consensus.Status {
-	return consensus.Status{ID: e.id, Role: consensus.RoleLeader, Slot: "node-a"}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return consensus.Status{ID: e.id, Role: consensus.RoleLeader, Slot: "node-a", ClusterVersion: e.version}
+}
+
+func (e *leaderEngine) RaiseClusterVersion(_ context.Context, _ consensus.Operator, _ consensus.Precondition, v uint32) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.raises = append(e.raises, v)
+	if e.raiseErr != nil {
+		return e.raiseErr
+	}
+	e.version = v
+	return nil
 }
 
 // Propose refuses with certainty: the audit records are not the point.

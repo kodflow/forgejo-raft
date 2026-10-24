@@ -235,6 +235,16 @@ five minutes parked a legitimate push. A binary of this version raises the
 cluster straight to version 4, the revocation of version 3 included, once
 every member runs it; entries written before keep the clock rule.
 
+**The engine's cluster version** is the consensus protocol every member
+must speak, apart from the payload version above. The leader raises it to
+protocol 2 by itself, in both modes, once every member announces it: a
+cluster founded at 0 never gets the protections of protocol 2, among them
+the record that lets a voter stopped while another member was admitted and
+made leader hear that leader again. `forgejo cluster status` shows it. The
+raise waits for a member still on a binary of protocol 1 and is never
+undone: a member rolled back to such a binary afterwards stops instead of
+forking.
+
 **A compromised CA** is replaced, never revoked in place. Sign new
 certificates under a new CA, add the new CA to `TLS_CA_FILE` beside the old
 one and roll the certificates; then remove the old CA from the file and

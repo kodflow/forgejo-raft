@@ -26,7 +26,7 @@ func TestAuditRecordsOfTheClusterShowOnTheStatusPage(t *testing.T) {
 		require.NoError(t, err)
 		var keys map[string]any
 		require.NoError(t, json.Unmarshal(b, &keys))
-		for _, action := range []string{reftable.AuditPayloadVersion, reftable.AuditRevokeKey} {
+		for _, action := range []string{reftable.AuditPayloadVersion, reftable.AuditRevokeKey, string(ActionRaiseCluster)} {
 			assert.Contains(t, keys, "admin.cluster.op."+action, lang)
 		}
 		for _, outcome := range []string{reftable.AuditRaised, reftable.AuditPending} {
