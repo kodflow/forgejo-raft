@@ -202,6 +202,8 @@ func (c *coordinator) run(ctx context.Context) {
 // take runs one checkpoint, steps 1 to 5.
 func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, error) {
 	r := c.r
+	r.checkpointing.Add(1)
+	defer r.checkpointing.Add(-1)
 	eng := r.Engine()
 	nonce := clusterhook.NewNonce()
 	got := c.expect(nonce)
@@ -509,6 +511,43 @@ func (c *consumer) earlierDrained(ctx context.Context, id consensus.LogIdentity)
 		}
 	}
 	return true
+}
+
+// backupSettled reports whether b, the backup cursor the consumer just
+// read, is the last one a checkpoint will write over what the table holds.
+// A checkpoint records its backup cursor once its position committed,
+// maybe long after it read PostgreSQL's position: a trim decided on the
+// cursor before it could pass what that backup replays (#205). Read after
+// b, in this order:
+//   - No checkpoint is in flight here. Only the leader of a term commits
+//     that term's barrier and position, and its coordinator runs here.
+//   - The table applied an entry of the engine's current term: it holds
+//     every checkpoint an earlier term's leader closed, whose backup
+//     cursor that leader may still be writing. A position commits in its
+//     barrier's term only, so none of those is still to come.
+//   - The newest checkpoint the table closed is the one b names, or none
+//     closed and b is empty. A backup cursor that failed to be written
+//     holds until the next checkpoint writes one.
+//
+// A checkpoint that starts later reads the drained lineage drained, or
+// trimmed: its PostgreSQL position comes after the cursor that said so.
+func (r *Replicator) backupSettled(b *cluster_model.Cursor) bool {
+	if r.checkpointing.Load() > 0 {
+		return false
+	}
+	eng := r.Engine()
+	if eng == nil {
+		return false
+	}
+	if applied, _ := r.table.Applied(); applied.Term != eng.Status().Term {
+		return false
+	}
+	cps := r.table.Checkpoints()
+	if len(cps) == 0 {
+		return b.Lineage == ""
+	}
+	last := cps[len(cps)-1]
+	return b.Lineage == last.Identity && b.Position >= 0 && uint64(b.Position) == last.Index
 }
 
 // ---- PostgreSQL ----

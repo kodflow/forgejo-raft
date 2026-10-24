@@ -67,6 +67,10 @@ type consumer struct {
 	// of the database; it is called after the values a trim depends on
 	// were read.
 	durable func(ctx context.Context) (bool, string)
+	// settled says whether the backup cursor just read is the last one a
+	// checkpoint will write over what the table holds (backupSettled);
+	// nil, in a unit test without checkpoints, says yes.
+	settled func(b *cluster_model.Cursor) bool
 	// The parked events' table; tests replace it.
 	park       func(ctx context.Context, rows []*cluster_model.ParkedEvent) error
 	hasParked  func(ctx context.Context, repo string, repoID int64) (bool, error)
@@ -177,7 +181,7 @@ func newConsumer(r *Replicator) *consumer {
 		park:    cluster_model.ParkEvents, hasParked: cluster_model.RepoHasParked, minParked: cluster_model.MinParkedIndex,
 		listParked: cluster_model.ListParked, unpark: cluster_model.UnparkEntry, noteParked: cluster_model.NoteParkedFailure,
 		lastAck: map[string]uint64{}, failures: map[uint64]int{}, reasons: map[uint64]string{}, seen: map[string]int64{},
-		stalledOut: map[string]bool{},
+		stalledOut: map[string]bool{}, settled: r.backupSettled,
 	}
 	c.ack = func(ctx context.Context, lineage string, index uint64) error {
 		data, err := reftable.Encode(reftable.KindAck, &reftable.Ack{Identity: lineage, Index: index})
@@ -1061,6 +1065,10 @@ func (c *consumer) maybeAck(ctx context.Context, lineage string, tail uint64) {
 //     of the current lineage taken before, or by a binary that does not
 //     say, may hold this lineage's cursor behind its end and replay from
 //     the log what follows: that backup keeps the margin, as before.
+//   - And that backup is the last one: no checkpoint still writes another
+//     (backupSettled). A checkpoint in flight may have read PostgreSQL's
+//     position before the lineage drained, and records its backup cursor
+//     only after the trim, with no backup cursor before it to hold it.
 //
 // Nothing else needs these events: a new leader rebuilds its queue from
 // the same cursor in SQL, a database failover cannot take back what the
@@ -1075,7 +1083,10 @@ func (c *consumer) lineageEnded(lineage string, pos, tail uint64, b *cluster_mod
 	if now == lineage || now == "" || now == (consensus.LogIdentity{}).String() {
 		return false
 	}
-	return b.Lineage == "" || b.Lineage == lineage || b.Lineage == now && b.Closed
+	if b.Lineage != "" && b.Lineage != lineage && (b.Lineage != now || !b.Closed) {
+		return false
+	}
+	return c.settled == nil || c.settled(b)
 }
 
 // lastIndexes is the index of the last event the queue holds of each

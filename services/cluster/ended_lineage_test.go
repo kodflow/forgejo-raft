@@ -238,6 +238,21 @@ func TestEndedLineageIsNotTrimmedEarly(t *testing.T) {
 		assert.Zero(t, n, "a checkpoint of the current lineage that read it drained releases it")
 	})
 
+	t.Run("a backup a checkpoint may still replace", func(t *testing.T) {
+		f := newEndedFixture(t, plain)
+		settled := false
+		f.c.settled = func(*cluster_model.Cursor) bool { return settled }
+		f.passes(t, 3)
+		n, lowest := countLineage(f.lg, oldToken(1))
+		assert.Equal(t, 16, n, "a checkpoint in flight may record a backup that replays it: the margin stays")
+		assert.EqualValues(t, 85, lowest)
+
+		settled = true
+		f.passes(t, 2)
+		n, _ = countLineage(f.lg, oldToken(1))
+		assert.Zero(t, n, "trimmed to its end once the backup cursor is the last one")
+	})
+
 	t.Run("a backup that did not read it drained", func(t *testing.T) {
 		f := newEndedFixture(t, plain)
 		f.backup(newToken(150), false)

@@ -113,6 +113,10 @@ type Replicator struct {
 	// the health read it, a test may swap it.
 	fence       sync.RWMutex
 	checkpoints atomic.Pointer[coordinator]
+	// checkpointing counts the checkpoints in flight on this node, from
+	// before their barrier until their backup cursor is written: the
+	// consumer does not trim an ended lineage to its end meanwhile (#205).
+	checkpointing atomic.Int32
 	// cut is the checkpoint's cut, one lock for the whole cluster in
 	// PostgreSQL; nil without PostgreSQL, where no checkpoint runs (cut.go).
 	cut cutLock
