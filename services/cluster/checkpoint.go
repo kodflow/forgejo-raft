@@ -645,7 +645,7 @@ func storedFiles() (*storedListing, error) {
 	if err != nil {
 		return nil, err
 	}
-	return listStoredFiles(sts)
+	return listStoredFiles(sts, storedDigests)
 }
 
 // digestCache keeps the digests of stored files by path, size and
@@ -662,7 +662,11 @@ type digestEntry struct {
 	sum   string
 }
 
-var storedDigests = &digestCache{sums: map[string]digestEntry{}}
+// storedDigests is the process's: it outlives a coordinator, and a member
+// that leads again reads only what changed since its last checkpoint.
+var storedDigests = newDigestCache()
+
+func newDigestCache() *digestCache { return &digestCache{sums: map[string]digestEntry{}} }
 
 // cached is the digest kept for a file still of this size and time.
 func (c *digestCache) cached(path string, info fs.FileInfo) (string, bool) {
@@ -700,6 +704,8 @@ type storedListing struct {
 	pending []pendingDigest
 	// seen is every attachment listed, which the cache keeps.
 	seen map[string]bool
+	// cache holds the digests read, by the walk's paths.
+	cache *digestCache
 	// read reads one file's digest; tests replace it.
 	read func(path string) (string, error)
 }
@@ -735,13 +741,13 @@ func (l *storedListing) digest() ([]clusterhook.FileEntry, error) {
 			errs = append(errs, fmt.Errorf("%s/%s: %w", f.Storage, f.Path, err))
 			continue
 		}
-		storedDigests.put(p.path, p.info, sum)
+		l.cache.put(p.path, p.info, sum)
 		l.files[p.at].SHA256 = sum
 	}
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
 	}
-	storedDigests.keep(l.seen)
+	l.cache.keep(l.seen)
 	return l.files, nil
 }
 
@@ -779,8 +785,9 @@ func (l *storedListing) readListed(p pendingDigest, read func(string) (string, e
 // the storage's temporary directory until it is renamed: listing it would
 // name a file that is gone, or partial, when an observer asks for it, and
 // fail the whole checkpoint. It reads no file: an attachment's digest is
-// taken from the cache, or left to the listing's digest.
-func listStoredFiles(roots map[string]*setting.Storage) (*storedListing, error) {
+// taken from the cache, or left to the listing's digest. A cache forgets what
+// its last listing did not see: one cache serves one set of roots.
+func listStoredFiles(roots map[string]*setting.Storage, cache *digestCache) (*storedListing, error) {
 	type listed struct {
 		e    clusterhook.FileEntry
 		path string
@@ -823,7 +830,7 @@ func listStoredFiles(roots map[string]*setting.Storage) (*storedListing, error) 
 		}
 		return found[i].e.Path < found[j].e.Path
 	})
-	l := &storedListing{files: make([]clusterhook.FileEntry, len(found)), seen: map[string]bool{}}
+	l := &storedListing{files: make([]clusterhook.FileEntry, len(found)), seen: map[string]bool{}, cache: cache}
 	for i, f := range found {
 		l.files[i] = f.e
 		// An LFS object's or a package blob's path is its digest; an
@@ -832,7 +839,7 @@ func listStoredFiles(roots map[string]*setting.Storage) (*storedListing, error) 
 			continue
 		}
 		l.seen[f.path] = true
-		if sum, ok := storedDigests.cached(f.path, f.info); ok {
+		if sum, ok := cache.cached(f.path, f.info); ok {
 			l.files[i].SHA256 = sum
 			continue
 		}
