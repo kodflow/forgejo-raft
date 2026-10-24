@@ -172,10 +172,12 @@ func (r *Replicator) autoChange(ctx context.Context, action Action, id consensus
 
 // revokedLearner names a learner whose key this node's table holds revoked:
 // one admitted by a member whose table had not applied the revocation yet
-// (#70). It is removed, never promoted.
+// (#70). It is removed, never promoted. So is a learner whose key is asked
+// for revocation: a refused change withdraws its request (#171), and one
+// left open is an operator's Remove or DenyPin that may have been made.
 func (r *Replicator) revokedLearner(m consensus.Membership) (consensus.NodeID, bool) {
 	for _, x := range m.Members {
-		if !x.Voter && r.keyRevoked(x.SPKI) {
+		if !x.Voter && r.revokedOrAsked(x.SPKI) {
 			return x.ID, true
 		}
 	}
@@ -201,7 +203,7 @@ func (r *Replicator) promotable(ctx context.Context, eng consensus.Engine) func(
 	asked := false
 	return func(x consensus.Member) bool {
 		p, ok := peers[x.ID]
-		if !ok || r.keyRevoked(x.SPKI) || p.Unreachable || p.Snapshot || p.Lag > promoteLag || p.LastContact > r.auto.downAfter {
+		if !ok || r.revokedOrAsked(x.SPKI) || p.Unreachable || p.Snapshot || p.Lag > promoteLag || p.LastContact > r.auto.downAfter {
 			return false
 		}
 		v := r.table.WriteVersion()

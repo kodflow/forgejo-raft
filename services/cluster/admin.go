@@ -445,7 +445,7 @@ func (r *Replicator) operate(ctx context.Context, eng consensus.Engine, op conse
 		} else if err := deniable(eng, id); err != nil {
 			return err
 		}
-		k, asked, err := r.revokeMember(ctx, eng, op, id)
+		k, asked, request, err := r.revokeMember(ctx, eng, op, id)
 		if err != nil {
 			return err
 		}
@@ -453,7 +453,7 @@ func (r *Replicator) operate(ctx context.Context, eng consensus.Engine, op conse
 			if asked {
 				// Only the request is recorded: the member keeps its key,
 				// its object channel and its place (#64, #157, #158).
-				log.Warn("cluster: the %s of %s was refused: %v; the revocation of its key stays requested, and is written once no member holds the key", o.Action, id, err)
+				r.settleRefusedRevocation(ctx, eng, o.Action, id, k, request, err)
 			}
 			return err
 		}
@@ -642,24 +642,120 @@ var ErrRevocationPending = errors.New("the key is not revoked yet: some members 
 // again, on the CA in the autonomous mode, before it lands, or for good
 // if this node stopped in between: the request committed first closes
 // that window.
-func (r *Replicator) revokeMember(ctx context.Context, eng consensus.Engine, op consensus.Operator, id consensus.NodeID) (k reftable.RevokeKey, asked bool, err error) {
+//
+// From reftable.WithdrawVersion the change records its own request, even
+// when another one is open for the key, and request is the index the table
+// numbered it by: a change the engine refuses for certain withdraws it,
+// and only it (settleRefusedRevocation). Below, an open request is reused
+// and request is 0: it stays, as before (#171).
+func (r *Replicator) revokeMember(ctx context.Context, eng consensus.Engine, op consensus.Operator, id consensus.NodeID) (k reftable.RevokeKey, asked bool, request uint64, err error) {
 	for _, m := range eng.Membership().Members {
 		if m.ID != id || m.SPKI == ([32]byte{}) {
 			continue
 		}
 		k = reftable.RevokeKey{SPKI: hex.EncodeToString(m.SPKI[:]), Slot: m.Slot, Operator: string(op), Time: time.Now().Unix()}
 		if r.table.KeyRevoked(k.SPKI) {
-			return k, false, nil
+			return k, false, 0, nil
 		}
-		if r.revocationAsked(k.SPKI) {
-			return k, true, nil
+		numbered := r.table.WriteVersion() >= reftable.WithdrawVersion
+		if !numbered && r.revocationAsked(k.SPKI) {
+			return k, true, 0, nil
 		}
-		if err := r.recordPendingRevocation(ctx, k); err != nil {
-			return k, false, fmt.Errorf("recording the revocation of %s: %w", id, err)
+		index, err := r.recordPendingRevocation(ctx, k)
+		if err != nil {
+			return k, false, 0, fmt.Errorf("recording the revocation of %s: %w", id, err)
 		}
-		return k, true, nil
+		// The table numbers a request by its commit only once it applied
+		// the raise; one committed before is numbered 0 and stays.
+		if !slices.Contains(r.table.RevocationRequests(k.SPKI), index) {
+			index = 0
+		}
+		return k, true, index, nil
 	}
-	return reftable.RevokeKey{}, false, nil
+	return reftable.RevokeKey{}, false, 0, nil
+}
+
+// changeRefused reports whether the engine refused a membership change
+// for certain, before appending it: on this node (consensus.Certain), or
+// in the leader's admission (MEMBERSHIP_INVALID, MEMBERSHIP_CHANGE_PENDING).
+// Any other answer, an unknown outcome or a context that ended among them,
+// may have let the change commit.
+func changeRefused(err error) bool {
+	return consensus.Certain(err) || errors.Is(err, consensus.ErrMembershipInvalid) || errors.Is(err, consensus.ErrMembershipPending)
+}
+
+// settleRefusedRevocation decides what becomes of the revocation request a
+// Remove or DenyPin recorded (revokeMember) once the engine refused the
+// change. A change refused for certain, of a member that still holds the
+// key, leaves no effect: its request is withdrawn, by the index the table
+// numbered it, and the key joins again if the member leaves another way,
+// as a dead member the autopilot removed does (#171). Any other refusal
+// keeps the request, which is written once no member holds the key: the
+// change may have committed (#64, #165). A request numbered 0, committed
+// before reftable.WithdrawVersion, stays too. The withdrawal is proposed
+// past the end of the operator's request, which may be what ended.
+func (r *Replicator) settleRefusedRevocation(ctx context.Context, eng consensus.Engine, action Action, id consensus.NodeID, k reftable.RevokeKey, request uint64, refusal error) {
+	keep := func(why string) {
+		log.Warn("cluster: the %s of %s was refused: %v; the revocation of its key stays requested (%s), and is written once no member holds the key", action, id, refusal, why)
+	}
+	switch {
+	case !changeRefused(refusal):
+		keep("the change may have been made")
+		return
+	case request == 0:
+		keep("the request was not recorded by this change, or before payload version " + strconv.Itoa(reftable.WithdrawVersion))
+		return
+	case !holdsKey(eng.Membership(), k.SPKI):
+		// The member left meanwhile, by another path: the request the
+		// operator made stays, so its key does not join again.
+		keep("the member left meanwhile")
+		return
+	}
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commandBudget)
+	defer cancel()
+	if err := r.withdrawRevocation(wctx, k, request); err != nil {
+		keep("withdrawing it failed: " + err.Error())
+		return
+	}
+	log.Warn("cluster: the %s of %s was refused: %v; the revocation request of its key is withdrawn", action, id, refusal)
+}
+
+// holdsKey reports whether a member of m holds the key spki, 64 hex digits.
+func holdsKey(m consensus.Membership, spki string) bool {
+	for _, x := range m.Members {
+		if hex.EncodeToString(x.SPKI[:]) == spki {
+			return true
+		}
+	}
+	return false
+}
+
+// withdrawRevocation withdraws the revocation request of k numbered
+// request, from reftable.WithdrawVersion.
+func (r *Replicator) withdrawRevocation(ctx context.Context, k reftable.RevokeKey, request uint64) error {
+	v := r.table.WriteVersion()
+	if v < reftable.WithdrawVersion {
+		return fmt.Errorf("the cluster writes payload version %d, a withdrawal needs %d", v, reftable.WithdrawVersion)
+	}
+	data, err := reftable.EncodeVersion(v, reftable.KindWithdrawRevocation, &reftable.WithdrawRevocation{
+		SPKI: k.SPKI, Index: request, Operator: k.Operator, Time: time.Now().Unix(),
+	})
+	if err != nil {
+		return err
+	}
+	open := func() bool { return slices.Contains(r.table.RevocationRequests(k.SPKI), request) }
+	_, result, err := r.proposeCommand(ctx, data, func() bool { return !open() })
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return errors.New(result.Reason)
+	}
+	if r.table.KeyRevoked(k.SPKI) {
+		// A flush wrote it between the refusal and the withdrawal.
+		return errors.New("the revocation was written before its request was withdrawn")
+	}
+	return nil
 }
 
 // revocationAsked reports whether an operator asked for the revocation of
@@ -755,24 +851,34 @@ func strandedBy(m consensus.Membership, h consensus.Health, leader, target conse
 }
 
 // recordPendingRevocation records a revocation the cluster cannot write
-// yet, as a version 1 audit record every binary applies.
-func (r *Replicator) recordPendingRevocation(ctx context.Context, k reftable.RevokeKey) error {
+// yet, as a version 1 audit record every binary applies, and returns the
+// index it committed at.
+func (r *Replicator) recordPendingRevocation(ctx context.Context, k reftable.RevokeKey) (uint64, error) {
 	id := clusterhook.NewNonce()
 	data, err := reftable.Encode(reftable.KindAudit, &reftable.Audit{
 		ID: id, Operator: k.Operator, Action: reftable.AuditRevokeKey, Target: k.Slot + ":" + k.SPKI,
 		Outcome: reftable.AuditPending, Time: k.Time,
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
-	_, result, err := r.proposeCommand(ctx, data, func() bool { return r.table.HasAudit(id) })
+	tok, result, err := r.proposeCommand(ctx, data, func() bool { return r.table.HasAudit(id) })
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !result.OK {
-		return errors.New(result.Reason)
+		return 0, errors.New(result.Reason)
 	}
-	return nil
+	// A proposal forwarded from a follower returns once the leader applied
+	// it: the index is read from this node's table once it applied it too.
+	// Unknown, it is 0, and the request is never withdrawn.
+	if eng := r.Engine(); eng != nil && !tok.IsZero() {
+		if err := eng.WaitApplied(ctx, tok); err != nil {
+			return 0, nil
+		}
+	}
+	index, _ := r.table.AuditIndex(id)
+	return index, nil
 }
 
 // writeRevocation writes one revocation, at reftable.RevokeVersion.

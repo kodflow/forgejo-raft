@@ -141,6 +141,12 @@ func (r *Replicator) keyRevoked(spki [32]byte) bool {
 	return r.table != nil && r.table.KeyRevoked(hex.EncodeToString(spki[:]))
 }
 
+// revokedOrAsked reports whether this node's table holds the key revoked,
+// or asked for revocation and not written yet.
+func (r *Replicator) revokedOrAsked(spki [32]byte) bool {
+	return r.keyRevoked(spki) || (r.table != nil && r.revocationAsked(hex.EncodeToString(spki[:])))
+}
+
 // checkRetired runs on a node that does not lead: when it is not in its own
 // membership any more, or no leader answers it, it asks the others, and
 // rejoins under a new id once a quorum confirms its id is retired.
