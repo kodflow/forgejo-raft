@@ -6,11 +6,13 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -185,20 +187,110 @@ func TestBarrierCutRefsMatchSQL(t *testing.T) {
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	pg := newFakePG()
 	coord := withCheckpoints(t, tc, pg)
-	zero := strings.Repeat("0", 40)
+	barrierCutWhilePushing(t, tc, pg, coord)
+}
 
+// lateWAL is the fake PostgreSQL whose lateAt-th SwitchWAL, called right
+// after the coordinator noted when it listed the stored files, makes
+// readToCommitBound pass on the coordinator's clock: what a slow fsync of
+// the artifacts, a busy runner or a long pause of the collector does.
+type lateWAL struct {
+	*fakePG
+	calls  atomic.Int32
+	lateAt int32
+	offset *atomic.Int64
+}
+
+func (w *lateWAL) SwitchWAL(ctx context.Context) error {
+	if w.calls.Add(1) == w.lateAt {
+		w.offset.Add(int64(readToCommitBound))
+	}
+	return w.fakePG.SwitchWAL(ctx)
+}
+
+// A period take skips, its position read more than readToCommitBound
+// before it could be proposed, is a period without a checkpoint, not a
+// failure: the test counts the checkpoints that closed. It failed on the
+// skip, and its writers, never waited for, then pushed through its t once
+// it had returned: "Fail in goroutine after ... has completed" took the
+// whole test binary down (#200).
+func TestBarrierCutToleratesASkippedPeriod(t *testing.T) {
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	pg := newFakePG()
+	coord := withCheckpoints(t, tc, pg)
+	var offset atomic.Int64
+	coord.now = func() time.Time { return time.Now().Add(time.Duration(offset.Load())) }
+	coord.wal = &lateWAL{fakePG: pg, lateAt: 2, offset: &offset}
+	skipped := barrierCutWhilePushing(t, tc, pg, coord)
+	assert.Positive(t, skipped, "the period made late was skipped")
+}
+
+// maxSkippedInARow bounds the periods skipped one after another: a take
+// that never closes is a failure, not a busy runner.
+const maxSkippedInARow = 3
+
+// periodSkipped reports whether take gave a period up on one of its time
+// bounds (checkpoint.go): the fence or the cut held past drainBound, the
+// barrier or the drain of the SQL past it, the position read more than
+// readToCommitBound before it committed. The next period takes another.
+func periodSkipped(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	for _, s := range []string{"kept the fence for longer than the bound", "did not drain within", " discarded: "} {
+		if strings.Contains(err.Error(), s) {
+			return true
+		}
+	}
+	return false
+}
+
+// barrierCutWhilePushing takes checkpoints while three writers push, one
+// repository each, through every member, and checks that each checkpoint
+// that closed pairs the refs at its barrier with the SQL at its WAL
+// position. A period take skips on one of its bounds is logged and
+// counted, at most maxSkippedInARow in a row; any other failure of take
+// fails the test. The writers report their failures instead of failing the
+// test from their goroutines, and the test waits for them whatever
+// happens. It returns the periods skipped.
+func barrierCutWhilePushing(t *testing.T, tc *testCluster, pg *fakePG, coord *coordinator) int {
+	t.Helper()
+	zero := strings.Repeat("0", 40)
+	works := make([]string, len(tc.nodes))
+	for i := range tc.nodes {
+		works[i] = t.TempDir()
+		run(t, works[i], "init", "-q")
+	}
 	// Each writer owns a repository and pushes one commit after another
-	// through its member, followers included.
+	// through its member, followers included. They stop between two pushes
+	// once the test ends, and the test waits for them on every path.
+	ctx, stop := context.WithCancel(t.Context())
 	var wg sync.WaitGroup
+	errs := make(chan error, len(tc.nodes))
+	defer func() {
+		stop()
+		wg.Wait()
+	}()
 	for i, n := range tc.nodes {
+		work := works[i]
 		wg.Go(func() {
-			work := t.TempDir()
-			run(t, work, "init", "-q")
 			repo := fmt.Sprintf("user%d/cut.git", i)
 			old := zero
 			for k := range 8 {
-				sha := commit(t, work, fmt.Sprintf("%d-%d", i, k))
-				if resp := tc.pushVia(n, work, repo, "refs/heads/main", old, sha); resp.OK {
+				if ctx.Err() != nil {
+					return
+				}
+				sha, err := commitIn(work, fmt.Sprintf("%d-%d", i, k))
+				if err != nil {
+					errs <- err
+					return
+				}
+				resp, err := tc.tryPushVia(n, work, repo, "refs/heads/main", old, sha)
+				if err != nil {
+					errs <- fmt.Errorf("push %d of %s: %w", k, repo, err)
+					return
+				}
+				if resp.OK {
 					old = sha
 				}
 			}
@@ -209,6 +301,7 @@ func TestBarrierCutRefsMatchSQL(t *testing.T) {
 
 	// Checkpoints while the pushes land, and one once they are done.
 	var closed []reftable.CheckpointRecord
+	skipped, inARow := 0, 0
 	for running := true; running; {
 		select {
 		case <-writing:
@@ -216,9 +309,23 @@ func TestBarrierCutRefsMatchSQL(t *testing.T) {
 		case <-time.After(200 * time.Millisecond):
 		}
 		rec, err := coord.take(context.Background())
-		require.NoError(t, err)
+		if err != nil {
+			require.True(t, periodSkipped(err), "take failed on something else than one of its bounds: %v", err)
+			skipped++
+			inARow++
+			t.Logf("period skipped (%d in a row): %v", inARow, err)
+			require.LessOrEqual(t, inARow, maxSkippedInARow, "take skips every period")
+			running = true // the one after the pushes must close
+			continue
+		}
+		inARow = 0
 		closed = append(closed, rec)
 	}
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err, "a writer")
+	}
+	t.Logf("%d checkpoints closed, %d periods skipped", len(closed), skipped)
 	require.GreaterOrEqual(t, len(closed), 4)
 	// Each checkpoint records the backup cursor at its barrier: the
 	// consumer never trims the events a restore to it would replay.
@@ -260,6 +367,7 @@ func TestBarrierCutRefsMatchSQL(t *testing.T) {
 	assert.Positive(t, pushesSeen, "the checkpoints saw pushes")
 	// Checkpoints closed while pushes ran: the cut was not taken at rest.
 	assert.Less(t, closed[0].Index, closed[len(closed)-1].Index)
+	return skipped
 }
 
 // Pushes on the leader queue behind the fence while PostgreSQL's position
@@ -274,18 +382,27 @@ func TestCheckpointFenceHoldsTheLeadersWriters(t *testing.T) {
 	sha := commit(t, work, "one")
 
 	leader.r.fence.Lock()
-	done := make(chan *clusterhook.Response, 1)
+	type pushed struct {
+		resp *clusterhook.Response
+		err  error
+	}
+	// The push reports git's failure instead of failing the test from its
+	// goroutine, which would leave the test waiting for it (#200).
+	done := make(chan pushed, 1)
 	go func() {
-		done <- tc.pushVia(leader, work, "alice/fence.git", "refs/heads/main", strings.Repeat("0", 40), sha)
+		resp, err := tc.tryPushVia(leader, work, "alice/fence.git", "refs/heads/main", strings.Repeat("0", 40), sha)
+		done <- pushed{resp, err}
 	}()
 	select {
 	case <-done:
+		leader.r.fence.Unlock()
 		t.Fatal("a push on the leader went through the fence")
 	case <-time.After(300 * time.Millisecond):
 	}
 	leader.r.fence.Unlock()
-	resp := <-done
-	require.True(t, resp.OK, resp.Message)
+	p := <-done
+	require.NoError(t, p.err)
+	require.True(t, p.resp.OK, p.resp.Message)
 
 	_, err := coord.take(context.Background())
 	require.NoError(t, err)

@@ -72,6 +72,19 @@ leaders() {
   return 0
 }
 leader() { local l; l="$(leaders)"; [ "$(echo "$l" | grep -c .)" = 1 ] && echo "$l"; }
+# three_voters: every node's own status lists three voters. Until then a
+# node may still be a learner, whose writes wait for its promotion.
+three_voters() {
+  local n
+  for n in 1 2 3; do
+    [ "$(field "$n" '[.Members[] | select(.Voter)] | length')" = 3 ] || return 1
+  done
+}
+# voters_seen: what each node's status says of each member, for a failure.
+voters_seen() {
+  local n
+  for n in 1 2 3; do printf 'node %s: %s; ' "$n" "$(field "$n" '[.Members[] | "\(.Slot)=\(.Voter)"] | join(",")')"; done
+}
 others() { local n; for n in 1 2 3; do [ "$n" = "$1" ] || echo "$n"; done; }
 
 # The suite's accounts. The passwords come from .env (scripts/secrets.sh).

@@ -149,16 +149,10 @@ else
   L=1
 fi
 
-three_voters() {
-  local n
-  for n in 1 2 3; do
-    [ "$(field "$n" '[.Members[] | select(.Voter)] | length')" = 3 ] || return 1
-  done
-}
 if poll 120 three_voters; then
   pass A.three-voters "$(field "$L" '[.Members[] | "\(.Slot)=\(if .Voter then "voter" else "learner" end)"] | join(",")')"
 else
-  flunk A.three-voters "$(for n in 1 2 3; do printf 'node %s: %s; ' "$n" "$(field "$n" '[.Members[] | "\(.Slot)=\(.Voter)"] | join(",")')"; done)"
+  flunk A.three-voters "$(voters_seen)"
 fi
 
 status_agrees() {

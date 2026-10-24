@@ -636,10 +636,14 @@ func TestPartitionNeverTwoWriters(t *testing.T) {
 		for i := range sides {
 			shas[i] = commit(t, works[i], fmt.Sprintf("%s side %d", repo, i))
 		}
+		// The pushes report git's failures: a goroutine of the test must
+		// not fail it (#200).
+		var errs [2]error
 		for i, side := range sides {
 			wg.Go(func() {
-				ok := tc.pushViaWithin(3*time.Second, side[0].n, works[i], repo, "refs/heads/main", zero, shas[i]).OK
-				if ok {
+				resp, err := tc.tryPushViaWithin(3*time.Second, side[0].n, works[i], repo, "refs/heads/main", zero, shas[i])
+				errs[i] = err
+				if err == nil && resp.OK {
 					mu.Lock()
 					committed++
 					mu.Unlock()
@@ -650,6 +654,9 @@ func TestPartitionNeverTwoWriters(t *testing.T) {
 			during()
 		}
 		wg.Wait()
+		for _, err := range errs {
+			require.NoError(t, err)
+		}
 		return committed
 	}
 	heal := func() {
@@ -715,7 +722,10 @@ func TestFullRebootWithAWipedFounderNeverFoundsTwice(t *testing.T) {
 	require.NoError(t, os.RemoveAll(a.dir), "node-a's disk is lost")
 
 	// The members restart slowly, answering from their disks meanwhile.
+	// The test waits for them whatever fails: a restart that fails the test
+	// after it returned would take the binary down (#200).
 	var wg sync.WaitGroup
+	defer wg.Wait()
 	for _, an := range b.nodes[1:] {
 		wg.Go(func() { b.restartAfter(an, 2*time.Second) })
 	}
