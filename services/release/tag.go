@@ -10,6 +10,7 @@ import (
 
 	"forgejo.org/models/db"
 	repo_model "forgejo.org/models/repo"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/graceful"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/queue"
@@ -26,11 +27,20 @@ type TagSyncOptions struct {
 var tagSyncQueue *queue.WorkerPoolQueue[*TagSyncOptions]
 
 func handlerTagSync(items ...*TagSyncOptions) []*TagSyncOptions {
+	skipped := 0
 	for _, opts := range items {
 		err := repo_module.SyncRepoTags(graceful.GetManager().ShutdownContext(), opts.RepoID)
+		if errors.Is(err, clusterhook.ErrBehind) {
+			skipped++
+			log.Warn("syncRepoTags [%d] skipped: %v", opts.RepoID, err)
+			continue
+		}
 		if err != nil {
 			log.Error("syncRepoTags [%d] failed: %v", opts.RepoID, err)
 		}
+	}
+	if skipped > 0 {
+		log.Warn("syncRepoTags: %d repositories skipped, this node of the cluster was behind on them; synchronise again, or from another node", skipped)
 	}
 	return nil
 }

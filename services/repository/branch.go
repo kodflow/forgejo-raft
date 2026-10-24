@@ -554,11 +554,20 @@ type BranchSyncOptions struct {
 var branchSyncQueue *queue.WorkerPoolQueue[*BranchSyncOptions]
 
 func handlerBranchSync(items ...*BranchSyncOptions) []*BranchSyncOptions {
+	skipped := 0
 	for _, opts := range items {
-		_, err := repo_module.SyncRepoBranches(graceful.GetManager().ShutdownContext(), opts.RepoID, 0)
+		_, err := repo_module.SyncRepoBranchesFresh(graceful.GetManager().ShutdownContext(), opts.RepoID, 0)
+		if errors.Is(err, clusterhook.ErrBehind) {
+			skipped++
+			log.Warn("syncRepoBranches [%d] skipped: %v", opts.RepoID, err)
+			continue
+		}
 		if err != nil {
 			log.Error("syncRepoBranches [%d] failed: %v", opts.RepoID, err)
 		}
+	}
+	if skipped > 0 {
+		log.Warn("syncRepoBranches: %d repositories skipped, this node of the cluster was behind on them; synchronise again, or from another node", skipped)
 	}
 	return nil
 }

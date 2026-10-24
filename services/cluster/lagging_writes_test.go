@@ -12,11 +12,14 @@ import (
 	"forgejo.org/models"
 	"forgejo.org/models/db"
 	git_model "forgejo.org/models/git"
+	issues_model "forgejo.org/models/issues"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unittest"
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/gitrepo"
+	repo_module "forgejo.org/modules/repository"
+	pull_service "forgejo.org/services/pull"
 	release_service "forgejo.org/services/release"
 	repo_service "forgejo.org/services/repository"
 
@@ -318,4 +321,105 @@ func TestATagDeletedOnALaggingNodeGoesThroughTheCluster(t *testing.T) {
 	require.NoError(t, db.Insert(ctx, gone))
 	require.NoError(t, release_service.DeleteReleaseByID(ctx, sqlRepo, gone, doer, true))
 	unittest.AssertNotExistsBean(t, &repo_model.Release{ID: gone.ID})
+}
+
+// The site administration's "Synchronise branches" and "Synchronise tags"
+// (routers/web/admin/admin.go, sync_repo_branches and sync_repo_tags) run
+// on the node that served the request, from its own git. On node-a, which
+// has not projected a branch and a tag pushed through node-b (their rows
+// already derived), the branch row was marked deleted and the published
+// release turned into a draft (#191). Now a repository node-a is behind on
+// is left as it is, and synchronised once node-a serves it.
+func TestAnAdminSyncOnALaggingNodeLeavesTheRepositoryAsItIs(t *testing.T) {
+	tc, a, b, work, c1, _, hold := laggingCluster(t)
+	ctx := db.DefaultContext
+	zero := strings.Repeat("0", 40)
+	pushOnB(t, tc, a, b, work, "refs/heads/lag-new", zero, c1)
+	pushOnB(t, tc, a, b, work, "refs/tags/lag-g3", zero, c1)
+	// What the consumer derived for the branch, and the release published
+	// on that tag through node-b.
+	require.NoError(t, db.Insert(ctx, &git_model.Branch{RepoID: 1, Name: "lag-new", CommitID: c1, CommitMessage: "one", PusherID: 2}))
+	rel := &repo_model.Release{RepoID: 1, PublisherID: 2, TagName: "lag-g3", LowerTagName: "lag-g3", Sha1: c1, Title: "release", NumCommits: 1}
+	require.NoError(t, db.Insert(ctx, rel))
+
+	withGitThroughReplicator(t, a)
+	freshFrom(t, a)
+	_, err := repo_module.SyncRepoBranchesFresh(ctx, 1, 0)
+	require.ErrorIs(t, err, clusterhook.ErrBehind)
+	require.ErrorIs(t, repo_module.SyncRepoTags(ctx, 1), clusterhook.ErrBehind)
+	br, err := git_model.GetBranch(ctx, 1, "lag-new")
+	require.NoError(t, err)
+	assert.False(t, br.IsDeleted, "a live branch is not marked deleted")
+	got := unittest.AssertExistsAndLoadBean(t, &repo_model.Release{ID: rel.ID})
+	assert.False(t, got.IsDraft, "a published release on a live tag is not turned into a draft")
+
+	caughtUp(t, a, hold, "refs/heads/lag-new", c1)
+	require.Eventually(t, func() bool { return gitRef(t, a, laggingRepo, "refs/tags/lag-g3") == c1 }, 15*time.Second, 20*time.Millisecond)
+	_, err = repo_module.SyncRepoBranchesFresh(ctx, 1, 0)
+	require.NoError(t, err)
+	require.NoError(t, repo_module.SyncRepoTags(ctx, 1))
+	br, err = git_model.GetBranch(ctx, 1, "lag-new")
+	require.NoError(t, err)
+	assert.False(t, br.IsDeleted)
+	got = unittest.AssertExistsAndLoadBean(t, &repo_model.Release{ID: rel.ID})
+	assert.False(t, got.IsDraft)
+	assert.Equal(t, c1, got.Sha1)
+}
+
+// A pull request created on node-a right after a push to its head branch
+// through node-b: NewPullRequest read the head from node-a's git, which
+// had not projected the push, and wrote refs/pull/N/head at the older
+// commit for the whole cluster. The push's own update of the pull
+// requests passes over one created after it (TestPullRequest), and the
+// pull request stayed broken until the next push (#191). Now the creation
+// waits for node-a to serve the repository, and is refused while it does
+// not.
+func TestAPullRequestCreatedOnALaggingNodeHasThePushedHead(t *testing.T) {
+	tc, a, b, work, c1, _, hold := laggingCluster(t)
+	ctx := db.DefaultContext
+	zero := strings.Repeat("0", 40)
+	head := "refs/heads/lag-feat"
+	// The head branch at c1 on every node, then at c3 through node-b.
+	a.r.registry.release(hold)
+	require.True(t, tc.pushVia(a, work, laggingRepo, head, zero, c1).OK)
+	for _, m := range tc.nodes {
+		require.Eventually(t, func() bool { return gitRef(t, m, laggingRepo, head) == c1 }, 15*time.Second, 20*time.Millisecond, "%s", m.slot)
+	}
+	hold = clusterhook.NewNonce()
+	require.NoError(t, a.r.registry.register(hold, laggingRepo, nil, os.Getpid(), false))
+	c3 := commit(t, work, "three")
+	pushOnB(t, tc, a, b, work, head, c1, c3)
+
+	withGitThroughReplicator(t, a)
+	freshFrom(t, a)
+	// The cluster's repository has no master, the fixtures' default branch,
+	// which the review requests of a pull request read.
+	_, err := db.GetEngine(ctx).ID(1).Cols("default_branch").Update(&repo_model.Repository{DefaultBranch: "main"})
+	require.NoError(t, err)
+	sqlRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	open := func() (*issues_model.PullRequest, error) {
+		issue := &issues_model.Issue{RepoID: 1, Title: "lagging head", PosterID: doer.ID, Poster: doer, IsPull: true}
+		pr := &issues_model.PullRequest{
+			HeadRepoID: 1, BaseRepoID: 1, HeadBranch: "lag-feat", BaseBranch: "main",
+			HeadRepo: sqlRepo, BaseRepo: sqlRepo, Type: issues_model.PullRequestGitea,
+		}
+		return pr, pull_service.NewPullRequest(ctx, sqlRepo, issue, nil, nil, pr, nil)
+	}
+	pr, err := open()
+	if err == nil {
+		v, _ := a.r.table.Get(laggingRepo, pr.GetGitRefName())
+		t.Logf("pull request %d created on lagging node-a: %s at %.10s, the head branch at %.10s", pr.Index, pr.GetGitRefName(), v.SHA, c3)
+		assert.Equal(t, c3, v.SHA, "the pull request's head is the commit the push acknowledged")
+	} else {
+		require.ErrorIs(t, err, clusterhook.ErrBehind)
+	}
+
+	caughtUp(t, a, hold, head, c3)
+	pr, err = open()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		v, _ := a.r.table.Get(laggingRepo, pr.GetGitRefName())
+		return v.SHA == c3
+	}, 10*time.Second, 20*time.Millisecond, "the pull request's head is the pushed commit")
 }

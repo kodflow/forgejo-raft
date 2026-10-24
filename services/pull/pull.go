@@ -19,6 +19,7 @@ import (
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/base"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/container"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
@@ -41,6 +42,10 @@ func NewPullRequest(ctx context.Context, repo *repo_model.Repository, issue *iss
 	// Check if the doer is not blocked by the repository's owner.
 	if user_model.IsBlocked(ctx, repo.OwnerID, issue.PosterID) {
 		return user_model.ErrBlockedByUser
+	}
+
+	if err := requireFreshRepos(ctx, pr); err != nil {
+		return err
 	}
 
 	testPatchCtx, err := testPatch(ctx, pr)
@@ -420,6 +425,36 @@ func ValidatePullRequest(ctx context.Context, pr *issues_model.PullRequest, newC
 			log.Error("UpdateCommitDivergence: %v", err)
 		}
 	}
+}
+
+// requireFreshRepos waits, in a cluster, until this node serves the head
+// and the base repositories of a new pull request at the cluster's commit
+// index. The head is read from this node's git: behind a push another node
+// acknowledged, refs/pull/N/head would be an older commit for the whole
+// cluster, and the push's own update of the pull requests passes over one
+// created after it (TestPullRequest), which stays broken until the next
+// push (#191). A node still behind refuses with clusterhook.ErrBehind. An
+// AGit pull request's head is the commit its push carries, from no branch:
+// it is created inside that push, which waits for no other.
+func requireFreshRepos(ctx context.Context, pr *issues_model.PullRequest) error {
+	if !clusterhook.Enabled() || pr.Flow != issues_model.PullRequestFlowGithub {
+		return nil
+	}
+	if err := pr.LoadHeadRepo(ctx); err != nil {
+		return err
+	}
+	if err := pr.LoadBaseRepo(ctx); err != nil {
+		return err
+	}
+	for _, r := range []*repo_model.Repository{pr.HeadRepo, pr.BaseRepo} {
+		if r == nil {
+			continue
+		}
+		if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(r.OwnerName, r.Name, false)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // PushToBaseRepo pushes commits from branches of head repository to

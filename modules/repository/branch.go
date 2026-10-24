@@ -10,6 +10,7 @@ import (
 	"forgejo.org/models/db"
 	git_model "forgejo.org/models/git"
 	repo_model "forgejo.org/models/repo"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/container"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
@@ -34,6 +35,23 @@ func SyncRepoBranches(ctx context.Context, repoID, doerID int64) (int64, error) 
 	defer gitRepo.Close()
 
 	return SyncRepoBranchesWithRepo(ctx, repo, gitRepo, doerID)
+}
+
+// SyncRepoBranchesFresh is SyncRepoBranches for the site administration's
+// "Synchronise branches", which runs on the node that served the request.
+// In a cluster it runs only once this node serves the repository at the
+// cluster's commit index: from a git behind, the branches another node
+// wrote would be marked deleted (#191). A repository this node is still
+// behind on is left as it is, with clusterhook.ErrBehind.
+func SyncRepoBranchesFresh(ctx context.Context, repoID, doerID int64) (int64, error) {
+	repo, err := repo_model.GetRepositoryByID(ctx, repoID)
+	if err != nil {
+		return 0, err
+	}
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
+		return 0, err
+	}
+	return SyncRepoBranches(ctx, repoID, doerID)
 }
 
 func SyncRepoBranchesWithRepo(ctx context.Context, repo *repo_model.Repository, gitRepo *git.Repository, doerID int64) (int64, error) {
