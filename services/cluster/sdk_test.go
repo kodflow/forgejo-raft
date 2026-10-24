@@ -60,6 +60,8 @@ func startSDKEnginesOver(t *testing.T, cluster consensus.ClusterID, nodes []*tes
 			Cluster: sdk.ClusterID(cluster), Machine: kitsunium.Machine(n.r.table), Durability: sdk.DurabilityVolatile,
 			Log: ps[i].log, Snapshots: ps[i].snaps, Transport: sdk.NewMemoryTransport(network, ps[i].id), InitialTiming: timing,
 			MaxSnapshotBytes: 1 << 30, MaxLogBytes: 1 << 30, MinVoters: 3, SnapshotPausesApply: true,
+			// The entry bounds the kitsunium driver opens a node with.
+			MaxEntryBytes: consensus.MaxEntryBytes, MaxBatchBytes: consensus.MaxEntryBytes,
 		}
 		require.NoError(t, sdk.Bootstrap(context.Background(), &cfg, members))
 		node, err := sdk.NewNode(cfg)

@@ -363,6 +363,30 @@ type TLSFiles struct {
 	CAFile   string
 }
 
+// MaxEntryBytes bounds one replicated command. A driver applies it as its
+// engine's bound, the kitsunium driver as the SDK's MaxEntryBytes and
+// MaxBatchBytes, which may not be below it; the replicator refuses a
+// larger lifecycle command before it proposes it.
+//
+// It is 4 MiB, four times the SDK's default, for an owner's rename: it
+// moves every repository of the owner in one entry, some 80 bytes per
+// repository for short names and as much again for its wiki, and under
+// 1 MiB an owner of about 6 600 repositories with wikis could never be
+// renamed (#182). The SDK's bounds hold: MaxBatchBytes and its framing
+// stay under the transport's MaxFrameBytes (16 MiB), MaxInflightBytes
+// (8 MiB) stays above MaxBatchBytes, and MaxPendingBytes (64 MiB) above
+// MaxEntryBytes. The node's memory budget, made of MaxInflightBytes and
+// the pending, apply-lag and recent-entries budgets, does not change. A
+// member running an older binary receives such an entry within its frame
+// bound and applies it; as the leader, it refuses it as ENTRY_TOO_LARGE,
+// with certainty, and Forgejo undoes the rename.
+//
+// What grows is one append: up to 4 MiB in a frame, which the transport
+// writes within its write deadline (WriteTimeout, 2 s), so the links
+// between members should carry 2 MiB/s, where a 1 MiB batch asked
+// 0.5 MiB/s.
+const MaxEntryBytes = 4 << 20
+
 // Config is what the replicator hands a driver to open a node.
 type Config struct {
 	DataDir       string

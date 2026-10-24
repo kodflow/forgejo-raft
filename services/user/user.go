@@ -114,6 +114,12 @@ func renameUser(ctx context.Context, u *user_model.User, newUserName string, doe
 		return repo_model.UpdateRepositoryOwnerNames(ctx, u.ID, newUserName)
 	}
 
+	// In a cluster, an owner whose repositories are too many to move in one
+	// replicated entry is refused before anything is written (#182).
+	if err := clusterhook.OwnerRenameRefusal(oldUserName, newUserName); err != nil {
+		return fmt.Errorf("rename user in the cluster: %w", err)
+	}
+
 	// In a cluster, the moves recorded in the replicated table and the SQL
 	// committed below fall on the same side of a checkpoint (#88).
 	releaseCut, err := clusterhook.HoldCut(ctx)

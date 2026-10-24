@@ -703,8 +703,7 @@ func (r *Replicator) proposeMoves(ctx context.Context, moves [][2]string, owner 
 	if len(moves) == 0 {
 		return nil
 	}
-	v := r.table.WriteVersion()
-	rn := &reftable.RepoRename{From: moves[0][0], To: moves[0][1], Time: time.Now().UnixNano(), Also: moves[1:]}
+	v, rn := r.renameCommand(moves, owner)
 	landed := func() bool {
 		for _, m := range moves {
 			if f, _, ok := r.table.RenamedFrom(m[1]); !ok || f != m[0] {
@@ -714,16 +713,45 @@ func (r *Replicator) proposeMoves(ctx context.Context, moves [][2]string, owner 
 		return true
 	}
 	if v >= reftable.GenerationVersion {
-		rn.Nonce, rn.Owner = clusterhook.NewNonce(), owner
 		landed = r.nonceLanded(rn.Nonce)
 	}
 	return r.proposeLifecycle(ctx, v, reftable.KindRepoRename, rn, landed)
+}
+
+// renameCommand is the command moving moves, at the version the table
+// writes; owner names an owner's rename.
+func (r *Replicator) renameCommand(moves [][2]string, owner [2]string) (uint8, *reftable.RepoRename) {
+	v := r.table.WriteVersion()
+	rn := &reftable.RepoRename{From: moves[0][0], To: moves[0][1], Time: time.Now().UnixNano(), Also: moves[1:]}
+	if v >= reftable.GenerationVersion {
+		rn.Nonce, rn.Owner = clusterhook.NewNonce(), owner
+	}
+	return v, rn
+}
+
+// tooLarge refuses a command of size bytes the engine would refuse as
+// ENTRY_TOO_LARGE, before it is proposed.
+func (r *Replicator) tooLarge(size int) error {
+	bound := r.maxEntry
+	if bound <= 0 {
+		bound = consensus.MaxEntryBytes
+	}
+	if size <= bound {
+		return nil
+	}
+	return fmt.Errorf("%w (%d bytes, the bound is %d)", clusterhook.ErrTooLarge, size, bound)
 }
 
 func (r *Replicator) proposeLifecycle(ctx context.Context, v uint8, kind reftable.Kind, body any, landed func() bool) error {
 	data, err := reftable.EncodeVersion(v, kind, body)
 	if err != nil {
 		return err
+	}
+	// Refused by the engine, it would be refused at every attempt: it is
+	// refused here, with certainty, the callers moving the directories
+	// back (#182).
+	if err := r.tooLarge(len(data)); err != nil {
+		return fmt.Errorf("the cluster cannot record it: %w", err)
 	}
 	// As a push: while the autonomous cluster forms, a deletion or a
 	// rename committed on the founder's disk alone, already done in SQL,
@@ -797,7 +825,39 @@ func (r *Replicator) proposeOwnerRename(ctx context.Context, oldOwner, newOwner 
 			return fmt.Errorf("the cluster did not record it: this node could not confirm it applied the log: %w", err)
 		}
 	}
-	return r.proposeMoves(ctx, r.ownerMoves(oldOwner, newOwner), [2]string{oldOwner, newOwner})
+	moves := r.ownerMoves(oldOwner, newOwner)
+	err := r.proposeMoves(ctx, moves, [2]string{oldOwner, newOwner})
+	if errors.Is(err, clusterhook.ErrTooLarge) {
+		return ownerTooLarge(oldOwner, len(moves), err)
+	}
+	return err
+}
+
+// ownerRenameRefusal is clusterhook.OwnerRenameRefusal: an owner's rename
+// whose entry, as this node's table lists its moves now, the engine would
+// refuse is refused before Forgejo writes anything (#182). The rename is
+// still checked once proposed, its moves read again after a commit
+// boundary a quorum confirmed.
+func (r *Replicator) ownerRenameRefusal(oldOwner, newOwner string) error {
+	moves := r.ownerMoves(oldOwner, newOwner)
+	if len(moves) == 0 {
+		return nil
+	}
+	v, rn := r.renameCommand(moves, [2]string{oldOwner, newOwner})
+	data, err := reftable.EncodeVersion(v, reftable.KindRepoRename, rn)
+	if err != nil {
+		return err
+	}
+	if err := r.tooLarge(len(data)); err != nil {
+		return ownerTooLarge(oldOwner, len(moves), err)
+	}
+	return nil
+}
+
+// ownerTooLarge explains the refusal of an owner's rename too large for
+// one entry, which every attempt meets again.
+func ownerTooLarge(owner string, keys int, err error) error {
+	return fmt.Errorf("renaming the owner %s moves its %d repositories, wikis included, at once: %w; move some of its repositories to another owner first", owner, keys, err)
 }
 
 // ownerMoves lists the moves of an owner's rename: every key under the old

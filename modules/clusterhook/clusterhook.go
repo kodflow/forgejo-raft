@@ -495,6 +495,39 @@ func OwnerRenamed(ctx context.Context, oldOwner, newOwner string) error {
 	return f(ctx, strings.ToLower(oldOwner), strings.ToLower(newOwner))
 }
 
+// ErrTooLarge is a lifecycle command larger than one replicated entry may
+// be: refused before it is proposed, so nothing was recorded and the
+// caller undoes what it did locally. Proposed again, it is refused again:
+// an owner's rename moves every repository of the owner in one entry
+// (#182).
+var ErrTooLarge = errors.New("too large for one replicated entry")
+
+var checkOwnerRename func(oldOwner, newOwner string) error
+
+// SetOwnerRenameCheck registers the replicator's check of an owner's
+// rename, nil when the cluster can record it.
+func SetOwnerRenameCheck(f func(oldOwner, newOwner string) error) {
+	lifecycleMu.Lock()
+	checkOwnerRename = f
+	lifecycleMu.Unlock()
+}
+
+// OwnerRenameRefusal refuses an owner's rename the cluster cannot record,
+// an error wrapping ErrTooLarge: Forgejo asks it before it writes the
+// rename to SQL or moves the owner's directory, rather than undo both
+// once the proposal is refused (#182). It reads this node's table, which
+// may be behind: OwnerRenamed checks again what it proposes. It is always
+// nil without a cluster.
+func OwnerRenameRefusal(oldOwner, newOwner string) error {
+	lifecycleMu.RLock()
+	f := checkOwnerRename
+	lifecycleMu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	return f(strings.ToLower(oldOwner), strings.ToLower(newOwner))
+}
+
 // ---- the checkpoint's cut ----
 
 // A checkpoint pairs the table at its barrier B with PostgreSQL at its WAL
