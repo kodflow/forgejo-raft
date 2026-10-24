@@ -25,9 +25,11 @@ dco() {
 # and an exec that lands then makes docker print "cannot exec in a stopped
 # container", which counted as a socket (#188). Such a sample is no sample,
 # and listening fails; an exec that failed for another reason is printed,
-# and fails the check, which must not go blind.
+# and fails the check, which must not go blind. Only docker's own message or
+# a `compose ps` that answers and sees no running observer says it stopped:
+# a `ps` that fails says nothing, and the sample stays a failure.
 listening() {
-  local out rc
+  local out rc running ps_rc=0 why=""
   # shellcheck disable=SC2016 # expanded inside the container
   out="$(dco exec -T -u 0 observer sh -c '
     pid="$(pgrep -f "[g]itea cluster observe" | head -n 1)"
@@ -41,11 +43,15 @@ listening() {
     printf '%s\n' "$out" | grep '^socket inode ' || true
     return 0
   fi
-  if printf '%s\n' "$out" | grep -qE 'cannot exec in a stopped container|is not running|No such container' ||
-    [ -z "$(dco ps -q --status running observer 2>/dev/null)" ]; then
+  if printf '%s\n' "$out" | grep -qE 'cannot exec in a stopped container|is not running|No such container'; then
     return 1
   fi
-  echo "sample failed (exit $rc): $(printf '%s' "$out" | tr '\n' ' ')"
+  running="$(dco ps -q --status running observer 2>/dev/null)" || ps_rc=$?
+  if [ "$ps_rc" = 0 ] && [ -z "$running" ]; then
+    return 1
+  fi
+  [ "$ps_rc" = 0 ] || why=", compose ps exit $ps_rc"
+  echo "sample failed (exit $rc$why): $(printf '%s' "$out" | tr '\n' ' ')"
 }
 watch_ports() {
   local i seen=0
