@@ -172,9 +172,29 @@ func cursorName(lineage string) string { return "dispatch@" + lineage }
 // runs in a savepoint, so a nested failure the work logs and swallows
 // rolls back that statement alone, never the batch before it nor the
 // cursor after it (#104).
+//
+// On PostgreSQL its statements wait at most batchLockTimeout for a lock
+// another transaction holds: a request's long transaction on a row the
+// work updates (a fork copying a repository holds its base's row, the
+// deletion of a repository its rows) kept the single dispatcher waiting,
+// and the SQL of every repository behind it (#177). The work then fails,
+// the batch is tried again, and the group is parked after maxAttempts
+// while the rest goes on; the parked group is retried on its own.
 func batchTx(ctx context.Context, f func(ctx context.Context) error) error {
-	return db.WithTx(db.WithNestedSavepoints(ctx), f)
+	return db.WithTx(db.WithNestedSavepoints(ctx), func(ctx context.Context) error {
+		if setting.Database.Type.IsPostgreSQL() {
+			if _, err := db.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = %d", batchLockTimeout.Milliseconds())); err != nil {
+				return fmt.Errorf("bounding the batch's lock waits: %w", err)
+			}
+		}
+		return f(ctx)
+	})
 }
+
+// batchLockTimeout bounds a lock wait of a batch's statement on
+// PostgreSQL: far above what the requests' short transactions hold a row,
+// far below the minutes a fork's copy took. A test lowers it.
+var batchLockTimeout = 5 * time.Second
 
 // errBatchTxEnded is the work of a batch that ended its transaction: what
 // it wrote before is rolled back, what follows would commit statement by
