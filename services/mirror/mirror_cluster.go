@@ -18,6 +18,7 @@ import (
 	"forgejo.org/modules/git"
 	giturl "forgejo.org/modules/git/url"
 	repo_module "forgejo.org/modules/repository"
+	"forgejo.org/modules/util"
 	"forgejo.org/services/cluster/reftable"
 )
 
@@ -31,14 +32,23 @@ import (
 // remoteURLOf returns the URL of the remote name in the repository at path,
 // "" when there is no such remote.
 func remoteURLOf(ctx context.Context, path, name string) (string, error) {
+	url, _, err := remoteURLIn(ctx, path, name)
+	return url, err
+}
+
+// remoteURLIn returns the URL of the remote name in the repository at
+// path, and whether the remote exists: UpdateAddress gives a wiki's remote
+// an empty URL when the new address serves no wiki, and a remote added
+// again over it fails.
+func remoteURLIn(ctx context.Context, path, name string) (url string, exists bool, err error) {
 	stdout, _, err := git.NewCommand(ctx, "config", "--get").AddDynamicArguments("remote." + name + ".url").RunStdString(&git.RunOpts{Dir: path})
 	if err != nil {
 		if git.IsErrorExitCode(err, 1) {
-			return "", nil
+			return "", false, nil
 		}
-		return "", err
+		return "", false, err
 	}
-	return strings.TrimSpace(stdout), nil
+	return strings.TrimSpace(stdout), true, nil
 }
 
 // addPullRemote adds the remote of a pull mirror as `git clone --mirror`
@@ -60,11 +70,11 @@ func addPullRemote(ctx context.Context, path, name, addr string) error {
 // a node that lacks the remote adds it.
 func setPullRemoteURL(ctx context.Context, path, name, addr string) error {
 	if clusterhook.Enabled() {
-		cur, err := remoteURLOf(ctx, path, name)
+		_, exists, err := remoteURLIn(ctx, path, name)
 		if err != nil {
 			return err
 		}
-		if cur == "" {
+		if !exists {
 			if addr == "" {
 				return nil
 			}
@@ -94,12 +104,12 @@ func ensurePullMirrorRemote(ctx context.Context, m *repo_model.Mirror) error {
 	}
 	name := m.GetRemoteName()
 	path := m.Repo.RepoPath()
-	cur, err := remoteURLOf(ctx, path, name)
+	cur, exists, err := remoteURLIn(ctx, path, name)
 	if err != nil {
 		return err
 	}
 	switch {
-	case cur == "":
+	case !exists:
 		if err := addPullRemote(ctx, path, name, addr); err != nil {
 			return err
 		}
@@ -115,39 +125,67 @@ func ensurePullMirrorRemote(ctx context.Context, m *repo_model.Mirror) error {
 var wikiRemoteURL = repo_module.WikiRemoteURL
 
 // ensurePullWikiRemote recreates, in a cluster, the remote of a pull
-// mirror's wiki. Its address is found by asking the remote, as the
+// mirror's wiki, and points it at the address SQL holds as
+// ensurePullMirrorRemote does the repository's: an address changed
+// through another node reached that node's git config only, and the
+// wiki went on syncing from the old address everywhere else (#183). A
+// remote whose URL is the wiki of addr follows SQL, and nothing is asked.
+// Otherwise the wiki's address is found by asking the remote, as the
 // migration did, so it runs only once the mirror's address passed the
 // allow and block lists again, and asks with authAddr, the address with
 // its credentials: a private wiki answers no other. The git config keeps
 // addr's form, without the password. A wiki the remote does not serve
-// keeps no remote.
+// keeps no remote, or an empty URL, as UpdateAddress writes it: never the
+// old address.
 func ensurePullWikiRemote(ctx context.Context, m *repo_model.Mirror, authAddr, addr string) error {
 	if !clusterhook.Enabled() || addr == "" || !m.Repo.HasWiki() {
 		return nil
 	}
 	name := m.GetRemoteName()
 	wikiPath := m.Repo.WikiPath()
-	if cur, err := remoteURLOf(ctx, wikiPath, name); err != nil || cur != "" {
-		return err
+	cur, exists, err := remoteURLIn(ctx, wikiPath, name)
+	if err != nil {
+		return util.SanitizeErrorCredentialURLs(err)
 	}
-	found := wikiRemoteURL(ctx, authAddr)
-	suffix, ok := strings.CutPrefix(found, strings.TrimSuffix(authAddr, ".git"))
-	if found == "" || !ok {
+	if cur != "" && repo_module.IsWikiRemoteURLOf(cur, addr) {
 		return nil
 	}
-	return addPullRemote(ctx, wikiPath, name, strings.TrimSuffix(addr, ".git")+suffix)
+	want := ""
+	found := wikiRemoteURL(ctx, authAddr)
+	if suffix, ok := strings.CutPrefix(found, strings.TrimSuffix(authAddr, ".git")); found != "" && ok {
+		want = strings.TrimSuffix(addr, ".git") + suffix
+	}
+	switch {
+	case !exists && want == "", exists && cur == want:
+		return nil
+	case !exists:
+		err = addPullRemote(ctx, wikiPath, name, want)
+	default:
+		_, _, err = git.NewCommand(ctx, "remote", "set-url").AddDynamicArguments(name, want).RunStdString(&git.RunOpts{Dir: wikiPath})
+	}
+	if err != nil {
+		return util.SanitizeErrorCredentialURLs(err)
+	}
+	return nil
 }
 
 // ensurePushMirrorRemote recreates, in a cluster, the remote of a push
 // mirror a node lacks, from the address SQL holds, without its password:
-// the push passes it through a credential helper (pushCredentialURL).
+// the push passes it through a credential helper (pushCredentialURL). A
+// remote the node holds gets the push refspecs of the branch filter SQL
+// holds: a filter changed through another node reached that node's git
+// config only, and the push from every other node went on mirroring the
+// branches the filter took out (#183).
 func ensurePushMirrorRemote(ctx context.Context, m *repo_model.PushMirror, path string, isWiki bool) error {
 	if !clusterhook.Enabled() || m.RemoteAddress == "" {
 		return nil
 	}
-	cur, err := remoteURLOf(ctx, path, m.RemoteName)
-	if err != nil || cur != "" {
+	_, exists, err := remoteURLIn(ctx, path, m.RemoteName)
+	if err != nil {
 		return err
+	}
+	if exists {
+		return alignPushRefSpecs(ctx, m, path)
 	}
 	addr := m.RemoteAddress
 	if isWiki {
@@ -177,6 +215,23 @@ func ensurePushMirrorRemote(ctx context.Context, m *repo_model.PushMirror, path 
 		addr = strings.TrimSuffix(addr, ".git") + suffix
 	}
 	return addPushRemoteAndConfig(ctx, m, addr, path)
+}
+
+// alignPushRefSpecs rewrites the push refspecs of the push mirror's remote
+// in the repository at path when they are not the ones its branch filter
+// gives, and reads them only otherwise.
+func alignPushRefSpecs(ctx context.Context, m *repo_model.PushMirror, path string) error {
+	stdout, _, err := git.NewCommand(ctx, "config", "--get-all").AddDynamicArguments("remote." + m.RemoteName + ".push").RunStdString(&git.RunOpts{Dir: path})
+	if err != nil && !git.IsErrorExitCode(err, 1) {
+		return err
+	}
+	if slices.Equal(strings.Fields(stdout), pushRefSpecs(m.BranchFilter)) {
+		return nil
+	}
+	if _, _, err := git.NewCommand(ctx, "config", "--unset-all").AddDynamicArguments("remote." + m.RemoteName + ".push").RunStdString(&git.RunOpts{Dir: path}); err != nil && !git.IsErrorExitCode(err, 5) {
+		return err
+	}
+	return addRemotePushRefSpecs(ctx, path, m)
 }
 
 // hasPassword reports whether u carries a password.

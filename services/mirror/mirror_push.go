@@ -80,28 +80,31 @@ func addPushRemoteAndConfig(ctx context.Context, m *repo_model.PushMirror, addr,
 }
 
 func addRemotePushRefSpecs(ctx context.Context, path string, m *repo_model.PushMirror) error {
-	if m.BranchFilter == "" {
-		// If there is no branch filter, set the push refspecs to mirror all branches and tags.
-		if _, _, err := git.NewCommand(ctx, "config", "--add").AddDynamicArguments("remote."+m.RemoteName+".push", "+refs/heads/*:refs/heads/*").RunStdString(&git.RunOpts{Dir: path}); err != nil {
+	for _, refspec := range pushRefSpecs(m.BranchFilter) {
+		if _, _, err := git.NewCommand(ctx, "config", "--add").AddDynamicArguments("remote."+m.RemoteName+".push", refspec).RunStdString(&git.RunOpts{Dir: path}); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// pushRefSpecs returns the push refspecs of a push mirror's remote for its
+// branch filter, in the order they are written.
+func pushRefSpecs(branchFilter string) []string {
+	var refspecs []string
+	if branchFilter == "" {
+		// If there is no branch filter, set the push refspecs to mirror all branches and tags.
+		refspecs = append(refspecs, "+refs/heads/*:refs/heads/*")
 	} else {
-		branches := strings.SplitSeq(m.BranchFilter, ",")
-		for branch := range branches {
+		for branch := range strings.SplitSeq(branchFilter, ",") {
 			branch = strings.TrimSpace(branch)
 			if branch == "" {
 				continue
 			}
-			refspec := fmt.Sprintf("+refs/heads/%s:refs/heads/%s", branch, branch)
-			if _, _, err := git.NewCommand(ctx, "config", "--add").AddDynamicArguments("remote."+m.RemoteName+".push", refspec).RunStdString(&git.RunOpts{Dir: path}); err != nil {
-				return err
-			}
+			refspecs = append(refspecs, fmt.Sprintf("+refs/heads/%s:refs/heads/%s", branch, branch))
 		}
 	}
-	if _, _, err := git.NewCommand(ctx, "config", "--add").AddDynamicArguments("remote."+m.RemoteName+".push", "+refs/tags/*:refs/tags/*").RunStdString(&git.RunOpts{Dir: path}); err != nil {
-		return err
-	}
-	return nil
+	return append(refspecs, "+refs/tags/*:refs/tags/*")
 }
 
 func UpdatePushMirrorBranchFilter(ctx context.Context, m *repo_model.PushMirror) error {
@@ -256,6 +259,15 @@ func preparePush(ctx context.Context, m *repo_model.PushMirror, repo *repo_model
 	if isWiki {
 		path = repo.WikiPath()
 	}
+	// In a cluster, the remote follows SQL first: recreated, it carries the
+	// fetch refspec `git remote add` writes, which goes below at once; and a
+	// push from refspecs SQL no longer gives would mirror the branches a
+	// filter took out, so it is not made.
+	if err := ensurePushMirrorRemote(ctx, m, path, isWiki); err != nil {
+		err = util.SanitizeErrorCredentialURLs(err)
+		log.Error("SyncPushMirror [repo: %-v]: recreating the remote of the push mirror: %v", m.Repo, err)
+		return nil, err
+	}
 	// We used to erronously configure repos with `--mirror`, which would set both push and fetch refspecs into the
 	// git config.  We need to remove any `fetch` configurations that were leftover from that error, as they caused
 	// source repository references to rollback: https://codeberg.org/forgejo/forgejo/issues/14273 Exit code 5 is
@@ -264,9 +276,6 @@ func preparePush(ctx context.Context, m *repo_model.PushMirror, repo *repo_model
 		AddDynamicArguments("remote." + m.RemoteName + ".fetch").
 		RunStdString(&git.RunOpts{Dir: path}); err != nil && !git.IsErrorExitCode(err, 5) {
 		return nil, err
-	}
-	if err := ensurePushMirrorRemote(ctx, m, path, isWiki); err != nil {
-		log.Error("SyncPushMirror [repo: %-v]: recreating the remote of the push mirror: %v", m.Repo, err)
 	}
 	remoteURL, err := git.GetRemoteURL(ctx, path, m.RemoteName)
 	if err != nil {
