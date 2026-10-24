@@ -569,6 +569,9 @@ func CreatePullRequest(ctx *context.APIContext) {
 	}
 
 	if err := pull_service.NewPullRequest(ctx, repo, prIssue, labelIDs, []string{}, pr, assigneeIDs); err != nil {
+		if clusterBehind(ctx, err) {
+			return
+		}
 		if errors.Is(err, user_model.ErrBlockedByUser) {
 			ctx.Error(http.StatusForbidden, "BlockedByUser", err)
 			return

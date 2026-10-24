@@ -54,7 +54,7 @@ func runTestHook(sock string) int {
 	if rel, err := filepath.Rel(os.Getenv(testHookRootEnv), gitDir); err != nil || strings.HasPrefix(rel, "..") {
 		return 0
 	}
-	req := &clusterhook.Request{Op: state, Nonce: os.Getenv(clusterhook.EnvTxn), GitDir: gitDir, PID: os.Getppid()}
+	req := &clusterhook.Request{Op: state, Nonce: os.Getenv(clusterhook.EnvTxn), GitDir: gitDir, PID: os.Getppid(), CreateOnly: clusterhook.CreateOnlyFromEnv()}
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		if f := strings.Fields(scanner.Text()); len(f) == 3 {

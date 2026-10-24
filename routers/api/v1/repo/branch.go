@@ -449,8 +449,14 @@ func UpdateBranch(ctx *context.APIContext) {
 		return
 	}
 
+	if refWritesRefused(ctx) {
+		return
+	}
 	msg, err := repo_service.RenameBranch(ctx, repo, ctx.Doer(), ctx.Repo().GitRepo, oldName, opt.Name)
 	if err != nil {
+		if clusterBehind(ctx, err) {
+			return
+		}
 		ctx.Error(http.StatusInternalServerError, "RenameBranch", err)
 		return
 	}

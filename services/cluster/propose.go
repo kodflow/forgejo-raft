@@ -271,13 +271,19 @@ func (e errGitRejects) Error() string {
 	return fmt.Sprintf("the push is refused: git on this node rejects %s (%s), and the cluster commits a push whole or not at all; nothing was written, push again", e.ref, e.why)
 }
 
-// errStaleCreate refuses a push that creates a ref the table already holds:
-// git on this node had not projected it yet, and the cluster must not take
-// a creation for an overwrite.
-type errStaleCreate struct{ ref string }
+// errStaleCreate refuses a push, or a creation Forgejo makes, of a ref the
+// table already holds: git on this node had not projected it yet, and the
+// cluster must not take a creation for an overwrite.
+type errStaleCreate struct {
+	ref  string
+	push bool
+}
 
 func (e errStaleCreate) Error() string {
-	return fmt.Sprintf("%s already exists in the cluster, this node had not shown it yet: fetch, then push again; nothing was written", e.ref)
+	if e.push {
+		return fmt.Sprintf("%s %s, this node had not shown it yet: fetch, then push again; nothing was written", e.ref, clusterhook.StaleCreateMark)
+	}
+	return fmt.Sprintf("%s %s, this node had not shown it yet; nothing was written, retry shortly", e.ref, clusterhook.StaleCreateMark)
 }
 
 // buildTxn turns the hook's lines into a proposal, reading each ref's
@@ -296,8 +302,11 @@ func (e errStaleCreate) Error() string {
 // branch the pusher never saw, a non-fast-forward no one forced. Such a
 // line is refused. The revision read here is the one Apply checks, so a
 // ref that becomes live after this check is refused by Apply instead.
-// Forgejo's own updates without an old value (update-ref, a forced
-// rewrite) carry no pusher and keep their meaning.
+// Forgejo's own creations carry no pusher, and say so instead
+// (clusterhook.EnvCreateOnly): `git tag`, a branch rename's update-ref
+// create, which check the absence against this node's git alone, are
+// refused the same way (#189). Forgejo's other updates without an old
+// value (update-ref, a forced rewrite) keep their meaning.
 func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook.Request) (*reftable.RefTxn, []string, error) {
 	// Read before the revisions: Apply refuses the transaction when the
 	// repository left the key after this index (reftable.RefTxn.ReadAt).
@@ -333,8 +342,8 @@ func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook
 			u.Old = l.Old
 		}
 		if v, ok := r.table.Get(repo, l.Ref); ok {
-			if req.PusherID != 0 && reftable.IsZeroSHA(l.Old) && !u.Delete && v.Live() {
-				return nil, nil, errStaleCreate{ref: l.Ref}
+			if (req.PusherID != 0 || req.CreateOnly) && reftable.IsZeroSHA(l.Old) && !u.Delete && v.Live() {
+				return nil, nil, errStaleCreate{ref: l.Ref, push: req.PusherID != 0}
 			}
 			u.ExpectRev = v.Rev
 		}

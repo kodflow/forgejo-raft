@@ -261,7 +261,10 @@ func CreateRelease(ctx *context.APIContext) {
 			Repo:             ctx.Repo().Repository,
 		}
 		if err := release_service.CreateRelease(ctx.Repo().GitRepo, rel, "", nil); err != nil {
-			if repo_model.IsErrReleaseAlreadyExist(err) {
+			if clusterBehind(ctx, err) {
+				return
+			}
+			if repo_model.IsErrReleaseAlreadyExist(err) || models.IsErrTagAlreadyExists(err) {
 				ctx.Error(http.StatusConflict, "ReleaseAlreadyExist", err)
 			} else if models.IsErrProtectedTagName(err) {
 				ctx.Error(http.StatusUnprocessableEntity, "ProtectedTagName", err)
@@ -290,6 +293,13 @@ func CreateRelease(ctx *context.APIContext) {
 		rel.Target = form.Target
 
 		if err = release_service.UpdateRelease(ctx, ctx.Doer(), ctx.Repo().GitRepo, rel, true, nil); err != nil {
+			if clusterBehind(ctx, err) {
+				return
+			}
+			if models.IsErrTagAlreadyExists(err) {
+				ctx.Error(http.StatusConflict, "TagAlreadyExists", err)
+				return
+			}
 			ctx.Error(http.StatusInternalServerError, "UpdateRelease", err)
 			return
 		}
@@ -367,6 +377,13 @@ func EditRelease(ctx *context.APIContext) {
 		rel.HideArchiveLinks = *form.HideArchiveLinks
 	}
 	if err := release_service.UpdateRelease(ctx, ctx.Doer(), ctx.Repo().GitRepo, rel, false, nil); err != nil {
+		if clusterBehind(ctx, err) {
+			return
+		}
+		if models.IsErrTagAlreadyExists(err) {
+			ctx.Error(http.StatusConflict, "TagAlreadyExists", err)
+			return
+		}
 		ctx.Error(http.StatusInternalServerError, "UpdateRelease", err)
 		return
 	}

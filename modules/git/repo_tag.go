@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git/foreachref"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/util"
@@ -20,15 +21,17 @@ import (
 // TagPrefix tags prefix path on the repository
 const TagPrefix = "refs/tags/"
 
-// CreateTag create one tag in the repository
+// CreateTag create one tag in the repository. In a cluster, git tag tells
+// the reference-transaction hook that it only creates the tag, which
+// another node may hold already (#189).
 func (repo *Repository) CreateTag(name, revision string) error {
-	_, _, err := NewCommand(repo.Ctx, "tag").AddDashesAndList(name, revision).RunStdString(&RunOpts{Dir: repo.Path})
+	_, _, err := NewCommand(repo.Ctx, "tag").AddDashesAndList(name, revision).RunStdString(&RunOpts{Dir: repo.Path, Env: clusterhook.CreateOnlyEnv()})
 	return err
 }
 
 // CreateAnnotatedTag create one annotated tag in the repository
 func (repo *Repository) CreateAnnotatedTag(name, message, revision string) error {
-	_, _, err := NewCommand(repo.Ctx, "tag", "-a", "-m").AddDynamicArguments(message).AddDashesAndList(name, revision).RunStdString(&RunOpts{Dir: repo.Path})
+	_, _, err := NewCommand(repo.Ctx, "tag", "-a", "-m").AddDynamicArguments(message).AddDashesAndList(name, revision).RunStdString(&RunOpts{Dir: repo.Path, Env: clusterhook.CreateOnlyEnv()})
 	return err
 }
 

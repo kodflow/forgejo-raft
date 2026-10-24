@@ -16,6 +16,7 @@ import (
 	git_model "forgejo.org/models/git"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/container"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
@@ -56,10 +57,19 @@ func IsWikiRemoteURLOf(wikiURL, remote string) bool {
 	return false
 }
 
-// SyncRepoTags synchronizes releases table with repository tags
+// SyncRepoTags synchronizes releases table with repository tags, as the
+// site administration's "Synchronise tags" does on the node that served
+// the request. In a cluster it runs only once this node serves the
+// repository at the cluster's commit index: from a git behind, the releases
+// of the tags another node wrote would turn into drafts (#191). A
+// repository this node is still behind on is left as it is, with
+// clusterhook.ErrBehind.
 func SyncRepoTags(ctx context.Context, repoID int64) error {
 	repo, err := repo_model.GetRepositoryByID(ctx, repoID)
 	if err != nil {
+		return err
+	}
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
 		return err
 	}
 

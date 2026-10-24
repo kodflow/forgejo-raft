@@ -18,6 +18,7 @@ import (
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unit"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/graceful"
@@ -375,6 +376,14 @@ func RenameBranch(ctx context.Context, repo *repo_model.Repository, doer *user_m
 		return "target_exist", nil
 	}
 
+	// In a cluster, this node's git may not show yet a branch another node
+	// wrote: both names are read once this node serves the repository at
+	// the cluster's commit index, and the cluster refuses a new name it
+	// holds already (#189).
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
+		return "", err
+	}
+
 	if gitRepo.IsBranchExist(to) {
 		return "target_exist", nil
 	}
@@ -413,6 +422,10 @@ func RenameBranch(ctx context.Context, repo *repo_model.Repository, doer *user_m
 
 		return nil
 	}); err != nil {
+		if clusterhook.IsStaleCreate(err) {
+			// Another node of the cluster created it meanwhile.
+			return "target_exist", nil
+		}
 		return "", err
 	}
 	refNameTo := git.RefNameFromBranch(to)
@@ -541,11 +554,20 @@ type BranchSyncOptions struct {
 var branchSyncQueue *queue.WorkerPoolQueue[*BranchSyncOptions]
 
 func handlerBranchSync(items ...*BranchSyncOptions) []*BranchSyncOptions {
+	skipped := 0
 	for _, opts := range items {
-		_, err := repo_module.SyncRepoBranches(graceful.GetManager().ShutdownContext(), opts.RepoID, 0)
+		_, err := repo_module.SyncRepoBranchesFresh(graceful.GetManager().ShutdownContext(), opts.RepoID, 0)
+		if errors.Is(err, clusterhook.ErrBehind) {
+			skipped++
+			log.Warn("syncRepoBranches [%d] skipped: %v", opts.RepoID, err)
+			continue
+		}
 		if err != nil {
 			log.Error("syncRepoBranches [%d] failed: %v", opts.RepoID, err)
 		}
+	}
+	if skipped > 0 {
+		log.Warn("syncRepoBranches: %d repositories skipped, this node of the cluster was behind on them; synchronise again, or from another node", skipped)
 	}
 	return nil
 }
