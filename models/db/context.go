@@ -242,12 +242,25 @@ func WithTxOpts(parentCtx context.Context, config *TransactionConfig, f func(ctx
 	return nil
 }
 
-type savepointsKey struct{}
+type (
+	savepointsKey         struct{}
+	savepointRollbacksKey struct{}
+)
 
 var (
 	savepointsContextKey = savepointsKey{}
 	savepointSeq         atomic.Uint64
 )
+
+// OnSavepointRollback returns ctx with see called with the error of every
+// transaction nested under it that rolls back to its savepoint (see
+// WithNestedSavepoints), whether its caller then swallows that error or
+// not: to that caller a harmless failure and a transient one that lost a
+// write look alike, and the owner of the outer transaction may want to
+// tell them apart.
+func OnSavepointRollback(ctx context.Context, see func(err error)) context.Context {
+	return context.WithValue(ctx, savepointRollbacksKey{}, see)
+}
 
 // WithNestedSavepoints marks ctx so that a WithTx nested in the transaction
 // opened under it runs in a SAVEPOINT: its failure rolls back to the
@@ -268,6 +281,9 @@ func withSavepoint(parentCtx context.Context, sess *xorm.Session, f func(ctx con
 	}
 	txCtx := newContext(parentCtx, sess, true)
 	if err := f(txCtx); err != nil {
+		if see, ok := parentCtx.Value(savepointRollbacksKey{}).(func(error)); ok {
+			see(err)
+		}
 		// The hooks of the rolled-back work are discarded with it.
 		if _, rerr := sess.Exec("ROLLBACK TO SAVEPOINT " + name); rerr != nil {
 			_ = sess.Close()

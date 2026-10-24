@@ -142,10 +142,6 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 			return err
 		}
 
-		if err = repo_model.IncrementRepoForkNum(txCtx, opts.BaseRepo.ID); err != nil {
-			return err
-		}
-
 		// copy lfs files failure should not be ignored
 		if err = git_model.CopyLFS(txCtx, repo, opts.BaseRepo); err != nil {
 			return err
@@ -189,8 +185,17 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 		}
 		defer gitRepo.Close()
 
-		_, err = repo_module.SyncRepoBranchesWithRepo(txCtx, repo, gitRepo, doer.ID)
-		return err
+		if _, err = repo_module.SyncRepoBranchesWithRepo(txCtx, repo, gitRepo, doer.ID); err != nil {
+			return err
+		}
+
+		// The base repository's row is locked from this update to the
+		// commit. Made last, it is not held while the fork's objects are
+		// copied, and in a cluster sent to a majority, for minutes: a push
+		// of the base waited behind it on the leader's log consumer, and
+		// with it the SQL of every repository of the cluster (#177). The
+		// transaction still commits the count with the fork, or neither.
+		return repo_model.IncrementRepoForkNum(txCtx, opts.BaseRepo.ID)
 	})
 	needsRollbackInPanic = false
 	if err != nil {

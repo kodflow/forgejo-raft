@@ -234,6 +234,8 @@ func TestFailedForkLeavesNoLiveKey(t *testing.T) {
 	_, err := repo_service.ForkRepositoryIfNotExists(ctx, owner, owner, repo_service.ForkRepoOptions{BaseRepo: base, Name: "broken-fork", SingleBranch: "no-such-branch"})
 	require.Error(t, err)
 	requireGoneEverywhere(t, tc, "user4/broken-fork.git")
+	unittest.AssertNotExistsBean(t, &repo_model.Repository{OwnerID: 4, LowerName: "broken-fork"})
+	assert.Equal(t, base.NumForks, unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1}).NumForks, "the base does not count the failed fork (#177)")
 }
 
 // A wiki the table holds alone is an orphan of its repository's name when
