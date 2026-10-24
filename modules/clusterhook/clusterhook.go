@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -38,6 +39,39 @@ const EnvTxn = "FORGEJO_CLUSTER_TXN"
 // runs the transaction: the generated wrapper exports its own parent's PID
 // before it runs the hook, whose parent is that wrapper.
 const EnvGitPID = "FORGEJO_GIT_PID"
+
+// EnvCreateOnly tells the reference-transaction hook that the git command
+// creates its refs only if they are absent: `git tag` without -f, `git
+// branch` without -f, update-ref's create. git gives such a line the same
+// null old value as a forced update of a ref this node does not hold, and
+// checks the absence against this node's git only (#189).
+const EnvCreateOnly = "FORGEJO_CLUSTER_CREATE_ONLY"
+
+// CreateOnlyEnv returns the environment of a git command that only creates
+// its refs, EnvCreateOnly added to this process's, or nil, git's default,
+// outside a cluster.
+func CreateOnlyEnv() []string {
+	if !Enabled() {
+		return nil
+	}
+	return append(os.Environ(), EnvCreateOnly+"=1")
+}
+
+// CreateOnlyFromEnv reads EnvCreateOnly, as the hook relays it.
+func CreateOnlyFromEnv() bool {
+	return os.Getenv(EnvCreateOnly) == "1"
+}
+
+// StaleCreateMark is in the replicator's refusal of a creation of a ref
+// the table already holds, which git on this node had not shown yet: the
+// message reaches Forgejo only as git's error output.
+const StaleCreateMark = "already exists in the cluster"
+
+// IsStaleCreate reports whether err is a git command's failure on that
+// refusal.
+func IsStaleCreate(err error) bool {
+	return err != nil && strings.Contains(err.Error(), StaleCreateMark)
+}
 
 // NewNonce draws a 128-bit nonce from crypto/rand.
 func NewNonce() string {
@@ -154,6 +188,9 @@ type Request struct {
 	PRID        int64             `json:"pr_id,omitempty"`
 	Trigger     string            `json:"trigger,omitempty"`
 	PushOptions map[string]string `json:"push_options,omitempty"`
+	// CreateOnly says the git command creates its refs only if they are
+	// absent (EnvCreateOnly).
+	CreateOnly bool `json:"create_only,omitempty"`
 	// PID is the git process owning the transaction, as the hook's wrapper
 	// names it (EnvGitPID), else the hook's parent.
 	PID int `json:"pid,omitempty"`
@@ -627,6 +664,21 @@ func WaitFresh(ctx context.Context, key string) bool {
 		return true
 	}
 	return f(ctx, key)
+}
+
+// ErrBehind refuses a write this node would decide from its own git while
+// it may be behind the cluster's last writes to the repository: it would
+// overwrite, or take for absent, what another node acknowledged.
+var ErrBehind = errors.New("this node of the cluster may be behind the cluster's last writes")
+
+// RequireFresh is WaitFresh as an error: nil once this node serves the
+// repository at the commit index the cluster confirms at the call, else
+// ErrBehind naming the repository. Without a cluster it returns nil.
+func RequireFresh(ctx context.Context, key string) error {
+	if WaitFresh(ctx, key) {
+		return nil
+	}
+	return fmt.Errorf("%w to %s; nothing was written, retry shortly or through another node", ErrBehind, key)
 }
 
 type afterCommitKey struct{}

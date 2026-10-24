@@ -80,6 +80,7 @@ func runHookReferenceTransaction(ctx context.Context, c *cli.Command) error {
 	req.PRID, _ = strconv.ParseInt(os.Getenv(repo_module.EnvPRID), 10, 64)
 	req.IsWiki, _ = strconv.ParseBool(os.Getenv(repo_module.EnvRepoIsWiki))
 	req.Trigger = os.Getenv(repo_module.EnvPushTrigger)
+	req.CreateOnly = clusterhook.CreateOnlyFromEnv()
 	if state == clusterhook.OpPrepared {
 		req.PushOptions = pushoptions.New().ReadEnv().Map()
 	}

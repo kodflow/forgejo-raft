@@ -222,16 +222,21 @@ func CreateTag(ctx *context.APIContext) {
 		form.Target = ctx.Repo().Repository.DefaultBranch
 	}
 
+	// Before the target is read: a node of a cluster behind on the
+	// repository would tag what its own git shows.
+	if refWritesRefused(ctx) {
+		return
+	}
 	commit, err := ctx.Repo().GitRepo.GetCommit(form.Target)
 	if err != nil {
 		ctx.Error(http.StatusNotFound, "target not found", fmt.Errorf("target not found: %w", err))
 		return
 	}
 
-	if refWritesRefused(ctx) {
-		return
-	}
 	if err := release_service.CreateNewTag(ctx, ctx.Doer(), ctx.Repo().Repository, commit.ID.String(), form.TagName, form.Message); err != nil {
+		if clusterBehind(ctx, err) {
+			return
+		}
 		if models.IsErrTagAlreadyExists(err) {
 			ctx.Error(http.StatusConflict, "tag exist", err)
 			return

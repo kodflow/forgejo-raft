@@ -120,12 +120,13 @@ func (repo *Repository) DeleteBranch(name string, opts DeleteBranchOptions) erro
 	return err
 }
 
-// CreateBranch create a new branch
+// CreateBranch create a new branch. In a cluster, git branch tells the
+// reference-transaction hook that it only creates the branch (#189).
 func (repo *Repository) CreateBranch(branch, oldbranchOrCommit string) error {
 	cmd := NewCommand(repo.Ctx, "branch")
 	cmd.AddDashesAndList(branch, oldbranchOrCommit)
 
-	_, _, err := cmd.RunStdString(&RunOpts{Dir: repo.Path})
+	_, _, err := cmd.RunStdString(&RunOpts{Dir: repo.Path, Env: clusterhook.CreateOnlyEnv()})
 
 	return err
 }
@@ -169,7 +170,9 @@ func (repo *Repository) RenameBranch(from, to string) error {
 // outside any transaction: the cluster saw the old branch deleted and never
 // the new one, which then lived on this node alone (#38). HEAD, when it
 // named the old branch, follows as with `git branch -m`, in a transaction
-// of its own: git refuses HEAD and its referent in one.
+// of its own: git refuses HEAD and its referent in one. The new name is
+// created only if absent, which this node's git alone was asked: the hook
+// is told, and the cluster refuses a name another node holds (#189).
 func (repo *Repository) renameBranchInOneTransaction(from, to string) error {
 	// A ref name holds no whitespace nor control character: none may reach
 	// update-ref's command stream either.
@@ -183,7 +186,7 @@ func (repo *Repository) renameBranchInOneTransaction(from, to string) error {
 	sha = strings.TrimSpace(sha)
 	head, _, headErr := NewCommand(repo.Ctx, "symbolic-ref", "-q", "HEAD").RunStdString(&RunOpts{Dir: repo.Path})
 	stdin := fmt.Sprintf("create %s%s %s\ndelete %s%s %s\n", BranchPrefix, to, sha, BranchPrefix, from, sha)
-	if _, _, err := NewCommand(repo.Ctx, "update-ref", "--stdin").RunStdString(&RunOpts{Dir: repo.Path, Stdin: strings.NewReader(stdin)}); err != nil {
+	if _, _, err := NewCommand(repo.Ctx, "update-ref", "--stdin").RunStdString(&RunOpts{Dir: repo.Path, Stdin: strings.NewReader(stdin), Env: clusterhook.CreateOnlyEnv()}); err != nil {
 		return err
 	}
 	if headErr == nil && strings.TrimSpace(head) == BranchPrefix+from {

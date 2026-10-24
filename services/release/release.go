@@ -14,6 +14,7 @@ import (
 	git_model "forgejo.org/models/git"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/container"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
@@ -49,7 +50,18 @@ func createTag(ctx context.Context, gitRepo *git.Repository, rel *repo_model.Rel
 	var created bool
 	// Only actual create when publish.
 	if !rel.IsDraft {
-		if !gitRepo.IsTagExist(rel.TagName) {
+		exists := gitRepo.IsTagExist(rel.TagName)
+		if !exists && clusterhook.Enabled() {
+			// This node's git may not show yet a tag another node of the
+			// cluster wrote: whether to create it is decided once this node
+			// serves the repository at the cluster's commit index, and the
+			// cluster refuses a creation of a tag it holds (#189).
+			if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(rel.Repo.OwnerName, rel.Repo.Name, false)); err != nil {
+				return false, err
+			}
+			exists = gitRepo.IsTagExist(rel.TagName)
+		}
+		if !exists {
 			protectedTags, err := git_model.GetProtectedTags(ctx, rel.Repo.ID)
 			if err != nil {
 				return false, fmt.Errorf("GetProtectedTags: %w", err)
@@ -79,6 +91,9 @@ func createTag(ctx context.Context, gitRepo *git.Repository, rel *repo_model.Rel
 							TagName: rel.TagName,
 						}
 					}
+					if clusterhook.IsStaleCreate(err) {
+						return false, models.ErrTagAlreadyExists{TagName: rel.TagName}
+					}
 					return false, err
 				}
 			} else if err = gitRepo.CreateTag(rel.TagName, commit.ID.String()); err != nil {
@@ -86,6 +101,10 @@ func createTag(ctx context.Context, gitRepo *git.Repository, rel *repo_model.Rel
 					return false, models.ErrInvalidTagName{
 						TagName: rel.TagName,
 					}
+				}
+				if clusterhook.IsStaleCreate(err) {
+					// Another node of the cluster created it meanwhile.
+					return false, models.ErrTagAlreadyExists{TagName: rel.TagName}
 				}
 				return false, err
 			}
