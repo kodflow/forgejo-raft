@@ -307,11 +307,9 @@ func Init(ctx context.Context) error {
 		return fmt.Errorf("[cluster] opening the consensus node: %w", err)
 	}
 	r.setEngine(eng)
-	if err := r.checkpointsRefusal(r.ctx, eng); err != nil {
-		_ = eng.Close(context.Background())
-		_ = srv.Close()
-		return err
-	}
+	// The refusal of a voter that would leave no checkpoint to close reads
+	// the backup cursor from SQL: it waits for the database
+	// (RefuseWithoutCheckpoints, routers/init.go).
 
 	currentMu.Lock()
 	current = r

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -197,6 +198,51 @@ func TestAVoterRefusesToStartWhenNoVoterTakesCheckpoints(t *testing.T) {
 	// A learner leads nothing: it is never refused.
 	r = refusalBench(t, backup, bothOff)
 	require.NoError(t, r.checkpointsRefusal(ctx, learnerView{Engine: r.Engine(), learner: r.Engine().Status().ID}), "a learner")
+}
+
+// closeRecorder is an engine whose Close is recorded, not done: the bench
+// closes the engine itself.
+type closeRecorder struct {
+	consensus.Engine
+	closed atomic.Bool
+}
+
+func (c *closeRecorder) Close(context.Context) error {
+	c.closed.Store(true)
+	return nil
+}
+
+// The refusal reads the backup cursor from SQL, so the start runs it once
+// the database is up, after the replicator started (routers/init.go): read
+// in Init, before the database, it panicked every node whose
+// CHECKPOINT_INTERVAL is 0. A refused voter closes its consensus node and
+// the start fails with why; without a replicator, or when the voter may
+// start, nothing is closed (#176).
+func TestTheStartRefusesOnceTheDatabaseIsUp(t *testing.T) {
+	t.Cleanup(test.MockVariableValue(&setting.Cluster.CheckpointInterval, 0))
+	ctx := t.Context()
+	require.NoError(t, RefuseWithoutCheckpoints(ctx), "no replicator")
+
+	bothOff := map[string]string{"node-b": checkpointsOff, "node-c": checkpointsOff}
+	lineage := refusalBench(t, nil, bothOff).Engine().Status().Identity.String()
+	backup := &cluster_model.Cursor{Name: cluster_model.CursorBackup, Lineage: lineage, Position: 10}
+
+	bench := func(answers map[string]string) *closeRecorder {
+		r := refusalBench(t, backup, answers)
+		e := &closeRecorder{Engine: r.Engine()}
+		r.setEngine(e)
+		t.Cleanup(SetCurrentForTesting(r))
+		return e
+	}
+	e := bench(bothOff)
+	err := RefuseWithoutCheckpoints(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CHECKPOINT_INTERVAL is 0 on this voter and on every other one (node-b, node-c)")
+	assert.True(t, e.closed.Load(), "the refused voter closes its consensus node")
+
+	e = bench(map[string]string{"node-b": checkpointsOff, "node-c": checkpointsOn})
+	require.NoError(t, RefuseWithoutCheckpoints(ctx), "a voter takes them")
+	assert.False(t, e.closed.Load(), "a voter that may start keeps its consensus node")
 }
 
 // On the SDK's engine, a leader whose CHECKPOINT_INTERVAL is 0 hands the

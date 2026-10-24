@@ -252,3 +252,30 @@ func (r *Replicator) checkpointsRefusal(ctx context.Context, eng consensus.Engin
 	}
 	return fmt.Errorf("[cluster] CHECKPOINT_INTERVAL is 0 %s, while the backup cursor of lineage %s stands at %d: no checkpoint would close again, and the event queue would not be trimmed past it until every write is refused (#176); set CHECKPOINT_INTERVAL on this node, or on another voter first", where, lineage, b.Position)
 }
+
+// RefuseWithoutCheckpoints is the start's refusal of checkpointsRefusal,
+// once the database is up: the replicator starts before it and does not
+// depend on it (routers/init.go), while the backup cursor is read from SQL;
+// read before, the start panicked on a database not opened yet. A refused
+// voter closes its consensus node, which hands the leadership over first,
+// and the start fails with why. It returns nil to go on.
+func RefuseWithoutCheckpoints(ctx context.Context) error {
+	r := Current()
+	if r == nil {
+		return nil
+	}
+	eng := r.Engine()
+	if eng == nil {
+		return nil
+	}
+	err := r.checkpointsRefusal(ctx, eng)
+	if err == nil {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if cerr := eng.Close(cctx); cerr != nil {
+		log.Error("cluster: closing the consensus node: %v", cerr)
+	}
+	return err
+}
