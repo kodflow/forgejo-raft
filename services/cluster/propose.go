@@ -797,6 +797,17 @@ func (r *Replicator) proposeOwnerRename(ctx context.Context, oldOwner, newOwner 
 			return fmt.Errorf("the cluster did not record it: this node could not confirm it applied the log: %w", err)
 		}
 	}
+	return r.proposeMoves(ctx, r.ownerMoves(oldOwner, newOwner), [2]string{oldOwner, newOwner})
+}
+
+// ownerMoves lists the moves of an owner's rename: every key under the old
+// owner that holds a repository, a live ref at least, the keys Apply's
+// check of an owner's rename requires. A key a rename moved away holds
+// none, nor the key of a wiki never created, which a repository's rename
+// moves with it: moved too, each one got a rename mark from a key holding
+// no repository, which a node behind the log followed to move another
+// repository's directory there (#181).
+func (r *Replicator) ownerMoves(oldOwner, newOwner string) [][2]string {
 	prefix := oldOwner + "/"
 	var moves [][2]string
 	for _, key := range r.table.Repos() {
@@ -806,9 +817,12 @@ func (r *Replicator) proposeOwnerRename(ctx context.Context, oldOwner, newOwner 
 		if _, deleted := r.table.Deleted(key); deleted {
 			continue
 		}
+		if refs, _ := r.table.Refs(key); !anyLive(refs) {
+			continue
+		}
 		moves = append(moves, [2]string{key, newOwner + "/" + strings.TrimPrefix(key, prefix)})
 	}
-	return r.proposeMoves(ctx, moves, [2]string{oldOwner, newOwner})
+	return moves
 }
 
 // RaisePayloadVersion makes the cluster write reftable.PayloadVersion from

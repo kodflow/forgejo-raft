@@ -851,13 +851,59 @@ func (p *projector) liveRename(repo string) (string, uint64, bool) {
 	return from, renIdx, true
 }
 
-// departed is the newest index at which the repository under repo was
-// deleted, kept after the key was written again; a directory certified
-// under repo before it holds the deleted repository. A rename away is not
-// a departure here: the chain of renames may come back to repo, and a
-// directory left behind is setAsideLeftBehind's (#43).
-func (p *projector) departed(repo string) (uint64, bool) {
-	return p.table.DeletedBefore(repo, math.MaxUint64)
+// heldAfter follows the repository certified under key at index at along
+// the renames that moved it on, before index before: the key it was under
+// last, and the index of the rename that brought it there, at when it
+// never moved. A chain of renames that comes back ends where it started
+// (#43). ok is false when it was deleted on the way, idx then the index
+// of that deletion, or when the chain is longer than the walk follows.
+//
+// A rename's mark alone does not tell which repository it moved: the key
+// it names may have been taken since by another repository, renamed in
+// turn. The walk starts from what the directory's stamp says it holds and
+// takes, from each key, the first rename after the repository arrived
+// there, which is the one that moved it (#181).
+func (p *projector) heldAfter(key string, at, before uint64) (string, uint64, bool) {
+	idx := at
+	for range renameLineageDepth {
+		next, nextIdx, moved := p.table.RenamedAfter(key, idx)
+		if !moved || nextIdx >= before {
+			if del, deleted := p.table.DeletedBefore(key, before); deleted && del > idx {
+				return key, del, false
+			}
+			return key, idx, true
+		}
+		if del, deleted := p.table.DeletedBefore(key, nextIdx); deleted && del > idx {
+			return key, del, false
+		}
+		key, idx = next, nextIdx
+	}
+	return key, idx, false
+}
+
+// departed reports whether dir's stamp s names a repository that is no
+// longer the one under repo: the key it went to and since which index, or,
+// with deleted, the key it was deleted under and the deletion's index.
+// Certified under repo, it was deleted since (#52, #98), or renamed away
+// by renames that did not come back to repo (#181). Certified under
+// another key, it went on to a key that is not repo: the directory came
+// here with an owner's directory, which Forgejo moved whole on a node that
+// had not projected one of the owner's renames (#181). A repository that
+// did not leave the key its stamp names is not judged: Forgejo moves a
+// directory on its own disk before the entry of the rename is applied. A
+// chain of renames longer than heldAfter follows counts as a departure:
+// the directory is set aside and the repository fetched again, never
+// served from a directory this node cannot place.
+func (p *projector) departed(repo string, s stamp) (key string, at uint64, deleted, left bool) {
+	holder, idx, ok := p.heldAfter(s.Repo, s.Watermark, math.MaxUint64)
+	switch {
+	case !ok:
+		return holder, idx, true, true
+	case holder == repo || holder == s.Repo:
+		return "", 0, false, false
+	default:
+		return holder, idx, false, true
+	}
 }
 
 // Verify compares a repository's git state with the table under the
@@ -907,11 +953,15 @@ func (p *projector) holdsRenamed(src, from, to string, renIdx uint64) bool {
 		return false
 	}
 	if s, known := readStamp(src); known {
-		// The rename moved the repository from held since its last
-		// deletion before the rename: a directory certified before that
-		// deletion holds the deleted one (#98).
-		del, _ := p.table.DeletedBefore(from, renIdx)
-		return s.Repo == from && s.Watermark < renIdx && (del == 0 || s.Watermark >= del)
+		// The rename moved the repository from held just before it: a
+		// directory certified under from holds that one only while the
+		// repository certified then stayed, never deleted (#98) nor
+		// renamed away by renames that did not come back (#181).
+		if s.Repo != from || s.Watermark >= renIdx {
+			return false
+		}
+		holder, _, ok := p.heldAfter(from, s.Watermark, renIdx)
+		return ok && holder == from
 	}
 	moved, ok := p.table.MovedAway(from)
 	return ok && moved == to
@@ -927,24 +977,8 @@ func (p *projector) movesOn(repo, dir string) bool {
 	if _, err := os.Stat(dir); err != nil {
 		return false
 	}
-	first, firstIdx, ok := p.table.RenamedInto(repo, math.MaxUint64)
-	if !ok {
-		return false
-	}
-	// Through the waypoints of a chain of renames (#43): the directory
-	// belongs to the chain's end, and stays here when the chain comes back.
-	z, zIdx := first, firstIdx
-	for range renameLineageDepth {
-		if _, moved := p.table.MovedAway(z); !moved {
-			break
-		}
-		next, nextIdx, ok := p.table.RenamedInto(z, math.MaxUint64)
-		if !ok || nextIdx <= zIdx {
-			break
-		}
-		z, zIdx = next, nextIdx
-	}
-	if z == repo {
+	first, firstIdx, z, zIdx, ok := p.movedOn(repo, dir)
+	if !ok || z == repo {
 		return false
 	}
 	if _, deleted := p.table.Deleted(z); deleted {
@@ -973,6 +1007,42 @@ func (p *projector) movesOn(repo, dir string) bool {
 	return true
 }
 
+// movedOn finds where the repository dir holds went from repo: the rename
+// that moved it, and the end of the chain of renames it took, through its
+// waypoints (#43); the chain's end is repo when it came back. ok is false
+// when no rename moved it, or when it was deleted on the way.
+//
+// With a stamp naming repo, the chain starts at the first rename after the
+// stamp's watermark: the newest rename from repo moves the repository that
+// took repo since, when one did (#181). Without one, it starts at the
+// newest rename, through keys left without a live ref.
+func (p *projector) movedOn(repo, dir string) (first string, firstIdx uint64, z string, zIdx uint64, ok bool) {
+	if s, known := readStamp(dir); known && s.Repo == repo {
+		first, firstIdx, ok = p.table.RenamedAfter(repo, s.Watermark)
+		if !ok {
+			return "", 0, "", 0, false
+		}
+		z, zIdx, ok = p.heldAfter(repo, s.Watermark, math.MaxUint64)
+		return first, firstIdx, z, zIdx, ok
+	}
+	first, firstIdx, ok = p.table.RenamedInto(repo, math.MaxUint64)
+	if !ok {
+		return "", 0, "", 0, false
+	}
+	z, zIdx = first, firstIdx
+	for range renameLineageDepth {
+		if _, moved := p.table.MovedAway(z); !moved {
+			break
+		}
+		next, nextIdx, ok := p.table.RenamedInto(z, math.MaxUint64)
+		if !ok || nextIdx <= zIdx {
+			break
+		}
+		z, zIdx = next, nextIdx
+	}
+	return first, firstIdx, z, zIdx, true
+}
+
 // setAsideStale handles a key taken by a rename while this node still holds
 // the key's previous repository under it, one deleted and not yet removed
 // here: the renamed repository must move in instead of being projected into
@@ -987,19 +1057,19 @@ func (p *projector) movesOn(repo, dir string) bool {
 // rename, Forgejo already moved the source in, and the directory is the
 // right one.
 //
-// A directory whose keyed stamp predates the key's last deletion holds a
-// repository that left the key, which a node behind the log did not
-// remove: it is set aside too, before
-// a repository created anew under the key is projected into it, its
-// deleted objects kept and served, its object format maybe another (#52,
-// #98).
+// A directory whose keyed stamp names a repository that left the key, which
+// a node behind the log did not remove or move, is set aside too (departed):
+// one deleted since its certification, or renamed away and not come back,
+// before a repository created anew under the key or renamed into it is
+// projected into it, its objects kept and served by their ids, its object
+// format maybe another (#52, #98, #181).
 func (p *projector) setAsideStale(repo, dir string) error {
 	p.mu.Lock()
 	delIdx, pending := p.deletedAt[repo]
 	delete(p.deletedAt, repo)
 	p.mu.Unlock()
-	if s, known := readStamp(dir); known && s.Repo == repo {
-		if at, left := p.departed(repo); left && s.Watermark < at {
+	if s, known := readStamp(dir); known {
+		if key, at, deleted, left := p.departed(repo, s); left {
 			if err := p.setAside(dir, repo, at); err != nil {
 				if pending {
 					p.mu.Lock()
@@ -1008,7 +1078,11 @@ func (p *projector) setAsideStale(repo, dir string) error {
 				}
 				return err
 			}
-			log.Warn("cluster: %s holds the repository certified under it at %d, which was deleted at %d: that directory is set aside", repo, s.Watermark, at)
+			if deleted {
+				log.Warn("cluster: %s holds the repository certified under %s at %d, which was deleted as %s at %d: that directory is set aside", repo, s.Repo, s.Watermark, key, at)
+			} else {
+				log.Warn("cluster: %s holds the repository certified under %s at %d, which is %s since %d: that directory is set aside", repo, s.Repo, s.Watermark, key, at)
+			}
 			return nil
 		}
 	}
@@ -1161,8 +1235,9 @@ func (p *projector) setAsideLeftBehind(repo, dir string, want map[string]reftabl
 
 // leavesKey reports whether the directory under repo is one the projector
 // sets aside or removes before repo is projected: the key is deleted in the
-// table, or a rename took it while the directory still holds, by its stamp,
-// the repository certified under it before that rename (setAsideStale,
+// table, the directory holds, by its stamp, a repository that left the key
+// (departed), or a rename took the key while the directory still holds the
+// repository certified under it before that rename (setAsideStale,
 // setAsideLeftBehind). The object channel refuses to index a pack there
 // (#99). Without a keyed stamp, nothing is refused.
 func (p *projector) leavesKey(repo string) bool {
@@ -1172,6 +1247,11 @@ func (p *projector) leavesKey(repo string) bool {
 	}
 	if _, deleted := p.table.Deleted(repo); deleted {
 		return true
+	}
+	if s, known := readStamp(dir); known {
+		if _, _, _, left := p.departed(repo, s); left {
+			return true
+		}
 	}
 	from, renIdx, ok := p.table.RenamedFrom(repo)
 	if !ok {
