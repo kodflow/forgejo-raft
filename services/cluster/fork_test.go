@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"forgejo.org/modules/test"
 	repo_service "forgejo.org/services/repository"
 
+	"code.forgejo.org/xorm/xorm/contexts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -54,7 +56,7 @@ func runTestHook(sock string) int {
 	if rel, err := filepath.Rel(os.Getenv(testHookRootEnv), gitDir); err != nil || strings.HasPrefix(rel, "..") {
 		return 0
 	}
-	req := &clusterhook.Request{Op: state, Nonce: os.Getenv(clusterhook.EnvTxn), GitDir: gitDir, PID: os.Getppid(), CreateOnly: clusterhook.CreateOnlyFromEnv()}
+	req := &clusterhook.Request{Op: state, Nonce: os.Getenv(clusterhook.EnvTxn), GitDir: gitDir, PID: os.Getppid()}
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		if f := strings.Fields(scanner.Text()); len(f) == 3 {
@@ -156,4 +158,77 @@ func TestForkInACluster(t *testing.T) {
 	}
 	_, err = os.Stat(filepath.Join(origin.r.root, "user4", "repo1-fork.git", "FETCH_HEAD"))
 	assert.True(t, os.IsNotExist(err), "no FETCH_HEAD left behind")
+}
+
+// forkCountProbe runs seen when the fork count of a base repository is
+// incremented, while on is set.
+type forkCountProbe struct {
+	on   atomic.Bool
+	seen func()
+}
+
+func (p *forkCountProbe) BeforeProcess(c *contexts.ContextHook) (context.Context, error) {
+	if p.on.Load() && strings.Contains(c.SQL, "num_forks=num_forks+1") {
+		p.seen()
+	}
+	return c.Ctx, nil
+}
+
+func (p *forkCountProbe) AfterProcess(*contexts.ContextHook) error { return nil }
+
+// A fork counts itself on its base only once its refs are copied: the
+// update locks the base repository's row until the fork's transaction
+// commits, and made first it held it during the whole copy, which in a
+// cluster sends the fork's objects to a majority. A push of the base then
+// waited on that row in the leader's log consumer, and the SQL of every
+// repository behind it (#177).
+func TestAForkCountsItselfOnItsBaseOnlyOnceCopied(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	for _, n := range tc.nodes {
+		n.r.objects.repoKnown = n.r.repoKnown
+	}
+	origin := tc.nodes[0]
+	require.NoError(t, unittest.CopyDir(filepath.Join(setting.RepoRootPath, "user2", "repo1.git"), filepath.Join(origin.r.root, "user2", "repo1.git")))
+	withGitThroughReplicator(t, origin)
+
+	ctx := db.DefaultContext
+	base := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	require.NoError(t, base.LoadOwner(ctx))
+	owner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 4})
+	want, err := readGitRefs(ctx, filepath.Join(origin.r.root, "user2", "repo1.git"))
+	require.NoError(t, err)
+	key := "user4/repo1-fork.git"
+	var copied []string
+	counted := 0
+	probe := &forkCountProbe{seen: func() {
+		counted++
+		for ref := range want {
+			if !strings.HasPrefix(ref, "refs/heads/") && !strings.HasPrefix(ref, "refs/tags/") {
+				continue
+			}
+			if v, ok := origin.r.table.Get(key, ref); ok && v.Live() {
+				copied = append(copied, ref)
+			}
+		}
+	}}
+	eng, err := db.GetMasterEngine(db.GetEngine(ctx))
+	require.NoError(t, err)
+	eng.AddHook(probe)
+	probe.on.Store(true)
+	t.Cleanup(func() { probe.on.Store(false) })
+
+	_, err = repo_service.ForkRepositoryIfNotExists(ctx, owner, owner, repo_service.ForkRepoOptions{BaseRepo: base, Name: "repo1-fork", Description: "fork"})
+	require.NoError(t, err)
+	probe.on.Store(false)
+	require.Equal(t, 1, counted, "the base counts the fork once")
+	var refs []string
+	for ref := range want {
+		if strings.HasPrefix(ref, "refs/heads/") || strings.HasPrefix(ref, "refs/tags/") {
+			refs = append(refs, ref)
+		}
+	}
+	require.NotEmpty(t, refs)
+	assert.ElementsMatch(t, refs, copied, "every ref of the fork was copied when the base counted it")
+	unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1, NumForks: base.NumForks + 1})
 }
