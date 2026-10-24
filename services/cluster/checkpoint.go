@@ -202,6 +202,8 @@ func (c *coordinator) run(ctx context.Context) {
 // take runs one checkpoint, steps 1 to 5.
 func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, error) {
 	r := c.r
+	r.checkpointing.Add(1)
+	defer r.checkpointing.Add(-1)
 	eng := r.Engine()
 	nonce := clusterhook.NewNonce()
 	got := c.expect(nonce)
@@ -265,6 +267,12 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
+	// Whether the lineages before B's were drained too, read before
+	// PostgreSQL's position: their cursors never go back, so the SQL at
+	// that position holds them at least there. It is recorded with the
+	// backup cursor, not waited for: a checkpoint right after a Recover
+	// does not wait for the old lineage's tail.
+	earlier := r.consumer.earlierDrained(bctx, tok.Identity())
 
 	// 4. PostgreSQL's position under the fence.
 	name := reftable.CheckpointName(tok.Identity().String(), tok.Index)
@@ -336,8 +344,10 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 	// The backup cursor: a PostgreSQL restored to this checkpoint's position
 	// holds the SQL of every entry up to B, and the log must keep what
 	// follows for it to be replayed; the consumer never trims past it.
+	// Closed says that it holds the earlier lineages drained as well: the
+	// consumer may then trim their tails to their end (#205).
 	if r.consumer != nil && r.consumer.dbReady() {
-		if err := c.backup(ctx, cluster_model.CursorBackup, cluster_model.Cursor{Lineage: tok.Identity().String(), Position: int64(tok.Index)}); err != nil {
+		if err := c.backup(ctx, cluster_model.CursorBackup, cluster_model.Cursor{Lineage: tok.Identity().String(), Position: int64(tok.Index), Closed: earlier}); err != nil {
 			log.Warn("cluster checkpoint %s: recording the backup cursor: %v", name, err)
 		}
 	}
@@ -481,6 +491,63 @@ func (c *consumer) drained(ctx context.Context, tok consensus.Token) (bool, erro
 		return false, err
 	}
 	return cur.Lineage == lin && uint64(cur.Position) >= last, nil
+}
+
+// earlierDrained reports whether every event the table holds of a lineage
+// other than id's, the current one, is behind that lineage's cursor in
+// SQL: dispatched, or parked with its row. drained waits for id's events
+// only, and a checkpoint right after a Recover or a restore may be taken
+// while the old lineage's tail still waits for its work; its backup holds
+// that lineage's cursor behind its end. Anything it cannot read says no.
+func (c *consumer) earlierDrained(ctx context.Context, id consensus.LogIdentity) bool {
+	current := id.String()
+	for lin, tail := range lastIndexes(c.events()) {
+		if lin == current {
+			continue
+		}
+		cur, err := c.cursor(ctx, cursorName(lin))
+		if err != nil || cur.Lineage != lin || uint64(cur.Position) < tail {
+			return false
+		}
+	}
+	return true
+}
+
+// backupSettled reports whether b, the backup cursor the consumer just
+// read, is the last one a checkpoint will write over what the table holds.
+// A checkpoint records its backup cursor once its position committed,
+// maybe long after it read PostgreSQL's position: a trim decided on the
+// cursor before it could pass what that backup replays (#205). Read after
+// b, in this order:
+//   - No checkpoint is in flight here. Only the leader of a term commits
+//     that term's barrier and position, and its coordinator runs here.
+//   - The table applied an entry of the engine's current term: it holds
+//     every checkpoint an earlier term's leader closed, whose backup
+//     cursor that leader may still be writing. A position commits in its
+//     barrier's term only, so none of those is still to come.
+//   - The newest checkpoint the table closed is the one b names, or none
+//     closed and b is empty. A backup cursor that failed to be written
+//     holds until the next checkpoint writes one.
+//
+// A checkpoint that starts later reads the drained lineage drained, or
+// trimmed: its PostgreSQL position comes after the cursor that said so.
+func (r *Replicator) backupSettled(b *cluster_model.Cursor) bool {
+	if r.checkpointing.Load() > 0 {
+		return false
+	}
+	eng := r.Engine()
+	if eng == nil {
+		return false
+	}
+	if applied, _ := r.table.Applied(); applied.Term != eng.Status().Term {
+		return false
+	}
+	cps := r.table.Checkpoints()
+	if len(cps) == 0 {
+		return b.Lineage == ""
+	}
+	last := cps[len(cps)-1]
+	return b.Lineage == last.Identity && b.Position >= 0 && uint64(b.Position) == last.Index
 }
 
 // ---- PostgreSQL ----

@@ -340,7 +340,7 @@ func TestFailingWorkIsParkedNotTrimmedThenAppliedOnce(t *testing.T) {
 	assert.Empty(t, parked.indexes())
 
 	store.replicate()
-	c.maybeAck(ctx, testToken(1).Identity().String())
+	c.maybeAck(ctx, testToken(1).Identity().String(), 3)
 	assert.Empty(t, lg.list(), "trimmed once nothing is parked")
 }
 
@@ -358,7 +358,7 @@ func TestTrimStopsAtTheBackupCursor(t *testing.T) {
 	store.primary[cluster_model.CursorBackup] = cluster_model.Cursor{Lineage: lin, Position: 20}
 	require.NoError(t, c.pass(context.Background()))
 	store.replicate()
-	c.maybeAck(context.Background(), lin)
+	c.maybeAck(context.Background(), lin, 50)
 	require.Len(t, lg.list(), 30)
 	assert.EqualValues(t, 21, lg.list()[0].Token.Index)
 }
@@ -378,7 +378,7 @@ func TestTrimHeldAtALaggingBackup(t *testing.T) {
 	store.primary[cluster_model.CursorBackup] = cluster_model.Cursor{Lineage: lin, Position: 10}
 	require.NoError(t, c.pass(context.Background()))
 	store.replicate()
-	c.maybeAck(context.Background(), lin)
+	c.maybeAck(context.Background(), lin, base+19)
 	assert.Len(t, lg.list(), 20, "nothing past the backup is trimmed")
 	assert.EqualValues(t, base+19-10, c.BackupLag(), "the held trim is reported")
 }
