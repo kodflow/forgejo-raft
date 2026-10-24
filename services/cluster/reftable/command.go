@@ -65,7 +65,16 @@ import (
 // KindWithdrawRevocation, written at version 7 only, withdraws the request
 // it names by that index, never another request of the same key. A request
 // committed before the raise is numbered by none and stays, as before.
-const PayloadVersion = 7
+//
+// Version 8 renames an owner by its names alone (OwnerRenameVersion): one
+// kind, KindOwnerRename, written at version 8 only, which Apply expands
+// into the moves of every key the table holds under the old owner at its
+// index, the RepoRename its proposer would list on that table, applied as
+// that RepoRename is. Its size does not grow with the owner, where the
+// RepoRename listing every key was refused past the engine's entry bound,
+// at every attempt, and the owner could never be renamed (#182). Below
+// version 8 an owner's rename is that RepoRename, as before.
+const PayloadVersion = 8
 
 // RevokeVersion is the payload version that carries KindRevokeKey.
 const RevokeVersion = 3
@@ -85,6 +94,9 @@ const InitVersion = 6
 // WithdrawVersion is the payload version from which a revocation request
 // is numbered by its commit, and that carries KindWithdrawRevocation.
 const WithdrawVersion = 7
+
+// OwnerRenameVersion is the payload version that carries KindOwnerRename.
+const OwnerRenameVersion = 8
 
 // MaxPusherName bounds a pusher's name, from PusherVersion: a longer one
 // is refused, on every node alike.
@@ -126,6 +138,9 @@ const (
 	// KindWithdrawRevocation is written from WithdrawVersion only, once
 	// every member applies it: an older binary stops on it (D18).
 	KindWithdrawRevocation Kind = 10
+	// KindOwnerRename is written from OwnerRenameVersion only, once every
+	// member applies it: an older binary stops on it (D18).
+	KindOwnerRename Kind = 11
 )
 
 // Limits pinned to the payload version: they are part of Apply's verdict, so
@@ -238,6 +253,18 @@ func (rn *RepoRename) Moves() [][2]string {
 	return append([][2]string{{rn.From, rn.To}}, rn.Also...)
 }
 
+// OwnerRename renames the owner From to To: Apply moves every key under
+// From that holds a repository at its index, as the RepoRename listing them
+// would, all or none (#182). It names no key, so its size does not depend
+// on what the owner holds.
+type OwnerRename struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	Time int64  `json:"t"`
+	// Nonce names this command (RepoDelete.Nonce).
+	Nonce string `json:"nonce,omitempty"`
+}
+
 // JoinGrant is an operator's permission for a new node to join under a slot
 // by itself, until Expires (unix seconds), optionally only with one key.
 // The consensus engine refuses a JOIN for a slot that still has a member;
@@ -292,6 +319,9 @@ func EncodeVersion(v uint8, kind Kind, body any) ([]byte, error) {
 	if kind == KindWithdrawRevocation && v < WithdrawVersion {
 		return nil, fmt.Errorf("%w: a revocation is withdrawn from payload version %d, not %d", ErrVersion, WithdrawVersion, v)
 	}
+	if kind == KindOwnerRename && v < OwnerRenameVersion {
+		return nil, fmt.Errorf("%w: an owner is renamed by its names from payload version %d, not %d", ErrVersion, OwnerRenameVersion, v)
+	}
 	b, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -345,6 +375,8 @@ func decode(data []byte, limit uint8) (Kind, any, error) {
 		v = &RevokeKey{}
 	case KindWithdrawRevocation:
 		v = &WithdrawRevocation{}
+	case KindOwnerRename:
+		v = &OwnerRename{}
 	default:
 		return 0, nil, fmt.Errorf("%w: command kind %d", ErrVersion, kind)
 	}

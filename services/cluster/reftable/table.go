@@ -305,6 +305,12 @@ func (t *Table) Apply(e consensus.Entry) any {
 				break
 			}
 			res = t.applyWithdrawRevocation(body.(*WithdrawRevocation))
+		case KindOwnerRename:
+			if version < OwnerRenameVersion {
+				res = refuse("an owner is renamed by its names at payload version %d", OwnerRenameVersion)
+				break
+			}
+			res, ch = t.applyOwnerRename(e, version, body.(*OwnerRename))
 		}
 	}
 	t.applied = e.Position
@@ -790,6 +796,73 @@ func (t *Table) ownerRenameRefuses(owner [2]string, moves [][2]string, sources m
 		return fmt.Sprintf("the owner %s holds %s, which the rename does not move", owner[0], keys[0])
 	}
 	return ""
+}
+
+// applyOwnerRename moves every key under the owner o.From that holds a
+// repository to the owner o.To: it is the RepoRename an owner's rename lists
+// for that owner on this table at this index, the same moves in the same
+// order, applied as that RepoRename, so the marks, the events, the
+// checksums and the snapshot are the ones it leaves (#182). The keys come
+// from this table alone, never from the proposer's: every member expands
+// the entry at the same index of the same log into the same moves. The
+// expansion reads memory only, in one pass over the table's keys, beside
+// the one ownerRenameRefuses makes for that RepoRename, and holds the
+// owner's moves, which that RepoRename's body held decoded.
+func (t *Table) applyOwnerRename(e consensus.Entry, version uint8, o *OwnerRename) (Result, Change) {
+	if validOwnerAt(o.From, version) != nil || validOwnerAt(o.To, version) != nil || o.From == o.To {
+		return refuse("invalid owner rename"), Change{}
+	}
+	keys := t.ownerKeysLocked(o.From)
+	if len(keys) == 0 {
+		// Nothing left to move: the owner's repositories went since its
+		// proposer listed them. The rename stands, as in the database.
+		t.keepNonce(o.Nonce, e.Index)
+		return Result{OK: true}, Change{}
+	}
+	moves := make([][2]string, len(keys))
+	for i, key := range keys {
+		moves[i] = [2]string{key, o.To + strings.TrimPrefix(key, o.From)}
+	}
+	return t.applyRepoRename(e, version, &RepoRename{
+		From: moves[0][0], To: moves[0][1], Time: o.Time, Also: moves[1:], Nonce: o.Nonce, Owner: [2]string{o.From, o.To},
+	})
+}
+
+// validOwnerAt checks an owner's name as the first component of a key that
+// Apply admits at payload version v.
+func validOwnerAt(owner string, v uint8) error {
+	return ValidRepoKeyAt(owner+"/o.git", v)
+}
+
+// OwnerKeys lists, sorted, the keys under owner that hold a repository,
+// those an owner's rename moves: a live ref at least, and no deletion
+// since. A key a rename moved away holds none, nor the key of a wiki never
+// created, which a repository's rename moves with it (#181).
+func (t *Table) OwnerKeys(owner string) []string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.ownerKeysLocked(owner)
+}
+
+func (t *Table) ownerKeysLocked(owner string) []string {
+	prefix := owner + "/"
+	var keys []string
+	for key, r := range t.repos {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if _, deleted := t.deleted[key]; deleted {
+			continue
+		}
+		for _, v := range r.refs {
+			if v.Live() {
+				keys = append(keys, key)
+				break
+			}
+		}
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func (t *Table) moveRepo(e consensus.Entry, fromKey, toKey string, at int64) {

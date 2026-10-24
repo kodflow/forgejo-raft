@@ -830,11 +830,21 @@ func (r *Replicator) resolveLanded(ctx context.Context, landed func() bool) (boo
 // confirmed: a node behind the log would leave a repository created just
 // before under the old owner, while the database renamed it (#56). From
 // reftable.GenerationVersion, Apply also refuses a list that misses one.
+// From reftable.OwnerRenameVersion the entry names the two owners alone,
+// and Apply lists the keys on its own table: past the engine's entry
+// bound, the list refused the rename at every attempt (#182). The list
+// read here then only tells whether the owner holds a repository at all,
+// which the confirmed table still decides: a node behind the log that
+// found none would propose nothing.
 func (r *Replicator) proposeOwnerRename(ctx context.Context, oldOwner, newOwner string) error {
 	if err := r.confirmOwnerKeys(ctx); err != nil {
 		return err
 	}
 	moves := r.ownerMoves(oldOwner, newOwner)
+	if v := r.table.WriteVersion(); v >= reftable.OwnerRenameVersion && len(moves) > 0 {
+		o := ownerRenameCommand(oldOwner, newOwner)
+		return r.proposeLifecycle(ctx, v, reftable.KindOwnerRename, o, r.nonceLanded(o.Nonce))
+	}
 	err := r.proposeMoves(ctx, moves, [2]string{oldOwner, newOwner})
 	if errors.Is(err, clusterhook.ErrTooLarge) {
 		return ownerTooLarge(oldOwner, len(moves), err)
@@ -858,6 +868,11 @@ func (r *Replicator) confirmOwnerKeys(ctx context.Context) error {
 	return nil
 }
 
+// ownerRenameCommand is an owner's rename from reftable.OwnerRenameVersion.
+func ownerRenameCommand(oldOwner, newOwner string) *reftable.OwnerRename {
+	return &reftable.OwnerRename{From: oldOwner, To: newOwner, Time: time.Now().UnixNano(), Nonce: clusterhook.NewNonce()}
+}
+
 // ownerRenameRefusal is clusterhook.OwnerRenameRefusal: an owner's rename
 // whose entry the engine would refuse is refused before Forgejo writes
 // anything (#182). Its moves are listed as proposeOwnerRename lists them,
@@ -867,6 +882,8 @@ func (r *Replicator) confirmOwnerKeys(ctx context.Context) error {
 // it, after the SQL and the directory had moved. A node that cannot
 // confirm refuses the rename too, before anything is written. The rename
 // is still checked once proposed, for a repository created meanwhile.
+// From reftable.OwnerRenameVersion the entry lists no key, and its size
+// does not depend on the owner.
 func (r *Replicator) ownerRenameRefusal(ctx context.Context, oldOwner, newOwner string) error {
 	if err := r.confirmOwnerKeys(ctx); err != nil {
 		return err
@@ -874,6 +891,13 @@ func (r *Replicator) ownerRenameRefusal(ctx context.Context, oldOwner, newOwner 
 	moves := r.ownerMoves(oldOwner, newOwner)
 	if len(moves) == 0 {
 		return nil
+	}
+	if v := r.table.WriteVersion(); v >= reftable.OwnerRenameVersion {
+		data, err := reftable.EncodeVersion(v, reftable.KindOwnerRename, ownerRenameCommand(oldOwner, newOwner))
+		if err != nil {
+			return err
+		}
+		return r.tooLarge(len(data))
 	}
 	v, rn := r.renameCommand(moves, [2]string{oldOwner, newOwner})
 	data, err := reftable.EncodeVersion(v, reftable.KindRepoRename, rn)
@@ -898,20 +922,12 @@ func ownerTooLarge(owner string, keys int, err error) error {
 // none, nor the key of a wiki never created, which a repository's rename
 // moves with it: moved too, each one got a rename mark from a key holding
 // no repository, which a node behind the log followed to move another
-// repository's directory there (#181).
+// repository's directory there (#181). They are the keys Apply moves for a
+// reftable.KindOwnerRename on the same table (reftable.Table.OwnerKeys).
 func (r *Replicator) ownerMoves(oldOwner, newOwner string) [][2]string {
 	prefix := oldOwner + "/"
 	var moves [][2]string
-	for _, key := range r.table.Repos() {
-		if !strings.HasPrefix(key, prefix) {
-			continue
-		}
-		if _, deleted := r.table.Deleted(key); deleted {
-			continue
-		}
-		if refs, _ := r.table.Refs(key); !anyLive(refs) {
-			continue
-		}
+	for _, key := range r.table.OwnerKeys(oldOwner) {
 		moves = append(moves, [2]string{key, newOwner + "/" + strings.TrimPrefix(key, prefix)})
 	}
 	return moves
