@@ -409,11 +409,8 @@ func DeleteReleaseByID(ctx context.Context, repo *repo_model.Repository, rel *re
 			}
 		}
 
-		err = repo_model.DeleteArchiveDownloadCountForRelease(ctx, rel.ID)
-		if err != nil {
-			return err
-		}
-
+		// Before anything else changes: a tag this node of a cluster may
+		// not show yet is not deleted, and its release keeps all it had.
 		if err := deleteTag(ctx, repo, rel); err != nil {
 			return err
 		}
@@ -430,6 +427,9 @@ func DeleteReleaseByID(ctx context.Context, repo *repo_model.Repository, rel *re
 		)
 		notify_service.DeleteRef(ctx, doer, repo, refName)
 
+		if err := repo_model.DeleteArchiveDownloadCountForRelease(ctx, rel.ID); err != nil {
+			return err
+		}
 		if _, err := db.DeleteByID[repo_model.Release](ctx, rel.ID); err != nil {
 			return fmt.Errorf("DeleteReleaseByID: %w", err)
 		}

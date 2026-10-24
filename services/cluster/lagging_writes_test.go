@@ -17,6 +17,7 @@ import (
 	"forgejo.org/models/unittest"
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/clusterhook"
+	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	repo_module "forgejo.org/modules/repository"
 	pull_service "forgejo.org/services/pull"
@@ -285,6 +286,16 @@ func TestATagDeletedOnALaggingNodeGoesThroughTheCluster(t *testing.T) {
 	ctx := db.DefaultContext
 	rel := &repo_model.Release{RepoID: 1, PublisherID: 2, TagName: "lag-g2", LowerTagName: "lag-g2", Sha1: c1, IsTag: true, NumCommits: 1}
 	require.NoError(t, db.Insert(ctx, rel))
+	require.NoError(t, repo_model.CountArchiveDownload(ctx, 1, rel.ID, git.ZIP))
+	// A refused deletion leaves the release as it was, its archives'
+	// download counts included.
+	countsKept := func(t *testing.T) {
+		t.Helper()
+		unittest.AssertExistsAndLoadBean(t, &repo_model.Release{ID: rel.ID})
+		counts, err := repo_model.GetArchiveDownloadCount(ctx, 1, rel.ID)
+		require.NoError(t, err)
+		assert.EqualValues(t, 1, counts.Zip, "the archive download counts are kept")
+	}
 
 	withGitThroughReplicator(t, a)
 	sqlRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
@@ -293,7 +304,7 @@ func TestATagDeletedOnALaggingNodeGoesThroughTheCluster(t *testing.T) {
 	t.Run("node-a waits to serve the repository", func(t *testing.T) {
 		freshFrom(t, a)
 		require.ErrorIs(t, release_service.DeleteReleaseByID(ctx, sqlRepo, rel, doer, true), clusterhook.ErrBehind)
-		unittest.AssertExistsAndLoadBean(t, &repo_model.Release{ID: rel.ID})
+		countsKept(t)
 		tableAt(t, tc, ref, c1, "nothing was deleted")
 	})
 
@@ -301,7 +312,7 @@ func TestATagDeletedOnALaggingNodeGoesThroughTheCluster(t *testing.T) {
 		clusterhook.SetRefLookup(a.r.refLive)
 		t.Cleanup(func() { clusterhook.SetRefLookup(nil) })
 		require.ErrorIs(t, release_service.DeleteReleaseByID(ctx, sqlRepo, rel, doer, true), clusterhook.ErrBehind)
-		unittest.AssertExistsAndLoadBean(t, &repo_model.Release{ID: rel.ID})
+		countsKept(t)
 		tableAt(t, tc, ref, c1, "nothing was deleted")
 	})
 
@@ -309,6 +320,7 @@ func TestATagDeletedOnALaggingNodeGoesThroughTheCluster(t *testing.T) {
 	freshFrom(t, a)
 	require.NoError(t, release_service.DeleteReleaseByID(ctx, sqlRepo, rel, doer, true))
 	unittest.AssertNotExistsBean(t, &repo_model.Release{ID: rel.ID})
+	unittest.AssertNotExistsBean(t, &repo_model.RepoArchiveDownloadCount{ReleaseID: rel.ID})
 	for _, m := range tc.nodes {
 		require.Eventually(t, func() bool {
 			v, _ := m.r.table.Get(laggingRepo, ref)
