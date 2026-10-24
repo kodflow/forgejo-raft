@@ -159,6 +159,31 @@ func TestRenewRefusesWhatThePinWouldRefuse(t *testing.T) {
 	assert.Equal(t, before.SerialNumber, after.SerialNumber, "a refused renewal leaves the certificate in use")
 }
 
+// A URI SAN that would name no cluster, or no slot, is never asked of the
+// signer (#185); with Identity, the certificate in use names them.
+func TestRenewNeverAsksForAURISANWithoutACluster(t *testing.T) {
+	s := &localSigner{life: time.Hour}
+	r := newNode(t, s)
+	called := s.called
+	for _, c := range []struct{ cluster, slot string }{{"", "node-a"}, {cluster, ""}} {
+		r.Cluster, r.Slot = c.cluster, c.slot
+		_, err := r.RenewNow(context.Background())
+		require.ErrorContains(t, err, "refusing to renew")
+	}
+	assert.Equal(t, called, s.called, "the signer was asked")
+
+	var named []string
+	r.Cluster, r.Slot = "", "node-a"
+	r.Identity = func(c *x509.Certificate) (string, string, error) {
+		named = append(named, c.URIs[0].String())
+		return cluster, "node-a", nil
+	}
+	renewed, err := r.RenewNow(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, URISAN(cluster, "node-a"), renewed.URIs[0].String(), "the certificate in use names the cluster")
+	assert.Equal(t, []string{URISAN(cluster, "node-a"), URISAN(cluster, "node-a")}, named, "the certificate in use, then the URI SAN to ask for, are checked")
+}
+
 func TestDueAtTwoThirdsWithJitter(t *testing.T) {
 	c := &x509.Certificate{NotBefore: time.Unix(0, 0), NotAfter: time.Unix(0, 0).Add(30 * 24 * time.Hour)}
 	r := &Renewer{Jitter: 0}

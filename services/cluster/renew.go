@@ -54,8 +54,18 @@ func NewRenewer() *certrenew.Renewer {
 	return &certrenew.Renewer{
 		CertFile: setting.Cluster.TLSCertFile, KeyFile: setting.Cluster.TLSKeyFile, CAFile: setting.Cluster.TLSCAFile,
 		Cluster: setting.Cluster.ClusterID, Slot: setting.Cluster.Slot, Jitter: certrenew.JitterFor(setting.Cluster.Slot),
-		Signer: v,
+		// The URI SAN the members check, from the certificate in use:
+		// CLUSTER_ID may stay empty, the certificate names the cluster.
+		Identity: certIdentity,
+		Signer:   v,
 	}
+}
+
+// certIdentity returns the cluster and the slot a node certificate's
+// canonical URI SAN names, as a member checks it.
+func certIdentity(c *x509.Certificate) (cluster, slot string, err error) {
+	p, err := peerFromChain(c)
+	return p.Cluster, p.Slot, err
 }
 
 // runRenewer keeps the node certificate fresh until ctx ends. The
