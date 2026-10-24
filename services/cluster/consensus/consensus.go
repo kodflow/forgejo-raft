@@ -205,16 +205,20 @@ func (r Role) String() string {
 
 // Status is a node's view of itself.
 type Status struct {
-	ID             NodeID
-	Slot           string
-	Role           Role
-	Term           uint64
-	Leader         NodeID
-	Commit         uint64
-	Applied        uint64
-	Identity       LogIdentity
-	ClusterVersion uint32
-	SPKI           [32]byte
+	ID       NodeID
+	Slot     string
+	Role     Role
+	Term     uint64
+	Leader   NodeID
+	Commit   uint64
+	Applied  uint64
+	Identity LogIdentity
+	// ClusterVersion is the committed cluster version, the engine's
+	// protocol every member must speak, and ClusterGeneration counts its
+	// raises: the generation a RaiseClusterVersion names (D18).
+	ClusterVersion    uint32
+	ClusterGeneration uint64
+	SPKI              [32]byte
 }
 
 // AlarmID is the index of the entry that raised an alarm (R4-06).
@@ -272,6 +276,7 @@ type Health struct {
 
 // Precondition names what a clearing or raising operation acts on, scoped by
 // lineage, so a stale click cannot clear an alarm raised since (R4-06, R5-09).
+// Generation is the cluster-version generation a raise replaces.
 type Precondition struct {
 	Identity   LogIdentity
 	AlarmID    AlarmID
@@ -326,6 +331,14 @@ type Engine interface {
 	DenyPin(ctx context.Context, op Operator, id NodeID) error
 	TransferLeadership(ctx context.Context, op Operator, to NodeID) error
 	ClearNoSpace(ctx context.Context, op Operator, pre Precondition) error
+	// RaiseClusterVersion raises the committed cluster version to v, against
+	// the lineage and the generation pre names (Status's Identity and
+	// ClusterGeneration): a stale one is ErrAdminPrecondition. It is refused
+	// ErrVersionUnsupported while a member of the latest configuration,
+	// voter or learner, was not heard in the leader's term announcing v: a
+	// member on an older binary would stop on the raise (D18). A raise is
+	// never undone.
+	RaiseClusterVersion(ctx context.Context, op Operator, pre Precondition, v uint32) error
 	SaveSnapshot(ctx context.Context, op Operator, w io.Writer) (SnapshotMeta, error)
 	// Watch returns its own channel of status changes, closed when ctx ends
 	// or the engine closes (D13, R7-11).
@@ -503,7 +516,8 @@ var (
 	// ErrVersionUnsupported, from a StateMachine's Restore, says the snapshot
 	// is of a format this build does not read: the engine stops the node and
 	// refuses a restart over that snapshot (D18), instead of having the
-	// leader resend it forever.
+	// leader resend it forever. From RaiseClusterVersion, it says a member
+	// does not announce the version yet: nothing was raised.
 	ErrVersionUnsupported = errors.New("VERSION_UNSUPPORTED")
 )
 

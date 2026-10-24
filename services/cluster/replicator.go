@@ -75,8 +75,10 @@ type Replicator struct {
 	// retire.go).
 	dead deadClock
 	// payloadProbe is when the autopilot next asks the members which
-	// command version they apply.
+	// command version they apply, and clusterProbe when it next asks the
+	// engine to raise the cluster version (clusterversion.go).
 	payloadProbe time.Time
+	clusterProbe time.Time
 	// hookFails counts the writer hook's failed promotions in a row, and
 	// yielded is when this leader last gave the leadership away because it
 	// could not derive the SQL (autopilot.go). Only the autopilot's
@@ -311,6 +313,9 @@ func Init(ctx context.Context) error {
 	}
 	if r.auto != nil {
 		go r.autopilot(r.ctx)
+	} else {
+		// No autopilot raises the cluster version here (#170).
+		go r.clusterVersionPilot(r.ctx, payloadProbeEvery)
 	}
 	watchIdentity(r.ctx, id, identityPoll, func() {
 		r.objects.rotate()

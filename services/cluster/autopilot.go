@@ -16,7 +16,8 @@ import (
 )
 
 // autopilotOperator is the identity the autonomous mode records in the log
-// for what it does without an operator: an admission and a promotion.
+// for what it does without an operator: an admission and a promotion, and
+// in both modes the raise of the engine's cluster version.
 const autopilotOperator consensus.Operator = "forgejo-autopilot"
 
 // admits is the autonomous mode's half of a JOIN without a grant: the
@@ -110,6 +111,7 @@ func (r *Replicator) autopilotStep(ctx context.Context) {
 		return
 	}
 	r.maybeRaisePayload(pctx, m)
+	r.maybeRaiseCluster(pctx, eng)
 	_ = r.flushRevocations(pctx) // logged; the next pass retries it
 }
 

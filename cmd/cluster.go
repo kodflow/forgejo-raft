@@ -664,7 +664,7 @@ func runClusterStatus(ctx context.Context, c *cli.Command) error {
 	}
 	w := c.Root().Writer
 	fmt.Fprintf(w, "slot %s  role %s  term %d  leader %s  commit %d  applied %d\n", v.Slot, v.Role, v.Term, v.Leader, v.Commit, v.Applied)
-	fmt.Fprintf(w, "ready %t  fenced %t  failure tolerance %d  lineage %s\n", v.Ready, v.Fenced, v.FailureTolerance, v.Identity)
+	fmt.Fprintf(w, "ready %t  fenced %t  failure tolerance %d  lineage %s  cluster version %d\n", v.Ready, v.Fenced, v.FailureTolerance, v.Identity, v.ClusterVersion)
 	if v.ExpectedNodes > 0 {
 		voters := 0
 		for _, m := range v.Members {
