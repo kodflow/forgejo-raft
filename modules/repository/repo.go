@@ -45,6 +45,18 @@ func WikiRemoteURL(ctx context.Context, remote string) string {
 	return ""
 }
 
+// IsWikiRemoteURLOf reports whether wikiURL is one of the addresses
+// WikiRemoteURL tries for remote.
+func IsWikiRemoteURLOf(wikiURL, remote string) bool {
+	remote = strings.TrimSuffix(remote, ".git")
+	for _, suffix := range commonWikiURLSuffixes {
+		if wikiURL == remote+suffix {
+			return true
+		}
+	}
+	return false
+}
+
 // SyncRepoTags synchronizes releases table with repository tags, as the
 // site administration's "Synchronise tags" does on the node that served
 // the request. In a cluster it runs only once this node serves the

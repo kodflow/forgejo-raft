@@ -552,7 +552,11 @@ Watch, Custom, Releases on GitHub, or the tags of
   512, whatever their number.
 - A mirror's remote is a node's git config, which the cluster does not
   replicate: a node that lacks it recreates it from the database before
-  each mirror operation, without any password. The database keeps a
+  each mirror operation, without any password, and a node that holds it
+  brings it in line with the database at each sync: a pull mirror's
+  address, its wiki's included, and a push mirror's branch filter, both
+  changed through one node only. A node whose remote already matches
+  rewrites nothing and asks no remote. The database keeps a
   mirror's password encrypted, and every node passes it to git through a
   credential helper, never through its git config. A push mirror created
   before this release has its password stored by the node that created

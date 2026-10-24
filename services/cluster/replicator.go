@@ -42,6 +42,10 @@ type Replicator struct {
 	projector *projector
 	objects   *objectChannel
 	consumer  *consumer
+	// maxEntry is consensus.MaxEntryBytes, the engine's bound on one
+	// entry, past which a lifecycle command is refused before it is
+	// proposed (#182); a test lowers it.
+	maxEntry int
 	// memberProbe replaces the object channel's hello probe in tests.
 	memberProbe func(ctx context.Context, consensusAddr, slot string) (hello, error)
 
@@ -141,6 +145,7 @@ func newReplicator(root string, reg *registry) *Replicator {
 		raw:      map[string]rawWrite{},
 		started:  time.Now(),
 		wake:     make(chan struct{}, 1),
+		maxEntry: consensus.MaxEntryBytes,
 	}
 	r.projector = newProjector(r.root, r.table, reg)
 	return r
@@ -295,6 +300,7 @@ func Init(ctx context.Context) error {
 	clusterhook.SetEnabled(true)
 	clusterhook.SetRepoLifecycle(r.proposeRepoDelete, r.proposeRepoMoves)
 	clusterhook.SetOwnerLifecycle(r.proposeOwnerRename)
+	clusterhook.SetOwnerRenameCheck(r.ownerRenameRefusal)
 	clusterhook.SetCutHold(r.holdCut)
 	storage.SetDeleteGate(r.gateDelete)
 	clusterhook.SetKeyCheck(r.writableKey)
