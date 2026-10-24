@@ -192,9 +192,13 @@ func TestTheRenewerTakesTheClusterFromTheCertificate(t *testing.T) {
 	_, cerr := autoClusterID(id2)
 	require.NoError(t, cerr, "the node starts again on its renewed certificate")
 
-	// `forgejo cluster cert renew` builds the same renewer.
+	// `forgejo cluster cert renew` builds the same renewer, and asks for
+	// the URI SAN the certificate the last renewal wrote names.
 	_, err = NewRenewer().RenewNow(context.Background())
-	assert.NoError(t, err)
+	require.NoError(t, err)
+	asked := v.uriSANsAsked()
+	require.Len(t, asked, 3)
+	assert.Equal(t, canonical, asked[2])
 }
 
 // A CLUSTER_ID or a SLOT that differs from what the certificate in use
