@@ -386,3 +386,21 @@ func TestWithTxOpts(t *testing.T) {
 		})
 	})
 }
+
+// OnSavepointRollback sees the failure of every nested transaction that
+// rolled back to its savepoint, the one its caller swallowed included,
+// and nothing of those that succeeded.
+func TestOnSavepointRollback(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	var seen []error
+	ctx := db.OnSavepointRollback(db.WithNestedSavepoints(db.DefaultContext), func(err error) { seen = append(seen, err) })
+	swallowed, returned := errors.New("swallowed"), errors.New("returned")
+	err := db.WithTx(ctx, func(ctx context.Context) error {
+		require.NoError(t, db.WithTx(ctx, func(context.Context) error { return nil }))
+		_ = db.WithTx(ctx, func(context.Context) error { return swallowed })
+		assert.True(t, db.InTransaction(ctx), "the outer transaction is still open")
+		return db.WithTx(ctx, func(context.Context) error { return returned })
+	})
+	require.ErrorIs(t, err, returned)
+	assert.Equal(t, []error{swallowed, returned}, seen)
+}

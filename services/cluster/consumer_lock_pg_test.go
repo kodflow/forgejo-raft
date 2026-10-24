@@ -67,16 +67,43 @@ func pgRepositories(t *testing.T) *xorm.Engine {
 // itself on its base held it during its whole copy (#177): the push of that
 // repository waited on the row in the single dispatcher of the log, and
 // the SQL of every repository behind it. On PostgreSQL a batch's statement
-// waits batchLockTimeout at most: the held repository's event is tried
-// again, then parked, and another repository's event is derived while the
-// request's transaction still runs. At batchLockTimeout, maxAttempts tries
-// take some 25 seconds.
+// waits batchLockTimeout at most, and only in the batch's transaction: the
+// held repository's event is tried again, then parked, and another
+// repository's event is derived while the request's transaction still
+// runs. So it goes too when the work swallows the failure of a nested
+// transaction, which rolled the lost write back to its savepoint.
 func TestADispatchDoesNotWaitForARowARequestHolds(t *testing.T) {
+	for name, size := range map[string]func(ctx context.Context, id int64) error{
+		// pushUpdates returns the failure of UpdateRepoSize.
+		"returned": func(ctx context.Context, id int64) error {
+			return repo_model.UpdateRepoSize(ctx, id, 10, 0)
+		},
+		// pushUpdates logs and swallows that of updateIssuesCommit.
+		"swallowed": func(ctx context.Context, id int64) error {
+			if err := db.WithTx(ctx, func(ctx context.Context) error {
+				return repo_model.UpdateRepoSize(ctx, id, 10, 0)
+			}); err != nil {
+				t.Logf("swallowed: %v", err)
+			}
+			return nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dispatchPastAHeldRow(t, size)
+		})
+	}
+}
+
+func dispatchPastAHeldRow(t *testing.T, size func(ctx context.Context, id int64) error) {
+	t.Cleanup(test.MockVariableValue(&batchLockTimeout, 300*time.Millisecond))
 	eng := pgRepositories(t)
 	for id, name := range map[int64]string{1: "base", 2: "other"} {
 		_, err := eng.Insert(&repo_model.Repository{ID: id, OwnerID: 1, OwnerName: "o", Name: name, LowerName: name})
 		require.NoError(t, err)
 	}
+	// One connection for the request, one for the dispatcher: what the
+	// dispatcher's connection holds after its batch is read below.
+	eng.SetMaxOpenConns(2)
 
 	// The request's transaction: the fork counts itself on its base, then
 	// copies for minutes.
@@ -101,8 +128,14 @@ func TestADispatchDoesNotWaitForARowARequestHolds(t *testing.T) {
 	}
 
 	store, lg, parked := newSQLStore(), &memLog{}, &memParked{}
+	var inBatch string
 	c := unitConsumer(store, lg, parked, func(ctx context.Context, evs []reftable.Event) error {
-		return repo_model.UpdateRepoSize(ctx, evs[0].RepoID, 10, 0)
+		v, err := db.GetEngine(ctx).Query("SHOW lock_timeout")
+		if err != nil {
+			return err
+		}
+		inBatch = string(v[0]["lock_timeout"])
+		return size(ctx, evs[0].RepoID)
 	})
 	c.tx, c.inTx = batchTx, db.InTransaction
 	batch := []reftable.Event{
@@ -111,6 +144,7 @@ func TestADispatchDoesNotWaitForARowARequestHolds(t *testing.T) {
 	}
 	lineage := testToken(1).Identity().String()
 	dispatched := make(chan error, 1)
+	var failed []error
 	go func() {
 		cur := &cluster_model.Cursor{}
 		var err error
@@ -118,6 +152,7 @@ func TestADispatchDoesNotWaitForARowARequestHolds(t *testing.T) {
 			if err = c.dispatch(context.Background(), lineage, cur, batch); err == nil {
 				break
 			}
+			failed = append(failed, err)
 		}
 		dispatched <- err
 	}()
@@ -129,9 +164,17 @@ func TestADispatchDoesNotWaitForARowARequestHolds(t *testing.T) {
 		<-dispatched
 		t.Fatal("the dispatcher waited for the request's transaction to commit")
 	}
+	require.Len(t, failed, maxAttempts)
+	for _, err := range failed {
+		assert.True(t, isLockTimeout(err), "an attempt gave up waiting for the lock: %v", err)
+	}
+	assert.Equal(t, "300ms", inBatch, "the batch's statements wait batchLockTimeout at most")
+	v, err := eng.QueryString("SHOW lock_timeout")
+	require.NoError(t, err)
+	assert.Equal(t, "0", v[0]["lock_timeout"], "the bound ends with the batch's transaction, its connection back in the pool unbounded")
 
 	var other repo_model.Repository
-	_, err := eng.ID(int64(2)).Get(&other)
+	_, err = eng.ID(int64(2)).Get(&other)
 	require.NoError(t, err)
 	assert.EqualValues(t, 10, other.Size, "the other repository's event is derived while the row is held")
 	require.Len(t, parked.rows, 1)

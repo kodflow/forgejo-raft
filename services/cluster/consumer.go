@@ -27,6 +27,8 @@ import (
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/reftable"
 	repo_service "forgejo.org/services/repository"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // consumer derives SQL from the log (ADR 0152 D19, R7-29). ONE dispatcher,
@@ -178,6 +180,7 @@ func cursorName(lineage string) string { return "dispatch@" + lineage }
 // work updates (a fork copying a repository holds its base's row, the
 // deletion of a repository its rows) kept the single dispatcher waiting,
 // and the SQL of every repository behind it (#177). The work then fails,
+// even when it swallowed that failure in a nested transaction (lockWaits),
 // the batch is tried again, and the group is parked after maxAttempts
 // while the rest goes on; the parked group is retried on its own.
 func batchTx(ctx context.Context, f func(ctx context.Context) error) error {
@@ -195,6 +198,54 @@ func batchTx(ctx context.Context, f func(ctx context.Context) error) error {
 // PostgreSQL: far above what the requests' short transactions hold a row,
 // far below the minutes a fork's copy took. A test lowers it.
 var batchLockTimeout = 5 * time.Second
+
+// lockWaits collects the lock waits a batch's work gave up in a nested
+// transaction. Its caller may log and swallow that failure, as pushUpdates
+// does updateIssuesCommit's: rolled back to its savepoint, the write the
+// wait lost would be missing from a batch that commits, where a statement
+// waiting without bound would have made it (#177). The group fails
+// instead, so it is tried again, then parked.
+type lockWaits struct {
+	mu    sync.Mutex
+	first error
+}
+
+func (w *lockWaits) see(err error) {
+	if !isLockTimeout(err) {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.first == nil {
+		w.first = err
+	}
+}
+
+// take returns, as the failure of the work that ran since the last take,
+// the first lock wait it gave up.
+func (w *lockWaits) take() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	err := w.first
+	w.first = nil
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("a nested statement gave up waiting for a lock, its write rolled back: %w", err)
+}
+
+// pgLockNotAvailable is the SQLSTATE of a statement PostgreSQL cancelled
+// at lock_timeout, or that asked NOWAIT for a held lock.
+const pgLockNotAvailable = "55P03"
+
+// isLockTimeout reports a statement PostgreSQL cancelled for want of a
+// lock. Code on the way may have formatted the error with %v.
+func isLockTimeout(err error) bool {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
+		return pgErr.Code == pgLockNotAvailable
+	}
+	return strings.Contains(err.Error(), "(SQLSTATE "+pgLockNotAvailable+")")
+}
 
 // errBatchTxEnded is the work of a batch that ended its transaction: what
 // it wrote before is rolled back, what follows would commit statement by
@@ -498,6 +549,8 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 	// only once this transaction commits: a rolled-back attempt is replayed,
 	// and its effects would otherwise happen twice.
 	ctx, effects := clusterhook.WithAfterCommit(ctx)
+	waits := &lockWaits{}
+	ctx = db.OnSavepointRollback(ctx, waits.see)
 	// seq is each event's place among the events of its entry.
 	seq := make([]int, len(batch))
 	for i := 1; i < len(batch); i++ {
@@ -555,6 +608,9 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 				continue
 			}
 			err := c.work(ctx, group)
+			if err == nil {
+				err = waits.take()
+			}
 			if err == nil {
 				err = c.stillInTx(ctx)
 			}
@@ -718,10 +774,15 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 			continue
 		}
 		wctx, effects := clusterhook.WithAfterCommit(ctx)
+		waits := &lockWaits{}
+		wctx = db.OnSavepointRollback(wctx, waits.see)
 		ran := false
 		err := c.tx(wctx, func(ctx context.Context) error {
 			ran = false
 			if err := c.work(ctx, evs); err != nil {
+				return err
+			}
+			if err := waits.take(); err != nil {
 				return err
 			}
 			if err := c.stillInTx(ctx); err != nil {
