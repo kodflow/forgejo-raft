@@ -203,7 +203,11 @@ grants a join.
   replacement standing by. A grant bound to another key still refuses,
   retired ids are still refused, and the Nomad drain check and the
   witnesses' boot check still apply. `CLUSTER_ID` may stay empty: the
-  certificate names the cluster.
+  certificate names the cluster, at start-up and to the in-process
+  renewer, which asks the signer for the URI SAN the certificate in use
+  names. Set, `CLUSTER_ID` must match that certificate, as at start-up,
+  and `SLOT` too: a mismatch refuses every renewal before the signer is
+  asked. A URI SAN with no cluster is never asked for.
 
 **What the CA is trusted with.** In this mode, possessing a certificate the
 cluster's CA signed for a slot is enough to join an empty slot, and a joining

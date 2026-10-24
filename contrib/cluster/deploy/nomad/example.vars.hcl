@@ -31,3 +31,8 @@ witness_keys = [
 ]
 
 vault_addr = "https://vault.example.internal:8200"
+
+# Optional: the CLUSTER_ID given to vault-setup.sh. The node certificates name
+# the cluster; set, it must match them: a node whose certificate names another
+# cluster refuses to start, and refuses to renew that certificate.
+# cluster_id = "00000000000000000000000000000000"

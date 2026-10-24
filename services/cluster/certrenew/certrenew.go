@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -40,10 +41,19 @@ type Renewer struct {
 	KeyFile  string
 	// CAFile verifies what the signer returns.
 	CAFile string
-	// Cluster and Slot make the single URI SAN.
+	// Cluster and Slot are the node's [cluster] CLUSTER_ID and SLOT. With
+	// Identity set, the single URI SAN is the one the certificate in use
+	// names, which they must agree with when set: CLUSTER_ID may stay empty
+	// in the autonomous mode, and a renewal that asked for the URI SAN of an
+	// empty cluster was refused by the signer's role, or signed into a
+	// certificate no member admits (#185). Without a certificate in use yet,
+	// or with one whose URI SAN is not canonical, they make it.
 	Cluster string
 	Slot    string
-	Signer  Signer
+	// Identity returns the cluster and the slot a certificate's canonical
+	// URI SAN names, and refuses any other URI SAN.
+	Identity func(*x509.Certificate) (cluster, slot string, err error)
+	Signer   Signer
 	// Jitter, between 0 and 1, moves this node's renewal point within the
 	// last third, so three nodes never renew together.
 	Jitter float64
@@ -122,6 +132,44 @@ func (r *Renewer) key() (crypto.Signer, []byte, error) {
 	}
 }
 
+// uriSAN is the URI SAN to ask for: the one the certificate in use names,
+// checked against CLUSTER_ID and SLOT, or theirs. It is refused before the
+// signer is asked when it would name no cluster, or not be canonical.
+func (r *Renewer) uriSAN() (string, error) {
+	cluster, slot := r.Cluster, r.Slot
+	if r.Identity != nil {
+		if cur, err := r.Current(); err == nil {
+			switch c, s, err := r.Identity(cur); {
+			case err != nil && cluster == "":
+				return "", fmt.Errorf("refusing to renew: the certificate in use names no cluster (%v) and [cluster] CLUSTER_ID is empty; set CLUSTER_ID to the cluster's id", err)
+			case err != nil:
+				// The certificate in use is not canonical: CLUSTER_ID and
+				// SLOT, which an operator set, renew it back.
+			case cluster != "" && c != cluster:
+				return "", fmt.Errorf("refusing to renew: [cluster] CLUSTER_ID is %s, the certificate in use names cluster %s", cluster, c)
+			case slot != "" && s != slot:
+				return "", fmt.Errorf("refusing to renew: [cluster] SLOT is %s, the certificate in use names slot %s", slot, s)
+			default:
+				cluster, slot = c, s
+			}
+		}
+	}
+	if cluster == "" || slot == "" {
+		return "", errors.New("refusing to renew: the URI SAN would name no cluster or no slot; set [cluster] CLUSTER_ID and SLOT")
+	}
+	san := URISAN(cluster, slot)
+	if r.Identity != nil {
+		u, err := url.Parse(san)
+		if err != nil {
+			return "", err
+		}
+		if _, _, err := r.Identity(&x509.Certificate{URIs: []*url.URL{u}}); err != nil {
+			return "", fmt.Errorf("refusing to renew: %w", err)
+		}
+	}
+	return san, nil
+}
+
 // RenewNow makes a CSR from the host key, has it signed, checks the result
 // and installs it. The new certificate must carry the same SPKI, the one
 // URI SAN, and chain to the CA.
@@ -130,13 +178,16 @@ func (r *Renewer) RenewNow(ctx context.Context) (*x509.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
-	san := URISAN(r.Cluster, r.Slot)
+	san, err := r.uriSAN()
+	if err != nil {
+		return nil, err
+	}
 	u, err := url.Parse(san)
 	if err != nil {
 		return nil, err
 	}
 	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
-		Subject: pkix.Name{CommonName: r.Slot}, URIs: []*url.URL{u},
+		Subject: pkix.Name{CommonName: strings.TrimPrefix(u.Path, "/slot/")}, URIs: []*url.URL{u},
 	}, key)
 	if err != nil {
 		return nil, err

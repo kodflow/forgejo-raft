@@ -80,11 +80,18 @@ variable "vault_addr" {
   type = string
 }
 
+variable "cluster_id" {
+  description = "The cluster's id, 32 lowercase hex digits, the CLUSTER_ID given to vault-setup.sh. Optional: the node certificates name the cluster, and each node checks it against them"
+  type        = string
+  default     = ""
+}
+
 locals {
   # The [cluster] settings both tasks render into app.ini. The witness check
   # reads the same file the server reads, so they must not diverge.
   cluster_env = {
     FORGEJO__cluster__ENABLED            = "true"
+    FORGEJO__cluster__CLUSTER_ID         = var.cluster_id
     FORGEJO__cluster__WITNESSES          = join(",", var.witnesses)
     FORGEJO__cluster__WITNESS_KEYS       = join(",", var.witness_keys)
     FORGEJO__cluster__TLS_CERT_FILE      = "/data/tls/node.pem"
