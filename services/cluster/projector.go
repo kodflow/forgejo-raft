@@ -1235,9 +1235,10 @@ func (p *projector) setAsideLeftBehind(repo, dir string, want map[string]reftabl
 
 // leavesKey reports whether the directory under repo is one the projector
 // sets aside or removes before repo is projected: the key is deleted in the
-// table, the directory holds, by its stamp, a repository that left the key
-// (departed), or a rename took the key while the directory still holds the
-// repository certified under it before that rename (setAsideStale,
+// table, the key holds a repository and the directory, by its stamp,
+// another one, which left the key or came with another (departed), or a
+// rename took the key while the directory still holds the repository
+// certified under it before that rename (setAsideStale,
 // setAsideLeftBehind). The object channel refuses to index a pack there
 // (#99). Without a keyed stamp, nothing is refused.
 func (p *projector) leavesKey(repo string) bool {
@@ -1248,9 +1249,14 @@ func (p *projector) leavesKey(repo string) bool {
 	if _, deleted := p.table.Deleted(repo); deleted {
 		return true
 	}
+	// A repository under repo that this directory, by its stamp, is not:
+	// a key renamed away, holding none, takes no push, and its directory
+	// may still move on to the rename's target.
 	if s, known := readStamp(dir); known {
-		if _, _, _, left := p.departed(repo, s); left {
-			return true
+		if refs, _ := p.table.Refs(repo); anyLive(refs) {
+			if _, _, _, left := p.departed(repo, s); left {
+				return true
+			}
 		}
 	}
 	from, renIdx, ok := p.table.RenamedFrom(repo)
