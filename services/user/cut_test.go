@@ -61,7 +61,7 @@ func TestRenameUserRefusedByTheClusterChangesNothing(t *testing.T) {
 		return nil
 	})
 	var asked [2]string
-	clusterhook.SetOwnerRenameCheck(func(oldOwner, newOwner string) error {
+	clusterhook.SetOwnerRenameCheck(func(_ context.Context, oldOwner, newOwner string) error {
 		asked = [2]string{oldOwner, newOwner}
 		return fmt.Errorf("renaming the owner %s moves its 9000 repositories, wikis included, at once: %w", oldOwner, clusterhook.ErrTooLarge)
 	})

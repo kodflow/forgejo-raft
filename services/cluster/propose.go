@@ -817,13 +817,8 @@ func (r *Replicator) resolveLanded(ctx context.Context, landed func() bool) (boo
 // before under the old owner, while the database renamed it (#56). From
 // reftable.GenerationVersion, Apply also refuses a list that misses one.
 func (r *Replicator) proposeOwnerRename(ctx context.Context, oldOwner, newOwner string) error {
-	if r.Engine() != nil {
-		cctx, cancel := context.WithTimeout(ctx, lifecycleResolveBudget)
-		_, err := r.confirm(cctx)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("the cluster did not record it: this node could not confirm it applied the log: %w", err)
-		}
+	if err := r.confirmOwnerKeys(ctx); err != nil {
+		return err
 	}
 	moves := r.ownerMoves(oldOwner, newOwner)
 	err := r.proposeMoves(ctx, moves, [2]string{oldOwner, newOwner})
@@ -833,12 +828,35 @@ func (r *Replicator) proposeOwnerRename(ctx context.Context, oldOwner, newOwner 
 	return err
 }
 
+// confirmOwnerKeys applies a commit boundary a quorum confirmed, within
+// lifecycleResolveBudget, before an owner's keys are listed: a node behind
+// the log would miss a repository created just before (#56). Without an
+// engine there is nothing to confirm.
+func (r *Replicator) confirmOwnerKeys(ctx context.Context) error {
+	if r.Engine() == nil {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, lifecycleResolveBudget)
+	defer cancel()
+	if _, err := r.confirm(cctx); err != nil {
+		return fmt.Errorf("the cluster did not record it: this node could not confirm it applied the log: %w", err)
+	}
+	return nil
+}
+
 // ownerRenameRefusal is clusterhook.OwnerRenameRefusal: an owner's rename
-// whose entry, as this node's table lists its moves now, the engine would
-// refuse is refused before Forgejo writes anything (#182). The rename is
-// still checked once proposed, its moves read again after a commit
-// boundary a quorum confirmed.
-func (r *Replicator) ownerRenameRefusal(oldOwner, newOwner string) error {
+// whose entry the engine would refuse is refused before Forgejo writes
+// anything (#182). Its moves are listed as proposeOwnerRename lists them,
+// once this node applied a commit boundary a quorum confirmed: on a node
+// behind repositories created through another one, the list came short,
+// the check let an entry too large through, and only the proposal refused
+// it, after the SQL and the directory had moved. A node that cannot
+// confirm refuses the rename too, before anything is written. The rename
+// is still checked once proposed, for a repository created meanwhile.
+func (r *Replicator) ownerRenameRefusal(ctx context.Context, oldOwner, newOwner string) error {
+	if err := r.confirmOwnerKeys(ctx); err != nil {
+		return err
+	}
 	moves := r.ownerMoves(oldOwner, newOwner)
 	if len(moves) == 0 {
 		return nil

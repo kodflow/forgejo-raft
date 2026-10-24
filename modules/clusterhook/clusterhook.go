@@ -502,11 +502,11 @@ func OwnerRenamed(ctx context.Context, oldOwner, newOwner string) error {
 // (#182).
 var ErrTooLarge = errors.New("too large for one replicated entry")
 
-var checkOwnerRename func(oldOwner, newOwner string) error
+var checkOwnerRename func(ctx context.Context, oldOwner, newOwner string) error
 
 // SetOwnerRenameCheck registers the replicator's check of an owner's
 // rename, nil when the cluster can record it.
-func SetOwnerRenameCheck(f func(oldOwner, newOwner string) error) {
+func SetOwnerRenameCheck(f func(ctx context.Context, oldOwner, newOwner string) error) {
 	lifecycleMu.Lock()
 	checkOwnerRename = f
 	lifecycleMu.Unlock()
@@ -515,17 +515,18 @@ func SetOwnerRenameCheck(f func(oldOwner, newOwner string) error) {
 // OwnerRenameRefusal refuses an owner's rename the cluster cannot record,
 // an error wrapping ErrTooLarge: Forgejo asks it before it writes the
 // rename to SQL or moves the owner's directory, rather than undo both
-// once the proposal is refused (#182). It reads this node's table, which
-// may be behind: OwnerRenamed checks again what it proposes. It is always
-// nil without a cluster.
-func OwnerRenameRefusal(oldOwner, newOwner string) error {
+// once the proposal is refused (#182). It reads this node's table once a
+// commit boundary a quorum confirmed is applied, and refuses the rename
+// when the node cannot confirm one within ctx; OwnerRenamed checks again
+// what it proposes. It is always nil without a cluster.
+func OwnerRenameRefusal(ctx context.Context, oldOwner, newOwner string) error {
 	lifecycleMu.RLock()
 	f := checkOwnerRename
 	lifecycleMu.RUnlock()
 	if f == nil {
 		return nil
 	}
-	return f(strings.ToLower(oldOwner), strings.ToLower(newOwner))
+	return f(ctx, strings.ToLower(oldOwner), strings.ToLower(newOwner))
 }
 
 // ---- the checkpoint's cut ----
