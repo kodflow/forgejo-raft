@@ -265,6 +265,12 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
+	// Whether the lineages before B's were drained too, read before
+	// PostgreSQL's position: their cursors never go back, so the SQL at
+	// that position holds them at least there. It is recorded with the
+	// backup cursor, not waited for: a checkpoint right after a Recover
+	// does not wait for the old lineage's tail.
+	earlier := r.consumer.earlierDrained(bctx, tok.Identity())
 
 	// 4. PostgreSQL's position under the fence.
 	name := reftable.CheckpointName(tok.Identity().String(), tok.Index)
@@ -336,8 +342,10 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 	// The backup cursor: a PostgreSQL restored to this checkpoint's position
 	// holds the SQL of every entry up to B, and the log must keep what
 	// follows for it to be replayed; the consumer never trims past it.
+	// Closed says that it holds the earlier lineages drained as well: the
+	// consumer may then trim their tails to their end (#205).
 	if r.consumer != nil && r.consumer.dbReady() {
-		if err := c.backup(ctx, cluster_model.CursorBackup, cluster_model.Cursor{Lineage: tok.Identity().String(), Position: int64(tok.Index)}); err != nil {
+		if err := c.backup(ctx, cluster_model.CursorBackup, cluster_model.Cursor{Lineage: tok.Identity().String(), Position: int64(tok.Index), Closed: earlier}); err != nil {
 			log.Warn("cluster checkpoint %s: recording the backup cursor: %v", name, err)
 		}
 	}
@@ -481,6 +489,26 @@ func (c *consumer) drained(ctx context.Context, tok consensus.Token) (bool, erro
 		return false, err
 	}
 	return cur.Lineage == lin && uint64(cur.Position) >= last, nil
+}
+
+// earlierDrained reports whether every event the table holds of a lineage
+// other than id's, the current one, is behind that lineage's cursor in
+// SQL: dispatched, or parked with its row. drained waits for id's events
+// only, and a checkpoint right after a Recover or a restore may be taken
+// while the old lineage's tail still waits for its work; its backup holds
+// that lineage's cursor behind its end. Anything it cannot read says no.
+func (c *consumer) earlierDrained(ctx context.Context, id consensus.LogIdentity) bool {
+	current := id.String()
+	for lin, tail := range lastIndexes(c.events()) {
+		if lin == current {
+			continue
+		}
+		cur, err := c.cursor(ctx, cursorName(lin))
+		if err != nil || cur.Lineage != lin || uint64(cur.Position) < tail {
+			return false
+		}
+	}
+	return true
 }
 
 // ---- PostgreSQL ----

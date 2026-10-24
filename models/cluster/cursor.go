@@ -20,7 +20,11 @@ const (
 	// has had its post-receive work committed.
 	CursorDispatch = "dispatch"
 	// CursorBackup is written by each checkpoint with the index of its
-	// barrier; trimming never passes it, whatever its lag (R9-14).
+	// barrier; trimming never passes it, whatever its lag (R9-14). Its
+	// Closed says that the checkpoint read, before PostgreSQL's position,
+	// every earlier lineage the event queue still held drained: the
+	// lineages a Recover or a restore ended may then be trimmed to their
+	// end (#205). A binary that does not say writes it false.
 	CursorBackup = "backup"
 )
 

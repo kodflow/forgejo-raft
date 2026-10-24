@@ -621,8 +621,9 @@ func (c *consumer) pass(ctx context.Context) error {
 			log.Warn("cluster consumer: retrying the parked events: %v", err)
 		}
 	}
+	tails := lastIndexes(events)
 	for lin := range cursors {
-		c.maybeAck(ctx, lin)
+		c.maybeAck(ctx, lin, tails[lin])
 	}
 	// The backup cursor of the leader's lineage, every backupNoteEvery,
 	// whether or not an event waits: the health says when no checkpoint
@@ -958,8 +959,15 @@ func (r *Replicator) RetryParked(ctx context.Context) (applied int, remaining in
 // the configured margin, never past the cursor of the last PostgreSQL
 // backup whatever its lag (R8-23, R9-14), and only
 // once the durability check, run AFTER those reads, confirms that a
-// failover of the database cannot bring them back.
-func (c *consumer) maybeAck(ctx context.Context, lineage string) {
+// failover of the database cannot bring them back. tail is the index of
+// the lineage's last event the table holds.
+//
+// The margin is the lag of a lineage that goes on. The cursor of a lineage
+// a Recover or a restore ended stops at its end, and its last margin of
+// events stayed in the table for good, pinning their repositories' objects
+// against gc on every node (#205): once lineageEnded says nothing can need
+// them any more, the lineage is trimmed to its cursor, without the margin.
+func (c *consumer) maybeAck(ctx context.Context, lineage string, tail uint64) {
 	readBack, err := c.cursor(ctx, cursorName(lineage))
 	if err != nil || readBack.Lineage != lineage {
 		return
@@ -973,16 +981,21 @@ func (c *consumer) maybeAck(ctx context.Context, lineage string) {
 		}
 		bound = min(bound, uint64(p)-1)
 	}
-	if bound <= setting.Cluster.AckMargin {
-		return
-	}
-	target := bound - setting.Cluster.AckMargin
-	var backupLag uint64
-	var backupHeld int64
 	b, err := c.cursor(ctx, cluster_model.CursorBackup)
 	if err != nil {
 		return
 	}
+	ended := c.lineageEnded(lineage, uint64(readBack.Position), tail, b)
+	margin := setting.Cluster.AckMargin
+	if ended {
+		margin = 0
+	}
+	if bound <= margin {
+		return
+	}
+	target := bound - margin
+	var backupLag uint64
+	var backupHeld int64
 	if b.Lineage == lineage {
 		// Never past the backup, whatever its lag: a PostgreSQL restored to
 		// it replays what follows from the log. A backup that holds too much
@@ -1014,7 +1027,9 @@ func (c *consumer) maybeAck(ctx context.Context, lineage string) {
 	c.mu.Lock()
 	last := c.lastAck[lineage]
 	c.mu.Unlock()
-	if target < last+ackEvery {
+	// The last trim of an ended lineage does not wait for ackEvery: no
+	// event of it comes to move the target any further.
+	if target <= last || !ended && target < last+ackEvery {
 		return
 	}
 	if !c.checkDurability(ctx) {
@@ -1028,6 +1043,57 @@ func (c *consumer) maybeAck(ctx context.Context, lineage string) {
 	c.mu.Lock()
 	c.lastAck[lineage] = target
 	c.mu.Unlock()
+}
+
+// lineageEnded reports whether a lineage's trim needs no margin: a Recover
+// or a restore ended it, SQL derived all of it, and the last PostgreSQL
+// backup needs none of its tail. pos is its cursor read back from SQL,
+// tail the index of its last event the table holds.
+//
+//   - The table applies another lineage: it receives no event of this one
+//     any more. A table that applied no entry yet does not say.
+//   - The cursor is at or past tail: no event of it waits for its work. A
+//     parked one still holds the trim below it (maybeAck).
+//   - The backup: there is none; or it is of this lineage, and the trim
+//     still stops at it (maybeAck); or it is of the current lineage, and
+//     its checkpoint read every earlier lineage drained before PostgreSQL's
+//     position (Closed, earlierDrained). A PostgreSQL restored to a backup
+//     of the current lineage taken before, or by a binary that does not
+//     say, may hold this lineage's cursor behind its end and replay from
+//     the log what follows: that backup keeps the margin, as before.
+//
+// Nothing else needs these events: a new leader rebuilds its queue from
+// the same cursor in SQL, a database failover cannot take back what the
+// durability check confirmed, a parked event's row holds the event, and
+// the values of a checkpoint the export still serves are named by the
+// events past its barrier, which its backup cursor keeps.
+func (c *consumer) lineageEnded(lineage string, pos, tail uint64, b *cluster_model.Cursor) bool {
+	if c.lineageNow == nil || pos < tail {
+		return false
+	}
+	now := c.lineageNow()
+	if now == lineage || now == "" || now == (consensus.LogIdentity{}).String() {
+		return false
+	}
+	return b.Lineage == "" || b.Lineage == lineage || b.Lineage == now && b.Closed
+}
+
+// lastIndexes is the index of the last event the queue holds of each
+// lineage. The queue is in log order, a lineage's events one after the
+// other: an identity is compared as a value, and named once per run.
+func lastIndexes(events []reftable.Event) map[string]uint64 {
+	out := map[string]uint64{}
+	for i := 0; i < len(events); {
+		id, last := events[i].Token.Identity(), events[i].Token.Index
+		j := i + 1
+		for ; j < len(events) && events[j].Token.Identity() == id; j++ {
+			last = max(last, events[j].Token.Index)
+		}
+		name := id.String()
+		out[name] = max(out[name], last)
+		i = j
+	}
+	return out
 }
 
 // waitCursor waits until the dispatcher's cursor of a token's lineage has

@@ -1272,7 +1272,13 @@ func (t *Table) Audit() []AuditRecord {
 }
 
 // PinnedObjects lists the old and new ids of every event not yet trimmed,
-// which gc must keep (R8-27).
+// which gc must keep (R8-27): of every lineage, dispatched or not. These
+// are the "unconsumed" events of the projector's gc gate: an event the
+// consumer dispatched stays while its work may run again (the margin
+// behind the cursor, a parked event before it, the backup cursor), and a
+// replay reads these objects. A lineage a Recover or a restore ended is
+// trimmed to its end once nothing can replay it (#205): its last events
+// do not pin their objects for good.
 func (t *Table) PinnedObjects(repo string) []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
