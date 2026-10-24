@@ -549,6 +549,20 @@ Watch, Custom, Releases on GitHub, or the tags of
   it, at its first sync there; until then it pushes from that node only.
   `forgejo doctor` never removes a push mirror in a cluster because one
   node lacks its remote.
+- A push mirror's sync pushes `--mirror --force` from the node's disk. A
+  node pushes only once it serves the repository, and its wiki, at the
+  commit index the cluster confirms, from a directory that holds the
+  repository the database names; otherwise the sync fails, is not
+  recorded as done, and the next `update_mirrors` round retries it. A
+  node holds the sync in the database while it runs: `push_mirror`'s
+  `last_update` is then the hold's expiry, some minutes ahead, which the
+  settings page and the API show meanwhile. Two nodes' pushes never
+  overlap, and each starts from a state at least as recent as the
+  previous one. This assumes the nodes' clocks agree within a minute, a
+  database that keeps its commits across a failover, and a remote that
+  applies a push within a minute of the client's `[git.timeout] MIRROR`;
+  a node from before this release does not hold the sync, and can still
+  push out of order until every node runs it.
 - A ref name must be valid UTF-8. git accepts other bytes, which the
   replicated table, in JSON, cannot carry unchanged.
 - The object channel accepts what Forgejo accepts on a push: the fsck

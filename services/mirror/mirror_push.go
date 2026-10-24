@@ -16,6 +16,7 @@ import (
 
 	"forgejo.org/models/db"
 	repo_model "forgejo.org/models/repo"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	giturl "forgejo.org/modules/git/url"
 	"forgejo.org/modules/gitrepo"
@@ -141,6 +142,8 @@ func RemovePushMirrorRemote(ctx context.Context, m *repo_model.PushMirror) error
 }
 
 // SyncPushMirror starts the sync of the push mirror and schedules the next run.
+// On a node of a cluster, it holds the sync in SQL and pushes only from a
+// fresh copy of the repository (syncPushMirrorInCluster).
 func SyncPushMirror(ctx context.Context, mirrorID int64) bool {
 	log.Trace("SyncPushMirror [mirror: %d]", mirrorID)
 	defer func() {
@@ -165,6 +168,10 @@ func SyncPushMirror(ctx context.Context, mirrorID int64) bool {
 
 	ctx, _, finished := process.GetManager().AddContext(ctx, fmt.Sprintf("Syncing PushMirror %s/%s to %s", m.Repo.OwnerName, m.Repo.Name, m.RemoteName))
 	defer finished()
+
+	if clusterhook.Enabled() {
+		return syncPushMirrorInCluster(ctx, m)
+	}
 
 	log.Trace("SyncPushMirror [mirror: %d][repo: %-v]: Running Sync", m.ID, m.Repo)
 	err = runPushSync(ctx, m)
@@ -197,119 +204,11 @@ func runPushSync(ctx context.Context, m *repo_model.PushMirror) error {
 	timeout := time.Duration(setting.Git.Timeout.Mirror) * time.Second
 
 	performPush := func(repo *repo_model.Repository, isWiki bool) error {
-		path := repo.RepoPath()
-		if isWiki {
-			path = repo.WikiPath()
-		}
-		// We used to erronously configure repos with `--mirror`, which would set both push and fetch refspecs into the
-		// git config.  We need to remove any `fetch` configurations that were leftover from that error, as they caused
-		// source repository references to rollback: https://codeberg.org/forgejo/forgejo/issues/14273 Exit code 5 is
-		// ignored; that occurs when `git config --unset-all` finds nothing to remove.
-		if _, _, err := git.NewCommand(ctx, "config", "--unset-all").
-			AddDynamicArguments("remote." + m.RemoteName + ".fetch").
-			RunStdString(&git.RunOpts{Dir: path}); err != nil && !git.IsErrorExitCode(err, 5) {
+		p, err := preparePush(ctx, m, repo, isWiki)
+		if err != nil {
 			return err
 		}
-		if err := ensurePushMirrorRemote(ctx, m, path, isWiki); err != nil {
-			log.Error("SyncPushMirror [repo: %-v]: recreating the remote of the push mirror: %v", m.Repo, err)
-		}
-		remoteURL, err := git.GetRemoteURL(ctx, path, m.RemoteName)
-		if err != nil {
-			log.Error("GetRemoteAddress(%s) Error %v", path, err)
-			return errors.New("Unexpected error")
-		}
-
-		useSSHAuthentication := len(m.PublicKey) != 0
-
-		// Recheck that the remote address is still permitted before pushing. The address passed IsPushMirrorURLAllowed
-		// at creation time, but the allow/block lists may have changed since, or DNS for the remote host may now
-		// resolve to an internal address (DNS rebinding).
-		if err := recheckPushPermitted(ctx, m, remoteURL); err != nil {
-			log.Error("SyncPushMirror [repo: %-v]: push mirror failed to meet migration URL requirements: %v", m.Repo, err)
-			return util.SanitizeErrorCredentialURLs(err)
-		}
-
-		credURL, err := pushCredentialURL(ctx, m, remoteURL, isWiki)
-		if err != nil {
-			log.Error("SyncPushMirror [repo: %-v]: the push mirror's credentials: %v", m.Repo, err)
-			return errors.New("Unexpected error")
-		}
-		lfsURL := remoteURL.String()
-		if credURL != "" {
-			lfsURL = credURL
-		}
-
-		if setting.LFS.StartServer && !useSSHAuthentication {
-			log.Trace("SyncMirrors [repo: %-v]: syncing LFS objects...", m.Repo)
-
-			var gitRepo *git.Repository
-			if isWiki {
-				gitRepo, err = gitrepo.OpenWikiRepository(ctx, repo)
-			} else {
-				gitRepo, err = gitrepo.OpenRepository(ctx, repo)
-			}
-			if err != nil {
-				log.Error("OpenRepository: %v", err)
-				return errors.New("Unexpected error")
-			}
-			defer gitRepo.Close()
-
-			endpoint := lfs.DetermineEndpoint(lfsURL, "")
-			lfsClient := lfs.NewClient(endpoint, migrations_allowlist.NewMigrationHTTPTransport())
-			if err := pushAllLFSObjects(ctx, gitRepo, lfsClient); err != nil {
-				return util.SanitizeErrorCredentialURLs(err)
-			}
-		}
-
-		log.Trace("Pushing %s mirror[%d] remote %s", path, m.ID, m.RemoteName)
-
-		// OpenSSH isn't very intuitive when you want to specify a specific keypair.
-		// Therefore, we need to create a temporary file that stores the private key, so that OpenSSH can use it.
-		// We delete the temporary file afterwards.
-		privateKeyPath := ""
-		if useSSHAuthentication {
-			f, err := os.CreateTemp(os.TempDir(), m.RemoteName)
-			if err != nil {
-				log.Error("os.CreateTemp: %v", err)
-				return errors.New("unexpected error")
-			}
-
-			defer func() {
-				f.Close()
-				if err := os.Remove(f.Name()); err != nil {
-					log.Error("os.Remove: %v", err)
-				}
-			}()
-
-			privateKey, err := m.Privatekey()
-			if err != nil {
-				log.Error("Privatekey: %v", err)
-				return errors.New("unexpected error")
-			}
-
-			if _, err := f.Write(privateKey); err != nil {
-				log.Error("f.Write: %v", err)
-				return errors.New("unexpected error")
-			}
-
-			privateKeyPath = f.Name()
-		}
-		if err := git.Push(ctx, path, git.PushOptions{
-			Remote:         m.RemoteName,
-			Force:          true,
-			Mirror:         true,
-			Timeout:        timeout,
-			PrivateKeyPath: privateKeyPath,
-			CredentialURL:  credURL,
-			// The remote URL passed IsPushMirrorURLAllowed, but any redirection URL may not. Prohibit redirects in
-			// order to protect against SSRF risks.
-			ProhibitHTTPRedirect: true,
-		}); err != nil {
-			log.Error("Error pushing %s mirror[%d] remote %s: %v", path, m.ID, m.RemoteName, err)
-
-			return util.SanitizeErrorCredentialURLs(err)
-		}
-		return nil
+		return p.push(ctx, m, timeout)
 	}
 
 	err := performPush(m.Repo, false)
@@ -337,6 +236,138 @@ func runPushSync(ctx context.Context, m *repo_model.PushMirror) error {
 		}
 	}
 
+	return nil
+}
+
+// preparedPush is a push of a push mirror, its repository's or its
+// wiki's, ready to run: its remote checked, its credentials known and its
+// LFS objects pushed.
+type preparedPush struct {
+	path    string
+	isWiki  bool
+	credURL string
+	useSSH  bool
+}
+
+// preparePush does what comes before the push of the repository, or of
+// its wiki, to the push mirror m: everything but the git push itself.
+func preparePush(ctx context.Context, m *repo_model.PushMirror, repo *repo_model.Repository, isWiki bool) (*preparedPush, error) {
+	path := repo.RepoPath()
+	if isWiki {
+		path = repo.WikiPath()
+	}
+	// We used to erronously configure repos with `--mirror`, which would set both push and fetch refspecs into the
+	// git config.  We need to remove any `fetch` configurations that were leftover from that error, as they caused
+	// source repository references to rollback: https://codeberg.org/forgejo/forgejo/issues/14273 Exit code 5 is
+	// ignored; that occurs when `git config --unset-all` finds nothing to remove.
+	if _, _, err := git.NewCommand(ctx, "config", "--unset-all").
+		AddDynamicArguments("remote." + m.RemoteName + ".fetch").
+		RunStdString(&git.RunOpts{Dir: path}); err != nil && !git.IsErrorExitCode(err, 5) {
+		return nil, err
+	}
+	if err := ensurePushMirrorRemote(ctx, m, path, isWiki); err != nil {
+		log.Error("SyncPushMirror [repo: %-v]: recreating the remote of the push mirror: %v", m.Repo, err)
+	}
+	remoteURL, err := git.GetRemoteURL(ctx, path, m.RemoteName)
+	if err != nil {
+		log.Error("GetRemoteAddress(%s) Error %v", path, err)
+		return nil, errors.New("Unexpected error")
+	}
+
+	useSSHAuthentication := len(m.PublicKey) != 0
+
+	// Recheck that the remote address is still permitted before pushing. The address passed IsPushMirrorURLAllowed
+	// at creation time, but the allow/block lists may have changed since, or DNS for the remote host may now
+	// resolve to an internal address (DNS rebinding).
+	if err := recheckPushPermitted(ctx, m, remoteURL); err != nil {
+		log.Error("SyncPushMirror [repo: %-v]: push mirror failed to meet migration URL requirements: %v", m.Repo, err)
+		return nil, util.SanitizeErrorCredentialURLs(err)
+	}
+
+	credURL, err := pushCredentialURL(ctx, m, remoteURL, isWiki)
+	if err != nil {
+		log.Error("SyncPushMirror [repo: %-v]: the push mirror's credentials: %v", m.Repo, err)
+		return nil, errors.New("Unexpected error")
+	}
+	lfsURL := remoteURL.String()
+	if credURL != "" {
+		lfsURL = credURL
+	}
+
+	if setting.LFS.StartServer && !useSSHAuthentication {
+		log.Trace("SyncMirrors [repo: %-v]: syncing LFS objects...", m.Repo)
+
+		var gitRepo *git.Repository
+		if isWiki {
+			gitRepo, err = gitrepo.OpenWikiRepository(ctx, repo)
+		} else {
+			gitRepo, err = gitrepo.OpenRepository(ctx, repo)
+		}
+		if err != nil {
+			log.Error("OpenRepository: %v", err)
+			return nil, errors.New("Unexpected error")
+		}
+		defer gitRepo.Close()
+
+		endpoint := lfs.DetermineEndpoint(lfsURL, "")
+		lfsClient := lfs.NewClient(endpoint, migrations_allowlist.NewMigrationHTTPTransport())
+		if err := pushAllLFSObjects(ctx, gitRepo, lfsClient); err != nil {
+			return nil, util.SanitizeErrorCredentialURLs(err)
+		}
+	}
+	return &preparedPush{path: path, isWiki: isWiki, credURL: credURL, useSSH: useSSHAuthentication}, nil
+}
+
+// push runs the git push of p, killed past timeout.
+func (p *preparedPush) push(ctx context.Context, m *repo_model.PushMirror, timeout time.Duration) error {
+	log.Trace("Pushing %s mirror[%d] remote %s", p.path, m.ID, m.RemoteName)
+
+	// OpenSSH isn't very intuitive when you want to specify a specific keypair.
+	// Therefore, we need to create a temporary file that stores the private key, so that OpenSSH can use it.
+	// We delete the temporary file afterwards.
+	privateKeyPath := ""
+	if p.useSSH {
+		f, err := os.CreateTemp(os.TempDir(), m.RemoteName)
+		if err != nil {
+			log.Error("os.CreateTemp: %v", err)
+			return errors.New("unexpected error")
+		}
+
+		defer func() {
+			f.Close()
+			if err := os.Remove(f.Name()); err != nil {
+				log.Error("os.Remove: %v", err)
+			}
+		}()
+
+		privateKey, err := m.Privatekey()
+		if err != nil {
+			log.Error("Privatekey: %v", err)
+			return errors.New("unexpected error")
+		}
+
+		if _, err := f.Write(privateKey); err != nil {
+			log.Error("f.Write: %v", err)
+			return errors.New("unexpected error")
+		}
+
+		privateKeyPath = f.Name()
+	}
+	if err := git.Push(ctx, p.path, git.PushOptions{
+		Remote:         m.RemoteName,
+		Force:          true,
+		Mirror:         true,
+		Timeout:        timeout,
+		PrivateKeyPath: privateKeyPath,
+		CredentialURL:  p.credURL,
+		// The remote URL passed IsPushMirrorURLAllowed, but any redirection URL may not. Prohibit redirects in
+		// order to protect against SSRF risks.
+		ProhibitHTTPRedirect: true,
+	}); err != nil {
+		log.Error("Error pushing %s mirror[%d] remote %s: %v", p.path, m.ID, m.RemoteName, err)
+
+		return util.SanitizeErrorCredentialURLs(err)
+	}
 	return nil
 }
 

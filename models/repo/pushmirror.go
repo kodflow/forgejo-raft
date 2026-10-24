@@ -145,6 +145,31 @@ func UpdatePushMirror(ctx context.Context, m *PushMirror) error {
 	return err
 }
 
+// GetPushMirrorSyncState reads the push mirror's last_update and
+// last_error as SQL holds them now. exist is false once the push mirror is
+// gone.
+func GetPushMirrorSyncState(ctx context.Context, id int64) (lastUpdate timeutil.TimeStamp, lastError string, exist bool, err error) {
+	m := &PushMirror{}
+	exist, err = db.GetEngine(ctx).ID(id).Cols("last_update", "last_error").Get(m)
+	return m.LastUpdateUnix, m.LastError, exist, err
+}
+
+// SwapPushMirrorLastUpdate sets the push mirror's last_update to to, and
+// its last_error to lastError when it has one, only while last_update is
+// still from, and reports whether it did. It is the compare-and-swap the
+// nodes of a cluster hold a push mirror's sync with: from and to always
+// differ, so the affected rows tell whether it matched on every database.
+func SwapPushMirrorLastUpdate(ctx context.Context, id int64, from, to timeutil.TimeStamp, lastError optional.Option[string]) (bool, error) {
+	cols := []string{"last_update"}
+	m := &PushMirror{LastUpdateUnix: to}
+	if has, e := lastError.Get(); has {
+		cols = append(cols, "last_error")
+		m.LastError = e
+	}
+	n, err := db.GetEngine(ctx).Where("id = ? AND last_update = ?", id, from).Cols(cols...).Update(m)
+	return n == 1, err
+}
+
 // UpdatePushMirrorInterval updates the push-mirror
 func UpdatePushMirrorInterval(ctx context.Context, m *PushMirror) error {
 	_, err := db.GetEngine(ctx).ID(m.ID).Cols("interval").Update(m)
