@@ -535,8 +535,8 @@ func OwnerRenamed(ctx context.Context, oldOwner, newOwner string) error {
 // ErrTooLarge is a lifecycle command larger than one replicated entry may
 // be: refused before it is proposed, so nothing was recorded and the
 // caller undoes what it did locally. Proposed again, it is refused again:
-// an owner's rename moves every repository of the owner in one entry
-// (#182).
+// until the cluster writes payload version 8, an owner's rename lists
+// every repository of the owner in one entry (#182).
 var ErrTooLarge = errors.New("too large for one replicated entry")
 
 var checkOwnerRename func(ctx context.Context, oldOwner, newOwner string) error

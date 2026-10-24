@@ -41,18 +41,19 @@ func renameEntrySize(t *testing.T, r *Replicator, moves [][2]string, owner [2]st
 	return len(data)
 }
 
-// An owner's rename is one entry listing every repository of the owner,
-// and the engine refuses one above consensus.MaxEntryBytes, the SDK's
-// default of 1 MiB, as ENTRY_TOO_LARGE at every attempt: about 6 600
-// repositories with wikis. An owner of 8000 was refused once its SQL was
-// written and its directory moved, and the rename undone (#182). Such a
-// rename is now refused before it is proposed, with certainty, and the
-// engine agrees on the bound: the largest owner under it is recorded on
-// the SDK's real engine, from a follower too, and one repository more is
-// refused early, as the engine refuses that very entry.
+// Below reftable.OwnerRenameVersion, an owner's rename is one entry listing
+// every repository of the owner, and the engine refuses one above
+// consensus.MaxEntryBytes, the SDK's default of 1 MiB, as ENTRY_TOO_LARGE
+// at every attempt: about 6 600 repositories with wikis. An owner of 8000
+// was refused once its SQL was written and its directory moved, and the
+// rename undone (#182). Such a rename is now refused before it is
+// proposed, with certainty, and the engine agrees on the bound: the
+// largest owner under it is recorded on the SDK's real engine, from a
+// follower too, and one repository more is refused early, as the engine
+// refuses that very entry.
 func TestAnOwnerRenameAboveTheEntryBoundIsRefusedBeforeTheEngine(t *testing.T) {
 	tc := newTestClusterOn(t, true, "node-a", "node-b", "node-c")
-	raisePayload(t, tc)
+	raiseClusterTo(t, tc.nodes[1].r, reftable.OwnerRenameVersion-1, replicatorsOf(tc)...)
 	ctx := context.Background()
 	for _, n := range tc.nodes {
 		from, to := "o-"+n.slot, "p-"+n.slot
@@ -95,14 +96,15 @@ func TestAnOwnerRenameAboveTheEntryBoundIsRefusedBeforeTheEngine(t *testing.T) {
 	}
 }
 
-// An owner's rename whose entry the engine would refuse is refused before
-// it is proposed, with a message that says why, once Forgejo asks before
-// writing anything and again when it is proposed: nothing reaches the
-// table, so nothing has to be undone there (#182). One within the bound
-// still passes.
+// Below reftable.OwnerRenameVersion, an owner's rename whose entry the
+// engine would refuse is refused before it is proposed, with a message that
+// says why, once Forgejo asks before writing anything and again when it is
+// proposed: nothing reaches the table, so nothing has to be undone there
+// (#182). One within the bound still passes. From OwnerRenameVersion the
+// entry names the owner alone: past the same bound, the owner is renamed.
 func TestAnOwnerRenameTooLargeForOneEntryIsRefusedBeforeItIsProposed(t *testing.T) {
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
-	raisePayload(t, tc)
+	raiseClusterTo(t, tc.nodes[1].r, reftable.OwnerRenameVersion-1, replicatorsOf(tc)...)
 	work := t.TempDir()
 	run(t, work, "init", "-q")
 	c1 := commit(t, work, "one")
@@ -142,4 +144,15 @@ func TestAnOwnerRenameTooLargeForOneEntryIsRefusedBeforeItIsProposed(t *testing.
 	require.NoError(t, os.Rename(filepath.Join(origin.r.root, "big"), filepath.Join(origin.r.root, "huge")))
 	require.NoError(t, origin.r.proposeOwnerRename(context.Background(), "big", "huge"))
 	waitAll(t, tc, func(n *testNode) bool { return gitRef(t, n, "huge/c.git", "refs/heads/main") == c1 })
+
+	// Every member applies OwnerRenameVersion: the owner goes back past the
+	// bound that refused it.
+	raisePayload(t, tc)
+	origin.r.maxEntry = len(data) - 1
+	settle(t, origin)
+	require.NoError(t, origin.r.ownerRenameRefusal(t.Context(), "huge", "big"))
+	require.NoError(t, os.Rename(filepath.Join(origin.r.root, "huge"), filepath.Join(origin.r.root, "big")))
+	require.NoError(t, origin.r.proposeOwnerRename(context.Background(), "huge", "big"))
+	assert.Equal(t, byte(reftable.KindOwnerRename), lastEntry(t, origin.node).Data[1])
+	waitAll(t, tc, func(n *testNode) bool { return gitRef(t, n, "big/c.git", "refs/heads/main") == c1 })
 }

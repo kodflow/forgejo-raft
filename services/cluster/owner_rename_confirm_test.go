@@ -36,10 +36,11 @@ func (e catchUpOnBarrier) Barrier(ctx context.Context) (consensus.Token, error) 
 // through, which only the proposal refused, once the SQL was written and
 // the directory moved (#182). The check now confirms the applied log
 // first, and a node that cannot confirm refuses the rename, both before
-// anything is written.
+// anything is written. From reftable.OwnerRenameVersion, where the entry
+// names the owner alone, it still confirms.
 func TestTheEarlyCheckOfAnOwnerRenameConfirmsTheTableFirst(t *testing.T) {
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
-	raisePayload(t, tc)
+	raiseClusterTo(t, tc.nodes[1].r, reftable.OwnerRenameVersion-1, replicatorsOf(tc)...)
 	work := t.TempDir()
 	run(t, work, "init", "-q")
 	c1 := commit(t, work, "one")
@@ -92,5 +93,18 @@ func TestTheEarlyCheckOfAnOwnerRenameConfirmsTheTableFirst(t *testing.T) {
 
 	// Within the bound, the check passes.
 	lag.r.maxEntry = len(data) + 64
+	require.NoError(t, lag.r.ownerRenameRefusal(t.Context(), "big", "huge"))
+
+	// Every member applies OwnerRenameVersion: cut off, lag still refuses;
+	// in reach, the owner passes the bound that refused it.
+	lag.r.setEngine(lag.node)
+	raisePayload(t, tc)
+	lag.r.maxEntry = len(data) - 1
+	tc.mem.SetDown(lag.node, true)
+	ctx, cancel = context.WithTimeout(t.Context(), 300*time.Millisecond)
+	err = lag.r.ownerRenameRefusal(ctx, "big", "huge")
+	cancel()
+	require.ErrorContains(t, err, "could not confirm it applied the log")
+	tc.mem.SetDown(lag.node, false)
 	require.NoError(t, lag.r.ownerRenameRefusal(t.Context(), "big", "huge"))
 }

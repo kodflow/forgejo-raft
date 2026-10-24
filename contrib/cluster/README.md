@@ -261,6 +261,20 @@ version (the autopilot raises the version; in the manual mode, the
 operator raises it from the administration page). A JOIN grant is bound to the key it first admits:
 that node may retry, another key does not join under it.
 
+**Payload version 8** renames an owner by its names. Before, the rename of
+a user or an organization was one entry listing every repository of the
+owner, wikis included, and the engine refuses an entry past 1 MiB: an
+owner of about 6 600 to 7 400 repositories with wikis could never be
+renamed, and the rename was refused before anything was written. From
+version 8 the entry names the old and the new owner alone, and each member
+moves, when it applies the entry, every repository its table holds under
+the old owner at that point of the log: the same moves as the entry
+listing them, so a member behind the log, or one restored from a snapshot
+or a checkpoint, ends up with the same table. The rename has no size limit
+any more. Until every member runs a binary of version 8 and the version is
+raised, an owner's rename is the entry listing its repositories, refused
+past the bound as before.
+
 **Payload version 7** makes a Remove or Deny pin that the engine refuses
 for certain leave no effect. The revocation is asked for before the
 change, so that the removed node never joins again in between. When the
