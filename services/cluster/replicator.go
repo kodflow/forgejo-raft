@@ -89,6 +89,19 @@ type Replicator struct {
 	// goroutine touches them.
 	hookFails int
 	yielded   time.Time
+	// sqlYield is when, in Unix seconds, this node last gave the leadership
+	// away because it could not derive the SQL; its hello says it, so the
+	// leadership is not handed back to it for its checkpoints
+	// (checkpointlead.go).
+	sqlYield atomic.Int64
+	// checkpointProbe is when the leader next asks the members whether they
+	// take the checkpoints, checkpointYielded when it last handed the
+	// leadership to one that does, and ckState what it found, for the
+	// health. Only the autopilot's goroutine, or the manual mode's pilot,
+	// touches the first two.
+	checkpointProbe   time.Time
+	checkpointYielded time.Time
+	ckState           checkpointState
 	// consumerFails counts the consumer's failed passes in a row, which
 	// the autopilot reads (consumer.go).
 	consumerFails atomic.Int32
@@ -294,6 +307,11 @@ func Init(ctx context.Context) error {
 		return fmt.Errorf("[cluster] opening the consensus node: %w", err)
 	}
 	r.setEngine(eng)
+	if err := r.checkpointsRefusal(r.ctx, eng); err != nil {
+		_ = eng.Close(context.Background())
+		_ = srv.Close()
+		return err
+	}
 
 	currentMu.Lock()
 	current = r
@@ -321,8 +339,9 @@ func Init(ctx context.Context) error {
 	if r.auto != nil {
 		go r.autopilot(r.ctx)
 	} else {
-		// No autopilot raises the cluster version here (#170).
-		go r.clusterVersionPilot(r.ctx, payloadProbeEvery)
+		// No autopilot raises the cluster version (#170) nor hands the
+		// leadership to a member that takes the checkpoints (#176) here.
+		go r.leaderPilot(r.ctx, payloadProbeEvery)
 	}
 	watchIdentity(r.ctx, id, identityPoll, func() {
 		r.objects.rotate()

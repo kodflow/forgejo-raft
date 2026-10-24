@@ -141,7 +141,7 @@ func (b *tcpBench) start(n *tcpNode) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		n.r.clusterVersionPilot(ctx, 50*time.Millisecond)
+		n.r.leaderPilot(ctx, 50*time.Millisecond)
 	}()
 	n.stop = func() { cancel(); <-done }
 	n.up = true
@@ -342,7 +342,7 @@ func TestTheManualPilotWaitsForEveryMemberToSpeakTheProtocol(t *testing.T) {
 	ctx, cancel := context.WithCancel(tc.ctx)
 	var wg sync.WaitGroup
 	for _, n := range tc.nodes {
-		wg.Go(func() { n.r.clusterVersionPilot(ctx, 10*time.Millisecond) })
+		wg.Go(func() { n.r.leaderPilot(ctx, 10*time.Millisecond) })
 	}
 	t.Cleanup(func() { cancel(); wg.Wait() })
 

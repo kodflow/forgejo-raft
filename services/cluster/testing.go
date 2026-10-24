@@ -85,3 +85,9 @@ func SetBackupCursorForTesting(r *Replicator, position uint64) {
 	r.consumer.backupSeen = backupNote{Lineage: lin, Position: position, At: time.Now()}
 	r.consumer.mu.Unlock()
 }
+
+// SetCheckpointViewForTesting makes the leader have just found which voters
+// take the checkpoints (on) and which did not say (unknown).
+func SetCheckpointViewForTesting(r *Replicator, on, unknown []string) {
+	r.ckState.set(checkpointView{At: r.clock(), On: on, Unknown: unknown})
+}

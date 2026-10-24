@@ -116,12 +116,29 @@ page says how much the backup holds. `cluster:checkpoints` warns as soon as
 the leader takes no checkpoint while a backup cursor of its lineage exists,
 and `cluster:event_queue` names what holds the trim.
 
-The way out is a checkpoint that closes. Set `CHECKPOINT_INTERVAL` on the
-leader and restart it, or transfer the leadership, from the administration
-page, to a member whose `CHECKPOINT_INTERVAL` is set. When a leader that
-takes them fails its checkpoints, its log says why (`cluster checkpoint:`).
-Nothing else releases the trim: once a checkpoint closed, keep
-`CHECKPOINT_INTERVAL` set on the members that may lead.
+The leader is therefore a member that takes the checkpoints whenever a
+voter does, in both modes. A leader whose `CHECKPOINT_INTERVAL` is 0 hands
+the leadership to a voter whose `CHECKPOINT_INTERVAL` is set (each member
+says it to the others), once that voter answers and is caught up, at most
+once every five minutes. A leader that takes them never hands the
+leadership over for them, so it does not go back and forth; and a member
+that gave the leadership away because it could not derive the SQL is not
+handed it back for its checkpoints within the hour. `cluster:checkpoints`
+says which voters take them, or that none does.
+
+A voter whose `CHECKPOINT_INTERVAL` is 0 does not start when the backup
+cursor of its lineage exists and every other voter answers that it takes
+none either: no checkpoint would ever close again. Set
+`CHECKPOINT_INTERVAL` on it, or on another voter first. It starts whenever
+it is not certain of that: a voter that does not answer, a member on an
+older binary, a database it cannot read.
+
+The way out of a held trim is a checkpoint that closes. Set
+`CHECKPOINT_INTERVAL` on a voter: the leadership goes to it, or set it on
+the leader and restart it. When a leader that takes them fails its
+checkpoints, its log says why (`cluster checkpoint:`). Nothing else
+releases the trim: once a checkpoint closed, keep `CHECKPOINT_INTERVAL` set
+on at least one voter.
 
 ## The `[cluster]` keys
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"forgejo.org/models/db"
@@ -206,7 +207,7 @@ func checkClusterSQL(r *cluster_service.Replicator, checks checks) {
 	ck := componentStatus{Status: Pass, Time: getCheckTime()}
 	switch {
 	case v.CheckpointsOff:
-		ck.Status, ck.Output = warn, fmt.Sprintf("this leader takes no checkpoint ([cluster] CHECKPOINT_INTERVAL is 0 here) while the backup cursor of the last checkpoint stands at %d: the event queue is not trimmed past it; %s", v.Backup, checkpointRemedy(v))
+		ck.Status, ck.Output = warn, fmt.Sprintf("this leader takes no checkpoint ([cluster] CHECKPOINT_INTERVAL is 0 here) while the backup cursor of the last checkpoint stands at %d: the event queue is not trimmed past it; %s", v.Backup, takersNote(v))
 	case v.CheckpointsHere:
 		ck.Output = "taken by this node while it leads"
 	default:
@@ -226,6 +227,21 @@ func checkpointRemedy(v cluster_service.View) string {
 		return "set [cluster] CHECKPOINT_INTERVAL on the leader, or transfer the leadership to a member whose CHECKPOINT_INTERVAL is set"
 	}
 	return "no checkpoint closed since it: see why in the leader's log (cluster checkpoint)"
+}
+
+// takersNote says who may take the checkpoints, from what the leader last
+// found: the leadership goes to a voter that takes them, or none does.
+func takersNote(v cluster_service.View) string {
+	switch {
+	case len(v.CheckpointTakers) > 0:
+		return fmt.Sprintf("the leadership goes to a voter that takes them (%s)", strings.Join(v.CheckpointTakers, ", "))
+	case v.CheckpointsAsked.IsZero():
+		return checkpointRemedy(v)
+	case len(v.CheckpointUnknown) > 0:
+		return fmt.Sprintf("no voter that answered takes them, and %s did not say: set [cluster] CHECKPOINT_INTERVAL on a voter", strings.Join(v.CheckpointUnknown, ", "))
+	default:
+		return "no voter takes them ([cluster] CHECKPOINT_INTERVAL is 0 on every voter), and every write is refused once the queue is full: set CHECKPOINT_INTERVAL on a voter"
+	}
 }
 
 // queueHolder names what holds the trim of a filling event queue, and the

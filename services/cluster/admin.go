@@ -134,6 +134,12 @@ type View struct {
 	HasBackup       bool
 	Backup          uint64
 	CheckpointsOff  bool
+	// CheckpointTakers are the voters the leader last found to take the
+	// checkpoints, and CheckpointUnknown those that did not say, by slot;
+	// CheckpointsAsked is when it asked, zero when it did not lately.
+	CheckpointTakers  []string
+	CheckpointUnknown []string
+	CheckpointsAsked  time.Time
 	// EventQueueMax is the bound past which pushes are refused;
 	// EventQueueAlarm is set past EventQueueAlarmShare of it.
 	EventQueueMax   int64
@@ -272,6 +278,9 @@ func (r *Replicator) ConsumerHealth(ctx context.Context) View {
 		if st := eng.Status(); st.Role == consensus.RoleLeader {
 			v.Backup, v.HasBackup = r.consumer.backup(st.Identity.String())
 			v.CheckpointsOff = v.HasBackup && !v.CheckpointsHere
+			if ck, ok := r.ckState.fresh(r.clock()); ok {
+				v.CheckpointTakers, v.CheckpointUnknown, v.CheckpointsAsked = ck.On, ck.Unknown, ck.At
+			}
 		}
 	}
 	if r.table != nil {

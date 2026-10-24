@@ -92,3 +92,34 @@ func TestCheckClusterCheckpointsOff(t *testing.T) {
 	assert.Contains(t, c["cluster:backup_lag"][0].Output, "transfer the leadership")
 	assert.NotContains(t, c["cluster:backup_lag"][0].Output, "take a checkpoint")
 }
+
+// The leader says who may take the checkpoints: the voter it hands the
+// leadership to, or that no voter takes them, and every write is refused
+// once the queue is full (#176).
+func TestCheckClusterNoVoterTakesCheckpoints(t *testing.T) {
+	_, reps := cluster.NewForTesting(t.TempDir(), "node-a", "node-b", "node-c")
+	leader := reps[0]
+	cluster.SetBackupCursorForTesting(leader, 10)
+
+	cluster.SetCheckpointViewForTesting(leader, []string{"node-c"}, nil)
+	c := checks{}
+	checkCluster(leader, c)
+	assert.Equal(t, warn, c["cluster:checkpoints"][0].Status)
+	assert.Contains(t, c["cluster:checkpoints"][0].Output, "the leadership goes to a voter that takes them (node-c)")
+
+	cluster.SetCheckpointViewForTesting(leader, nil, []string{"node-b"})
+	c = checks{}
+	checkCluster(leader, c)
+	assert.Contains(t, c["cluster:checkpoints"][0].Output, "no voter that answered takes them, and node-b did not say")
+
+	cluster.SetCheckpointViewForTesting(leader, nil, nil)
+	c = checks{}
+	checkCluster(leader, c)
+	assert.Contains(t, c["cluster:checkpoints"][0].Output, "no voter takes them")
+	assert.Contains(t, c["cluster:checkpoints"][0].Output, "every write is refused once the queue is full")
+
+	// A follower reports nothing of the leader's.
+	c = checks{}
+	checkCluster(reps[1], c)
+	assert.Equal(t, Pass, c["cluster:checkpoints"][0].Status)
+}

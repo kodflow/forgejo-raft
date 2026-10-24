@@ -110,6 +110,9 @@ func (r *Replicator) autopilotStep(ctx context.Context) {
 		}
 		return
 	}
+	if r.maybeYieldForCheckpoints(pctx, eng, m) {
+		return
+	}
 	r.maybeRaisePayload(pctx, m)
 	r.maybeRaiseCluster(pctx, eng)
 	_ = r.flushRevocations(pctx) // logged; the next pass retries it
@@ -262,6 +265,7 @@ func (r *Replicator) yieldIfStuck(ctx context.Context, eng consensus.Engine, m c
 		log.Warn("cluster: autopilot: this leader cannot derive the SQL (%s); transferring the leadership to %s: %v", why, to, err)
 		return false
 	}
+	r.sqlYield.Store(now.Unix())
 	log.Error("cluster: autopilot: this leader cannot derive the SQL (%s): the leadership goes to %s", why, to)
 	r.audit(ctx, autopilotOperator, Operation{Action: ActionTransfer, Target: to.String()}, "ok", "the leader cannot derive the SQL: "+why)
 	return true

@@ -37,6 +37,15 @@ type leaderEngine struct {
 	version  uint32
 	raises   []uint32
 	raiseErr error
+	// transfers are the leadership transfers asked for.
+	transfers []consensus.NodeID
+}
+
+func (e *leaderEngine) TransferLeadership(_ context.Context, _ consensus.Operator, to consensus.NodeID) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.transfers = append(e.transfers, to)
+	return nil
 }
 
 func (e *leaderEngine) Status() consensus.Status {
