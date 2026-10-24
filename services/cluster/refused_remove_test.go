@@ -89,7 +89,8 @@ func TestPendingRevocationOfAHeldKeyIsNotWritten(t *testing.T) {
 	mem.Add("node-b", keyB, reftable.New())
 	mem.Add("node-c", sha256.Sum256([]byte("node-c")), reftable.New())
 	// An older binary recorded it before a Remove the engine refused.
-	require.NoError(t, r.recordPendingRevocation(ctx, reftable.RevokeKey{SPKI: hex.EncodeToString(keyB[:]), Slot: "node-b", Operator: "op", Time: 1}))
+	_, err := r.recordPendingRevocation(ctx, reftable.RevokeKey{SPKI: hex.EncodeToString(keyB[:]), Slot: "node-b", Operator: "op", Time: 1})
+	require.NoError(t, err)
 	require.NoError(t, r.RaisePayloadVersion(ctx, "op"))
 	r.flushRevocations(ctx)
 	assert.False(t, r.table.KeyRevoked(hex.EncodeToString(keyB[:])))

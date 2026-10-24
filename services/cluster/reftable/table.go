@@ -127,8 +127,13 @@ type Table struct {
 	// cluster could write them (AuditRevokeKey), by key.
 	revoked       map[string]RevokeKey
 	pendingRevoke map[string]RevokeKey
-	applied       consensus.Position
-	identity      consensus.LogIdentity
+	// revokeRequests lists, for each key of pendingRevoke, the requests
+	// open for it by the index of their commit, oldest first, 0 standing
+	// for every request committed before WithdrawVersion, which no
+	// withdrawal names (#171). The key stays asked for while one is open.
+	revokeRequests map[string][]uint64
+	applied        consensus.Position
+	identity       consensus.LogIdentity
 	// pending is the open checkpoint barrier; checkpoints the closed ones.
 	pending     *pendingCheckpoint
 	checkpoints []CheckpointRecord
@@ -169,18 +174,19 @@ type renameMark struct {
 // New returns an empty table.
 func New() *Table {
 	return &Table{
-		repos:         map[string]*repoState{},
-		deleted:       map[string]uint64{},
-		renamed:       map[string]renameMark{},
-		renames:       map[string][]renameMark{},
-		ids:           map[string]int64{},
-		grants:        map[string]JoinGrant{},
-		revoked:       map[string]RevokeKey{},
-		pendingRevoke: map[string]RevokeKey{},
-		byNonce:       map[string]uint64{},
-		deletions:     map[string][]uint64{},
-		departedAt:    map[string]uint64{},
-		limit:         PayloadVersion,
+		repos:          map[string]*repoState{},
+		deleted:        map[string]uint64{},
+		renamed:        map[string]renameMark{},
+		renames:        map[string][]renameMark{},
+		ids:            map[string]int64{},
+		grants:         map[string]JoinGrant{},
+		revoked:        map[string]RevokeKey{},
+		pendingRevoke:  map[string]RevokeKey{},
+		revokeRequests: map[string][]uint64{},
+		byNonce:        map[string]uint64{},
+		deletions:      map[string][]uint64{},
+		departedAt:     map[string]uint64{},
+		limit:          PayloadVersion,
 	}
 }
 
@@ -293,6 +299,12 @@ func (t *Table) Apply(e consensus.Entry) any {
 				break
 			}
 			res = t.applyRevokeKey(body.(*RevokeKey))
+		case KindWithdrawRevocation:
+			if version < WithdrawVersion {
+				res = refuse("a revocation is withdrawn at payload version %d", WithdrawVersion)
+				break
+			}
+			res = t.applyWithdrawRevocation(body.(*WithdrawRevocation))
 		}
 	}
 	t.applied = e.Position
@@ -332,7 +344,7 @@ func (t *Table) Reset() {
 	t.mu.Lock()
 	t.repos, t.root, t.events, t.eventBytes = nt.repos, nt.root, nil, 0
 	t.audit, t.deleted, t.renamed, t.grants, t.revoked = nil, nt.deleted, nt.renamed, nt.grants, nt.revoked
-	t.pendingRevoke = nt.pendingRevoke
+	t.pendingRevoke, t.revokeRequests = nt.pendingRevoke, nt.revokeRequests
 	t.applied, t.identity = consensus.Position{}, consensus.LogIdentity{}
 	t.pending, t.checkpoints = nil, nil
 	t.payload, t.nonces, t.byNonce = 0, nil, nt.byNonce
@@ -658,6 +670,14 @@ func (t *Table) applyAudit(e consensus.Entry, a *Audit) Result {
 	if k, ok := pendingRevocation(a); ok {
 		if _, done := t.revoked[k.SPKI]; !done {
 			t.pendingRevoke[k.SPKI] = k
+			// From WithdrawVersion a request is numbered by its commit,
+			// which a withdrawal names; one committed before is not, and
+			// stays until the revocation is written.
+			var n uint64
+			if t.payload >= WithdrawVersion {
+				n = e.Index
+			}
+			t.revokeRequests[k.SPKI] = openRequest(t.revokeRequests[k.SPKI], n)
 		}
 	}
 	if len(t.audit) > AuditKeep {
@@ -849,11 +869,44 @@ func (t *Table) applyRevokeKey(k *RevokeKey) Result {
 		t.revoked[k.SPKI] = *k
 	}
 	delete(t.pendingRevoke, k.SPKI)
+	delete(t.revokeRequests, k.SPKI)
 	// A grant bound to the revoked key admits nothing any more.
 	if g, ok := t.grants[k.Slot]; ok && g.SPKI == k.SPKI {
 		delete(t.grants, k.Slot)
 	}
 	return Result{OK: true}
+}
+
+// applyWithdrawRevocation withdraws the revocation request of w.SPKI
+// numbered w.Index: its Remove or DenyPin was refused for certain (#171).
+// The key stays asked for while another request of it is open, and a
+// request numbered otherwise, or a key already revoked, is not touched.
+func (t *Table) applyWithdrawRevocation(w *WithdrawRevocation) Result {
+	if consensus.Operator(w.Operator).Validate() != nil || !(len(w.SPKI) == 64 && validSHA(w.SPKI, "sha256")) || w.Index == 0 {
+		return refuse("malformed revocation withdrawal")
+	}
+	reqs := t.revokeRequests[w.SPKI]
+	i := slices.Index(reqs, w.Index)
+	if i < 0 {
+		return refuse("no revocation of this key was asked at %d, or it is written", w.Index)
+	}
+	reqs = slices.Delete(slices.Clone(reqs), i, i+1)
+	if len(reqs) == 0 {
+		delete(t.revokeRequests, w.SPKI)
+		delete(t.pendingRevoke, w.SPKI)
+		return Result{OK: true}
+	}
+	t.revokeRequests[w.SPKI] = reqs
+	return Result{OK: true}
+}
+
+// openRequest adds request n to the open requests of a key once: the
+// requests committed before WithdrawVersion are all 0.
+func openRequest(reqs []uint64, n uint64) []uint64 {
+	if slices.Contains(reqs, n) {
+		return reqs
+	}
+	return append(slices.Clone(reqs), n)
 }
 
 // pendingRevocation reads an AuditRevokeKey record; ok is false for any
@@ -880,6 +933,27 @@ func (t *Table) PendingRevocations() []RevokeKey {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].SPKI < out[j].SPKI })
 	return out
+}
+
+// RevocationRequests lists the open revocation requests of spki by the
+// index of their commit, 0 for those committed before WithdrawVersion.
+func (t *Table) RevocationRequests(spki string) []uint64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return slices.Clone(t.revokeRequests[spki])
+}
+
+// AuditIndex reports the index at which the audit record id committed,
+// while the table retains it.
+func (t *Table) AuditIndex(id string) (uint64, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for _, a := range t.audit {
+		if a.ID == id && id != "" {
+			return a.Token.Index, true
+		}
+	}
+	return 0, false
 }
 
 // KeyRevoked reports whether an operator revoked spki, 64 hex digits.
@@ -1225,6 +1299,10 @@ type persisted struct {
 	// PendingRevoke is absent from a snapshot an older member cut: it is
 	// then read back from the audit records kept.
 	PendingRevoke map[string]RevokeKey `json:"pending_revoke,omitempty"`
+	// RevokeRequests is absent from a snapshot an older binary cut, which
+	// numbered no request: each key it asked for has one request, 0,
+	// which no withdrawal names, as on a table that replayed the log.
+	RevokeRequests map[string][]uint64 `json:"revoke_requests,omitempty"`
 	// Pending and Checkpoints are absent from snapshots older than the
 	// checkpoints, which then restore with none.
 	Pending     *pendingCheckpoint `json:"pending,omitempty"`
@@ -1273,7 +1351,8 @@ func (t *Table) persistedLocked() *persisted {
 		Format: snapshotFormat(t.payload), Applied: t.applied, Identity: t.identity,
 		Repos: make(map[string]map[string]*RefValue, len(t.repos)), Last: map[string]uint64{},
 		Events: t.events, Audit: t.audit, Deleted: t.deleted, Renamed: t.renamed, Grants: t.grants, Revoked: t.revoked, PendingRevoke: t.pendingRevoke,
-		Pending: t.pending, Checkpoints: t.checkpoints, Payload: t.payload, Nonces: t.nonces,
+		RevokeRequests: t.revokeRequests,
+		Pending:        t.pending, Checkpoints: t.checkpoints, Payload: t.payload, Nonces: t.nonces,
 		Deletions: t.deletions, DepartedAt: t.departedAt, Renames: t.renames, IDs: t.ids,
 	}
 	for k, r := range t.repos {
@@ -1440,10 +1519,20 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 			}
 		}
 	}
+	for spki, reqs := range p.RevokeRequests {
+		if _, asked := nt.pendingRevoke[spki]; asked && len(reqs) > 0 {
+			nt.revokeRequests[spki] = reqs
+		}
+	}
+	for spki := range nt.pendingRevoke {
+		if len(nt.revokeRequests[spki]) == 0 {
+			nt.revokeRequests[spki] = []uint64{0}
+		}
+	}
 	t.mu.Lock()
 	t.repos, t.root, t.events, t.eventBytes = nt.repos, nt.root, nt.events, nt.eventBytes
 	t.audit, t.deleted, t.renamed, t.grants, t.revoked = nt.audit, nt.deleted, nt.renamed, nt.grants, nt.revoked
-	t.pendingRevoke = nt.pendingRevoke
+	t.pendingRevoke, t.revokeRequests = nt.pendingRevoke, nt.revokeRequests
 	t.applied, t.identity = p.Applied, p.Identity
 	t.pending, t.checkpoints = p.Pending, p.Checkpoints
 	t.payload, t.nonces, t.byNonce = nt.payload, nt.nonces, nt.byNonce

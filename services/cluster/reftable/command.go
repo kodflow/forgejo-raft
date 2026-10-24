@@ -55,7 +55,17 @@ import (
 // in holds no ref yet; from version 6 only such a transaction is taken for
 // a creation (#136). Below version 6 Apply ignores the field, as an older
 // binary does.
-const PayloadVersion = 6
+//
+// Version 7 lets a revocation an operator asked for be withdrawn
+// (WithdrawVersion): a Remove or a DenyPin the engine refused for certain
+// leaves no effect, where its request stayed and was written once the
+// member left by any path, the autopilot's removal of a dead member
+// included, which is meant to let it come back (#171). From version 7 the
+// table numbers each request by the index of its commit, and one kind,
+// KindWithdrawRevocation, written at version 7 only, withdraws the request
+// it names by that index, never another request of the same key. A request
+// committed before the raise is numbered by none and stays, as before.
+const PayloadVersion = 7
 
 // RevokeVersion is the payload version that carries KindRevokeKey.
 const RevokeVersion = 3
@@ -71,6 +81,10 @@ const GenerationVersion = 5
 // InitVersion is the payload version from which a creation is a ref
 // transaction marked Init, not any transaction of HEAD alone.
 const InitVersion = 6
+
+// WithdrawVersion is the payload version from which a revocation request
+// is numbered by its commit, and that carries KindWithdrawRevocation.
+const WithdrawVersion = 7
 
 // MaxPusherName bounds a pusher's name, from PusherVersion: a longer one
 // is refused, on every node alike.
@@ -109,6 +123,9 @@ const (
 	// KindRevokeKey is written at payload version 3 only (RevokeVersion),
 	// once every member applies it: an older binary stops on it (D18).
 	KindRevokeKey Kind = 9
+	// KindWithdrawRevocation is written from WithdrawVersion only, once
+	// every member applies it: an older binary stops on it (D18).
+	KindWithdrawRevocation Kind = 10
 )
 
 // Limits pinned to the payload version: they are part of Apply's verdict, so
@@ -243,6 +260,17 @@ type RevokeKey struct {
 	Time     int64  `json:"t"`
 }
 
+// WithdrawRevocation withdraws the revocation request of the key SPKI the
+// table numbered Index, the index of its commit: the Remove or DenyPin it
+// was asked for was refused for certain, and leaves no effect (#171).
+// Another request of the same key, numbered otherwise, stays.
+type WithdrawRevocation struct {
+	SPKI     string `json:"spki"`
+	Index    uint64 `json:"i"`
+	Operator string `json:"op"`
+	Time     int64  `json:"t"`
+}
+
 // Encode writes the envelope at BaseVersion: payload version, kind, JSON
 // body.
 func Encode(kind Kind, body any) ([]byte, error) {
@@ -260,6 +288,9 @@ func EncodeVersion(v uint8, kind Kind, body any) ([]byte, error) {
 	}
 	if v < BaseVersion || v > PayloadVersion {
 		return nil, fmt.Errorf("%w: cannot write payload version %d", ErrVersion, v)
+	}
+	if kind == KindWithdrawRevocation && v < WithdrawVersion {
+		return nil, fmt.Errorf("%w: a revocation is withdrawn from payload version %d, not %d", ErrVersion, WithdrawVersion, v)
 	}
 	b, err := json.Marshal(body)
 	if err != nil {
@@ -312,6 +343,8 @@ func decode(data []byte, limit uint8) (Kind, any, error) {
 		v = &CheckpointPosition{}
 	case KindRevokeKey:
 		v = &RevokeKey{}
+	case KindWithdrawRevocation:
+		v = &WithdrawRevocation{}
 	default:
 		return 0, nil, fmt.Errorf("%w: command kind %d", ErrVersion, kind)
 	}
