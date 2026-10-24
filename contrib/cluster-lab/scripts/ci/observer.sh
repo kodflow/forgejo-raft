@@ -20,15 +20,38 @@ dco() {
 # The LISTEN sockets the observer's own process holds: the inodes of the
 # LISTEN entries of /proc/net/tcp{,6} that are among its file descriptors.
 # Other listeners of the container's network namespace, such as Docker's
-# embedded DNS on 127.0.0.11, are not the observer's.
+# embedded DNS on 127.0.0.11, are not the observer's. Only the script's own
+# `socket inode` lines are kept: the suite stops the observer's container,
+# and an exec that lands then makes docker print "cannot exec in a stopped
+# container", which counted as a socket (#188). Such a sample is no sample,
+# and listening fails; an exec that failed for another reason is printed,
+# and fails the check, which must not go blind. Only docker's own message or
+# a `compose ps` that answers and sees no running observer says it stopped:
+# a `ps` that fails says nothing, and the sample stays a failure.
 listening() {
+  local out rc running ps_rc=0 why=""
   # shellcheck disable=SC2016 # expanded inside the container
-  dco exec -T -u 0 observer sh -c '
+  out="$(dco exec -T -u 0 observer sh -c '
     pid="$(pgrep -f "[g]itea cluster observe" | head -n 1)"
     [ -n "$pid" ] || exit 0
     for ino in $(cat /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null | awk "NR > 1 && (\$4 == \"0A\" || \$4 == \"07\") { print \$10 }"); do
       ls -l "/proc/$pid/fd" 2>/dev/null | grep -q "socket:\[$ino\]" && echo "socket inode $ino"
-    done' || true
+    done
+    exit 0' 2>&1)"
+  rc=$?
+  if [ "$rc" = 0 ]; then
+    printf '%s\n' "$out" | grep '^socket inode ' || true
+    return 0
+  fi
+  if printf '%s\n' "$out" | grep -qE 'cannot exec in a stopped container|is not running|No such container'; then
+    return 1
+  fi
+  running="$(dco ps -q --status running observer 2>/dev/null)" || ps_rc=$?
+  if [ "$ps_rc" = 0 ] && [ -z "$running" ]; then
+    return 1
+  fi
+  [ "$ps_rc" = 0 ] || why=", compose ps exit $ps_rc"
+  echo "sample failed (exit $rc$why): $(printf '%s' "$out" | tr '\n' ' ')"
 }
 watch_ports() {
   local i seen=0
@@ -36,9 +59,8 @@ watch_ports() {
   for ((i = 0; i < 900; i++)); do
     # The suite ended (the observer may never have started).
     [ ! -e "$PORTS_STOP" ] || break
-    if dco exec -T observer pgrep -f 'cluster observe' >/dev/null 2>&1; then
+    if dco exec -T observer pgrep -f 'cluster observe' >/dev/null 2>&1 && listening >>"$PORTS"; then
       seen=$((seen + 1))
-      listening >>"$PORTS"
       # Two minutes of samples while the observer runs and pulls.
       [ "$seen" -lt 60 ] || break
     fi
