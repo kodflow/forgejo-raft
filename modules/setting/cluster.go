@@ -212,6 +212,10 @@ type ObserverSettings struct {
 	// member's sshd answers, so this alone bounds an export stuck behind a
 	// live sshd; it must outlast a big repository's pack-objects.
 	ExportSilence time.Duration
+	// BaseEvery is how old the newest base backup may grow before the
+	// observer takes another, though the older still covers: it bounds the
+	// WAL the observer holds and the WAL a restore copies and replays.
+	BaseEvery time.Duration
 }
 
 // observerRefusedKeys are what an observer may not hold: it never listens,
@@ -405,6 +409,7 @@ func loadObserver(sec ConfigSection, refused []string) error {
 		PollInterval:   clusterDuration(sec, "OBSERVER_POLL_INTERVAL", 15*time.Second),
 		StagingQuota:   sec.Key("OBSERVER_STAGING_QUOTA").MustInt64(10 << 30),
 		ExportSilence:  clusterDuration(sec, "OBSERVER_EXPORT_SILENCE", 30*time.Minute),
+		BaseEvery:      clusterDuration(sec, "OBSERVER_BASE_EVERY", 7*24*time.Hour),
 	}
 	for _, p := range sec.Key("OBSERVER_ENDPOINTS").Strings(",") {
 		slot, addr, ok := strings.Cut(strings.TrimSpace(p), "=")
@@ -440,6 +445,12 @@ func loadObserver(sec ConfigSection, refused []string) error {
 	}
 	if o.ExportSilence < time.Minute {
 		errs = append(errs, errors.New("OBSERVER_EXPORT_SILENCE must be one minute at least"))
+	}
+	// Every base a live checkpoint restores from is kept: a period of a few
+	// minutes would hold a base per pass for the 72 hours of the live
+	// directory.
+	if o.BaseEvery < time.Hour {
+		errs = append(errs, errors.New("OBSERVER_BASE_EVERY must be one hour at least"))
 	}
 	Cluster.Observer = o
 	return errors.Join(errs...)

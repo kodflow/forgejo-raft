@@ -70,7 +70,9 @@ type Config struct {
 	// directory; older ones live on in the hook's snapshots. Zero keeps
 	// everything.
 	LiveKeep time.Duration
-	// BaseEvery is how old the newest base backup may grow before another.
+	// BaseEvery is how old the newest base backup may grow before another,
+	// taken after a pass's checkpoint even while the older still covers:
+	// it bounds the WAL held and the WAL a restore replays.
 	BaseEvery time.Duration
 	// StepTimeout bounds one pass, a base backup included: a member that
 	// stalls ends the pass, never the observer.
@@ -90,6 +92,9 @@ type Observer struct {
 	// uncovered counts the passes whose checkpoint the newest base did not
 	// reach: past gapPasses, the WAL has a gap, not a lag.
 	uncovered int
+	// renewAfter is when a base renewal that failed is tried again: each
+	// try may stream a whole base before it fails.
+	renewAfter time.Time
 	// stepStarted is when the running pass began, zero between passes.
 	stepStarted time.Time
 	// lock holds the directory for this process.
@@ -108,6 +113,9 @@ const viewTimeout = time.Minute
 // gapPasses is how many passes a base backup may fail to cover before the
 // observer takes a new one: any gap in the archive forces a new base.
 const gapPasses = 20
+
+// renewRetry is how long after a failed base renewal the next is tried.
+const renewRetry = time.Hour
 
 // The refusals that stop ingestion until a human acts.
 var (
@@ -247,7 +255,7 @@ func (o *Observer) Run(ctx context.Context, interval time.Duration) {
 }
 
 // Step runs one pass: the pending hooks, the leader's view, the log, the
-// newest new checkpoint.
+// newest new checkpoint, the prune, then a new base backup when it is due.
 func (o *Observer) Step(ctx context.Context) error {
 	if err := o.acceptRequested(); err != nil {
 		return err
@@ -289,7 +297,11 @@ func (o *Observer) Step(ctx context.Context) error {
 	if err := o.protectPending(ctx); err != nil {
 		return err
 	}
-	return o.prune(ctx)
+	if err := o.prune(ctx); err != nil {
+		return err
+	}
+	o.renewBase(ctx, slot, cp.SystemID)
+	return nil
 }
 
 // Accept is the human act that ends a quarantine. For a new lineage, the
@@ -1064,6 +1076,32 @@ func (o *Observer) coverPG(ctx context.Context, leader string, cp clusterhook.Ex
 		}
 	}
 	return Coverage{}, err
+}
+
+// renewBase takes a new base backup once the newest of the system is older
+// than BaseEvery, though the bases held still cover the checkpoints: coverPG
+// takes one only when they cover nothing, and with an archive that has no
+// gap the first base would restore every checkpoint, with all the WAL since
+// it, kept forever and replayed by each restore (#179). The next checkpoints
+// restore from the new base, and the prune lets the older one and its WAL
+// go with the last live checkpoint that restores from them.
+//
+// It runs once the pass's checkpoint is published, protected and the prune
+// done: that checkpoint never waits for the base nor fails with it, and no
+// checkpoint is in staging, so every base a checkpoint restores from is a
+// published one's, which the dropIdleBases of the new base keeps. A
+// failure is logged, the bases held still cover, and a pass renewRetry
+// later tries again.
+func (o *Observer) renewBase(ctx context.Context, leader, sysid string) {
+	if !o.needsBase(sysid) || o.cfg.Now().Before(o.renewAfter) {
+		return
+	}
+	if err := o.fetchBase(ctx, leader); err != nil {
+		o.renewAfter = o.cfg.Now().Add(renewRetry)
+		log.Warn("cluster observer: renewing the base backup of system %s: %v; the bases held still cover, tried again in %s", sysid, err, renewRetry)
+		return
+	}
+	o.renewAfter = time.Time{}
 }
 
 // needsBase reports whether no base held could start a coverage: none of

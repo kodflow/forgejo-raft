@@ -125,6 +125,33 @@ func TestCoverSkipsABaseThatEndsPastThePosition(t *testing.T) {
 	require.ErrorIs(t, err, ErrNoCoverage)
 }
 
+// The newest base is the one at the furthest position, whatever the text
+// of the positions: 0/F000000 sorts after 0/10000000 and 9/0 after 10/0 as
+// text. Taken for the newest, the older base would restore every
+// checkpoint, with all the WAL since it held and replayed (#179).
+func TestCoverTakesTheNewestBaseByPosition(t *testing.T) {
+	const seg = 16 << 20
+	have := func(string) bool { return true }
+	for _, starts := range [][2]string{{"0/F000028", "0/10000028"}, {"9/28", "10/28"}} {
+		older, err := ParseLSN(starts[0])
+		require.NoError(t, err)
+		newer, err := ParseLSN(starts[1])
+		require.NoError(t, err)
+		require.Less(t, older, newer)
+		bases := []BaseInfo{
+			{Label: "newer", Start: starts[1], Timeline: 1, SystemID: "42"},
+			{Label: "older", Start: starts[0], Timeline: 1, SystemID: "42"},
+		}
+		cov, err := Cover(bases, "42", newer+LSN(2*seg), 1, seg, have, nil, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "newer", cov.Base.Label, "%v", starts)
+		assert.Len(t, cov.Segments, 3, "%v: the segments from the newer base alone", starts)
+		cov, err = Cover(bases, "42", newer-1, 1, seg, have, nil, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "older", cov.Base.Label, "%v: a position before the newer base", starts)
+	}
+}
+
 // The backup's end is read from the manifest pg_basebackup injects into
 // the tar it writes on stdout.
 func TestScanBaseTarReadsTheManifestEnd(t *testing.T) {

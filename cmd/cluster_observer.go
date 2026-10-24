@@ -183,7 +183,7 @@ func newObserverFromSettings() (*observer.Observer, error) {
 	}
 	return observer.New(observer.Config{
 		Name: o.Name, Dir: o.Dir, Endpoints: eps, SecretsKey: key, HookCommand: o.SnapshotHook,
-		StagingQuota: o.StagingQuota, LiveKeep: 72 * time.Hour, Git: setting.Git.Path,
+		StagingQuota: o.StagingQuota, LiveKeep: 72 * time.Hour, BaseEvery: o.BaseEvery, Git: setting.Git.Path,
 	})
 }
 

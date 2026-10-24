@@ -43,6 +43,13 @@ func TestObserverSettingsRefuseListeners(t *testing.T) {
 	assert.Equal(t, 2*time.Hour, Cluster.Observer.ExportSilence)
 	loadClusterSection(t, observerNode+"OBSERVER_EXPORT_SILENCE = 10s\n")
 	require.ErrorContains(t, Cluster.ConfigError, "OBSERVER_EXPORT_SILENCE")
+	loadClusterSection(t, observerNode)
+	assert.Equal(t, 7*24*time.Hour, Cluster.Observer.BaseEvery)
+	loadClusterSection(t, observerNode+"OBSERVER_BASE_EVERY = 24h\n")
+	require.NoError(t, Cluster.ConfigError)
+	assert.Equal(t, 24*time.Hour, Cluster.Observer.BaseEvery)
+	loadClusterSection(t, observerNode+"OBSERVER_BASE_EVERY = 10m\n")
+	require.ErrorContains(t, Cluster.ConfigError, "OBSERVER_BASE_EVERY")
 
 	for _, line := range []string{
 		"LISTEN_ADDR = 192.0.2.9:7480",

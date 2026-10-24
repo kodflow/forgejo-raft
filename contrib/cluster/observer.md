@@ -158,6 +158,7 @@ OBSERVER_SNAPSHOT_HOOK = /usr/local/bin/observer-snapshot
 OBSERVER_POLL_INTERVAL = 15s
 OBSERVER_STAGING_QUOTA = 10737418240
 OBSERVER_EXPORT_SILENCE = 30m
+OBSERVER_BASE_EVERY = 168h
 ```
 
 `ROLE = observer` refuses every key that would make the node a member:
@@ -206,6 +207,7 @@ followed off the pinned endpoints. Then:
   past the point where its timeline was abandoned in a failover is refused:
   that tail was lost. Without coverage, it takes a base backup
   (`pg_basebackup -D - -Ft -X none`), and the next checkpoint is covered.
+  The coverage starts from the newest base that reaches L.
 - Its refs are created under `refs/observer/<checkpoint>/` of each
   repository, in one transaction of create-only updates: an accepted
   checkpoint's ref is never moved, and `gc.auto = 0` keeps every object.
@@ -264,6 +266,20 @@ newest protected one, never while the hook fails), and with it the base
 backups, WAL and stored files no remaining checkpoint needs; its snapshots
 keep it. Staging is bounded by `OBSERVER_STAGING_QUOTA`: at the quota,
 ingestion stops; nothing protected is deleted.
+
+Once the newest base backup is older than `OBSERVER_BASE_EVERY` (default
+`168h`, one hour at least), a pass takes another after its checkpoint is
+protected, though the older one still covers. The next checkpoints restore
+from the new base; the older base, and the WAL before the new one, go with
+the last live checkpoint that restores from them. A restore then copies and
+replays the WAL of one period at most (more only while a base fails to be
+taken), and the observer holds the WAL of one period plus the 72 hours, with
+a base for each period those 72 hours reach into. Lower it for a shorter
+restore, raise it for fewer base backups across the link: the pass that
+takes one lasts as long as the base takes to cross it, which the freshness
+alert may see. A base that fails then is logged and tried again by a pass an
+hour later: the checkpoint is not held back, and the bases held keep
+covering.
 
 `STATUS.json` and `ALERTS` in the observer directory are for the host's
 monitoring: freshness is the age of the newest PROTECTED checkpoint, never of

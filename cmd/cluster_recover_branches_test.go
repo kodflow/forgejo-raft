@@ -10,9 +10,11 @@ import (
 	"testing"
 
 	"forgejo.org/models/db"
+	git_model "forgejo.org/models/git"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unittest"
 	"forgejo.org/modules/gitrepo"
+	repo_module "forgejo.org/modules/repository"
 	"forgejo.org/services/cluster/observer"
 
 	"github.com/stretchr/testify/assert"
@@ -98,5 +100,81 @@ func TestRecoverDerivesTheBranchRowsBehindTheRefs(t *testing.T) {
 		require.ErrorContains(t, err, "user2/renamed.git refs/heads/master: refs ")
 		require.ErrorContains(t, err, "user2/repo1.git refs/heads/master: in SQL, not in the refs")
 		assert.NotContains(t, out.String(), "reconciled")
+	})
+}
+
+// A pull mirror whose upstream deleted a branch, then recreated it at the
+// same commit (a branch restored after its pull request was merged): the
+// synchronisation marked the row deleted, and the next one, git holding
+// the branch again, makes it live, the commit being the same or not. A
+// checkpoint whose SQL at L still holds the row deleted, taken before
+// that synchronisation or by a binary that did not revive it, holds the
+// branch in its refs and not in its live rows: step 6 derives the row
+// from the restored refs, as for any row behind them, instead of refusing
+// the checkpoint after the old cluster was fenced (#178). Nothing here
+// touches the repository on disk: only SQL rows change.
+func TestRecoverDerivesABranchRecreatedAtItsCommit(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	unittest.PrepareTestEnv(t)
+	t.Cleanup(func() { unittest.PrepareTestEnv(t) })
+	ctx := db.DefaultContext
+
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	gitRepo, err := gitrepo.OpenRepository(ctx, repo)
+	require.NoError(t, err)
+	defer gitRepo.Close()
+
+	// Mirror sync 1: the branch rows follow the refs.
+	_, err = repo_module.SyncRepoBranchesWithRepo(ctx, repo, gitRepo, 0)
+	require.NoError(t, err)
+	b, err := git_model.GetBranch(ctx, repo.ID, "branch2")
+	require.NoError(t, err)
+	require.False(t, b.IsDeleted)
+	commit := b.CommitID
+	// Mirror sync 2, the upstream deleted branch2: what
+	// SyncRepoBranchesWithRepo's toRemove does.
+	deleteBranch2 := func(t *testing.T) {
+		t.Helper()
+		require.NoError(t, git_model.DeleteBranches(ctx, repo.ID, 0, []int64{b.ID}))
+		b, err := git_model.GetBranch(ctx, repo.ID, "branch2")
+		require.NoError(t, err)
+		require.True(t, b.IsDeleted)
+		require.Equal(t, commit, b.CommitID)
+	}
+
+	t.Run("the next synchronisation", func(t *testing.T) {
+		deleteBranch2(t)
+		// Mirror sync 3, the upstream recreated branch2 at the same commit.
+		_, err := repo_module.SyncRepoBranchesWithRepo(ctx, repo, gitRepo, 0)
+		require.NoError(t, err)
+		b, err := git_model.GetBranch(ctx, repo.ID, "branch2")
+		require.NoError(t, err)
+		assert.False(t, b.IsDeleted, "git holds branch2 again: its row is live")
+		assert.Equal(t, commit, b.CommitID)
+
+		// A checkpoint now: the refs at B hold branch2, and so does the SQL
+		// at L.
+		m := checkpointOfSQL(t)
+		require.Equal(t, commit, m.Repos["user2/repo1.git"].Refs["refs/heads/branch2"])
+		var out bytes.Buffer
+		require.NoError(t, verifyBranches(ctx, m, &out), out.String())
+		assert.NotContains(t, out.String(), "reconciled")
+		assert.Contains(t, out.String(), "refs and SQL rows match")
+	})
+
+	t.Run("a checkpoint whose SQL holds the row deleted", func(t *testing.T) {
+		deleteBranch2(t)
+		m := checkpointOfSQL(t)
+		require.Equal(t, commit, m.Repos["user2/repo1.git"].Refs["refs/heads/branch2"])
+		var out bytes.Buffer
+		require.NoError(t, verifyBranches(ctx, m, &out), out.String())
+		assert.Contains(t, out.String(), "reconciled: user2/repo1.git, its branch rows derived from its restored refs")
+		assert.Contains(t, out.String(), "refs and SQL rows match")
+		b, err := git_model.GetBranch(ctx, repo.ID, "branch2")
+		require.NoError(t, err)
+		assert.False(t, b.IsDeleted)
+		mismatch, _, _, err := branchMismatch(ctx, m)
+		require.NoError(t, err)
+		assert.Empty(t, mismatch)
 	})
 }

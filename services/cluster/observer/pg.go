@@ -219,8 +219,16 @@ func Cover(bases []BaseInfo, sysid string, target LSN, tli uint32, segSize int64
 	if err != nil {
 		return Coverage{}, err
 	}
+	// The newest base first, by its position: as text, 0/F000000 sorts
+	// after 0/10000000, and an older base tried first would restore every
+	// checkpoint, the WAL since it held and replayed, the newer ones never
+	// used (#179).
 	sorted := append([]BaseInfo(nil), bases...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Start > sorted[j].Start })
+	startOf := func(b BaseInfo) LSN {
+		l, _ := ParseLSN(b.Start)
+		return l
+	}
+	sort.SliceStable(sorted, func(i, j int) bool { return startOf(sorted[i]) > startOf(sorted[j]) })
 	lastErr := ErrNoCoverage
 	for _, b := range sorted {
 		start, err := ParseLSN(b.Start)
