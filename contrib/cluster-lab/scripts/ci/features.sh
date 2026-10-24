@@ -29,8 +29,11 @@ branch_row() { [ "$(json "$1" "/repos/$REPO/branches/$2" .commit.id 2>/dev/null)
 export GIT_CONFIG_GLOBAL="$WORK/gitconfig"
 : >"$GIT_CONFIG_GLOBAL"
 
-say "C0. Every node ready"
+say "C0. Every node ready, every node a voter"
 for n in 1 2 3; do poll 180 healthy "$n" || flunk C.node-ready "forgejo-$n"; done
+# /api/healthz answers 200 on a learner too: the writes below start once
+# every node votes, as suite A waits for it (#199).
+poll 120 three_voters || flunk C.three-voters "$(voters_seen)"
 
 say "C1. The web UI"
 for n in 1 2 3; do

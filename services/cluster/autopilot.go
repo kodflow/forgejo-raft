@@ -351,17 +351,35 @@ func probeLeader(ctx context.Context, eng consensus.Engine) bool {
 }
 
 // learnerGate refuses a write up front on a learner that no leader answers,
-// rather than letting it wait for a leader that cannot come from it.
+// rather than letting it wait for a leader that cannot come from it. One
+// failed probe is not that answer: the engine fails every read in flight
+// when the node's role changes, its own promotion from learner included,
+// leader and term unchanged (#199). A failed probe is asked again, as
+// WriteRefusal does, within writeLeaderWait or the caller's deadline, and
+// the membership is read again before each probe and once more before the
+// refusal: a node promoted meanwhile passes as a voter, a leader that
+// answers a later probe passes, and only a learner that no leader answered
+// for the whole wait is refused.
 func (r *Replicator) learnerGate(ctx context.Context, eng consensus.Engine) error {
 	if r.auto == nil || eng == nil {
 		return nil
 	}
-	m := eng.Membership()
-	if i := Rank(m, eng.Status().ID); i > 0 && m.Members[i-1].Voter {
-		return nil
+	ctx, cancel := context.WithTimeout(ctx, writeLeaderWait)
+	defer cancel()
+	for {
+		m := eng.Membership()
+		if i := Rank(m, eng.Status().ID); i > 0 && m.Members[i-1].Voter {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return errReadOnly
+		}
+		if probeLeader(ctx, eng) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
-	if probeLeader(ctx, eng) {
-		return nil
-	}
-	return errReadOnly
 }
