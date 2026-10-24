@@ -72,6 +72,9 @@ func (driver) Open(ctx context.Context, cfg consensus.Config) (consensus.Engine,
 		Durability: sdk.DurabilityVolatile, Log: d.Log(), Snapshots: d.Snapshots(), Transport: tr,
 		MaxSnapshotBytes: cfg.MaxSnapshotBytes, MaxLogBytes: cfg.MaxLogBytes, SnapshotPausesApply: true,
 		Meter: newEngineMeter(), Logger: engineLogger(), MinVoters: cfg.MinVoters,
+		// The bound the replicator's early refusal reads too (#182);
+		// MaxBatchBytes stays the SDK's default, which it may not exceed.
+		MaxEntryBytes: consensus.MaxEntryBytes,
 	}
 	if cfg.JoinAuthorizer != nil {
 		sc.JoinAuthorizer = joinAuthorizer(cfg.JoinAuthorizer)

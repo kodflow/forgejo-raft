@@ -363,6 +363,23 @@ type TLSFiles struct {
 	CAFile   string
 }
 
+// MaxEntryBytes bounds one replicated command: the engine's own bound,
+// which the kitsunium driver passes to the SDK as MaxEntryBytes, and past
+// which the replicator refuses a lifecycle command before it proposes it.
+// Both read it here, so the early refusal and the engine never disagree.
+//
+// It is the SDK's default, 1 MiB. An owner's rename moves every repository
+// of the owner in one entry, some 80 bytes per repository for short names
+// and as much again for its wiki: past about 6 600 repositories with
+// wikis, it is refused, early and with its reason (#182). Raising it is an
+// operating trade-off, not taken here: the SDK refuses a MaxEntryBytes
+// above MaxBatchBytes, so every catch-up append would grow with it, and
+// the transport writes one within its write deadline (WriteTimeout, 2 s),
+// which at 4 MiB would ask the links between members for 2 MiB/s where
+// 1 MiB asks 0.5 MiB/s. A rename by prefix, constant in size, would need
+// a new reftable.PayloadVersion.
+const MaxEntryBytes = 1 << 20
+
 // Config is what the replicator hands a driver to open a node.
 type Config struct {
 	DataDir       string
