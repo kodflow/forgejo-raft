@@ -428,8 +428,8 @@ func TestCheckpointListsTheFilesOutsideTheFence(t *testing.T) {
 
 // listAndDigest lists the stored files and reads their digests, as a
 // checkpoint does on each side of its cut.
-func listAndDigest(roots map[string]*setting.Storage) ([]clusterhook.FileEntry, error) {
-	l, err := listStoredFiles(roots)
+func listAndDigest(roots map[string]*setting.Storage, cache *digestCache) ([]clusterhook.FileEntry, error) {
+	l, err := listStoredFiles(roots, cache)
 	if err != nil {
 		return nil, err
 	}
@@ -448,10 +448,11 @@ func TestStoredFilesSkipTheTemporaryDirectory(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(other, "elsewhere"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(other, "kept"), []byte("1"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(other, "elsewhere", "upload"), []byte("1"), 0o644))
+	cache := newDigestCache()
 	files, err := listAndDigest(map[string]*setting.Storage{
 		StorageLFS:         {Type: setting.LocalStorageType, Path: root},
 		StorageAttachments: {Type: setting.LocalStorageType, Path: other, TemporaryPath: filepath.Join(other, "elsewhere")},
-	})
+	}, cache)
 	require.NoError(t, err)
 	var got []string
 	for _, f := range files {
@@ -466,7 +467,7 @@ func TestStoredFilesSkipTheTemporaryDirectory(t *testing.T) {
 	require.NoError(t, os.Chtimes(filepath.Join(other, "kept"), time.Now(), time.Now().Add(time.Hour)))
 	files, err = listAndDigest(map[string]*setting.Storage{
 		StorageAttachments: {Type: setting.LocalStorageType, Path: other, TemporaryPath: filepath.Join(other, "elsewhere")},
-	})
+	}, cache)
 	require.NoError(t, err)
 	assert.Equal(t, sha256Hex([]byte("2")), files[0].SHA256)
 }

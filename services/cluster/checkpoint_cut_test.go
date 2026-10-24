@@ -6,6 +6,7 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -208,9 +209,10 @@ func TestCheckpointCutHoldsTheLifecycleOperations(t *testing.T) {
 // A stored file deleted once PostgreSQL's position L is read, by the
 // deletion of an attachment or of a repository's LFS objects, on the leader
 // or on a follower, is still listed by the checkpoint: the SQL at L names
-// it, and a restore needs it (#90).
+// it, and a restore needs it (#90). The attachments' digests were read by
+// an earlier checkpoint: the cut holds the deletion until the walk ends,
+// and the listing needs nothing more of the file.
 func TestCheckpointListsEveryFileTheSQLAtLNames(t *testing.T) {
-	ctx := context.Background()
 	for _, tt := range []struct {
 		name, storage, path string
 		node                int
@@ -221,58 +223,140 @@ func TestCheckpointListsEveryFileTheSQLAtLNames(t *testing.T) {
 		{name: "LFS object of a deleted repository", storage: StorageLFS, path: "4f/26/8c12" + strings.Repeat("0", 58), node: 2, repoDeleted: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			tc := newTestCluster(t, "node-a", "node-b", "node-c")
-			pg := newFakePG()
-			coord := withCheckpoints(t, tc, pg)
-			hook := &markHook{fakePG: pg}
-			coord.wal = hook
-
-			cfg := &setting.Storage{Type: setting.LocalStorageType, Path: t.TempDir()}
-			local, err := storage.NewLocalStorage(ctx, cfg)
+			b := newDeletedAfterL(t, tt.storage, tt.path, tt.node, tt.repoDeleted)
+			_, err := listAndDigest(b.roots, b.cache)
+			require.NoError(t, err, "an earlier checkpoint read the digests")
+			rec, err := b.coord.take(context.Background())
 			require.NoError(t, err)
-			st := storage.WithDeleteGate(local)
-			_, err = st.Save(tt.path, strings.NewReader("1234567"), 7)
-			require.NoError(t, err)
-			pg.exec("file+", tt.storage+"/"+tt.path, "")
-			r := tc.nodes[tt.node].r
-			storage.SetDeleteGate(r.gateDelete)
-			t.Cleanup(func() { storage.SetDeleteGate(nil) })
-			coord.files = func() (*storedListing, error) {
-				// A walk that takes its time on a large storage.
-				time.Sleep(300 * time.Millisecond)
-				return listStoredFiles(map[string]*setting.Storage{tt.storage: cfg})
-			}
+			require.NoError(t, <-b.deleted)
+			b.requireGone(t)
 
-			deleted := make(chan error, 1)
-			hook.after = func() {
-				go func() {
-					// The SQL first, past L, then the file, as Forgejo does.
-					release := func() {}
-					if tt.repoDeleted {
-						var err error
-						if release, err = r.holdCut(ctx); err != nil {
-							deleted <- err
-							return
-						}
-					}
-					defer release()
-					pg.exec("file-", tt.storage+"/"+tt.path, "")
-					deleted <- st.Delete(tt.path)
-				}()
-			}
-			rec, err := coord.take(ctx)
-			require.NoError(t, err)
-			require.NoError(t, <-deleted)
-			_, err = os.Stat(filepath.Join(cfg.Path, tt.path))
-			require.ErrorIs(t, err, os.ErrNotExist, "the file goes once the walk ended")
-
-			named := pg.filesAt(parseFakeLSN(t, rec.LSN))
+			named := b.pg.filesAt(parseFakeLSN(t, rec.LSN))
 			require.True(t, named[tt.storage+"/"+tt.path], "the SQL at L names the file")
-			b, err := os.ReadFile(filepath.Join(coord.dir, rec.Name(), "files.json"))
-			require.NoError(t, err)
-			assert.Contains(t, string(b), `"`+tt.path+`"`, "checkpoint %s at L=%s: files.json misses a file the SQL at L names", rec.Name(), rec.LSN)
+			files := b.listed(t, rec)
+			require.Contains(t, files, tt.path, "checkpoint %s at L=%s: files.json misses a file the SQL at L names", rec.Name(), rec.LSN)
+			if tt.storage == StorageAttachments {
+				assert.Equal(t, sha256Hex([]byte("1234567")), files[tt.path], "the attachment is listed with its digest")
+			}
 		})
 	}
+}
+
+// An attachment no checkpoint has read yet, deleted once L is read: the
+// cut holds the deletion until the walk ends, and lets it go before the
+// digest is read (#161). The checkpoint then fails, never lists the file
+// without its digest nor leaves it out, and the next period, past the
+// deletion, closes without it (#173: the deletion the cut held back used
+// to race the read of its digest).
+func TestCheckpointFailsOnAnAttachmentDeletedBeforeItsDigest(t *testing.T) {
+	const path = "7/f/7f3c2e10-hunt-r5ck-ptfi-les000000003"
+	for _, node := range []int{0, 1} {
+		t.Run(fmt.Sprintf("deleted on node %d", node), func(t *testing.T) {
+			b := newDeletedAfterL(t, StorageAttachments, path, node, false)
+			var reads []string
+			files := b.coord.files
+			b.coord.files = func() (*storedListing, error) {
+				l, err := files()
+				if l != nil {
+					l.read = func(p string) (string, error) {
+						// The deletion the cut held back goes first.
+						require.NoError(t, <-b.deleted)
+						reads = append(reads, filepath.Base(p))
+						return fileDigest(p)
+					}
+				}
+				return l, err
+			}
+			_, err := b.coord.take(context.Background())
+			require.ErrorContains(t, err, path+": listed, and gone before its digest was read")
+			assert.Equal(t, []string{filepath.Base(path)}, reads, "the walk listed the file: the cut held its deletion")
+			b.requireGone(t)
+
+			b.coord.files = files
+			rec, err := b.coord.take(context.Background())
+			require.NoError(t, err)
+			assert.False(t, b.pg.filesAt(parseFakeLSN(t, rec.LSN))[StorageAttachments+"/"+path], "the SQL at the next L no longer names the file")
+			assert.NotContains(t, b.listed(t, rec), path)
+		})
+	}
+}
+
+// deletedAfterL is a cluster whose checkpoint deletes one stored file once
+// PostgreSQL's position L is read: its SQL first, then the file, through
+// the deletion gate of one member, as Forgejo does. The walk takes its time.
+type deletedAfterL struct {
+	coord   *coordinator
+	pg      *fakePG
+	roots   map[string]*setting.Storage
+	cache   *digestCache
+	file    string
+	deleted chan error
+}
+
+func newDeletedAfterL(t *testing.T, storageName, path string, node int, repoDeleted bool) *deletedAfterL {
+	t.Helper()
+	ctx := context.Background()
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	pg := newFakePG()
+	coord := withCheckpoints(t, tc, pg)
+	hook := &markHook{fakePG: pg}
+	coord.wal = hook
+
+	cfg := &setting.Storage{Type: setting.LocalStorageType, Path: t.TempDir()}
+	local, err := storage.NewLocalStorage(ctx, cfg)
+	require.NoError(t, err)
+	st := storage.WithDeleteGate(local)
+	_, err = st.Save(path, strings.NewReader("1234567"), 7)
+	require.NoError(t, err)
+	pg.exec("file+", storageName+"/"+path, "")
+	r := tc.nodes[node].r
+	storage.SetDeleteGate(r.gateDelete)
+	t.Cleanup(func() { storage.SetDeleteGate(nil) })
+	b := &deletedAfterL{
+		coord: coord, pg: pg, roots: map[string]*setting.Storage{storageName: cfg}, cache: newDigestCache(),
+		file: filepath.Join(cfg.Path, path), deleted: make(chan error, 1),
+	}
+	coord.files = func() (*storedListing, error) {
+		// A walk that takes its time on a large storage.
+		time.Sleep(300 * time.Millisecond)
+		return listStoredFiles(b.roots, b.cache)
+	}
+	hook.after = func() {
+		go func() {
+			release := func() {}
+			if repoDeleted {
+				var err error
+				if release, err = r.holdCut(ctx); err != nil {
+					b.deleted <- err
+					return
+				}
+			}
+			defer release()
+			pg.exec("file-", storageName+"/"+path, "")
+			b.deleted <- st.Delete(path)
+		}()
+	}
+	return b
+}
+
+func (b *deletedAfterL) requireGone(t *testing.T) {
+	t.Helper()
+	_, err := os.Stat(b.file)
+	require.ErrorIs(t, err, os.ErrNotExist, "the file goes once the walk ended")
+}
+
+// listed is the checkpoint's files.json: each path, with its digest.
+func (b *deletedAfterL) listed(t *testing.T, rec reftable.CheckpointRecord) map[string]string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(b.coord.dir, rec.Name(), "files.json"))
+	require.NoError(t, err)
+	var fm clusterhook.FilesManifest
+	require.NoError(t, json.Unmarshal(raw, &fm))
+	out := map[string]string{}
+	for _, f := range fm.Files {
+		out[f.Path] = f.SHA256
+	}
+	return out
 }
 
 // attachmentsAt is an attachments storage holding files, by path.
@@ -291,8 +375,7 @@ func attachmentsAt(t *testing.T, files map[string]string) *setting.Storage {
 // a rename, a transfer or the deletion of a stored file on any member
 // does not wait for it (#161).
 func TestCheckpointReadsTheDigestsOutsideTheCut(t *testing.T) {
-	// Not in parallel: the digests' cache is the process's, and a
-	// checkpoint forgets what its listing did not see.
+	t.Parallel()
 	ctx := context.Background()
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	pg := newFakePG()
@@ -301,8 +384,9 @@ func TestCheckpointReadsTheDigestsOutsideTheCut(t *testing.T) {
 	follower := tc.nodes[1].r
 	var reads []string
 	var held []error
+	cache := newDigestCache()
 	coord.files = func() (*storedListing, error) {
-		l, err := listStoredFiles(map[string]*setting.Storage{StorageAttachments: cfg})
+		l, err := listStoredFiles(map[string]*setting.Storage{StorageAttachments: cfg}, cache)
 		if l != nil {
 			l.read = func(path string) (string, error) {
 				// A deletion on a follower takes the cut while the
@@ -346,8 +430,7 @@ func TestCheckpointReadsTheDigestsOutsideTheCut(t *testing.T) {
 // or without it would not restore it. The digests read are kept, and the
 // next period's checkpoint, which no longer lists it, closes (#161).
 func TestCheckpointRetriesAnAttachmentGoneBeforeItsDigest(t *testing.T) {
-	// Not in parallel: the digests' cache is the process's, and a
-	// checkpoint forgets what its listing did not see.
+	t.Parallel()
 	ctx := context.Background()
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	pg := newFakePG()
@@ -358,8 +441,9 @@ func TestCheckpointRetriesAnAttachmentGoneBeforeItsDigest(t *testing.T) {
 	follower := tc.nodes[1].r
 	reads := 0
 	deleteOnRead := true
+	cache := newDigestCache()
 	coord.files = func() (*storedListing, error) {
-		l, err := listStoredFiles(map[string]*setting.Storage{StorageAttachments: cfg})
+		l, err := listStoredFiles(map[string]*setting.Storage{StorageAttachments: cfg}, cache)
 		if l != nil {
 			l.read = func(path string) (string, error) {
 				reads++
