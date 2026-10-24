@@ -199,14 +199,50 @@ func checkClusterSQL(r *cluster_service.Replicator, checks checks) {
 	checks["cluster:parked_events"] = []componentStatus{pk}
 	bk := componentStatus{Status: Pass, Time: getCheckTime()}
 	if v.BackupLag > 0 {
-		bk.Status, bk.Output = warn, fmt.Sprintf("the PostgreSQL backup lags %d entries, trim held: take a checkpoint", v.BackupLag)
+		bk.Status, bk.Output = warn, fmt.Sprintf("the PostgreSQL backup of the last checkpoint holds the trim: %d entries and %d bytes of the event queue behind it, pushes are refused at %d bytes; %s",
+			v.BackupLag, v.BackupHeld, v.PushRefusedBytes, checkpointRemedy(v))
 	}
 	checks["cluster:backup_lag"] = []componentStatus{bk}
+	ck := componentStatus{Status: Pass, Time: getCheckTime()}
+	switch {
+	case v.CheckpointsOff:
+		ck.Status, ck.Output = warn, fmt.Sprintf("this leader takes no checkpoint ([cluster] CHECKPOINT_INTERVAL is 0 here) while the backup cursor of the last checkpoint stands at %d: the event queue is not trimmed past it; %s", v.Backup, checkpointRemedy(v))
+	case v.CheckpointsHere:
+		ck.Output = "taken by this node while it leads"
+	default:
+		ck.Output = "not taken by this node"
+	}
+	checks["cluster:checkpoints"] = []componentStatus{ck}
 	q := componentStatus{Status: Pass, Time: getCheckTime(), Output: fmt.Sprintf("%d of %d bytes", v.EventBytes, v.EventQueueMax)}
 	if v.EventQueueAlarm {
-		q.Status, q.Output = warn, fmt.Sprintf("the event queue holds %d of %d bytes: pushes are refused when it is full; resolve what holds the trim (parked events, backup lag, durability)", v.EventBytes, v.EventQueueMax)
+		q.Status, q.Output = warn, fmt.Sprintf("the event queue holds %d of %d bytes: pushes are refused past %d; %s", v.EventBytes, v.EventQueueMax, v.PushRefusedBytes, queueHolder(v))
 	}
 	checks["cluster:event_queue"] = []componentStatus{q}
+}
+
+// checkpointRemedy is the way out of a trim held by the backup cursor.
+func checkpointRemedy(v cluster_service.View) string {
+	if v.CheckpointsOff || v.HasBackup && !v.CheckpointsHere {
+		return "set [cluster] CHECKPOINT_INTERVAL on the leader, or transfer the leadership to a member whose CHECKPOINT_INTERVAL is set"
+	}
+	return "no checkpoint closed since it: see why in the leader's log (cluster checkpoint)"
+}
+
+// queueHolder names what holds the trim of a filling event queue, and the
+// check that says more.
+func queueHolder(v cluster_service.View) string {
+	switch {
+	case v.BackupLag > 0:
+		return "the backup of the last checkpoint holds the trim (cluster:backup_lag)"
+	case v.ParkedEvents > 0:
+		return "parked events hold the trim (cluster:parked_events)"
+	case !v.SQLDurable:
+		return "SQL is not durable across a database failover, the trim waits for it (cluster:sql_durability)"
+	case v.CheckpointsOff:
+		return "the backup of the last checkpoint holds the trim and no checkpoint will move it (cluster:checkpoints)"
+	default:
+		return "the SQL of the events is not derived yet: see the leader's consumer in its log"
+	}
 }
 
 func getCheckTime() string {

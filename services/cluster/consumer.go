@@ -93,9 +93,16 @@ type consumer struct {
 	seen      map[string]int64
 	lastRetry time.Time
 	lag       uint64
-	// backupLag is how far the backup cursor lags the dispatch cursor when
-	// that lag is beyond backupMaxLag and holds the trim; 0 otherwise.
-	backupLag uint64
+	// backupLag is how far the backup cursor lags the dispatch cursor, and
+	// backupHeld the bytes of the event queue it holds behind it, once the
+	// lag passes backupMaxLag or the bytes backupMaxHeld; 0 otherwise.
+	backupLag  uint64
+	backupHeld int64
+	// backupSeen is the backup cursor as the last pass read it, on this
+	// node while it led; its Lineage is empty when the pass read none.
+	// offNoted is set once the log said this leader takes no checkpoint.
+	backupSeen backupNote
+	offNoted   bool
 	// stalledOut holds the repositories whose event was parked for want of
 	// projection, until one of their events is projected.
 	stalledOut map[string]bool
@@ -134,6 +141,21 @@ const (
 	// the trim never passes the backup, whatever its lag.
 	backupMaxLag = 1 << 20
 )
+
+// backupMaxHeld is the size of the event queue the backup may hold behind
+// it before the held trim is alarmed: a quarter of MaxEventBytes, long
+// before pushes are refused at pushRefusedBytes. The bound in entries alone
+// came after the refusal: at a few hundred bytes an event, the queue is
+// full long before it lags backupMaxLag entries (#176).
+var backupMaxHeld int64 = reftable.MaxEventBytes / 4
+
+// backupNote is a backup cursor read on the leader: its lineage, its
+// position, and when it was read.
+type backupNote struct {
+	Lineage  string
+	Position uint64
+	At       time.Time
+}
 
 func newConsumer(r *Replicator) *consumer {
 	c := &consumer{
@@ -288,6 +310,72 @@ func (c *consumer) BackupLag() uint64 {
 	return c.backupLag
 }
 
+// BackupHeld is the size of the event queue the last PostgreSQL backup
+// holds behind it, while BackupLag is set; 0 otherwise.
+func (c *consumer) BackupHeld() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.backupHeld
+}
+
+// backup is the backup cursor of lineage as this node's last pass read it,
+// within the last backupNoteFresh; false when it read none of that lineage.
+func (c *consumer) backup(lineage string) (uint64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b := c.backupSeen
+	if b.Lineage == "" || b.Lineage != lineage || time.Since(b.At) > backupNoteFresh {
+		return 0, false
+	}
+	return b.Position, true
+}
+
+// backupNoteFresh is how long a pass's reading of the backup cursor stands:
+// a node that stopped leading stops reading it. The leader reads it every
+// backupNoteEvery.
+const (
+	backupNoteFresh = time.Minute
+	backupNoteEvery = 10 * time.Second
+)
+
+// noteBackup keeps what a pass read of the backup cursor, and says once,
+// when this leader takes no checkpoint while a backup cursor of its lineage
+// exists, that nothing will move it (#176).
+func (c *consumer) noteBackup(lineage string, b *cluster_model.Cursor) {
+	note := backupNote{At: time.Now()}
+	if b != nil && b.Lineage == lineage {
+		note.Lineage, note.Position = b.Lineage, uint64(b.Position)
+	}
+	off := note.Lineage != "" && c.noCoordinator()
+	c.mu.Lock()
+	c.backupSeen = note
+	say := off && !c.offNoted
+	c.offNoted = off
+	c.mu.Unlock()
+	if say {
+		log.Error("cluster consumer: this leader takes no checkpoint ([cluster] CHECKPOINT_INTERVAL is 0 here) while the backup cursor of lineage %s stands at %d: the event queue is not trimmed past it until a checkpoint closes; %s", note.Lineage, note.Position, checkpointRemedy)
+	}
+}
+
+// noCoordinator reports whether this node takes no checkpoint: no
+// coordinator runs here. A consumer of a unit test, with no replicator,
+// does not know.
+func (c *consumer) noCoordinator() bool {
+	return c.r != nil && c.r.checkpoints.Load() == nil
+}
+
+// heldBytes is the size of the events of a lineage a trim at to frees that
+// a trim at from does not; 0 for a consumer of a unit test, with no table.
+func (c *consumer) heldBytes(lineage string, from, to uint64) int64 {
+	if c.r == nil || c.r.table == nil {
+		return 0
+	}
+	return c.r.table.EventBytesBetween(lineage, from, to)
+}
+
+// checkpointRemedy is the way out of a trim held by the backup cursor.
+const checkpointRemedy = "set [cluster] CHECKPOINT_INTERVAL on the leader, or transfer the leadership to a member whose CHECKPOINT_INTERVAL is set"
+
 func (c *consumer) run(ctx context.Context) {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
@@ -340,6 +428,9 @@ func (c *consumer) step(ctx context.Context) error {
 	eng := c.r.Engine()
 	if eng == nil || eng.Status().Role != consensus.RoleLeader {
 		c.notePass(nil)
+		c.mu.Lock()
+		c.offNoted = false
+		c.mu.Unlock()
 		return nil
 	}
 	if !c.dbReady() || c.r.writerGate(eng) != nil {
@@ -461,6 +552,20 @@ func (c *consumer) pass(ctx context.Context) error {
 	}
 	for lin := range cursors {
 		c.maybeAck(ctx, lin)
+	}
+	// The backup cursor of the leader's lineage, every backupNoteEvery,
+	// whether or not an event waits: the health says when no checkpoint
+	// will ever move it (#176).
+	c.mu.Lock()
+	note := time.Since(c.backupSeen.At) >= backupNoteEvery
+	c.mu.Unlock()
+	if c.r == nil {
+		return nil
+	}
+	if eng := c.r.Engine(); note && eng != nil {
+		if b, err := c.cursor(ctx, cluster_model.CursorBackup); err == nil {
+			c.noteBackup(eng.Status().Identity.String(), b)
+		}
 	}
 	return nil
 }
@@ -792,28 +897,37 @@ func (c *consumer) maybeAck(ctx context.Context, lineage string) {
 	}
 	target := bound - setting.Cluster.AckMargin
 	var backupLag uint64
-	if b, err := c.cursor(ctx, cluster_model.CursorBackup); err != nil {
+	var backupHeld int64
+	b, err := c.cursor(ctx, cluster_model.CursorBackup)
+	if err != nil {
 		return
-	} else if b.Lineage == lineage {
+	}
+	if b.Lineage == lineage {
 		// Never past the backup, whatever its lag: a PostgreSQL restored to
-		// it replays what follows from the log. A backup that lags too far
-		// holds the trim, loudly, until the next checkpoint closes.
+		// it replays what follows from the log. A backup that holds too much
+		// of the queue, or lags too far, holds the trim loudly until the
+		// next checkpoint closes, and long before the queue is full.
 		pos := uint64(readBack.Position)
 		if bp := uint64(b.Position); bp < target {
+			held := c.heldBytes(lineage, bp, target)
 			target = bp
-			if pos-bp >= backupMaxLag {
-				backupLag = pos - bp
+			if pos-bp >= backupMaxLag || held >= backupMaxHeld {
+				backupLag, backupHeld = max(pos-bp, 1), held
 			}
 		}
 	}
 	c.mu.Lock()
 	prevLag := c.backupLag
-	c.backupLag = backupLag
+	c.backupLag, c.backupHeld = backupLag, backupHeld
 	c.mu.Unlock()
 	if backupLag > 0 {
 		backupTrimHeldTotal.Inc()
 		if prevLag == 0 {
-			log.Error("cluster consumer: the PostgreSQL backup lags %d entries behind the cursor; the event queue is not trimmed past it until a checkpoint closes", backupLag)
+			why := "no checkpoint closed since: see why in this leader's log (cluster checkpoint)"
+			if c.noCoordinator() {
+				why = "this leader takes no checkpoint ([cluster] CHECKPOINT_INTERVAL is 0 here): " + checkpointRemedy
+			}
+			log.Error("cluster consumer: the PostgreSQL backup of the last checkpoint holds the trim, %d entries and %d bytes of the event queue behind it; pushes are refused once the queue holds %d bytes; %s", backupLag, backupHeld, pushRefusedBytes, why)
 		}
 	}
 	c.mu.Lock()

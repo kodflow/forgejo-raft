@@ -65,5 +65,30 @@ func TestCheckClusterBackupLag(t *testing.T) {
 	c = checks{}
 	checkCluster(reps[0], c)
 	assert.Equal(t, warn, c["cluster:backup_lag"][0].Status)
-	assert.Contains(t, c["cluster:backup_lag"][0].Output, "lags 2000000 entries, trim held")
+	assert.Contains(t, c["cluster:backup_lag"][0].Output, "holds the trim: 2000000 entries")
+}
+
+// A leader that takes no checkpoint while a backup cursor of its lineage
+// exists says so, with the way out, before the backup holds anything; the
+// event queue's warning names the backup as what holds the trim (#176).
+func TestCheckClusterCheckpointsOff(t *testing.T) {
+	_, reps := cluster.NewForTesting(t.TempDir(), "node-a")
+	c := checks{}
+	checkCluster(reps[0], c)
+	assert.Equal(t, Pass, c["cluster:checkpoints"][0].Status, c["cluster:checkpoints"][0].Output)
+
+	cluster.SetBackupCursorForTesting(reps[0], 10)
+	c = checks{}
+	checkCluster(reps[0], c)
+	assert.Equal(t, warn, c["cluster:checkpoints"][0].Status)
+	assert.Contains(t, c["cluster:checkpoints"][0].Output, "takes no checkpoint")
+	assert.Contains(t, c["cluster:checkpoints"][0].Output, "CHECKPOINT_INTERVAL")
+
+	cluster.SetBackupHoldForTesting(reps[0], 40, 17<<20)
+	c = checks{}
+	checkCluster(reps[0], c)
+	assert.Equal(t, warn, c["cluster:backup_lag"][0].Status)
+	assert.Contains(t, c["cluster:backup_lag"][0].Output, "40 entries and 17825792 bytes")
+	assert.Contains(t, c["cluster:backup_lag"][0].Output, "transfer the leadership")
+	assert.NotContains(t, c["cluster:backup_lag"][0].Output, "take a checkpoint")
 }

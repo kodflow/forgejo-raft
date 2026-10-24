@@ -1148,6 +1148,32 @@ func (t *Table) EventBytes() int64 {
 	return t.eventBytes
 }
 
+// EventBytesBetween is the accounted size of the events of a lineage after
+// index from, up to and including index to: what a trim at to frees that a
+// trim at from does not. It reads the queue, it changes nothing.
+func (t *Table) EventBytesBetween(lineage string, from, to uint64) int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var n int64
+	// The lineage is compared as a string once per identity met, not per
+	// event: the queue may hold a few hundred thousand of them.
+	var last consensus.LogIdentity
+	same, met := false, false
+	for i := range t.events {
+		ev := &t.events[i]
+		if ev.Token.Index <= from || ev.Token.Index > to {
+			continue
+		}
+		if id := ev.Token.Identity(); !met || id != last {
+			last, same, met = id, id.String() == lineage, true
+		}
+		if same {
+			n += ev.size()
+		}
+	}
+	return n
+}
+
 // HasAudit reports whether a record with this id is retained.
 func (t *Table) HasAudit(id string) bool {
 	t.mu.RLock()

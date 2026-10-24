@@ -96,9 +96,10 @@ type Replicator struct {
 	seen          map[consensus.NodeID]memberRecord
 	// fence queues this node's own writers while a checkpoint reads
 	// PostgreSQL's position; checkpoints is the coordinator, nil while
-	// [cluster] CHECKPOINT_INTERVAL is 0 (checkpoint.go).
+	// [cluster] CHECKPOINT_INTERVAL is 0 (checkpoint.go). The consumer and
+	// the health read it, a test may swap it.
 	fence       sync.RWMutex
-	checkpoints *coordinator
+	checkpoints atomic.Pointer[coordinator]
 	// cut is the checkpoint's cut, one lock for the whole cluster in
 	// PostgreSQL; nil without PostgreSQL, where no checkpoint runs (cut.go).
 	cut cutLock
@@ -249,7 +250,7 @@ func Init(ctx context.Context) error {
 		if _, err := storageRoots(); err != nil {
 			return fmt.Errorf("[cluster] CHECKPOINT_INTERVAL: %w", err)
 		}
-		r.checkpoints = newCoordinator(r, setting.Cluster.CheckpointInterval, setting.Cluster.CheckpointDir, wal)
+		r.checkpoints.Store(newCoordinator(r, setting.Cluster.CheckpointInterval, setting.Cluster.CheckpointDir, wal))
 	}
 
 	// The private socket first: a hook that cannot reach it fails closed.
@@ -314,8 +315,8 @@ func Init(ctx context.Context) error {
 	go r.exitOnStop(r.ctx)
 	go r.consumer.run(r.ctx)
 	go r.sweepRaw(r.ctx)
-	if r.checkpoints != nil {
-		go r.checkpoints.run(r.ctx)
+	if c := r.checkpoints.Load(); c != nil {
+		go c.run(r.ctx)
 	}
 	if r.auto != nil {
 		go r.autopilot(r.ctx)

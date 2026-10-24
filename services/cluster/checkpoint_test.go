@@ -170,7 +170,7 @@ func withCheckpoints(t *testing.T, tc *testCluster, pg *fakePG) *coordinator {
 	c := newCoordinator(leader, time.Hour, t.TempDir(), pg)
 	c.files = func() (*storedListing, error) { return nil, nil }
 	c.backup = tc.cursors.set
-	leader.checkpoints = c
+	leader.checkpoints.Store(c)
 	for _, n := range tc.nodes {
 		n.r.export.ckptDir = c.dir
 	}
