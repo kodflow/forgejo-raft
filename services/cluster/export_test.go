@@ -42,7 +42,7 @@ func TestExportIsLeaderOnlyWithAHint(t *testing.T) {
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	pg := newFakePG()
 	withCheckpoints(t, tc, pg)
-	_, err := tc.nodes[0].r.checkpoints.take(context.Background())
+	_, err := tc.nodes[0].r.checkpoints.Load().take(context.Background())
 	require.NoError(t, err)
 
 	for _, op := range []string{clusterhook.OpExportCheckpoints, clusterhook.OpExportLog, clusterhook.OpExportRefs, clusterhook.OpExportFiles} {

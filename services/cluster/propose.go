@@ -454,6 +454,11 @@ func WriteRefusal(ctx context.Context) error {
 	return nil
 }
 
+// pushRefusedBytes is the size of the event queue past which a push is
+// refused before anything is written, a tenth below MaxEventBytes, where
+// Apply refuses.
+const pushRefusedBytes = reftable.MaxEventBytes * 9 / 10
+
 func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.Request, tx *reftable.RefTxn) *clusterhook.Response {
 	eng := r.Engine()
 	if eng == nil || r.projector.Fenced() {
@@ -462,7 +467,7 @@ func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.
 	if !r.projector.Writable(repo) {
 		return fail(fmt.Errorf("the repository %s is not reconciled on this node since its start; retry shortly or through another node", repo))
 	}
-	if r.table.EventBytes() > reftable.MaxEventBytes*9/10 {
+	if r.table.EventBytes() > pushRefusedBytes {
 		return fail(errors.New("the cluster's event queue is nearly full; the push is refused before anything is written"))
 	}
 	// Before the objects travel: a learner no leader answers, and a leader

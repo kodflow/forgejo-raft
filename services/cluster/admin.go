@@ -116,9 +116,33 @@ type View struct {
 	SQLDurabilityChecked time.Time
 	// Parked lists the first parked entries with their error.
 	Parked []ParkedView
-	// BackupLag is how far the PostgreSQL backup lags the cursor while it
+	// BackupLag is how far the PostgreSQL backup lags the cursor, and
+	// BackupHeld the bytes of the event queue it holds behind it, while it
 	// holds the trim beyond its bound; 0 otherwise.
-	BackupLag uint64
+	BackupLag  uint64
+	BackupHeld int64
+	// PushRefusedBytes is the size of the queue past which pushes are
+	// refused.
+	PushRefusedBytes int64
+	// CheckpointsHere is set when this node takes the checkpoints while it
+	// leads ([cluster] CHECKPOINT_INTERVAL is set). On the leader, Backup
+	// is the backup cursor of its lineage, when one exists (HasBackup), and
+	// CheckpointsOff says that this leader takes no checkpoint while that
+	// cursor holds the trim: nothing moves it until a member that takes
+	// them leads (#176).
+	CheckpointsHere bool
+	HasBackup       bool
+	Backup          uint64
+	CheckpointsOff  bool
+	// CheckpointTakers are the voters the leader last found to take the
+	// checkpoints, and CheckpointUnknown those that did not say, by slot;
+	// CheckpointsAsked is when it asked, zero when it did not lately.
+	// CheckpointTakersHeld are the takers it would not hand the leadership
+	// to then, each as "slot: why".
+	CheckpointTakers     []string
+	CheckpointUnknown    []string
+	CheckpointsAsked     time.Time
+	CheckpointTakersHeld []string
 	// EventQueueMax is the bound past which pushes are refused;
 	// EventQueueAlarm is set past EventQueueAlarmShare of it.
 	EventQueueMax   int64
@@ -163,6 +187,8 @@ func (r *Replicator) View(ctx context.Context) View {
 	ch := r.ConsumerHealth(ctx)
 	v.SQLDurable, v.SQLDurability, v.SQLDurabilityChecked, v.ParkedEvents = ch.SQLDurable, ch.SQLDurability, ch.SQLDurabilityChecked, ch.ParkedEvents
 	v.BackupLag, v.EventQueueMax, v.EventQueueAlarm = ch.BackupLag, ch.EventQueueMax, ch.EventQueueAlarm
+	v.BackupHeld, v.PushRefusedBytes = ch.BackupHeld, ch.PushRefusedBytes
+	v.CheckpointsHere, v.HasBackup, v.Backup, v.CheckpointsOff = ch.CheckpointsHere, ch.HasBackup, ch.Backup, ch.CheckpointsOff
 	if v.ParkedEvents > 0 {
 		if ps, err := r.ListParked(ctx); err == nil {
 			if len(ps) > 100 {
@@ -247,13 +273,33 @@ func (r *Replicator) ConsumerHealth(ctx context.Context) View {
 		}
 	}
 	if r.consumer != nil {
-		v.BackupLag = r.consumer.BackupLag()
+		v.BackupLag, v.BackupHeld = r.consumer.BackupLag(), r.consumer.BackupHeld()
+	}
+	v.PushRefusedBytes = pushRefusedBytes
+	v.CheckpointsHere = r.checkpoints.Load() != nil
+	if eng := r.Engine(); eng != nil && r.consumer != nil {
+		if st := eng.Status(); st.Role == consensus.RoleLeader {
+			v.Backup, v.HasBackup = r.consumer.backup(st.Identity.String())
+			v.CheckpointsOff = v.HasBackup && !v.CheckpointsHere
+			if ck, ok := r.ckState.fresh(r.clock()); ok {
+				v.CheckpointTakers, v.CheckpointUnknown, v.CheckpointsAsked = ck.On, ck.Unknown, ck.At
+				v.CheckpointTakersHeld = ck.Held
+			}
+		}
 	}
 	if r.table != nil {
 		v.EventBytes, v.EventQueueMax = r.table.EventBytes(), reftable.MaxEventBytes
 		v.EventQueueAlarm = v.EventBytes >= int64(float64(reftable.MaxEventBytes)*EventQueueAlarmShare)
 	}
 	return v
+}
+
+// CheckpointsUntaken reports whether the trim the backup holds waits for a
+// leader that takes the checkpoints, rather than for a checkpoint of this
+// one that closes: the health check and the status page say the way out
+// from it.
+func (v View) CheckpointsUntaken() bool {
+	return v.CheckpointsOff || v.HasBackup && !v.CheckpointsHere
 }
 
 // EventQueueAlarmShare is the share of the event queue's bound at which the

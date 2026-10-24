@@ -89,6 +89,19 @@ type Replicator struct {
 	// goroutine touches them.
 	hookFails int
 	yielded   time.Time
+	// sqlYield is when, in Unix seconds, this node last gave the leadership
+	// away because it could not derive the SQL; its hello says it, so the
+	// leadership is not handed back to it for its checkpoints
+	// (checkpointlead.go).
+	sqlYield atomic.Int64
+	// checkpointProbe is when the leader next asks the members whether they
+	// take the checkpoints, checkpointYielded when it last handed the
+	// leadership to one that does, and ckState what it found, for the
+	// health. Only the autopilot's goroutine, or the manual mode's pilot,
+	// touches the first two.
+	checkpointProbe   time.Time
+	checkpointYielded time.Time
+	ckState           checkpointState
 	// consumerFails counts the consumer's failed passes in a row, which
 	// the autopilot reads (consumer.go).
 	consumerFails atomic.Int32
@@ -96,9 +109,10 @@ type Replicator struct {
 	seen          map[consensus.NodeID]memberRecord
 	// fence queues this node's own writers while a checkpoint reads
 	// PostgreSQL's position; checkpoints is the coordinator, nil while
-	// [cluster] CHECKPOINT_INTERVAL is 0 (checkpoint.go).
+	// [cluster] CHECKPOINT_INTERVAL is 0 (checkpoint.go). The consumer and
+	// the health read it, a test may swap it.
 	fence       sync.RWMutex
-	checkpoints *coordinator
+	checkpoints atomic.Pointer[coordinator]
 	// cut is the checkpoint's cut, one lock for the whole cluster in
 	// PostgreSQL; nil without PostgreSQL, where no checkpoint runs (cut.go).
 	cut cutLock
@@ -249,7 +263,7 @@ func Init(ctx context.Context) error {
 		if _, err := storageRoots(); err != nil {
 			return fmt.Errorf("[cluster] CHECKPOINT_INTERVAL: %w", err)
 		}
-		r.checkpoints = newCoordinator(r, setting.Cluster.CheckpointInterval, setting.Cluster.CheckpointDir, wal)
+		r.checkpoints.Store(newCoordinator(r, setting.Cluster.CheckpointInterval, setting.Cluster.CheckpointDir, wal))
 	}
 
 	// The private socket first: a hook that cannot reach it fails closed.
@@ -293,6 +307,9 @@ func Init(ctx context.Context) error {
 		return fmt.Errorf("[cluster] opening the consensus node: %w", err)
 	}
 	r.setEngine(eng)
+	// The refusal of a voter that would leave no checkpoint to close reads
+	// the backup cursor from SQL: it waits for the database
+	// (RefuseWithoutCheckpoints, routers/init.go).
 
 	currentMu.Lock()
 	current = r
@@ -315,14 +332,15 @@ func Init(ctx context.Context) error {
 	go r.exitOnStop(r.ctx)
 	go r.consumer.run(r.ctx)
 	go r.sweepRaw(r.ctx)
-	if r.checkpoints != nil {
-		go r.checkpoints.run(r.ctx)
+	if c := r.checkpoints.Load(); c != nil {
+		go c.run(r.ctx)
 	}
 	if r.auto != nil {
 		go r.autopilot(r.ctx)
 	} else {
-		// No autopilot raises the cluster version here (#170).
-		go r.clusterVersionPilot(r.ctx, payloadProbeEvery)
+		// No autopilot raises the cluster version (#170) nor hands the
+		// leadership to a member that takes the checkpoints (#176) here.
+		go r.leaderPilot(r.ctx, payloadProbeEvery)
 	}
 	watchIdentity(r.ctx, id, identityPoll, func() {
 		r.objects.rotate()

@@ -36,9 +36,10 @@
 		</dl>
 	</div>
 
-	{{if or .View.BackupLag .View.EventQueueAlarm}}
+	{{if or .View.BackupLag .View.EventQueueAlarm .View.CheckpointsOff}}
 	<div class="ui warning message">
-		{{if .View.BackupLag}}<p>{{ctx.Locale.Tr "admin.cluster.backup_lag_held" .View.BackupLag}}</p>{{end}}
+		{{if .View.BackupLag}}<p>{{if .View.CheckpointsUntaken}}{{ctx.Locale.Tr "admin.cluster.backup_lag_held" .View.BackupLag (ctx.Locale.TrSize .View.BackupHeld)}}{{else}}{{ctx.Locale.Tr "admin.cluster.backup_lag_held_no_checkpoint" .View.BackupLag (ctx.Locale.TrSize .View.BackupHeld)}}{{end}}</p>{{end}}
+		{{if .View.CheckpointsOff}}<p>{{ctx.Locale.Tr "admin.cluster.checkpoints_off" .View.Backup}}</p>{{end}}
 		{{if .View.EventQueueAlarm}}<p>{{ctx.Locale.Tr "admin.cluster.event_queue_alarm" (ctx.Locale.TrSize .View.EventBytes) (ctx.Locale.TrSize .View.EventQueueMax)}}</p>{{end}}
 	</div>
 	{{end}}

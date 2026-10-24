@@ -60,10 +60,35 @@ func SetSQLDurabilityForTesting(r *Replicator, ok bool, reason string) {
 
 // SetBackupLagForTesting sets the consumer's held backup lag.
 func SetBackupLagForTesting(r *Replicator, lag uint64) {
+	SetBackupHoldForTesting(r, lag, 0)
+}
+
+// SetBackupHoldForTesting sets the consumer's held backup lag and the bytes
+// the backup holds behind it.
+func SetBackupHoldForTesting(r *Replicator, lag uint64, held int64) {
 	if r.consumer == nil {
 		r.consumer = &consumer{r: r}
 	}
 	r.consumer.mu.Lock()
-	r.consumer.backupLag = lag
+	r.consumer.backupLag, r.consumer.backupHeld = lag, held
 	r.consumer.mu.Unlock()
+}
+
+// SetBackupCursorForTesting makes the consumer's last pass have read the
+// backup cursor of the engine's lineage at position.
+func SetBackupCursorForTesting(r *Replicator, position uint64) {
+	if r.consumer == nil {
+		r.consumer = &consumer{r: r}
+	}
+	lin := r.Engine().Status().Identity.String()
+	r.consumer.mu.Lock()
+	r.consumer.backupSeen = backupNote{Lineage: lin, Position: position, At: time.Now()}
+	r.consumer.mu.Unlock()
+}
+
+// SetCheckpointViewForTesting makes the leader have just found which voters
+// take the checkpoints (on), which did not say (unknown), and why it would
+// not hand the leadership to some of the takers (held, "slot: why").
+func SetCheckpointViewForTesting(r *Replicator, on, unknown []string, held ...string) {
+	r.ckState.set(checkpointView{At: r.clock(), On: on, Unknown: unknown, Held: held})
 }

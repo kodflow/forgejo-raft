@@ -105,11 +105,42 @@ logged. Only then may the trim pass it.
 
 Each checkpoint records the backup cursor; the event queue is never trimmed
 past it, whatever its lag, since a PostgreSQL restored to that checkpoint
-replays what follows from the log. When it lags more than 1,048,576 entries
-(checkpoints stopped or failing), the held trim is counted
-(`forgejo_cluster_consumer_backup_trim_held_total`), `/api/healthz` warns
-under `cluster:backup_lag` and the administration page says "backup lags N
-entries": take a checkpoint.
+replays what follows from the log. Only the next checkpoint moves it, and
+only the leader takes checkpoints, when its own `CHECKPOINT_INTERVAL` is
+set. Pushes are refused once the queue holds 90% of its 64 MiB. Long
+before that, once the backup holds a quarter of the queue (16 MiB) behind
+it, or lags 1,048,576 entries, the held trim is counted
+(`forgejo_cluster_consumer_backup_trim_held_total`) and logged,
+`/api/healthz` warns under `cluster:backup_lag`, and the administration
+page says how much the backup holds. `cluster:checkpoints` warns as soon as
+the leader takes no checkpoint while a backup cursor of its lineage exists,
+and `cluster:event_queue` names what holds the trim.
+
+The leader is therefore a member that takes the checkpoints whenever a
+voter does, in both modes. A leader whose `CHECKPOINT_INTERVAL` is 0 hands
+the leadership to a voter whose `CHECKPOINT_INTERVAL` is set (each member
+says it to the others), once that voter answers and is caught up, at most
+once every five minutes. A leader that takes them never hands the
+leadership over for them, so it does not go back and forth; and a member
+that gave the leadership away because it could not derive the SQL is not
+handed it back for its checkpoints within the hour. `cluster:checkpoints`
+says which voters take them and, for each one the leader does not hand the
+leadership to yet, why (behind, out of contact, receiving a snapshot, gave
+it away for the SQL); or that none does.
+
+A voter whose `CHECKPOINT_INTERVAL` is 0 does not start when the backup
+cursor of its lineage exists and every other voter answers that it takes
+none either: no checkpoint would ever close again. Set
+`CHECKPOINT_INTERVAL` on it, or on another voter first. It starts whenever
+it is not certain of that: a voter that does not answer, a member on an
+older binary, a database it cannot read.
+
+The way out of a held trim is a checkpoint that closes. Set
+`CHECKPOINT_INTERVAL` on a voter: the leadership goes to it, or set it on
+the leader and restart it. When a leader that takes them fails its
+checkpoints, its log says why (`cluster checkpoint:`). Nothing else
+releases the trim: once a checkpoint closed, keep `CHECKPOINT_INTERVAL` set
+on at least one voter.
 
 ## The `[cluster]` keys
 

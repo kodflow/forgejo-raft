@@ -124,6 +124,12 @@ type hello struct {
 	// Payload is the highest command version the answering binary
 	// applies; absent from older binaries, which apply version 1 only.
 	Payload int `json:"payload,omitempty"`
+	// Checkpoints says whether the answering member takes the checkpoints
+	// when it leads (checkpointsOn, checkpointsOff), and SQLYield when, in
+	// Unix seconds, it last gave the leadership away because it could not
+	// derive the SQL; both absent from older binaries (#176).
+	Checkpoints string `json:"checkpoints,omitempty"`
+	SQLYield    int64  `json:"sql_yield,omitempty"`
 	// SPKI is the key the handshake proved, never read from the body.
 	SPKI [32]byte `json:"-"`
 }
@@ -181,7 +187,10 @@ func (a *autoMode) noteDisk(member bool) {
 // holds before its engine opens, so a restarting member is never taken for
 // a fresh node, and what its committed membership says once it is open.
 func (r *Replicator) helloOf() hello {
-	h := hello{Slot: r.auto.self, State: helloStarting, Address: r.auto.listen, Expected: r.auto.expected, Payload: reftable.PayloadVersion}
+	h := hello{
+		Slot: r.auto.self, State: helloStarting, Address: r.auto.listen, Expected: r.auto.expected, Payload: reftable.PayloadVersion,
+		Checkpoints: r.checkpointsWord(), SQLYield: r.sqlYield.Load(),
+	}
 	switch r.auto.disk.Load() {
 	case diskMember:
 		h.State = helloMember
@@ -214,7 +223,7 @@ func (r *Replicator) helloOf() hello {
 // applies, which an operator's raise of the version asks every member for
 // (#50).
 func (r *Replicator) memberHello() hello {
-	h := hello{Slot: setting.Cluster.Slot, State: helloMember, Payload: reftable.PayloadVersion}
+	h := hello{Slot: setting.Cluster.Slot, State: helloMember, Payload: reftable.PayloadVersion, Checkpoints: r.checkpointsWord(), SQLYield: r.sqlYield.Load()}
 	if eng := r.Engine(); eng != nil {
 		h.Node = eng.Status().ID.String()
 	}

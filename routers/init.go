@@ -147,6 +147,9 @@ func InitWebInstalled(ctx context.Context) {
 	mustInitCtx(ctx, auth_model.Init)
 	mustInitCtx(ctx, repo_service.Init)
 	mustInitCtx(ctx, cluster_service.SeedOperators)
+	// A voter that would leave no checkpoint to close refuses to start
+	// (#176): the backup cursor it reads is in SQL, so only here.
+	mustInitCtx(ctx, cluster_service.RefuseWithoutCheckpoints)
 
 	// Booting long running goroutines.
 	mustInit(indexer_service.Init)

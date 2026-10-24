@@ -66,9 +66,11 @@ func (r *Replicator) maybeRaiseCluster(ctx context.Context, eng consensus.Engine
 	r.raiseClusterVersion(ctx, eng)
 }
 
-// clusterVersionPilot raises the cluster version outside the autonomous
-// mode, where no autopilot runs: at every tick, on the leader alone.
-func (r *Replicator) clusterVersionPilot(ctx context.Context, every time.Duration) {
+// leaderPilot is what the leader does by itself outside the autonomous
+// mode, where no autopilot runs, at every tick: raise the cluster version
+// (#170), and hand the leadership to a member that takes the checkpoints
+// when this one takes none (#176).
+func (r *Replicator) leaderPilot(ctx context.Context, every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
@@ -78,11 +80,13 @@ func (r *Replicator) clusterVersionPilot(ctx context.Context, every time.Duratio
 		case <-t.C:
 		}
 		eng := r.Engine()
-		if eng == nil || eng.Status().ClusterVersion >= clusterProtocol {
+		if eng == nil || eng.Status().Role != consensus.RoleLeader {
 			continue
 		}
 		pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		r.raiseClusterVersion(pctx, eng)
+		if !r.maybeYieldForCheckpoints(pctx, eng, eng.Membership()) {
+			r.raiseClusterVersion(pctx, eng)
+		}
 		cancel()
 	}
 }
