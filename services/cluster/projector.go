@@ -559,8 +559,7 @@ func (p *projector) project(base, ctx context.Context, repo string) error {
 		return err
 	}
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) && !p.passesOn(repo, want) {
-		if first, firstIdx, ok := p.liveRename(repo); ok {
-			from, to, renIdx := p.renameSource(repo, first, firstIdx)
+		if from, to, renIdx, ok := p.renamedIn(repo); ok {
 			src := filepath.Join(p.root, filepath.FromSlash(from))
 			if p.registry.inFlight(from) || p.isFetching(from) {
 				// A git process still writes under the old key, or a fetch
@@ -849,6 +848,35 @@ func (p *projector) liveRename(repo string) (string, uint64, bool) {
 		return "", 0, false
 	}
 	return from, renIdx, true
+}
+
+// renamedIn is where the repository the newest rename into repo brought
+// there comes from on this node: the old key of the chain renameSource
+// walks back to, the key the rename from there moved it to, and that
+// rename's index. ok is false when no rename into repo is live
+// (liveRename), or when the repository that rename brought is not the one
+// under repo any more: followed from its arrival along the renames that
+// moved it on, it does not end at repo by that rename. A rename's mark
+// stays on its target once the repository it brought left it, renamed on
+// (o/a to o/b, then o/b to o/c), and a repository created anew under the
+// freed name finds that mark: a node behind the log moved the old o/a
+// directory, o/c's repository, under the new o/b, certified it there and
+// served o/c's objects by their ids, and through the next rename of the new
+// o/b, under that one's name. The directory stays under its own key, whose
+// projection sets it aside once the chain's end is projected (movesOn,
+// departed), and repo is projected afresh, its objects fetched from the
+// members (#204).
+func (p *projector) renamedIn(repo string) (from, to string, renIdx uint64, ok bool) {
+	first, firstIdx, ok := p.liveRename(repo)
+	if !ok {
+		return "", "", 0, false
+	}
+	from, to, renIdx = p.renameSource(repo, first, firstIdx)
+	holder, at, held := p.heldAfter(to, renIdx, math.MaxUint64)
+	if !held || holder != repo || at != firstIdx {
+		return "", "", 0, false
+	}
+	return from, to, renIdx, true
 }
 
 // heldAfter follows the repository certified under key at index at along
@@ -1275,16 +1303,18 @@ func (p *projector) leavesKey(repo string) bool {
 // awaitsRename reports whether repo's directory is absent here while the
 // repository a rename moved into it still sits under an older key of the
 // chain, which the projection moves in: a directory created under repo
-// meanwhile would keep it out (#100).
+// meanwhile would keep it out (#100). It follows the projection's rule
+// (renamedIn): a key whose rename's repository left it again waits for no
+// directory, and a pack for the repository created anew there is taken
+// (#204).
 func (p *projector) awaitsRename(repo string) bool {
 	if _, err := os.Stat(filepath.Join(p.root, filepath.FromSlash(repo))); err == nil {
 		return false
 	}
-	first, firstIdx, ok := p.table.RenamedFrom(repo)
+	from, to, renIdx, ok := p.renamedIn(repo)
 	if !ok {
 		return false
 	}
-	from, to, renIdx := p.renameSource(repo, first, firstIdx)
 	return p.holdsRenamed(filepath.Join(p.root, filepath.FromSlash(from)), from, to, renIdx)
 }
 
