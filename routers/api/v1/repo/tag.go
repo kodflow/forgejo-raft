@@ -322,6 +322,9 @@ func DeleteTag(ctx *context.APIContext) {
 		return
 	}
 	if err = release_service.DeleteReleaseByID(ctx, ctx.Repo().Repository, tag, ctx.Doer(), true); err != nil {
+		if clusterBehind(ctx, err) {
+			return
+		}
 		if models.IsErrProtectedTagName(err) {
 			ctx.Error(http.StatusUnprocessableEntity, "delTag", "user not allowed to delete protected tag")
 			return

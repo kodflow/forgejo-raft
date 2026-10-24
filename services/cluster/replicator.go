@@ -302,6 +302,7 @@ func Init(ctx context.Context) error {
 	clusterhook.SetWriteWaiter(r.waitWrites)
 	clusterhook.SetFreshWaiter(r.WaitFresh)
 	clusterhook.SetReadGuard(r.ReadRefusal)
+	clusterhook.SetRefLookup(r.refLive)
 
 	go r.projector.run(r.ctx)
 	go r.startupBarrier(r.ctx)
@@ -632,6 +633,13 @@ func (r *Replicator) ReadRefusal(repo string, repoID int64) error {
 		return fmt.Errorf("this node of the cluster still holds another repository under %s than repository %d; retry shortly or through another node", repo, repoID)
 	}
 	return nil
+}
+
+// refLive reports whether the table this node applied holds ref of repo
+// live: a ref another node wrote, which this node's git may not show yet.
+func (r *Replicator) refLive(repo, ref string) bool {
+	v, ok := r.table.Get(repo, ref)
+	return ok && v.Live()
 }
 
 // WaitProjected waits until the local projection of repo reaches index.

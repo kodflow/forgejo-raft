@@ -72,12 +72,16 @@ func pushOnB(t *testing.T, tc *testCluster, a, b *testNode, work, ref, old, sha 
 	require.Equal(t, before, gitRef(t, a, laggingRepo, ref), "node-a has not projected it")
 }
 
-// freshFrom makes Forgejo's freshness checks ask node n, as they ask the
-// replicator of the node that serves the request.
+// freshFrom makes Forgejo's freshness checks and table lookups ask node n,
+// as they ask the replicator of the node that serves the request.
 func freshFrom(t *testing.T, n *testNode) {
 	t.Helper()
 	clusterhook.SetFreshWaiter(n.r.WaitFresh)
-	t.Cleanup(func() { clusterhook.SetFreshWaiter(nil) })
+	clusterhook.SetRefLookup(n.r.refLive)
+	t.Cleanup(func() {
+		clusterhook.SetFreshWaiter(nil)
+		clusterhook.SetRefLookup(nil)
+	})
 }
 
 // caughtUp releases node-a's projection and waits until its git shows ref
@@ -260,4 +264,58 @@ func TestACreationOfARefAbsentFromTheClusterIsWritten(t *testing.T) {
 	}
 	rel := unittest.AssertExistsAndLoadBean(t, &repo_model.Release{RepoID: 1, TagName: "lag-new"})
 	assert.Equal(t, c2, rel.Sha1)
+}
+
+// A tag the cluster holds, and its release row, is deleted through the API
+// (DELETE /repos/{owner}/{repo}/tags/{tag} calls DeleteReleaseByID with
+// delTag), served by node-a, which has not projected the tag yet: `git tag
+// -d` failed "not found" on this node, which DeleteReleaseByID took for a
+// tag already gone. The row went and the answer was 204, and nothing
+// reached the cluster: the tag stayed on every node (#190). Now the
+// deletion is refused while node-a does not show the tag, and goes through
+// the cluster once it does. A tag that no node holds is still taken for
+// gone.
+func TestATagDeletedOnALaggingNodeGoesThroughTheCluster(t *testing.T) {
+	tc, a, b, work, c1, _, hold := laggingCluster(t)
+	ref := "refs/tags/lag-g2"
+	pushOnB(t, tc, a, b, work, ref, strings.Repeat("0", 40), c1)
+	ctx := db.DefaultContext
+	rel := &repo_model.Release{RepoID: 1, PublisherID: 2, TagName: "lag-g2", LowerTagName: "lag-g2", Sha1: c1, IsTag: true, NumCommits: 1}
+	require.NoError(t, db.Insert(ctx, rel))
+
+	withGitThroughReplicator(t, a)
+	sqlRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+
+	t.Run("node-a waits to serve the repository", func(t *testing.T) {
+		freshFrom(t, a)
+		require.ErrorIs(t, release_service.DeleteReleaseByID(ctx, sqlRepo, rel, doer, true), clusterhook.ErrBehind)
+		unittest.AssertExistsAndLoadBean(t, &repo_model.Release{ID: rel.ID})
+		tableAt(t, tc, ref, c1, "nothing was deleted")
+	})
+
+	t.Run("the table holds the tag", func(t *testing.T) {
+		clusterhook.SetRefLookup(a.r.refLive)
+		t.Cleanup(func() { clusterhook.SetRefLookup(nil) })
+		require.ErrorIs(t, release_service.DeleteReleaseByID(ctx, sqlRepo, rel, doer, true), clusterhook.ErrBehind)
+		unittest.AssertExistsAndLoadBean(t, &repo_model.Release{ID: rel.ID})
+		tableAt(t, tc, ref, c1, "nothing was deleted")
+	})
+
+	caughtUp(t, a, hold, ref, c1)
+	freshFrom(t, a)
+	require.NoError(t, release_service.DeleteReleaseByID(ctx, sqlRepo, rel, doer, true))
+	unittest.AssertNotExistsBean(t, &repo_model.Release{ID: rel.ID})
+	for _, m := range tc.nodes {
+		require.Eventually(t, func() bool {
+			v, _ := m.r.table.Get(laggingRepo, ref)
+			return v.Tombstone
+		}, 10*time.Second, 20*time.Millisecond, "%s: the tag is deleted in the cluster", m.slot)
+	}
+
+	// A row whose tag no node holds goes, as before.
+	gone := &repo_model.Release{RepoID: 1, PublisherID: 2, TagName: "lag-nowhere", LowerTagName: "lag-nowhere", Sha1: c1, IsTag: true, NumCommits: 1}
+	require.NoError(t, db.Insert(ctx, gone))
+	require.NoError(t, release_service.DeleteReleaseByID(ctx, sqlRepo, gone, doer, true))
+	unittest.AssertNotExistsBean(t, &repo_model.Release{ID: gone.ID})
 }

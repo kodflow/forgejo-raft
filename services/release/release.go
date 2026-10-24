@@ -414,11 +414,8 @@ func DeleteReleaseByID(ctx context.Context, repo *repo_model.Repository, rel *re
 			return err
 		}
 
-		if stdout, _, err := git.NewCommand(ctx, "tag", "-d").AddDashesAndList(rel.TagName).
-			SetDescription(fmt.Sprintf("DeleteReleaseByID (git tag -d): %d", rel.ID)).
-			RunStdString(&git.RunOpts{Dir: repo.RepoPath()}); err != nil && !strings.Contains(err.Error(), "not found") {
-			log.Error("DeleteReleaseByID (git tag -d): %d in %v Failed:\nStdout: %s\nError: %v", rel.ID, repo, stdout, err)
-			return fmt.Errorf("git tag -d: %w", err)
+		if err := deleteTag(ctx, repo, rel); err != nil {
+			return err
 		}
 
 		refName := git.RefNameFromTag(rel.TagName)
@@ -462,6 +459,44 @@ func DeleteReleaseByID(ctx context.Context, repo *repo_model.Repository, rel *re
 
 	if !rel.IsDraft {
 		notify_service.DeleteRelease(ctx, doer, rel)
+	}
+	return nil
+}
+
+// deleteTag deletes the tag of rel with git, a tag git does not find
+// taken for one already gone. In a cluster, git on this node may not show
+// yet a tag another node wrote, which the table holds live: taken for gone,
+// the release row would go and the tag live on, on every node (#190). The
+// deletion then waits until this node serves the repository at the
+// cluster's commit index, and runs again, through the cluster; a node
+// still behind deletes nothing.
+func deleteTag(ctx context.Context, repo *repo_model.Repository, rel *repo_model.Release) error {
+	run := func() (bool, error) {
+		stdout, _, err := git.NewCommand(ctx, "tag", "-d").AddDashesAndList(rel.TagName).
+			SetDescription(fmt.Sprintf("DeleteReleaseByID (git tag -d): %d", rel.ID)).
+			RunStdString(&git.RunOpts{Dir: repo.RepoPath()})
+		if err != nil && !strings.Contains(err.Error(), "not found") {
+			log.Error("DeleteReleaseByID (git tag -d): %d in %v Failed:\nStdout: %s\nError: %v", rel.ID, repo, stdout, err)
+			return false, fmt.Errorf("git tag -d: %w", err)
+		}
+		return err != nil, nil
+	}
+	notFound, err := run()
+	if err != nil || !notFound {
+		return err
+	}
+	key, ref := clusterhook.RepoKey(repo.OwnerName, repo.Name, false), git.TagPrefix+rel.TagName
+	if !clusterhook.TableHoldsRef(key, ref) {
+		return nil
+	}
+	if err := clusterhook.RequireFresh(ctx, key); err != nil {
+		return err
+	}
+	if notFound, err = run(); err != nil || !notFound {
+		return err
+	}
+	if clusterhook.TableHoldsRef(key, ref) {
+		return fmt.Errorf("%w to %s: the cluster holds %s, which this node does not show yet; nothing was deleted, retry shortly", clusterhook.ErrBehind, key, ref)
 	}
 	return nil
 }

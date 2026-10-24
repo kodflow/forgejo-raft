@@ -681,6 +681,26 @@ func RequireFresh(ctx context.Context, key string) error {
 	return fmt.Errorf("%w to %s; nothing was written, retry shortly or through another node", ErrBehind, key)
 }
 
+var refLive func(key, ref string) bool
+
+// SetRefLookup registers the replicator's read of a ref in the table this
+// node applied.
+func SetRefLookup(f func(key, ref string) bool) {
+	lifecycleMu.Lock()
+	refLive = f
+	lifecycleMu.Unlock()
+}
+
+// TableHoldsRef reports whether the table this node applied holds ref of
+// the repository key live, which this node's git may not show yet. Without
+// a cluster it reports false.
+func TableHoldsRef(key, ref string) bool {
+	lifecycleMu.RLock()
+	f := refLive
+	lifecycleMu.RUnlock()
+	return f != nil && f(key, ref)
+}
+
 type afterCommitKey struct{}
 
 // AfterCommit collects side effects that must happen once the work of a
