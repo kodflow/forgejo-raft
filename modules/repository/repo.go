@@ -44,6 +44,18 @@ func WikiRemoteURL(ctx context.Context, remote string) string {
 	return ""
 }
 
+// IsWikiRemoteURLOf reports whether wikiURL is one of the addresses
+// WikiRemoteURL tries for remote.
+func IsWikiRemoteURLOf(wikiURL, remote string) bool {
+	remote = strings.TrimSuffix(remote, ".git")
+	for _, suffix := range commonWikiURLSuffixes {
+		if wikiURL == remote+suffix {
+			return true
+		}
+	}
+	return false
+}
+
 // SyncRepoTags synchronizes releases table with repository tags
 func SyncRepoTags(ctx context.Context, repoID int64) error {
 	repo, err := repo_model.GetRepositoryByID(ctx, repoID)
