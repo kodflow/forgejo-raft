@@ -116,7 +116,7 @@ func TestAnOwnerRenameTooLargeForOneEntryIsRefusedBeforeItIsProposed(t *testing.
 	require.NoError(t, err)
 	origin.r.maxEntry = len(data) - 1
 
-	err = origin.r.ownerRenameRefusal("big", "huge")
+	err = origin.r.ownerRenameRefusal(t.Context(), "big", "huge")
 	require.ErrorIs(t, err, clusterhook.ErrTooLarge)
 	assert.Contains(t, err.Error(), "renaming the owner big moves its 3 repositories")
 	assert.Contains(t, err.Error(), fmt.Sprintf("the bound is %d", len(data)-1))
@@ -138,7 +138,7 @@ func TestAnOwnerRenameTooLargeForOneEntryIsRefusedBeforeItIsProposed(t *testing.
 	}
 
 	origin.r.maxEntry = len(data) + 64
-	require.NoError(t, origin.r.ownerRenameRefusal("big", "huge"))
+	require.NoError(t, origin.r.ownerRenameRefusal(t.Context(), "big", "huge"))
 	require.NoError(t, os.Rename(filepath.Join(origin.r.root, "big"), filepath.Join(origin.r.root, "huge")))
 	require.NoError(t, origin.r.proposeOwnerRename(context.Background(), "big", "huge"))
 	waitAll(t, tc, func(n *testNode) bool { return gitRef(t, n, "huge/c.git", "refs/heads/main") == c1 })

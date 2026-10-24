@@ -115,8 +115,9 @@ func renameUser(ctx context.Context, u *user_model.User, newUserName string, doe
 	}
 
 	// In a cluster, an owner whose repositories are too many to move in one
-	// replicated entry is refused before anything is written (#182).
-	if err := clusterhook.OwnerRenameRefusal(oldUserName, newUserName); err != nil {
+	// replicated entry is refused before anything is written, and so is the
+	// rename on a node that cannot confirm it applied the log (#182).
+	if err := clusterhook.OwnerRenameRefusal(ctx, oldUserName, newUserName); err != nil {
 		return fmt.Errorf("rename user in the cluster: %w", err)
 	}
 
