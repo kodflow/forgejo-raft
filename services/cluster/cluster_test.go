@@ -300,20 +300,45 @@ func (tc *testCluster) close() {
 
 func run(t *testing.T, dir string, args ...string) string {
 	t.Helper()
+	out, err := gitIn(dir, args...)
+	require.NoError(t, err)
+	return out
+}
+
+// gitIn is run without the test: it returns git's failure instead of
+// failing the test, for a goroutine of a test, which must not call
+// FailNow (#200).
+func gitIn(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", append([]string{"-c", "core.hooksPath=/dev/null", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"}, args...)...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "HOME="+setting.Git.HomePath)
 	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "git %v: %s", args, out)
-	return strings.TrimSpace(string(out))
+	if err != nil {
+		return "", fmt.Errorf("git %v: %w: %s", args, err, out)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // commit makes a commit in a scratch repository and returns its id.
 func commit(t *testing.T, work, msg string) string {
-	require.NoError(t, os.WriteFile(filepath.Join(work, "f.txt"), []byte(msg), 0o644))
-	run(t, work, "add", ".")
-	run(t, work, "commit", "-q", "-m", msg)
-	return run(t, work, "rev-parse", "HEAD")
+	t.Helper()
+	sha, err := commitIn(work, msg)
+	require.NoError(t, err)
+	return sha
+}
+
+// commitIn is commit without the test, as gitIn.
+func commitIn(work, msg string) (string, error) {
+	if err := os.WriteFile(filepath.Join(work, "f.txt"), []byte(msg), 0o644); err != nil {
+		return "", err
+	}
+	if _, err := gitIn(work, "add", "."); err != nil {
+		return "", err
+	}
+	if _, err := gitIn(work, "commit", "-q", "-m", msg); err != nil {
+		return "", err
+	}
+	return gitIn(work, "rev-parse", "HEAD")
 }
 
 // pushVia plays what git receive-pack does on node n: the objects land in
@@ -325,14 +350,33 @@ func (tc *testCluster) pushVia(n *testNode, work, repo, ref, old, sha string) *c
 
 // pushViaWithin is pushVia with the hook's budget given.
 func (tc *testCluster) pushViaWithin(budget time.Duration, n *testNode, work, repo, ref, old, sha string) *clusterhook.Response {
-	t := tc.t
+	tc.t.Helper()
+	resp, err := tc.tryPushViaWithin(budget, n, work, repo, ref, old, sha)
+	require.NoError(tc.t, err)
+	return resp
+}
+
+// tryPushVia is pushVia without the test: git's failures are returned, for
+// a goroutine of a test, which must not call FailNow (#200).
+func (tc *testCluster) tryPushVia(n *testNode, work, repo, ref, old, sha string) (*clusterhook.Response, error) {
+	return tc.tryPushViaWithin(30*time.Second, n, work, repo, ref, old, sha)
+}
+
+// tryPushViaWithin is tryPushVia with the hook's budget given.
+func (tc *testCluster) tryPushViaWithin(budget time.Duration, n *testNode, work, repo, ref, old, sha string) (*clusterhook.Response, error) {
 	dir := filepath.Join(n.r.root, filepath.FromSlash(repo))
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		run(t, n.r.root, "init", "-q", "--bare", dir)
+		if _, err := gitIn(n.r.root, "init", "-q", "--bare", dir); err != nil {
+			return nil, err
+		}
 	}
 	// Objects first, through a temporary ref, as receive-pack's quarantine.
-	run(t, work, "push", "-q", dir, sha+":refs/tmp/incoming")
-	run(t, dir, "update-ref", "-d", "refs/tmp/incoming")
+	if _, err := gitIn(work, "push", "-q", dir, sha+":refs/tmp/incoming"); err != nil {
+		return nil, err
+	}
+	if _, err := gitIn(dir, "update-ref", "-d", "refs/tmp/incoming"); err != nil {
+		return nil, err
+	}
 	nonce := clusterhook.NewNonce()
 	req := &clusterhook.Request{
 		Op: clusterhook.OpPrepared, Nonce: nonce, GitDir: dir, RepoID: tc.repoID(repo), PusherID: 2,
@@ -341,27 +385,43 @@ func (tc *testCluster) pushViaWithin(budget time.Duration, n *testNode, work, re
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	// In "prepared" git holds the ref's lock, written with the new value.
-	unlock := holdRefLock(t, dir, ref, sha)
+	unlock, err := holdRefLockIn(dir, ref, sha)
+	if err != nil {
+		return nil, err
+	}
 	resp := n.r.Handle(ctx, req)
 	unlock()
+	// The transaction ends either way, as git ends it: a ref git could not
+	// update after "prepared" is "aborted".
+	req.Op = clusterhook.OpAborted
 	if resp.OK {
-		run(t, dir, "update-ref", ref, sha)
-		req.Op = clusterhook.OpCommitted
-	} else {
-		req.Op = clusterhook.OpAborted
+		if _, err = gitIn(dir, "update-ref", ref, sha); err == nil {
+			req.Op = clusterhook.OpCommitted
+		}
 	}
 	n.r.Handle(ctx, req)
-	return resp
+	return resp, err
 }
 
 // holdRefLock writes the lock git holds on ref during "prepared", and
 // returns its removal.
 func holdRefLock(t *testing.T, dir, ref, value string) func() {
 	t.Helper()
+	unlock, err := holdRefLockIn(dir, ref, value)
+	require.NoError(t, err)
+	return unlock
+}
+
+// holdRefLockIn is holdRefLock without the test.
+func holdRefLockIn(dir, ref, value string) (func(), error) {
 	lock := filepath.Join(dir, filepath.FromSlash(ref)) + ".lock"
-	require.NoError(t, os.MkdirAll(filepath.Dir(lock), 0o755))
-	require.NoError(t, os.WriteFile(lock, []byte(value+"\n"), 0o644))
-	return func() { _ = os.Remove(lock) }
+	if err := os.MkdirAll(filepath.Dir(lock), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(lock, []byte(value+"\n"), 0o644); err != nil {
+		return nil, err
+	}
+	return func() { _ = os.Remove(lock) }, nil
 }
 
 func gitRef(t *testing.T, n *testNode, repo, ref string) string {
