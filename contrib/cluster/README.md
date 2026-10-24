@@ -226,6 +226,18 @@ version (the autopilot raises the version; in the manual mode, the
 operator raises it from the administration page). A JOIN grant is bound to the key it first admits:
 that node may retry, another key does not join under it.
 
+**Payload version 7** makes a Remove or Deny pin that the engine refuses
+for certain leave no effect. The revocation is asked for before the
+change, so that the removed node never joins again in between. When the
+engine refuses the change (another change in flight, no answering
+majority without the member), the request is withdrawn, and the key joins
+again if the member later leaves another way, for instance when the
+autopilot removes it as a dead member. Before version 7 the request
+stayed, and that member was refused for good. A change whose outcome is
+unknown keeps its request, written once no member holds the key. The
+autopilot neither promotes nor keeps a learner whose key is asked for
+revocation. A request made before the raise stays as it was.
+
 **Payload version 4** carries the pusher's name in each push entry. The
 log consumer uses it to tell a pusher ID handed out again after a database
 loss (another name, and no redirect from the old name to the account) from

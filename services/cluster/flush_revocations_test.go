@@ -74,7 +74,8 @@ func TestARaiseFromAFollowerFlushesThePendingRevocations(t *testing.T) {
 	key := sha256.Sum256([]byte("node-b"))
 	spki := hex.EncodeToString(key[:])
 	// A Remove recorded its revocation while the cluster wrote version 1.
-	require.NoError(t, r.recordPendingRevocation(ctx, reftable.RevokeKey{SPKI: spki, Slot: "node-b", Operator: "op", Time: 1}))
+	_, err := r.recordPendingRevocation(ctx, reftable.RevokeKey{SPKI: spki, Slot: "node-b", Operator: "op", Time: 1})
+	require.NoError(t, err)
 	require.NoError(t, eng.WaitApplied(ctx, consensus.Token{Index: eng.index}))
 	require.Len(t, r.table.PendingRevocations(), 1)
 
@@ -86,7 +87,8 @@ func TestARaiseFromAFollowerFlushesThePendingRevocations(t *testing.T) {
 	r2 := newReplicator(t.TempDir(), newRegistry(0, 1, 1))
 	eng2 := &followerEngine{leader: reftable.New(), local: r2.table}
 	r2.setEngine(eng2)
-	require.NoError(t, r2.recordPendingRevocation(ctx, reftable.RevokeKey{SPKI: spki, Slot: "node-b", Operator: "op", Time: 1}))
+	_, err = r2.recordPendingRevocation(ctx, reftable.RevokeKey{SPKI: spki, Slot: "node-b", Operator: "op", Time: 1})
+	require.NoError(t, err)
 	require.NoError(t, r2.RaisePayloadVersion(ctx, "op"))
 	eng2.fail = consensus.ErrNoSpace
 	assert.Error(t, r2.flushRevocations(ctx))

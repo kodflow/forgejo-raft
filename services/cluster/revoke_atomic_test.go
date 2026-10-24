@@ -42,8 +42,9 @@ func keyState(t *testing.T, r *Replicator, slot string) (revoked bool, admitted 
 
 // A Remove submitted on a follower, where the check of a stranded voter
 // sees no peers, and refused by the leader: the member keeps its key and
-// its object channel. The revocation stays asked for, and is written once
-// the removal is made (#157).
+// its object channel (#157). Refused for certain, the Remove leaves no
+// request either (#171); the one a Remove that is made records is written
+// once the member left.
 func TestARemoveTheLeaderRefusesLeavesTheKeyUsable(t *testing.T) {
 	t.Parallel()
 	mem, rs := NewForTesting(t.TempDir(), "node-a", "node-b", "node-c", "node-d")
@@ -65,10 +66,12 @@ func TestARemoveTheLeaderRefusesLeavesTheKeyUsable(t *testing.T) {
 		assert.False(t, revoked, "the key of a member the engine keeps")
 		require.NoError(t, admitted)
 	}
-	require.Len(t, leader.table.PendingRevocations(), 1, "the revocation stays asked for")
+	for _, r := range rs[1:] {
+		assert.Empty(t, r.table.PendingRevocations(), "the refused Remove's request is withdrawn")
+	}
 	require.NoError(t, leader.flushRevocations(ctx))
 	revoked, _ := keyState(t, leader, "node-b")
-	assert.False(t, revoked, "and is not written while node-b holds the key")
+	assert.False(t, revoked, "and nothing is written while node-b holds the key")
 
 	follower.setEngine(real)
 	mem.SetDown(rs[0].Engine().(*memraft.Node), false)
@@ -131,7 +134,7 @@ func TestAnAskedRevocationRefusesTheJoinBeforeItIsWritten(t *testing.T) {
 	idB := slotID(t, r, "node-b")
 	keyB := sha256.Sum256([]byte("node-b"))
 
-	_, asked, err := r.revokeMember(ctx, r.Engine(), OperatorFor(1), idB)
+	_, asked, _, err := r.revokeMember(ctx, r.Engine(), OperatorFor(1), idB)
 	require.NoError(t, err)
 	require.True(t, asked)
 	require.NoError(t, r.Engine().Remove(ctx, OperatorFor(1), idB), "the change commits, the node stops there")
@@ -169,7 +172,7 @@ func TestAFlushWaitsForACommittedMembership(t *testing.T) {
 	r := rs[0]
 	require.NoError(t, r.RaisePayloadVersion(ctx, "op"))
 	idB := slotID(t, r, "node-b")
-	_, _, err := r.revokeMember(ctx, r.Engine(), OperatorFor(1), idB)
+	_, _, _, err := r.revokeMember(ctx, r.Engine(), OperatorFor(1), idB)
 	require.NoError(t, err)
 	require.NoError(t, r.Engine().Remove(ctx, OperatorFor(1), idB))
 
