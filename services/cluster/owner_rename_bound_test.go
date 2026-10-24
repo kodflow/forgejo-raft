@@ -32,34 +32,66 @@ func ownerRenameMoves(from, to string, n int) [][2]string {
 	return moves
 }
 
-// An owner's rename is one entry listing every repository of the owner:
-// past the SDK's default MaxEntryBytes of 1 MiB, about 6 600 repositories
-// with wikis, it was refused as ENTRY_TOO_LARGE, a certain refusal, and the
-// rename undone, at every attempt (#182). Forgejo opens the engine with
-// consensus.MaxEntryBytes, which the SDK engine of this test runs with.
-func TestAnOwnerRenameAboveTheSDKDefaultEntryBoundIsRecorded(t *testing.T) {
-	for _, n := range []int{1000, 6000, 8000, 26000} {
-		data, err := reftable.EncodeVersion(reftable.PayloadVersion, reftable.KindRepoRename, &reftable.RepoRename{
-			From: "organisation/a.git", To: "organization/a.git", Also: ownerRenameMoves("organisation", "organization", n),
-			Nonce: clusterhook.NewNonce(), Owner: [2]string{"organisation", "organization"},
-		})
-		require.NoError(t, err)
-		t.Logf("owner of %d repositories with wikis: the rename entry is %d bytes (bound %d)", n, len(data), consensus.MaxEntryBytes)
-		if n == 8000 {
-			require.Greater(t, len(data), 1<<20, "the entry is above the SDK's default bound")
-			require.Less(t, len(data), consensus.MaxEntryBytes)
-		}
-	}
+// renameEntrySize is the size of the entry r proposes for moves.
+func renameEntrySize(t *testing.T, r *Replicator, moves [][2]string, owner [2]string) int {
+	t.Helper()
+	v, rn := r.renameCommand(moves, owner)
+	data, err := reftable.EncodeVersion(v, reftable.KindRepoRename, rn)
+	require.NoError(t, err)
+	return len(data)
+}
 
+// An owner's rename is one entry listing every repository of the owner,
+// and the engine refuses one above consensus.MaxEntryBytes, the SDK's
+// default of 1 MiB, as ENTRY_TOO_LARGE at every attempt: about 6 600
+// repositories with wikis. An owner of 8000 was refused once its SQL was
+// written and its directory moved, and the rename undone (#182). Such a
+// rename is now refused before it is proposed, with certainty, and the
+// engine agrees on the bound: the largest owner under it is recorded on
+// the SDK's real engine, from a follower too, and one repository more is
+// refused early, as the engine refuses that very entry.
+func TestAnOwnerRenameAboveTheEntryBoundIsRefusedBeforeTheEngine(t *testing.T) {
 	tc := newTestClusterOn(t, true, "node-a", "node-b", "node-c")
 	raisePayload(t, tc)
+	ctx := context.Background()
 	for _, n := range tc.nodes {
-		moves := ownerRenameMoves("o-"+n.slot, "p-"+n.slot, 8000)
-		require.NoError(t, n.r.proposeMoves(context.Background(), moves, [2]string{"o-" + n.slot, "p-" + n.slot}),
-			"%s: an owner of 8000 repositories is renamed", n.slot)
-		from, _, ok := n.r.table.RenamedFrom(moves[len(moves)-1][1])
+		from, to := "o-"+n.slot, "p-"+n.slot
+		owner := [2]string{from, to}
+		// The names have one length: the entry grows by the same bytes
+		// with each repository.
+		base := renameEntrySize(t, n.r, ownerRenameMoves(from, to, 6000), owner)
+		each := renameEntrySize(t, n.r, ownerRenameMoves(from, to, 6001), owner) - base
+		under := 6000 + (consensus.MaxEntryBytes-base)/each
+		atBound, past := renameEntrySize(t, n.r, ownerRenameMoves(from, to, under), owner), renameEntrySize(t, n.r, ownerRenameMoves(from, to, under+1), owner)
+		require.LessOrEqual(t, atBound, consensus.MaxEntryBytes)
+		require.Greater(t, past, consensus.MaxEntryBytes)
+		t.Logf("%s: an owner of %d repositories with wikis is %d bytes, of %d repositories %d bytes (bound %d)", n.slot,
+			under, atBound, under+1, past, consensus.MaxEntryBytes)
+
+		for _, count := range []int{under + 1, 8000} {
+			moves := ownerRenameMoves(from, to, count)
+			before, _ := n.r.table.Applied()
+			err := n.r.proposeMoves(ctx, moves, owner)
+			require.ErrorIs(t, err, clusterhook.ErrTooLarge, "%s: an owner of %d repositories", n.slot, count)
+			assert.False(t, clusterhook.IsOutcomeUnresolved(err), "a certain refusal: the caller moves the directories back")
+			after, _ := n.r.table.Applied()
+			assert.Equal(t, before.Index, after.Index, "%s: nothing was proposed", n.slot)
+			_, _, renamed := n.r.table.RenamedFrom(moves[len(moves)-1][1])
+			assert.False(t, renamed, "%s: an owner of %d repositories", n.slot, count)
+
+			// The very entry, proposed to the engine, is refused there.
+			v, rn := n.r.renameCommand(moves, owner)
+			data, err := reftable.EncodeVersion(v, reftable.KindRepoRename, rn)
+			require.NoError(t, err)
+			_, _, err = n.r.Engine().Propose(ctx, data)
+			require.ErrorIs(t, err, consensus.ErrEntryTooLarge, "%s: the engine takes what the replicator refused", n.slot)
+		}
+
+		moves := ownerRenameMoves(from, to, under)
+		require.NoError(t, n.r.proposeMoves(ctx, moves, owner), "%s: an owner of %d repositories is renamed", n.slot, under)
+		from0, _, ok := n.r.table.RenamedFrom(moves[len(moves)-1][1])
 		require.True(t, ok)
-		assert.Equal(t, moves[len(moves)-1][0], from)
+		assert.Equal(t, moves[len(moves)-1][0], from0)
 	}
 }
 

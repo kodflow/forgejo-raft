@@ -72,9 +72,9 @@ func (driver) Open(ctx context.Context, cfg consensus.Config) (consensus.Engine,
 		Durability: sdk.DurabilityVolatile, Log: d.Log(), Snapshots: d.Snapshots(), Transport: tr,
 		MaxSnapshotBytes: cfg.MaxSnapshotBytes, MaxLogBytes: cfg.MaxLogBytes, SnapshotPausesApply: true,
 		Meter: newEngineMeter(), Logger: engineLogger(), MinVoters: cfg.MinVoters,
-		// An owner's rename is one entry (#182); a batch carries one entry
-		// at least, so it may not be bounded below it.
-		MaxEntryBytes: consensus.MaxEntryBytes, MaxBatchBytes: consensus.MaxEntryBytes,
+		// The bound the replicator's early refusal reads too (#182);
+		// MaxBatchBytes stays the SDK's default, which it may not exceed.
+		MaxEntryBytes: consensus.MaxEntryBytes,
 	}
 	if cfg.JoinAuthorizer != nil {
 		sc.JoinAuthorizer = joinAuthorizer(cfg.JoinAuthorizer)
