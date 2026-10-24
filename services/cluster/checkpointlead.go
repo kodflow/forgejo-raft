@@ -59,11 +59,14 @@ var checkpointHandBack = time.Hour
 var checkpointProbeEvery = payloadProbeEvery
 
 // checkpointView is what the leader last found of the checkpoints: when it
-// asked, the voters that take them and those that did not say, by slot.
+// asked, the voters that take them and those that did not say, by slot, and
+// for each voter of On it would not hand the leadership to, "slot: why"
+// (takerHold).
 type checkpointView struct {
 	At      time.Time
 	On      []string
 	Unknown []string
+	Held    []string
 }
 
 // checkpointViewFresh is how long the leader's view of the takers stands.
@@ -132,6 +135,7 @@ func (r *Replicator) maybeYieldForCheckpoints(ctx context.Context, eng consensus
 	}
 	seen := r.memberAnswers(ctx, eng)
 	self := eng.Status().ID
+	peers := peerHealth(eng)
 	v := checkpointView{At: now}
 	for _, x := range m.Members {
 		if !x.Voter || x.ID == self {
@@ -143,10 +147,47 @@ func (r *Replicator) maybeYieldForCheckpoints(ctx context.Context, eng consensus
 			v.Unknown = append(v.Unknown, x.Slot)
 		case h.Checkpoints == checkpointsOn:
 			v.On = append(v.On, x.Slot)
+			p, known := peers[x.ID]
+			if why := takerHold(h, p, known, now); why != "" {
+				v.Held = append(v.Held, x.Slot+": "+why)
+			}
 		}
 	}
 	r.ckState.set(v)
 	return r.yieldForCheckpoints(ctx, eng, m, seen)
+}
+
+// peerHealth is the engine's replication health of each peer, by id.
+func peerHealth(eng consensus.Engine) map[consensus.NodeID]consensus.PeerHealth {
+	peers := map[consensus.NodeID]consensus.PeerHealth{}
+	for _, p := range eng.Health().Peers {
+		peers[p.ID] = p
+	}
+	return peers
+}
+
+// takerHold is why the leader does not hand the leadership, for the
+// checkpoints, to a voter that takes them and answered h, "" when it would:
+// it gave the leadership away for want of the SQL within
+// checkpointHandBack, or its replication health p (known when the engine
+// has one) says it is unreachable, receives a snapshot, lags more than
+// checkpointYieldLag or was last heard of more than checkpointContact ago.
+func takerHold(h hello, p consensus.PeerHealth, known bool, now time.Time) string {
+	switch {
+	case h.SQLYield != 0 && now.Sub(time.Unix(h.SQLYield, 0)) < checkpointHandBack:
+		return fmt.Sprintf("gave the leadership away for want of the SQL at %s, not handed it back within %s", time.Unix(h.SQLYield, 0).UTC().Format(time.RFC3339), checkpointHandBack)
+	case !known:
+		return "no replication health for it"
+	case p.Unreachable:
+		return "unreachable"
+	case p.Snapshot:
+		return "receiving a snapshot"
+	case p.Lag > checkpointYieldLag:
+		return fmt.Sprintf("%d entries behind, at most %d", p.Lag, checkpointYieldLag)
+	case p.LastContact > checkpointContact:
+		return fmt.Sprintf("last heard of %s ago, at most %s", p.LastContact.Round(time.Millisecond), checkpointContact)
+	}
+	return ""
 }
 
 // yieldForCheckpoints hands the leadership of this leader, which takes no
@@ -163,10 +204,7 @@ func (r *Replicator) yieldForCheckpoints(ctx context.Context, eng consensus.Engi
 	if !r.checkpointYielded.IsZero() && now.Sub(r.checkpointYielded) < yieldBackoff {
 		return false
 	}
-	peers := map[consensus.NodeID]consensus.PeerHealth{}
-	for _, p := range eng.Health().Peers {
-		peers[p.ID] = p
-	}
+	peers := peerHealth(eng)
 	self := eng.Status().ID
 	var to consensus.Member
 	var best consensus.PeerHealth
@@ -179,11 +217,8 @@ func (r *Replicator) yieldForCheckpoints(ctx context.Context, eng consensus.Engi
 		if !ok || h.Checkpoints != checkpointsOn {
 			continue
 		}
-		if h.SQLYield != 0 && now.Sub(time.Unix(h.SQLYield, 0)) < checkpointHandBack {
-			continue
-		}
-		p, ok := peers[x.ID]
-		if !ok || p.Unreachable || p.Snapshot || p.Lag > checkpointYieldLag || p.LastContact > checkpointContact {
+		p, known := peers[x.ID]
+		if takerHold(h, p, known, now) != "" {
 			continue
 		}
 		if !found || p.Lag < best.Lag {

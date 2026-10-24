@@ -137,9 +137,12 @@ type View struct {
 	// CheckpointTakers are the voters the leader last found to take the
 	// checkpoints, and CheckpointUnknown those that did not say, by slot;
 	// CheckpointsAsked is when it asked, zero when it did not lately.
-	CheckpointTakers  []string
-	CheckpointUnknown []string
-	CheckpointsAsked  time.Time
+	// CheckpointTakersHeld are the takers it would not hand the leadership
+	// to then, each as "slot: why".
+	CheckpointTakers     []string
+	CheckpointUnknown    []string
+	CheckpointsAsked     time.Time
+	CheckpointTakersHeld []string
 	// EventQueueMax is the bound past which pushes are refused;
 	// EventQueueAlarm is set past EventQueueAlarmShare of it.
 	EventQueueMax   int64
@@ -280,6 +283,7 @@ func (r *Replicator) ConsumerHealth(ctx context.Context) View {
 			v.CheckpointsOff = v.HasBackup && !v.CheckpointsHere
 			if ck, ok := r.ckState.fresh(r.clock()); ok {
 				v.CheckpointTakers, v.CheckpointUnknown, v.CheckpointsAsked = ck.On, ck.Unknown, ck.At
+				v.CheckpointTakersHeld = ck.Held
 			}
 		}
 	}
@@ -288,6 +292,14 @@ func (r *Replicator) ConsumerHealth(ctx context.Context) View {
 		v.EventQueueAlarm = v.EventBytes >= int64(float64(reftable.MaxEventBytes)*EventQueueAlarmShare)
 	}
 	return v
+}
+
+// CheckpointsUntaken reports whether the trim the backup holds waits for a
+// leader that takes the checkpoints, rather than for a checkpoint of this
+// one that closes: the health check and the status page say the way out
+// from it.
+func (v View) CheckpointsUntaken() bool {
+	return v.CheckpointsOff || v.HasBackup && !v.CheckpointsHere
 }
 
 // EventQueueAlarmShare is the share of the event queue's bound at which the

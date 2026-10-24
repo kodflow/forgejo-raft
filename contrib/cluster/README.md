@@ -124,7 +124,9 @@ once every five minutes. A leader that takes them never hands the
 leadership over for them, so it does not go back and forth; and a member
 that gave the leadership away because it could not derive the SQL is not
 handed it back for its checkpoints within the hour. `cluster:checkpoints`
-says which voters take them, or that none does.
+says which voters take them and, for each one the leader does not hand the
+leadership to yet, why (behind, out of contact, receiving a snapshot, gave
+it away for the SQL); or that none does.
 
 A voter whose `CHECKPOINT_INTERVAL` is 0 does not start when the backup
 cursor of its lineage exists and every other voter answers that it takes

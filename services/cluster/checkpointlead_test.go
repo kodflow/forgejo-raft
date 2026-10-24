@@ -66,6 +66,7 @@ func TestALeaderWithoutCheckpointsHandsTheLeadershipToOneThatTakesThem(t *testin
 	view, ok := r.ckState.fresh(clock.now())
 	require.True(t, ok)
 	assert.Equal(t, []string{"node-c"}, view.On)
+	assert.Equal(t, []string{"node-c: 65 entries behind, at most 64"}, view.Held, "the health says why node-c is not handed it")
 
 	e.mu.Lock()
 	e.peers[0xc] = consensus.PeerHealth{ID: 0xc, Lag: 3}
@@ -73,6 +74,9 @@ func TestALeaderWithoutCheckpointsHandsTheLeadershipToOneThatTakesThem(t *testin
 	clock.advance(payloadProbeEvery)
 	r.autopilotStep(ctx)
 	assert.Equal(t, []consensus.NodeID{0xc}, e.transferred(), "handed to node-c once it is caught up")
+	view, ok = r.ckState.fresh(clock.now())
+	require.True(t, ok)
+	assert.Empty(t, view.Held)
 
 	for range 8 {
 		clock.advance(payloadProbeEvery)
@@ -91,6 +95,38 @@ func TestALeaderWithoutCheckpointsHandsTheLeadershipToOneThatTakesThem(t *testin
 		clock2.advance(yieldBackoff)
 	}
 	assert.Empty(t, e2.transferred())
+}
+
+// The leader hands the leadership, for the checkpoints, only to a taker that
+// is caught up, in contact, receives no snapshot and did not give it away
+// for the SQL within checkpointHandBack; otherwise it says why, which the
+// health repeats (#176).
+func TestTakerHoldSaysWhyTheLeadershipIsNotHandedOver(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	ok := consensus.PeerHealth{Lag: 3, LastContact: time.Second}
+	for _, tc := range []struct {
+		name  string
+		h     hello
+		p     consensus.PeerHealth
+		known bool
+		why   string
+	}{
+		{"caught up", hello{}, ok, true, ""},
+		{"gave it away for the SQL", hello{SQLYield: now.Add(-time.Minute).Unix()}, ok, true, "gave the leadership away for want of the SQL at 2027-01-15T07:59:00Z"},
+		{"gave it away long ago", hello{SQLYield: now.Add(-2 * checkpointHandBack).Unix()}, ok, true, ""},
+		{"no health", hello{}, ok, false, "no replication health for it"},
+		{"unreachable", hello{}, consensus.PeerHealth{Unreachable: true}, true, "unreachable"},
+		{"a snapshot", hello{}, consensus.PeerHealth{Snapshot: true}, true, "receiving a snapshot"},
+		{"behind", hello{}, consensus.PeerHealth{Lag: checkpointYieldLag + 1}, true, "65 entries behind, at most 64"},
+		{"silent", hello{}, consensus.PeerHealth{LastContact: checkpointContact + time.Second}, true, "last heard of 11s ago, at most 10s"},
+	} {
+		got := takerHold(tc.h, tc.p, tc.known, now)
+		if tc.why == "" {
+			assert.Empty(t, got, tc.name)
+		} else {
+			assert.Contains(t, got, tc.why, tc.name)
+		}
+	}
 }
 
 // A member that gave the leadership away because it could not derive the

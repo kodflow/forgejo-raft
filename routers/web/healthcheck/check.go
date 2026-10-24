@@ -221,20 +221,27 @@ func checkClusterSQL(r *cluster_service.Replicator, checks checks) {
 	checks["cluster:event_queue"] = []componentStatus{q}
 }
 
-// checkpointRemedy is the way out of a trim held by the backup cursor.
+// checkpointRemedy is the way out of a trim held by the backup cursor; the
+// status page chooses its text the same way (View.CheckpointsUntaken).
 func checkpointRemedy(v cluster_service.View) string {
-	if v.CheckpointsOff || v.HasBackup && !v.CheckpointsHere {
+	if v.CheckpointsUntaken() {
 		return "set [cluster] CHECKPOINT_INTERVAL on the leader, or transfer the leadership to a member whose CHECKPOINT_INTERVAL is set"
 	}
 	return "no checkpoint closed since it: see why in the leader's log (cluster checkpoint)"
 }
 
 // takersNote says who may take the checkpoints, from what the leader last
-// found: the leadership goes to a voter that takes them, or none does.
+// found: a voter that takes them may lead instead, unless the leader would
+// not hand it the leadership (lag, contact, snapshot, a hand-over for the
+// SQL), which it says; or none takes them.
 func takersNote(v cluster_service.View) string {
 	switch {
 	case len(v.CheckpointTakers) > 0:
-		return fmt.Sprintf("the leadership goes to a voter that takes them (%s)", strings.Join(v.CheckpointTakers, ", "))
+		s := fmt.Sprintf("the leadership may go to a voter that takes them (%s)", strings.Join(v.CheckpointTakers, ", "))
+		if len(v.CheckpointTakersHeld) > 0 {
+			s += "; not handed to it for now: " + strings.Join(v.CheckpointTakersHeld, "; ")
+		}
+		return s
 	case v.CheckpointsAsked.IsZero():
 		return checkpointRemedy(v)
 	case len(v.CheckpointUnknown) > 0:
@@ -245,17 +252,20 @@ func takersNote(v cluster_service.View) string {
 }
 
 // queueHolder names what holds the trim of a filling event queue, and the
-// check that says more.
+// check that says more. SQL is said not durable only once checked, as
+// cluster:sql_durability says it.
 func queueHolder(v cluster_service.View) string {
 	switch {
 	case v.BackupLag > 0:
 		return "the backup of the last checkpoint holds the trim (cluster:backup_lag)"
 	case v.ParkedEvents > 0:
 		return "parked events hold the trim (cluster:parked_events)"
-	case !v.SQLDurable:
+	case !v.SQLDurable && !v.SQLDurabilityChecked.IsZero():
 		return "SQL is not durable across a database failover, the trim waits for it (cluster:sql_durability)"
 	case v.CheckpointsOff:
 		return "the backup of the last checkpoint holds the trim and no checkpoint will move it (cluster:checkpoints)"
+	case v.SQLDurabilityChecked.IsZero():
+		return "the durability of SQL across a database failover is not checked yet, and the trim waits for it (cluster:sql_durability)"
 	default:
 		return "the SQL of the events is not derived yet: see the leader's consumer in its log"
 	}

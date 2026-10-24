@@ -87,7 +87,8 @@ func SetBackupCursorForTesting(r *Replicator, position uint64) {
 }
 
 // SetCheckpointViewForTesting makes the leader have just found which voters
-// take the checkpoints (on) and which did not say (unknown).
-func SetCheckpointViewForTesting(r *Replicator, on, unknown []string) {
-	r.ckState.set(checkpointView{At: r.clock(), On: on, Unknown: unknown})
+// take the checkpoints (on), which did not say (unknown), and why it would
+// not hand the leadership to some of the takers (held, "slot: why").
+func SetCheckpointViewForTesting(r *Replicator, on, unknown []string, held ...string) {
+	r.ckState.set(checkpointView{At: r.clock(), On: on, Unknown: unknown, Held: held})
 }
