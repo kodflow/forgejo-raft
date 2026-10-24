@@ -110,19 +110,33 @@ func pushRefSpecs(branchFilter string) []string {
 func UpdatePushMirrorBranchFilter(ctx context.Context, m *repo_model.PushMirror) error {
 	path := m.Repo.RepoPath()
 
-	// First, remove all existing push refspecs for this remote
-	cmd := git.NewCommand(ctx, "config", "--unset-all").AddDynamicArguments("remote." + m.RemoteName + ".push")
-	if _, _, err := cmd.RunStdString(&git.RunOpts{Dir: path}); err != nil {
-		// Ignore error if the key doesn't exist
-		if !strings.Contains(err.Error(), "does not exist") {
-			return err
-		}
-	}
-	err := addRemotePushRefSpecs(ctx, path, m)
+	// A push refspec written without the remote's url would leave a remote
+	// section that `git remote add` then refuses ("remote already exists").
+	// In a cluster, a node that lacks the remote writes SQL only: its next
+	// sync recreates the remote from SQL, with the new filter (#79, #183).
+	// Without a cluster nothing recreates it: a missing remote fails as
+	// before.
+	_, exists, err := remoteURLIn(ctx, path, m.RemoteName)
 	if err != nil {
 		return err
 	}
-	return nil
+	if !exists {
+		if clusterhook.Enabled() {
+			return nil
+		}
+		return fmt.Errorf("the push mirror's remote %s is missing from %s", m.RemoteName, path)
+	}
+
+	// First, remove all existing push refspecs for this remote. Exit code 5
+	// is git finding none, which writes nothing on stderr (#201).
+	cmd := git.NewCommand(ctx, "config", "--unset-all").AddDynamicArguments("remote." + m.RemoteName + ".push")
+	if _, _, err := cmd.RunStdString(&git.RunOpts{Dir: path}); err != nil {
+		// Ignore error if the key doesn't exist
+		if !git.IsErrorExitCode(err, 5) && !strings.Contains(err.Error(), "does not exist") {
+			return err
+		}
+	}
+	return addRemotePushRefSpecs(ctx, path, m)
 }
 
 // RemovePushMirrorRemote removes the push mirror remote.

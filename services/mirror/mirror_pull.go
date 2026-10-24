@@ -297,6 +297,23 @@ func ModernizePullMirrorConfig(ctx context.Context, m *repo_model.Mirror) error 
 	return nil
 }
 
+// wikiHasPullRemote reports whether the wiki at wikiPath has a remote to
+// update from. An address that serves no wiki gives the wiki's remote an
+// empty URL (UpdateAddress, and every node of a cluster since #183), and
+// the wiki's update then failed the whole sync, at every sync, its
+// results dropped and the mirror due again at every cron tick (#201). A
+// wiki with no remote, or with an empty URL, is skipped, as runPushSync
+// skips one, with or without a cluster. A git config this cannot read lets
+// the update run and report it.
+func wikiHasPullRemote(ctx context.Context, m *repo_model.Mirror, wikiPath string) bool {
+	addr, exists, err := remoteURLIn(ctx, wikiPath, m.GetRemoteName())
+	if err == nil && (!exists || addr == "") {
+		log.Trace("SyncMirrors [repo: %-v Wiki]: skipped, no remote to update from", m.Repo)
+		return false
+	}
+	return true
+}
+
 func recheckPullPermitted(ctx context.Context, m *repo_model.Mirror, remoteURL *url.URL) error {
 	if err := m.Repo.LoadOwner(ctx); err != nil {
 		return err
@@ -475,7 +492,7 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 		log.Error("SyncMirrors [repo: %-v]: failed to update size for mirror repository: %v", m.Repo, err)
 	}
 
-	if m.Repo.HasWiki() {
+	if m.Repo.HasWiki() && wikiHasPullRemote(ctx, m, wikiPath) {
 		// The wiki's remote holds no password, as the repository's: the
 		// same credential helper authenticates its update.
 		updateWiki := func() error {

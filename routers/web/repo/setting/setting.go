@@ -603,26 +603,27 @@ func SettingsPost(ctx *context.Context) {
 			return
 		}
 
+		// The interval and the branch filter are one update: a filter that
+		// fails leaves the interval as it was too.
 		m.Interval = interval
-		if err := repo_model.UpdatePushMirrorInterval(ctx, m); err != nil {
-			ctx.ServerError("UpdatePushMirrorInterval", err)
-			return
-		}
-
-		if m.BranchFilter != form.PushMirrorBranchFilter {
-			// replace `remote.<remote>.push` in config and db
-			m.BranchFilter = form.PushMirrorBranchFilter
-			if err := db.WithTx(ctx, func(ctx go_context.Context) error {
-				// Update the DB
-				if err = repo_model.UpdatePushMirrorBranchFilter(ctx, m); err != nil {
-					return err
-				}
-				// Update the repo config
-				return mirror_service.UpdatePushMirrorBranchFilter(ctx, m)
-			}); err != nil {
-				ctx.ServerError("UpdatePushMirrorBranchFilter", err)
-				return
+		filterChanged := m.BranchFilter != form.PushMirrorBranchFilter
+		m.BranchFilter = form.PushMirrorBranchFilter
+		if err := db.WithTx(ctx, func(ctx go_context.Context) error {
+			if err := repo_model.UpdatePushMirrorInterval(ctx, m); err != nil {
+				return err
 			}
+			if !filterChanged {
+				return nil
+			}
+			// replace `remote.<remote>.push` in config and db
+			if err := repo_model.UpdatePushMirrorBranchFilter(ctx, m); err != nil {
+				return err
+			}
+			// Update the repo config
+			return mirror_service.UpdatePushMirrorBranchFilter(ctx, m)
+		}); err != nil {
+			ctx.ServerError("UpdatePushMirror", err)
+			return
 		}
 
 		// Background why we are adding it to Queue
