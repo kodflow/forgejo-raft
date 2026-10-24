@@ -91,7 +91,7 @@ func SyncRepoBranchesWithRepo(ctx context.Context, repo *repo_model.Repository, 
 				PusherID:      doerID,
 				CommitTime:    timeutil.TimeStamp(commit.Committer.When.Unix()),
 			})
-		} else if commit.ID.String() != dbb.CommitID {
+		} else if commit.ID.String() != dbb.CommitID || dbb.IsDeleted {
 			toUpdate = append(toUpdate, &git_model.Branch{
 				ID:            dbb.ID,
 				RepoID:        repo.ID,
