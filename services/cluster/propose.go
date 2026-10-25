@@ -554,17 +554,32 @@ const retryDelay = 150 * time.Millisecond
 // expects: a copy of an attempt that did commit is refused by Apply, and
 // the table then shows our values, which is success. An unknown outcome is
 // resolved from the table after a barrier, never by retrying blindly (R1-04).
+// When the table no longer tells (txnLanded), the write is answered as
+// unknown, never as refused: it may have committed (#234).
 func (r *Replicator) proposeWithRetry(ctx context.Context, repo, nonce string, tx *reftable.RefTxn, data []byte) *clusterhook.Response {
 	eng := r.Engine()
-	maybeCommitted := false
+	start := r.proposalStart()
+	maybeCommitted, open := false, false
+	unknown := func(err error) *clusterhook.Response {
+		log.Error("cluster: outcome of a write to %s unknown, and the table no longer tells whether it committed: %v", repo, err)
+		return fail(fmt.Errorf("the outcome of the write is unknown (%v): the cluster may have committed it; fetch before pushing again", err))
+	}
 	var lastErr error
 	for {
 		tok, res, err := eng.Propose(ctx, data)
 		if err == nil {
 			result, _ := res.(reftable.Result)
-			if result.OK || (maybeCommitted && r.committed(repo, tx)) {
+			l := landingNo
+			if !result.OK && maybeCommitted {
+				l = r.txnLanded(repo, tx, start)
+			}
+			switch {
+			case result.OK || l == landingYes:
 				proposalsTotal.WithLabelValues("committed").Inc()
 				return r.proposed(repo, nonce, tok)
+			case l == landingUnknown:
+				proposalsTotal.WithLabelValues("unknown").Inc()
+				return unknown(fmt.Errorf("proposed again, it was refused: %s", result.Reason))
 			}
 			proposalsTotal.WithLabelValues("refused").Inc()
 			return fail(fmt.Errorf("the cluster refused the write: %s", result.Reason))
@@ -574,6 +589,9 @@ func (r *Replicator) proposeWithRetry(ctx context.Context, repo, nonce string, t
 		case retryable(err):
 			// Certainly not appended: wait for a leader and propose again.
 		case consensus.Certain(err):
+			if open {
+				return unknown(err)
+			}
 			proposalsTotal.WithLabelValues("error").Inc()
 			return fail(fmt.Errorf("the cluster refused the write (%v); nothing was written", err))
 		default:
@@ -585,14 +603,24 @@ func (r *Replicator) proposeWithRetry(ctx context.Context, repo, nonce string, t
 				log.Error("cluster: outcome of a write to %s unknown and unresolved: %v (%v)", repo, err, cerr)
 				return fail(fmt.Errorf("the outcome of the write is unknown (%v); retry, the cluster will refuse a duplicate", err))
 			}
-			if r.committed(repo, tx) {
+			switch r.txnLanded(repo, tx, start) {
+			case landingYes:
 				proposalsTotal.WithLabelValues("committed").Inc()
 				return r.proposed(repo, nonce, tok)
+			case landingNo:
+				// Absent after a confirmed barrier: it never commits.
+				open = false
+			default:
+				// The table no longer tells: a copy is refused if it
+				// committed, which leaves it unknown.
+				open = true
 			}
-			// Absent after a confirmed barrier: it never commits, propose again.
 		}
 		select {
 		case <-ctx.Done():
+			if open {
+				return unknown(lastErr)
+			}
 			return fail(fmt.Errorf("the cluster found no leader in time (%v); nothing was written", lastErr))
 		case <-time.After(retryDelay):
 		}
@@ -649,6 +677,23 @@ func (r *Replicator) committed(repo string, tx *reftable.RefTxn) bool {
 	return true
 }
 
+// txnLanded is committed for a ref transaction proposed from start, once
+// this node applied a commit boundary a quorum confirmed: a transaction
+// neither found by its nonce nor by its values is certainly not committed
+// only while the ring of nonces covers the proposal. Past it, a push that
+// committed and whose ref another write moved since reads as refused
+// (#234): it is landingUnknown instead. A transaction without a nonce is
+// told by its values alone, as before: the ring holds nothing of it.
+func (r *Replicator) txnLanded(repo string, tx *reftable.RefTxn, start proposalStart) landing {
+	if r.committed(repo, tx) {
+		return landingYes
+	}
+	if tx.Nonce == "" {
+		return landingNo
+	}
+	return r.nonceAbsent(start)
+}
+
 func (r *Replicator) proposed(repo, nonce string, tok consensus.Token) *clusterhook.Response {
 	r.registry.markProposed(nonce)
 	r.recordRaw(nonce, repo, tok)
@@ -681,12 +726,72 @@ func (r *Replicator) finished(req *clusterhook.Request) {
 func (r *Replicator) proposeRepoDelete(ctx context.Context, key string, repoID int64) error {
 	v := r.table.WriteVersion()
 	d := &reftable.RepoDelete{Repo: key, RepoID: repoID, Time: time.Now().UnixNano()}
-	landed := func() bool { _, deleted := r.table.Deleted(key); return deleted }
+	landed := certainly(func() bool { _, deleted := r.table.Deleted(key); return deleted })
 	if v >= reftable.GenerationVersion {
 		d.Nonce = clusterhook.NewNonce()
-		landed = r.nonceLanded(d.Nonce)
+		landed = r.nonceLanded(d.Nonce, func(after uint64) bool { return r.table.DeletedSince(key, after) })
 	}
 	return r.proposeLifecycle(ctx, v, reftable.KindRepoDelete, d, landed)
+}
+
+// landing is what the table tells of a command whose outcome was unknown,
+// once this node applied a commit boundary a quorum confirmed.
+type landing uint8
+
+const (
+	// landingUnknown: the table no longer tells (#234). It is the zero
+	// value: a test that forgets to answer never reads as a refusal.
+	landingUnknown landing = iota
+	// landingNo: certainly not applied, and safe to propose again.
+	landingNo
+	// landingYes: applied.
+	landingYes
+)
+
+// certainly is a landed test whose answer is always certain.
+func certainly(landed func() bool) func() landing {
+	if landed == nil {
+		return nil
+	}
+	return func() landing {
+		if landed() {
+			return landingYes
+		}
+		return landingNo
+	}
+}
+
+// proposalStart is the position this node applied before a proposal: an
+// entry committed for the proposal lies past it, every index up to it
+// holding an entry committed before.
+type proposalStart struct {
+	index uint64
+	id    consensus.LogIdentity
+}
+
+func (r *Replicator) proposalStart() proposalStart {
+	p, id := r.table.Applied()
+	return proposalStart{index: p.Index, id: id}
+}
+
+// sameLineage reports whether the table still applies the lineage the
+// proposal started in, whose indexes compare with its start. A table that
+// had applied nothing compares with any.
+func (r *Replicator) sameLineage(s proposalStart) bool {
+	_, id := r.table.Applied()
+	return s.id == (consensus.LogIdentity{}) || id == s.id
+}
+
+// nonceAbsent says what the absence of a proposal's nonce among the
+// committed ones tells: landingNo while the table still holds the nonce of
+// every command it accepted since the proposal started, landingUnknown
+// once the ring dropped some of them, or the table moved to another
+// lineage (#234).
+func (r *Replicator) nonceAbsent(s proposalStart) landing {
+	if r.table.NoncesKeptSince(s.id, s.index) {
+		return landingNo
+	}
+	return landingUnknown
 }
 
 // nonceLanded is the landed test of a lifecycle command written at
@@ -694,9 +799,29 @@ func (r *Replicator) proposeRepoDelete(ctx context.Context, key string, repoID i
 // state of the table cannot tell THIS command from an older one: after a
 // round trip a to b and back, b's rename mark already names a, and a third
 // a to b whose outcome was unknown read as committed when nothing was
-// (#74).
-func (r *Replicator) nonceLanded(nonce string) func() bool {
-	return func() bool { _, ok := r.table.CommittedNonce(nonce); return ok }
+// (#74). The nonce's absence is a certain refusal only while the ring of
+// nonces covers the proposal: one ring, NoncesKept of them, holds the
+// nonces of every accepted ref transaction too, and a rename that
+// committed while more pushes than that committed before its outcome was
+// settled read as refused, its directories moved back and its database
+// never written (#234). Past the ring, done reads the command's effect on
+// the table as it is now: an entry past the proposal's start that left
+// the table where this command would, which the database must then
+// follow. The start is read here, so the test is built before the command
+// is proposed. When neither tells, the outcome stays unknown, which the
+// callers keep without undoing anything.
+func (r *Replicator) nonceLanded(nonce string, done func(after uint64) bool) func() landing {
+	s := r.proposalStart()
+	return func() landing {
+		if _, ok := r.table.CommittedNonce(nonce); ok {
+			return landingYes
+		}
+		v := r.nonceAbsent(s)
+		if v == landingUnknown && done != nil && r.sameLineage(s) && done(s.index) {
+			return landingYes
+		}
+		return v
+	}
 }
 
 // proposeRepoRename moves a repository's refs to its new key; every
@@ -725,18 +850,23 @@ func (r *Replicator) proposeMoves(ctx context.Context, moves [][2]string, owner 
 		}
 	}
 	v, rn := r.renameCommand(moves, owner)
-	landed := func() bool {
+	landed := certainly(func() bool {
 		for _, m := range moves {
 			if f, _, ok := r.table.RenamedFrom(m[1]); !ok || f != m[0] {
 				return false
 			}
 		}
 		return true
-	}
+	})
 	if v >= reftable.GenerationVersion {
-		landed = r.nonceLanded(rn.Nonce)
+		landed = r.nonceLanded(rn.Nonce, r.movedSince(moves))
 	}
 	return r.proposeLifecycle(ctx, v, reftable.KindRepoRename, rn, landed)
+}
+
+// movedSince is the effect of a rename moving moves, for nonceLanded.
+func (r *Replicator) movedSince(moves [][2]string) func(after uint64) bool {
+	return func(after uint64) bool { return r.table.MovedSince(moves, after) }
 }
 
 // renameSourceRefusal is clusterhook.RepoRenameRefusal: the rename or the
@@ -784,7 +914,7 @@ func (r *Replicator) tooLarge(size int) error {
 	return fmt.Errorf("%w (%d bytes, the bound is %d)", clusterhook.ErrTooLarge, size, bound)
 }
 
-func (r *Replicator) proposeLifecycle(ctx context.Context, v uint8, kind reftable.Kind, body any, landed func() bool) error {
+func (r *Replicator) proposeLifecycle(ctx context.Context, v uint8, kind reftable.Kind, body any, landed func() landing) error {
 	data, err := reftable.EncodeVersion(v, kind, body)
 	if err != nil {
 		return err
@@ -814,16 +944,22 @@ func (r *Replicator) proposeLifecycle(ctx context.Context, v uint8, kind reftabl
 		defer cancel()
 	}
 	r.fence.RLock()
-	_, result, err := r.proposeCommand(pctx, data, landed)
+	_, result, err := r.proposeSettled(pctx, data, landed, copySafe(kind))
 	r.fence.RUnlock()
-	if clusterhook.IsOutcomeUnresolved(err) && landed != nil {
-		if ok, rerr := r.resolveLanded(detached, landed); rerr == nil {
-			if !ok {
+	if clusterhook.IsOutcomeUnresolved(err) && !errors.Is(err, errTableNoLongerTells) && landed != nil {
+		if l, rerr := r.resolveLanded(detached, landed); rerr == nil {
+			switch l {
+			case landingNo:
 				// Certain: a commit boundary a quorum confirmed was applied
 				// without it, so the callers move the directories back.
 				return fmt.Errorf("the cluster did not record it: not applied at a commit boundary after %v", err)
+			case landingYes:
+				result, err = reftable.Result{OK: true}, nil
+			default:
+				// Its nonce may be gone with the oldest ones: still
+				// unresolved, never refused (#234).
+				err = fmt.Errorf("%w (%w)", err, errTableNoLongerTells)
 			}
-			result, err = reftable.Result{OK: true}, nil
 		}
 	}
 	if err != nil {
@@ -836,6 +972,20 @@ func (r *Replicator) proposeLifecycle(ctx context.Context, v uint8, kind reftabl
 	return nil
 }
 
+// copySafe says whether a lifecycle command of kind may be proposed again
+// while the table no longer tells whether it committed (landingUnknown,
+// #234). Apply refuses the copy of a rename that committed: its targets
+// hold the refs it moved, or, from RenameSourceVersion, its source moved
+// away. The copy of an owner's rename that committed moves only what the
+// old owner holds since, which the database's rename of the owner takes
+// along. A deletion's copy is always applied: once the first one
+// committed, it would delete a repository created again under the key
+// since, the database having let the name go before the deletion was
+// proposed.
+func copySafe(kind reftable.Kind) bool {
+	return kind != reftable.KindRepoDelete
+}
+
 // lifecycleResolveBudget bounds how long a lifecycle command whose outcome
 // stayed unknown is resolved, a commit boundary at a time, before its
 // caller is told ErrOutcomeUnresolved.
@@ -843,11 +993,11 @@ var lifecycleResolveBudget = clusterhook.DefaultTimeout
 
 // resolveLanded applies a commit boundary confirmed by a quorum and then
 // asks landed, within lifecycleResolveBudget.
-func (r *Replicator) resolveLanded(ctx context.Context, landed func() bool) (bool, error) {
+func (r *Replicator) resolveLanded(ctx context.Context, landed func() landing) (landing, error) {
 	ctx, cancel := context.WithTimeout(ctx, lifecycleResolveBudget)
 	defer cancel()
 	if _, err := r.confirm(ctx); err != nil {
-		return false, err
+		return landingUnknown, err
 	}
 	return landed(), nil
 }
@@ -870,8 +1020,11 @@ func (r *Replicator) proposeOwnerRename(ctx context.Context, oldOwner, newOwner 
 	}
 	moves := r.ownerMoves(oldOwner, newOwner)
 	if v := r.table.WriteVersion(); v >= reftable.OwnerRenameVersion && len(moves) > 0 {
+		// Its effect is read on the keys listed here, which Apply moves
+		// unless one left the owner meanwhile: the outcome then stays
+		// unknown once the nonce is gone.
 		o := ownerRenameCommand(oldOwner, newOwner)
-		return r.proposeLifecycle(ctx, v, reftable.KindOwnerRename, o, r.nonceLanded(o.Nonce))
+		return r.proposeLifecycle(ctx, v, reftable.KindOwnerRename, o, r.nonceLanded(o.Nonce, r.movedSince(moves)))
 	}
 	err := r.proposeMoves(ctx, moves, [2]string{oldOwner, newOwner})
 	if errors.Is(err, clusterhook.ErrTooLarge) {
@@ -1007,6 +1160,23 @@ const commandBudget = 30 * time.Second
 // unknown outcome, and a copy refused because the first attempt committed.
 // A nil landed marks an idempotent command, which is simply proposed again.
 func (r *Replicator) proposeCommand(ctx context.Context, data []byte, landed func() bool) (consensus.Token, reftable.Result, error) {
+	return r.proposeSettled(ctx, data, certainly(landed), false)
+}
+
+// errTableNoLongerTells is the unresolved outcome of a command whose
+// table no longer tells whether it committed (landingUnknown).
+var errTableNoLongerTells = errors.New("the table no longer tells whether an attempt committed")
+
+// proposeSettled is proposeCommand with a landed test that may not know
+// (landingUnknown, #234). While it does not, the command is proposed
+// again only when again says a copy is safe whether or not the first one
+// committed; otherwise the caller is told clusterhook.ErrOutcomeUnresolved
+// at once. A refusal of the copy, the end of ctx, or a certain error of
+// the engine then leaves the outcome open, and the caller is told
+// ErrOutcomeUnresolved as well, never a refusal: the command may have
+// committed, and the callers must not undo it. again does not matter to a
+// landed test that always knows.
+func (r *Replicator) proposeSettled(ctx context.Context, data []byte, landed func() landing, again bool) (consensus.Token, reftable.Result, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, commandBudget)
@@ -1016,19 +1186,30 @@ func (r *Replicator) proposeCommand(ctx context.Context, data []byte, landed fun
 	if eng == nil {
 		return consensus.Token{}, reftable.Result{}, errors.New("the cluster is not running")
 	}
-	maybeCommitted := false
+	unresolved := func(tok consensus.Token, err error) (consensus.Token, reftable.Result, error) {
+		return tok, reftable.Result{}, fmt.Errorf("%w: %w (%w)", clusterhook.ErrOutcomeUnresolved, err, errTableNoLongerTells)
+	}
+	maybeCommitted, open := false, false
 	for {
 		tok, res, err := eng.Propose(ctx, data)
 		if err == nil {
 			result, _ := res.(reftable.Result)
-			if !result.OK && maybeCommitted && landed != nil && landed() {
-				result = reftable.Result{OK: true}
+			if !result.OK && maybeCommitted && landed != nil {
+				switch landed() {
+				case landingYes:
+					result = reftable.Result{OK: true}
+				case landingUnknown:
+					return unresolved(tok, fmt.Errorf("proposed again, it was refused: %s", result.Reason))
+				}
 			}
 			return tok, result, nil
 		}
 		switch {
 		case retryable(err):
 		case consensus.Certain(err):
+			if open {
+				return unresolved(tok, err)
+			}
 			return tok, reftable.Result{}, err
 		default:
 			maybeCommitted = true
@@ -1036,12 +1217,25 @@ func (r *Replicator) proposeCommand(ctx context.Context, data []byte, landed fun
 			if cerr != nil {
 				return tok, reftable.Result{}, fmt.Errorf("%w: %w (unresolved: %v)", clusterhook.ErrOutcomeUnresolved, err, cerr)
 			}
-			if landed != nil && landed() {
-				return ctok, reftable.Result{OK: true}, nil
+			if landed != nil {
+				switch landed() {
+				case landingYes:
+					return ctok, reftable.Result{OK: true}, nil
+				case landingNo:
+					open = false
+				default:
+					if !again {
+						return unresolved(ctok, err)
+					}
+					open = true
+				}
 			}
 		}
 		select {
 		case <-ctx.Done():
+			if open {
+				return unresolved(tok, fmt.Errorf("no leader in time: %w", err))
+			}
 			return tok, reftable.Result{}, fmt.Errorf("no leader in time: %w", err)
 		case <-time.After(retryDelay):
 		}
