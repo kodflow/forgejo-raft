@@ -293,6 +293,22 @@ version (the autopilot raises the version; in the manual mode, the
 operator raises it from the administration page). A JOIN grant is bound to the key it first admits:
 that node may retry, another key does not join under it.
 
+**Payload version 9** refuses the rename or the transfer of a repository
+whose name the cluster no longer holds: deleted, or moved away by the
+rename of its owner. A request loaded before an owner's rename committed
+through another node, and served by a node whose disk was still behind
+that rename, moved a directory the cluster had already moved elsewhere:
+the cluster took a rename that moved nothing, the database committed the
+new name, and every node served the repository empty under it while its
+git data stayed under a name the database did not know. At every version
+the node serving the request now reads the repository's name in its
+table, once it applied the log as far as a majority confirms, before
+Forgejo writes or moves anything, and again before it proposes the move;
+the refusal is certain, and Forgejo moves the directories back. From
+version 9 the entry itself is refused when an owner's rename commits
+between that check and the entry. Until every member runs a binary of
+version 9 and the version is raised, that last race is taken as before.
+
 **Payload version 8** renames an owner by its names. Before, the rename of
 a user or an organization was one entry listing every repository of the
 owner, wikis included, and the engine refuses an entry past 1 MiB: an

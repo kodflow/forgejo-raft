@@ -21,11 +21,14 @@ import (
 
 // unknownEngine applies a proposal and then answers OUTCOME_UNKNOWN, as a
 // leader whose context ended after the append; its barriers fail until
-// barrierFrom, never when it is zero.
+// barrierFrom, never when it is zero. With checked, a barrier before the
+// first proposal passes: the proposer's check of its table, which a rename
+// makes before it proposes (#220), found a leader.
 type unknownEngine struct {
 	consensus.Engine
 	table       *reftable.Table
 	barrierFrom time.Time
+	checked     bool
 	// lost drops the proposal instead of applying it: the outcome stays
 	// unknown, and a commit boundary shows it did not land.
 	lost  bool
@@ -49,11 +52,14 @@ func (e *unknownEngine) Propose(_ context.Context, data []byte) (consensus.Token
 }
 
 func (e *unknownEngine) Barrier(context.Context) (consensus.Token, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.checked && e.index == 0 {
+		return e.token(), nil
+	}
 	if e.barrierFrom.IsZero() || time.Now().Before(e.barrierFrom) {
 		return consensus.Token{}, consensus.ErrLeadershipUnconfirmed
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	return e.token(), nil
 }
 
@@ -72,7 +78,7 @@ func TestARenameWithAnUnknownOutcomeIsNotReportedRefused(t *testing.T) {
 	// The client went away and the request's budget ended before a leader
 	// confirmed: the rename committed, and is reported so.
 	r := newReplicator(t.TempDir(), newRegistry(0, 1, 1))
-	r.setEngine(&unknownEngine{table: r.table, barrierFrom: time.Now().Add(600 * time.Millisecond)})
+	r.setEngine(&unknownEngine{table: r.table, checked: true, barrierFrom: time.Now().Add(600 * time.Millisecond)})
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	require.NoError(t, r.proposeRepoMoves(ctx, moves))
@@ -83,7 +89,7 @@ func TestARenameWithAnUnknownOutcomeIsNotReportedRefused(t *testing.T) {
 	// No commit boundary within the budget: unresolved, never refused.
 	defer test.MockVariableValue(&lifecycleResolveBudget, 300*time.Millisecond)()
 	r = newReplicator(t.TempDir(), newRegistry(0, 1, 1))
-	r.setEngine(&unknownEngine{table: r.table})
+	r.setEngine(&unknownEngine{table: r.table, checked: true})
 	ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	err := r.proposeRepoMoves(ctx, moves)
@@ -99,7 +105,7 @@ func TestARenameWithAnUnknownOutcomeIsNotReportedRefused(t *testing.T) {
 func TestARenameShownLostAtACommitBoundaryIsRefused(t *testing.T) {
 	moves := [][2]string{{"o/a.git", "o/b.git"}}
 	r := newReplicator(t.TempDir(), newRegistry(0, 1, 1))
-	r.setEngine(&unknownEngine{table: r.table, lost: true, barrierFrom: time.Now().Add(400 * time.Millisecond)})
+	r.setEngine(&unknownEngine{table: r.table, lost: true, checked: true, barrierFrom: time.Now().Add(400 * time.Millisecond)})
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	err := r.proposeRepoMoves(ctx, moves)
@@ -107,4 +113,19 @@ func TestARenameShownLostAtACommitBoundaryIsRefused(t *testing.T) {
 	assert.False(t, clusterhook.IsOutcomeUnresolved(err), "%v", err)
 	_, _, ok := r.table.RenamedFrom("o/b.git")
 	assert.False(t, ok)
+}
+
+// A rename on a node that cannot confirm it applied the log is refused for
+// certain, before it is proposed: its source is read on the confirmed
+// table only, as an owner's keys are, and the caller moves the directories
+// back (#220).
+func TestARenameOnANodeThatCannotConfirmIsRefusedBeforeItIsProposed(t *testing.T) {
+	defer test.MockVariableValue(&lifecycleResolveBudget, 300*time.Millisecond)()
+	r := newReplicator(t.TempDir(), newRegistry(0, 1, 1))
+	eng := &unknownEngine{table: r.table}
+	r.setEngine(eng)
+	err := r.proposeRepoMoves(context.Background(), [][2]string{{"o/a.git", "o/b.git"}})
+	require.ErrorContains(t, err, "could not confirm it applied the log")
+	assert.False(t, clusterhook.IsOutcomeUnresolved(err), "%v", err)
+	assert.Zero(t, eng.index, "nothing was proposed")
 }

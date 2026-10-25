@@ -5,6 +5,7 @@ package reftable
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -74,7 +75,7 @@ func TestWriteVersionIsRaisedByAnAuditRecord(t *testing.T) {
 	assert.Equal(t, uint8(BaseVersion), h.table.WriteVersion())
 	require.True(t, h.apply(KindAudit, &Audit{Operator: "op", Action: AuditPayloadVersion, Target: "2", Outcome: "requested"}).OK)
 	assert.Equal(t, uint8(BaseVersion), h.table.WriteVersion(), "only a raised outcome counts")
-	require.True(t, h.apply(KindAudit, &Audit{Operator: "op", Action: AuditPayloadVersion, Target: "9", Outcome: AuditRaised}).OK)
+	require.True(t, h.apply(KindAudit, &Audit{Operator: "op", Action: AuditPayloadVersion, Target: strconv.Itoa(PayloadVersion + 1), Outcome: AuditRaised}).OK)
 	assert.Equal(t, uint8(BaseVersion), h.table.WriteVersion(), "a version this code cannot apply is not adopted")
 	require.True(t, h.apply(KindAudit, &Audit{Operator: "op", Action: AuditPayloadVersion, Target: "2", Outcome: AuditRaised}).OK)
 	assert.Equal(t, uint8(2), h.table.WriteVersion())

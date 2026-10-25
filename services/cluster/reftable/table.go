@@ -745,6 +745,14 @@ func (t *Table) applyRepoRename(e consensus.Entry, version uint8, rn *RepoRename
 			return refuse("a rename chains through %s", m[0]), Change{}
 		}
 	}
+	if version >= RenameSourceVersion && rn.Owner == [2]string{} {
+		// An owner's rename moves the keys its owner holds at this index,
+		// checked by ownerRenameRefuses; a repository's rename moves the
+		// one it names, which must still be there (#220).
+		if why := t.renameSourceRefusesLocked(moves[0][0]); why != "" {
+			return refuse("%s", why), Change{}
+		}
+	}
 	if version >= GenerationVersion && rn.Owner != [2]string{} {
 		if why := t.ownerRenameRefuses(rn.Owner, moves, sources); why != "" {
 			return refuse("%s", why), Change{}
@@ -763,6 +771,34 @@ func (t *Table) applyRepoRename(e consensus.Entry, version uint8, rn *RepoRename
 		ch.Renamed = append(ch.Renamed, [2]string{m[0], m[1]})
 	}
 	return Result{OK: true}, ch
+}
+
+// RenameSourceRefusal says why a repository's rename from key would move
+// nothing the database names, "" when it may be proposed: the repository
+// under key was deleted, or renamed away, and no live ref was written
+// under key since. Forgejo moved the directory of a repository it loaded
+// before that, on a node whose disk was behind, and the rename recorded
+// empty left the repository under a key the database no longer knows
+// (#220). A key the table never held passes: there is nothing to lose.
+// It is Apply's check from RenameSourceVersion, which the proposer makes
+// on its confirmed table at every version.
+func (t *Table) RenameSourceRefusal(key string) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.renameSourceRefusesLocked(key)
+}
+
+// renameSourceRefusesLocked is RenameSourceRefusal; the caller holds the
+// lock. Its reason reads the same on every node: movedAwayLocked picks the
+// newest rename, the smallest key on a tie.
+func (t *Table) renameSourceRefusesLocked(key string) string {
+	if _, deleted := t.deleted[key]; deleted {
+		return fmt.Sprintf("the repository %s was deleted", key)
+	}
+	if to, moved := t.movedAwayLocked(key); moved {
+		return fmt.Sprintf("the repository %s was renamed to %s", key, to)
+	}
+	return ""
 }
 
 // ownerRenameRefuses checks an owner's rename against the table at its

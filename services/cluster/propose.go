@@ -712,10 +712,17 @@ func (r *Replicator) proposeRepoMoves(ctx context.Context, moves [][2]string) er
 }
 
 // proposeMoves is proposeRepoMoves; owner names an owner's rename, old and
-// new names, which Apply checks from reftable.GenerationVersion.
+// new names, which Apply checks from reftable.GenerationVersion. A
+// repository's rename is refused before it is proposed when its source
+// left the confirmed table (renameSourceRefusal).
 func (r *Replicator) proposeMoves(ctx context.Context, moves [][2]string, owner [2]string) error {
 	if len(moves) == 0 {
 		return nil
+	}
+	if owner == ([2]string{}) {
+		if err := r.renameSourceRefusal(ctx, moves[0][0]); err != nil {
+			return err
+		}
 	}
 	v, rn := r.renameCommand(moves, owner)
 	landed := func() bool {
@@ -730,6 +737,27 @@ func (r *Replicator) proposeMoves(ctx context.Context, moves [][2]string, owner 
 		landed = r.nonceLanded(rn.Nonce)
 	}
 	return r.proposeLifecycle(ctx, v, reftable.KindRepoRename, rn, landed)
+}
+
+// renameSourceRefusal is clusterhook.RepoRenameRefusal: the rename or the
+// transfer of a repository whose key left the table, deleted or renamed
+// away, is refused for certain, before anything is proposed, the callers
+// moving the directories back (#220). The source is read once this node
+// applied a commit boundary a quorum confirmed, as an owner's keys are
+// (#56): Forgejo loaded the repository, and a node whose disk was behind
+// let it move the directory, before an owner's rename committed through
+// another node, and its rename, recorded empty, left the repository under
+// a key the database no longer knows. A node that cannot confirm refuses
+// the move too. A rename the check passes and an owner's rename commits
+// ahead of is refused by Apply from reftable.RenameSourceVersion.
+func (r *Replicator) renameSourceRefusal(ctx context.Context, source string) error {
+	if err := r.confirmTable(ctx); err != nil {
+		return err
+	}
+	if why := r.table.RenameSourceRefusal(source); why != "" {
+		return fmt.Errorf("the cluster refused it: %s; reload the repository and retry", why)
+	}
+	return nil
 }
 
 // renameCommand is the command moving moves, at the version the table
@@ -837,7 +865,7 @@ func (r *Replicator) resolveLanded(ctx context.Context, landed func() bool) (boo
 // which the confirmed table still decides: a node behind the log that
 // found none would propose nothing.
 func (r *Replicator) proposeOwnerRename(ctx context.Context, oldOwner, newOwner string) error {
-	if err := r.confirmOwnerKeys(ctx); err != nil {
+	if err := r.confirmTable(ctx); err != nil {
 		return err
 	}
 	moves := r.ownerMoves(oldOwner, newOwner)
@@ -852,11 +880,12 @@ func (r *Replicator) proposeOwnerRename(ctx context.Context, oldOwner, newOwner 
 	return err
 }
 
-// confirmOwnerKeys applies a commit boundary a quorum confirmed, within
-// lifecycleResolveBudget, before an owner's keys are listed: a node behind
-// the log would miss a repository created just before (#56). Without an
-// engine there is nothing to confirm.
-func (r *Replicator) confirmOwnerKeys(ctx context.Context) error {
+// confirmTable applies a commit boundary a quorum confirmed, within
+// lifecycleResolveBudget, before an owner's keys are listed or a rename's
+// source is read: a node behind the log would miss a repository created
+// just before (#56), or one an owner's rename moved away (#220). Without
+// an engine there is nothing to confirm.
+func (r *Replicator) confirmTable(ctx context.Context) error {
 	if r.Engine() == nil {
 		return nil
 	}
@@ -885,7 +914,7 @@ func ownerRenameCommand(oldOwner, newOwner string) *reftable.OwnerRename {
 // From reftable.OwnerRenameVersion the entry lists no key, and its size
 // does not depend on the owner.
 func (r *Replicator) ownerRenameRefusal(ctx context.Context, oldOwner, newOwner string) error {
-	if err := r.confirmOwnerKeys(ctx); err != nil {
+	if err := r.confirmTable(ctx); err != nil {
 		return err
 	}
 	moves := r.ownerMoves(oldOwner, newOwner)

@@ -344,6 +344,7 @@ func Init(ctx context.Context) error {
 	clusterhook.SetRepoLifecycle(r.proposeRepoDelete, r.proposeRepoMoves)
 	clusterhook.SetOwnerLifecycle(r.proposeOwnerRename)
 	clusterhook.SetOwnerRenameCheck(r.ownerRenameRefusal)
+	clusterhook.SetRepoRenameCheck(r.renameSourceRefusal)
 	clusterhook.SetCutHold(r.holdCut)
 	storage.SetDeleteGate(r.gateDelete)
 	clusterhook.SetKeyCheck(r.writableKey)

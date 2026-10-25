@@ -162,7 +162,7 @@ func TestAnOwnerPastTheEntryBoundIsRenamedOnceThePayloadIsRaised(t *testing.T) {
 
 	require.NoError(t, rs[1].RaisePayloadVersion(ctx, "op"))
 	for _, r := range rs {
-		require.Eventually(t, func() bool { return r.table.WriteVersion() == reftable.OwnerRenameVersion }, 10*time.Second, 10*time.Millisecond)
+		require.Eventually(t, func() bool { return r.table.WriteVersion() == reftable.PayloadVersion }, 10*time.Second, 10*time.Millisecond)
 	}
 	for _, r := range rs {
 		require.NoError(t, r.ownerRenameRefusal(ctx, from, to))
@@ -237,12 +237,12 @@ func TestAnOwnerRenameByItsNamesWaitsForEveryMemberToApplyIt(t *testing.T) {
 	older = false
 	require.NoError(t, leader.Operate(ctx, OperatorFor(1), Operation{Action: ActionRaisePayload, Target: strconv.Itoa(reftable.PayloadVersion)}))
 	for _, r := range rs {
-		require.Equal(t, uint8(reftable.OwnerRenameVersion), r.table.WriteVersion())
+		require.Equal(t, uint8(reftable.PayloadVersion), r.table.WriteVersion())
 	}
 	require.NoError(t, follower.ownerRenameRefusal(ctx, "big", "huge"))
 	require.NoError(t, follower.proposeOwnerRename(ctx, "big", "huge"))
 	e := lastEntry(t, leader.Engine().(*memraft.Node))
-	assert.Equal(t, []byte{reftable.OwnerRenameVersion, byte(reftable.KindOwnerRename)}, e.Data[:2])
+	assert.Equal(t, []byte{reftable.PayloadVersion, byte(reftable.KindOwnerRename)}, e.Data[:2])
 	assert.Less(t, len(e.Data), len(listing), "the entry names the owner alone")
 	for _, r := range rs {
 		assert.Empty(t, r.table.OwnerKeys("big"))

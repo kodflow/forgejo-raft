@@ -160,14 +160,16 @@ func TestTheMarkWaitsForEveryMemberToWithdrawIt(t *testing.T) {
 		assert.Empty(t, r.table.PendingRevocations(), "below WithdrawVersion nothing is asked")
 	}
 
-	require.NoError(t, leader.RaisePayloadVersion(ctx, "op"))
+	// Raised to WithdrawVersion exactly, not to this binary's version: the
+	// mark needs no payload version of its own.
+	raiseClusterTo(t, leader, reftable.WithdrawVersion, rs...)
 	idC := slotID(t, leader, "node-c")
 	keyC := sha256.Sum256([]byte("node-c"))
 	require.True(t, leader.removeDead(ctx, leader.Engine(), idC))
 	for _, r := range rs {
 		assert.True(t, r.table.KeyRevoked(hex.EncodeToString(keyC[:])), "from WithdrawVersion the key is marked")
 	}
-	assert.Equal(t, 8, reftable.PayloadVersion, "no payload version raised for it")
+	assert.Equal(t, uint8(reftable.WithdrawVersion), leader.table.WriteVersion(), "no payload version raised for it")
 }
 
 // ---- the node's side: a new id takes a new key ----
