@@ -36,6 +36,7 @@ import (
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/base"
 	"forgejo.org/modules/charset"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/emoji"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
@@ -1426,6 +1427,10 @@ func MergePullRequest(ctx *context.Context) {
 	if manuallyMerged {
 		if err := pull_service.MergedManually(ctx, pr, ctx.Doer, ctx.Repo.GitRepo, form.MergeCommitID); err != nil {
 			switch {
+			case errors.Is(err, clusterhook.ErrBehind):
+				// A node of the cluster behind on the base repository:
+				// nothing was marked, the user retries (#247).
+				ctx.Error(http.StatusServiceUnavailable, err.Error())
 			case models.IsErrInvalidMergeStyle(err):
 				ctx.JSONError(ctx.Tr("repo.pulls.invalid_merge_option"))
 			case strings.Contains(err.Error(), "Wrong commit ID"):
@@ -1482,7 +1487,11 @@ func MergePullRequest(ctx *context.Context) {
 	defer cancelWorkCtx()
 
 	if err := pull_service.Merge(workCtx, pr, ctx.Doer, ctx.Repo.GitRepo, repo_model.MergeStyle(form.Do), form.HeadCommitID, message, false); err != nil {
-		if models.IsErrInvalidMergeStyle(err) {
+		if errors.Is(err, clusterhook.ErrBehind) {
+			// A node of the cluster behind on the head or the base
+			// repository: nothing was merged, the user retries (#247).
+			ctx.Error(http.StatusServiceUnavailable, err.Error())
+		} else if models.IsErrInvalidMergeStyle(err) {
 			ctx.JSONError(ctx.Tr("repo.pulls.invalid_merge_option"))
 		} else if models.IsErrMergeConflicts(err) {
 			conflictError := err.(models.ErrMergeConflicts)

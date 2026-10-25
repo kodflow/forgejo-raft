@@ -972,6 +972,9 @@ func MergePullRequest(ctx *context.APIContext) {
 	// handle manually-merged mark
 	if manuallyMerged {
 		if err := pull_service.MergedManually(ctx, pr, ctx.Doer(), ctx.Repo().GitRepo, form.MergeCommitID); err != nil {
+			if clusterBehind(ctx, err) {
+				return
+			}
 			if models.IsErrInvalidMergeStyle(err) {
 				ctx.Error(http.StatusMethodNotAllowed, "Invalid merge style", fmt.Errorf("%s is not an allowed merge style for this repository", repo_model.MergeStyle(form.Do)))
 				return
@@ -1022,6 +1025,12 @@ func MergePullRequest(ctx *context.APIContext) {
 	}
 
 	if err := pull_service.Merge(ctx, pr, ctx.Doer(), ctx.Repo().GitRepo, repo_model.MergeStyle(form.Do), form.HeadCommitID, message, false); err != nil {
+		// A node of the cluster behind on the head or the base repository
+		// merges nothing: the client retries, through this node or another
+		// (#247).
+		if clusterBehind(ctx, err) {
+			return
+		}
 		if models.IsErrInvalidMergeStyle(err) {
 			ctx.Error(http.StatusMethodNotAllowed, "Invalid merge style", fmt.Errorf("%s is not an allowed merge style for this repository", repo_model.MergeStyle(form.Do)))
 		} else if models.IsErrMergeConflicts(err) {
