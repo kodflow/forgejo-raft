@@ -109,6 +109,12 @@ func TestADeposedCoordinatorClosesNoCheckpoint(t *testing.T) {
 			one := commit(t, work, "one")
 			require.True(t, tc.pushVia(a, work, repo, "refs/heads/main", zero, one).OK)
 			require.Eventually(t, func() bool { return pg.stateAt(1 << 62)[key] == one }, 10*time.Second, 10*time.Millisecond)
+			// The push returns once a majority holds it: node-b, through
+			// which the next push goes with one as its old value, may be
+			// the member left behind, whose git rejects that push until it
+			// projects one (#231).
+			require.Eventually(t, func() bool { return gitRef(t, b, repo, "refs/heads/main") == one },
+				15*time.Second, 20*time.Millisecond, "node-b projects the push")
 			two := commit(t, work, "two")
 
 			moveToB := func() { tc.mem.SetLeader(b.node) }

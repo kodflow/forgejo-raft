@@ -17,7 +17,9 @@
 #
 # raft-release.yml calls it on a release branch (release/vX.Y.Z, which carries
 # no .github of its own) with `ref`, and without the lint: that code was
-# linted on `forgejo`, and a release branch has no meaningful baseline.
+# linted on `forgejo`, and a release branch has no meaningful baseline. For
+# the same reason, every script this workflow runs is written here, none in
+# .github/scripts: the checkout of a release branch would not have it.
 name: cluster-checks
 
 on:
@@ -47,8 +49,6 @@ permissions:
 
 env:
   TAGS: sqlite sqlite_unlock_notify
-  # The tests of services/cluster race-l-z runs; checks skips them.
-  SECOND_HALF: ^Test[L-Z]
   SCOPE: >-
     ./services/cluster/...
     ./routers/web/admin/
@@ -57,37 +57,89 @@ env:
     ./services/webhook/
     ./modules/clusterhook/
     ./models/cluster/
+  # The shards of the race tests of services/cluster, one per line: a name,
+  # then the -run pattern of its tests. A pattern selects top-level tests by
+  # name, so it has no "/" (that would cut a test's subtests apart). The one
+  # line without a pattern is the rest: it runs every test no other line
+  # selects (-skip of all their patterns), TestT to TestZ today, so a new
+  # test always lands in exactly one shard, whatever its name, and checks
+  # verifies that no two patterns select the same test.
+  #
+  # Balanced on the time each shard took under -race (GOMAXPROCS=4) on
+  # 1e8c66f2e1, in this order: 236, 285, 292, 225, 256, 201, 259 and 188 s,
+  # the slowest under half of SHARD_TIMEOUT. The runners took about 0.9 of
+  # that for the two halves this replaces (A to K 1090-1200 s, L to Z
+  # 580-609 s). The race job reports every shard's time and its tests' on
+  # each run: split a shard that nears 70 % of the bound rather than raise
+  # it, since the bound is there to catch a test that hangs.
+  CLUSTER_SHARDS: |
+    A[A-L]    ^TestA[A-L]
+    A[M-Z]    ^TestA[M-Z]
+    A[a-z]+B  ^Test(A[a-z]|B)
+    C-G       ^Test[C-G]
+    H-K       ^Test[H-K]
+    L-P       ^Test[L-P]
+    Q-S       ^Test[Q-S]
+    T-Z+rest
+  SHARD_TIMEOUT: 10m
 
-# The race tests of services/cluster alone came close to their 20 minute
-# bound, so that package runs in two halves, split by the first letter of
-# the test's name after "Test": checks runs the others and every other
-# package, race-l-z the tests from TestL to TestZ, in parallel. A new test
-# lands in one half by its name, never in none. cluster-checks, the job
-# name the ruleset requires, only gathers the two verdicts: it is green
-# when both are.
+# The race tests of services/cluster outgrew one job, then two: the half from
+# TestA to TestK reached its 20 minute bound under -race (#240). They now run
+# in the shards of CLUSTER_SHARDS, one job each and in parallel; checks runs
+# the rest of the scope, the lint, and the check that the shards deal every
+# test of the commit exactly once. cluster-checks, the job name the ruleset
+# requires, only gathers the verdicts: it is green when every one is.
 jobs:
+  # CLUSTER_SHARDS as a matrix, for race and for the check in checks.
+  shards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: The shards of services/cluster
+        id: matrix
+        run: |
+          set -euo pipefail
+          entries=()
+          patterns=()
+          rest=
+          while read -r name pattern extra; do
+            [ -n "$name" ] || continue
+            if [ -n "$extra" ] || [[ $pattern == */* ]]; then
+              echo "::error::CLUSTER_SHARDS: '$name $pattern $extra' is not a name and a pattern without '/'" >&2
+              exit 1
+            fi
+            if [ -z "$pattern" ]; then
+              if [ -n "$rest" ]; then
+                echo "::error::CLUSTER_SHARDS: two shards without a pattern, $rest and $name" >&2
+                exit 1
+              fi
+              rest=$name
+              continue
+            fi
+            patterns+=("($pattern)")
+            entries+=("$(jq -cn --arg name "$name" --arg run "$pattern" '{name: $name, run: $run, skip: ""}')")
+          done <<<"$CLUSTER_SHARDS"
+          if [ -z "$rest" ]; then
+            echo "::error::CLUSTER_SHARDS: no shard without a pattern, for the rest" >&2
+            exit 1
+          fi
+          skip=$(IFS='|'; echo "${patterns[*]}")
+          entries+=("$(jq -cn --arg name "$rest" --arg skip "$skip" '{name: $name, run: "", skip: $skip}')")
+          matrix=$(printf '%s\n' "${entries[@]}" | jq -cs '{include: .}')
+          if ! jq -e '.include | map(.name) | length == (unique | length)' <<<"$matrix" >/dev/null; then
+            echo "::error::CLUSTER_SHARDS: two shards have the same name" >&2
+            exit 1
+          fi
+          jq . <<<"$matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   checks:
+    needs: shards
     runs-on: ubuntu-latest
     # The race tests alone are bounded at 20 minutes.
     timeout-minutes: 30
-    # The checkpoint's cut is a PostgreSQL advisory lock: TestCutOnPostgreSQL
-    # runs against this one, and is skipped without it. It changes the
-    # database's idle_in_transaction_session_timeout for a while, which no
-    # other test reads.
-    services:
-      postgres:
-        image: postgres:18-alpine@sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5
-        # A throwaway database on the runner, reached by the job alone: no
-        # password, which a secret scanner would take for a real one.
-        env:
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 30
     steps:
       # The merge commit GitHub would produce on a pull request, which is
       # what the cluster must build against.
@@ -112,17 +164,65 @@ jobs:
           # shellcheck disable=SC2086 # the scope is a list of packages
           go vet -tags "$TAGS" $SCOPE
 
-      - name: Race tests of the cluster scope, but TestL to TestZ of services/cluster
-        env:
-          FORGEJO_CLUSTER_TEST_PGSQL: postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable
+      - name: Race tests of the cluster scope, but services/cluster itself
         run: |
-          # Every package of the scope but services/cluster itself, then
-          # services/cluster without the half race-l-z runs.
+          # Every package of the scope but services/cluster, which the race
+          # job runs in shards.
           # shellcheck disable=SC2086 # the scope is a list of packages
           others=$(go list -tags "$TAGS" $SCOPE | grep -vx 'forgejo.org/services/cluster')
           # shellcheck disable=SC2086 # a list of packages
           go test -race -timeout 20m -count=1 -tags "$TAGS" $others
-          go test -race -timeout 20m -count=1 -tags "$TAGS" -skip "$SECOND_HALF" ./services/cluster
+
+      # The shards select tests by name: a test two patterns select would run
+      # twice, and one a pattern misses only in the rest, which may then be
+      # the shard that outgrows its bound. go test -list matches a pattern as
+      # -run and -skip do a pattern without "/", on the tests of this commit.
+      - name: Every test of services/cluster in exactly one shard
+        env:
+          MATRIX: ${{ needs.shards.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C # one collation for sort and comm
+          dir=$RUNNER_TEMP/shards
+          mkdir -p "$dir"
+          # The tests, fuzz tests and examples a pattern matches, sorted;
+          # benchmarks never run without -bench.
+          list() {
+            go test -race -tags "$TAGS" -list "$1" ./services/cluster < /dev/null > "$dir/list.out"
+            { grep -E '^(Test|Fuzz|Example)[^[:space:]]*$' "$dir/list.out" || true; } | sort
+          }
+          list . > "$dir/all"
+          : > "$dir/dealt"
+          failed=0
+          # Fields split on a unit separator, not a tab: read folds tabs, and
+          # an empty -run or -skip would shift the next field into its place.
+          while IFS=$'\x1f' read -r name run skip; do
+            if [ -n "$run" ]; then list "$run"; else cat "$dir/all"; fi > "$dir/selected"
+            if [ -n "$skip" ]; then
+              list "$skip" | comm -23 "$dir/selected" -
+            else
+              cat "$dir/selected"
+            fi > "$dir/shard"
+            echo "$name: $(wc -l < "$dir/shard") tests"
+            if [ ! -s "$dir/shard" ]; then
+              echo "::error::shard $name runs no test: its pattern matches none"
+              failed=1
+            fi
+            awk -v shard="$name" '{ print $0 "\t" shard }' "$dir/shard" >> "$dir/dealt"
+          done < <(jq -r '.include[] | [.name, .run, .skip] | join("\u001f")' <<<"$MATRIX")
+          cut -f1 "$dir/dealt" | sort | uniq -d > "$dir/twice"
+          while read -r test; do
+            shards=$(awk -F'\t' -v test="$test" '$1 == test { print $2 }' "$dir/dealt" | xargs)
+            echo "::error::$test runs in several shards: $shards"
+            failed=1
+          done < "$dir/twice"
+          cut -f1 "$dir/dealt" | sort -u | comm -23 "$dir/all" - > "$dir/missed"
+          while read -r test; do
+            echo "::error::$test runs in no shard"
+            failed=1
+          done < "$dir/missed"
+          echo "$(wc -l < "$dir/all") tests: $(wc -l < "$dir/twice") in several shards, $(wc -l < "$dir/missed") in none"
+          exit "$failed"
 
       # The baseline is computed here, not by the action's only-new-issues:
       # that one fetches the pull request's patch from the API, which GitHub
@@ -177,9 +277,36 @@ jobs:
             ./modules/clusterhook/
             ./models/cluster/
 
-  race-l-z:
+  race:
+    needs: shards
+    name: race ${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # SHARD_TIMEOUT, and the checkout, the toolchain and the build before it.
+    timeout-minutes: 20
+    strategy:
+      # Every shard runs to its end, so one red run names every failing test.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.shards.outputs.matrix) }}
+    # The checkpoint's cut is a PostgreSQL advisory lock: TestCutOnPostgreSQL,
+    # like the consumer's row lock test, runs against this database and is
+    # skipped without it. It changes the database's
+    # idle_in_transaction_session_timeout for a while, which no other test
+    # reads. Every shard has its own, so a test keeps it when its shard
+    # changes.
+    services:
+      postgres:
+        image: postgres:18-alpine@sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5
+        # A throwaway database on the runner, reached by the job alone: no
+        # password, which a secret scanner would take for a real one.
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -191,22 +318,98 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Race tests TestL to TestZ of services/cluster
-        run: go test -race -timeout 20m -count=1 -tags "$TAGS" -run "$SECOND_HALF" ./services/cluster
+      # -json keeps every test's duration for the next step. The log shows
+      # what a plain go test would: the package's lines, the output of every
+      # test that failed, and that of the tests a timeout or a panic stopped
+      # mid-run, which never end in the stream. A line that is not JSON is
+      # shown as the package's; tee goes on writing the file if jq stops.
+      - name: Race tests of services/cluster, shard ${{ matrix.name }}
+        env:
+          RUN: ${{ matrix.run }}
+          SKIP: ${{ matrix.skip }}
+          FORGEJO_CLUSTER_TEST_PGSQL: postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable
+        run: |
+          set -o pipefail
+          go test -race -json -timeout "$SHARD_TIMEOUT" -count=1 -tags "$TAGS" \
+              -run "$RUN" -skip "$SKIP" ./services/cluster \
+            | tee -p "$RUNNER_TEMP/tests.json" \
+            | jq -nRrj --unbuffered '
+                foreach ((inputs | (fromjson? | objects) // {Action: "output", Output: (. + "\n")}), null) as $e (
+                  {tests: {}};
+                  .print = null
+                  | if $e == null or ($e.Test == null
+                        and ($e.Action == "output" or $e.Action == "build-output")) then
+                      .print = (([.tests[]] | add) // "") + ($e.Output // "")
+                      | .tests = {}
+                    elif $e.Test == null then .
+                    elif $e.Action == "output" then
+                      if ($e.Output | test("^=== (RUN|PAUSE|CONT|NAME) ")) then .
+                      else .tests[$e.Test] += $e.Output end
+                    elif $e.Action == "fail" then
+                      .print = .tests[$e.Test] | del(.tests[$e.Test])
+                    elif $e.Action == "pass" or $e.Action == "skip" then
+                      del(.tests[$e.Test])
+                    else . end;
+                  .print // empty)'
+
+      # The measure the shards are balanced on, in the log and in the run's
+      # summary: the shard's time under -race on this runner, and each
+      # top-level test's span, from its start (its resume, for a parallel
+      # one) to its end. Go's own Elapsed leaves out the parallel subtests a
+      # test waits for. Only a report: it never turns the shard red.
+      - name: Durations of shard ${{ matrix.name }}
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          SHARD: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          json=$RUNNER_TEMP/tests.json
+          [ -s "$json" ] || exit 0
+          jq -nRr '
+            def secs: capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?<f>[.][0-9]+)?")
+              | (.d + "Z" | fromdateiso8601) + ("0" + (.f // "") | tonumber);
+            reduce (inputs | fromjson? | objects
+                    | select(.Test != null and (.Test | contains("/") | not))) as $e ({};
+              if $e.Action == "run" or $e.Action == "cont" then .[$e.Test].from = ($e.Time | secs)
+              elif $e.Action == "pass" or $e.Action == "fail" or $e.Action == "skip" then
+                .[$e.Test] += {result: $e.Action, span: (($e.Time | secs) - (.[$e.Test].from // ($e.Time | secs)))}
+              else . end)
+            | to_entries[] | select(.value.result)
+            | [(.value.span * 100 | round / 100), .value.result, .key] | @tsv' "$json" \
+            | sort -t$'\t' -k1,1rn > "$RUNNER_TEMP/durations.tsv"
+          total=$(jq -nRr 'inputs | fromjson? | objects
+            | select(.Test == null and (.Action == "pass" or .Action == "fail")) | .Elapsed' "$json" | tail -n 1)
+          line="shard $SHARD: $(wc -l < "$RUNNER_TEMP/durations.tsv") tests, ${total:-unfinished} s (bound $SHARD_TIMEOUT)"
+          echo "$line, the longest spans:"
+          head -n 15 "$RUNNER_TEMP/durations.tsv"
+          {
+            echo "### services/cluster under -race, $line"
+            echo
+            echo "<details><summary>Every top-level test, longest span first</summary>"
+            echo
+            echo "| span (s) | result | test |"
+            echo "|--:|---|---|"
+            awk -F'\t' '{ printf "| %s | %s | `%s` |\n", $1, $2, $3 }' "$RUNNER_TEMP/durations.tsv"
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # The status the ruleset on forgejo requires: renaming it, or letting it
-  # go unreported, blocks every merge. A half cancelled leaves it skipped,
+  # go unreported, blocks every merge. A shard red, cancelled or never run
+  # (the matrix failed) makes it red; a run cancelled leaves it skipped,
   # which blocks too.
   cluster-checks:
-    needs: [checks, race-l-z]
+    needs: [shards, checks, race]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Both halves are green
+      - name: Every job is green
         env:
+          SHARDS: ${{ needs.shards.result }}
           CHECKS: ${{ needs.checks.result }}
-          RACE_L_Z: ${{ needs.race-l-z.result }}
+          RACE: ${{ needs.race.result }}
         run: |
-          echo "checks: $CHECKS, race-l-z: $RACE_L_Z"
-          test "$CHECKS" = success && test "$RACE_L_Z" = success
+          echo "shards: $SHARDS, checks: $CHECKS, race (every shard): $RACE"
+          test "$SHARDS" = success && test "$CHECKS" = success && test "$RACE" = success
