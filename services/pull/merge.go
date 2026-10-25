@@ -248,6 +248,14 @@ func Merge(ctx context.Context, pr *issues_model.PullRequest, doer *user_model.U
 		return models.ErrInvalidMergeStyle{ID: pr.BaseRepo.ID, Style: mergeStyle}
 	}
 
+	// In a cluster, every merge style reads the head and the base from this
+	// node's git: a node behind a push to the head merged the commit before
+	// it (#247). expectedHeadCommitID, which the API leaves optional, is
+	// compared after the wait, to the head the cluster acknowledged.
+	if err := RequireFreshHeadAndBase(ctx, pr); err != nil {
+		return err
+	}
+
 	defer func() {
 		AddTestPullRequestTask(ctx, doer, pr.BaseRepo.ID, pr.BaseBranch, false, "", "", 0)
 	}()

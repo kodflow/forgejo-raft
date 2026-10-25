@@ -440,13 +440,32 @@ func requireFreshRepos(ctx context.Context, pr *issues_model.PullRequest) error 
 	if !clusterhook.Enabled() || pr.Flow != issues_model.PullRequestFlowGithub {
 		return nil
 	}
+	return RequireFreshHeadAndBase(ctx, pr)
+}
+
+// RequireFreshHeadAndBase waits, in a cluster, until this node serves the
+// head and the base repositories of pr at the cluster's commit index, and
+// refuses with clusterhook.ErrBehind while it does not: nothing is read or
+// written then, the caller retries. A merge reads both from this node's
+// git (createTemporaryRepoForPR): the head branch of the head repository,
+// or refs/pull/N/head of the base repository for an AGit pull request, and
+// the base branch. Behind a push another node acknowledged, the head is
+// the commit before it, which the cluster accepts since the base did not
+// move: the pull request is marked merged without the push, which then
+// passes over a merged pull request, and its commit is never merged
+// (#247). Without a cluster it returns nil at once.
+func RequireFreshHeadAndBase(ctx context.Context, pr *issues_model.PullRequest) error {
 	if err := pr.LoadHeadRepo(ctx); err != nil {
 		return err
 	}
 	if err := pr.LoadBaseRepo(ctx); err != nil {
 		return err
 	}
-	for _, r := range []*repo_model.Repository{pr.HeadRepo, pr.BaseRepo} {
+	repos := []*repo_model.Repository{pr.HeadRepo}
+	if pr.HeadRepo == nil || pr.BaseRepo == nil || pr.HeadRepo.ID != pr.BaseRepo.ID {
+		repos = append(repos, pr.BaseRepo)
+	}
+	for _, r := range repos {
 		if r == nil {
 			continue
 		}

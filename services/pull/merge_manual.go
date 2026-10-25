@@ -14,6 +14,7 @@ import (
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unit"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/timeutil"
@@ -23,6 +24,18 @@ import (
 // MergedManually mark pr as merged manually
 func MergedManually(ctx context.Context, pr *issues_model.PullRequest, doer *user_model.User, baseGitRepo *git.Repository, commitID string) error {
 	defer pullWorkingPool.Lock(fmt.Sprint(pr.ID))()
+
+	// In a cluster, the commit is looked up in this node's git of the base
+	// repository: behind a push another node acknowledged, a commit it
+	// brought to the base branch is refused, and one a forced push took out
+	// of it is recorded as the merge (#247). A node still behind refuses
+	// with clusterhook.ErrBehind, before the transaction.
+	if err := pr.LoadBaseRepo(ctx); err != nil {
+		return err
+	}
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(pr.BaseRepo.OwnerName, pr.BaseRepo.Name, false)); err != nil {
+		return err
+	}
 
 	if err := db.WithTx(ctx, func(ctx context.Context) error {
 		if err := pr.LoadBaseRepo(ctx); err != nil {

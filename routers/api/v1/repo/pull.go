@@ -947,6 +947,21 @@ func MergePullRequest(ctx *context.APIContext) {
 		mergeCheckType = pull_service.MergeCheckTypeManually
 	}
 
+	// In a cluster, the checks below judge the head as this node's git
+	// has it, and the merge waits for this node to serve the head: behind
+	// a push another node acknowledged, the checks would pass the commit
+	// before it, and the merge would take the pushed commit, unchecked
+	// (#247). An immediate merge waits first, and is refused while this
+	// node is behind.
+	if mergeCheckType == pull_service.MergeCheckTypeGeneral {
+		if err := pull_service.RequireFreshHeadAndBase(ctx, pr); err != nil {
+			if !clusterBehind(ctx, err) {
+				ctx.Error(http.StatusInternalServerError, "RequireFreshHeadAndBase", err)
+			}
+			return
+		}
+	}
+
 	// start with merging by checking
 	if err := pull_service.CheckPullMergeable(ctx, ctx.Doer(), &ctx.Repo().Permission, pr, mergeCheckType, form.ForceMerge, mergeStyle); err != nil {
 		if errors.Is(err, pull_service.ErrIsClosed) {
@@ -972,6 +987,9 @@ func MergePullRequest(ctx *context.APIContext) {
 	// handle manually-merged mark
 	if manuallyMerged {
 		if err := pull_service.MergedManually(ctx, pr, ctx.Doer(), ctx.Repo().GitRepo, form.MergeCommitID); err != nil {
+			if clusterBehind(ctx, err) {
+				return
+			}
 			if models.IsErrInvalidMergeStyle(err) {
 				ctx.Error(http.StatusMethodNotAllowed, "Invalid merge style", fmt.Errorf("%s is not an allowed merge style for this repository", repo_model.MergeStyle(form.Do)))
 				return
@@ -1022,6 +1040,12 @@ func MergePullRequest(ctx *context.APIContext) {
 	}
 
 	if err := pull_service.Merge(ctx, pr, ctx.Doer(), ctx.Repo().GitRepo, repo_model.MergeStyle(form.Do), form.HeadCommitID, message, false); err != nil {
+		// A node of the cluster behind on the head or the base repository
+		// merges nothing: the client retries, through this node or another
+		// (#247).
+		if clusterBehind(ctx, err) {
+			return
+		}
 		if models.IsErrInvalidMergeStyle(err) {
 			ctx.Error(http.StatusMethodNotAllowed, "Invalid merge style", fmt.Errorf("%s is not an allowed merge style for this repository", repo_model.MergeStyle(form.Do)))
 		} else if models.IsErrMergeConflicts(err) {
