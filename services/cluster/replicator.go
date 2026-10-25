@@ -81,10 +81,12 @@ type Replicator struct {
 	writerHook WriterHook
 	writer     atomic.Uint32
 	writerAt   atomic.Pointer[writerMark]
-	// dead is when the leader found each member out of reach; seen is
-	// what this node saw of each member, for the status (autopilot.go,
-	// retire.go).
-	dead deadClock
+	// dead is when the leader found each member out of reach, and
+	// markRefused when the engine last refused for certain the removal of
+	// a dead member whose key it marked; seen is what this node saw of each
+	// member, for the status (autopilot.go, retire.go).
+	dead        deadClock
+	markRefused map[consensus.NodeID]time.Time
 	// payloadProbe is when the autopilot next asks the members which
 	// command version they apply, and clusterProbe when it next asks the
 	// engine to raise the cluster version (clusterversion.go).
@@ -321,13 +323,15 @@ func Init(ctx context.Context) error {
 		r.auto.rejoin = func(ctx context.Context) error { return r.rejoinUnderNewID(ctx, driver, cfg, autoCluster) }
 	}
 	// The transport the engine opens reads the pair now, and keeps its key
-	// for as long as it runs.
-	r.setOpenedKey(id.SPKI())
+	// for as long as it runs: recorded once it opened, before anything
+	// reads the engine.
+	opened := id.SPKI()
 	eng, err := driver.Open(r.ctx, cfg)
 	if err != nil {
 		_ = srv.Close()
 		return fmt.Errorf("[cluster] opening the consensus node: %w", err)
 	}
+	r.setOpenedKey(opened)
 	r.setEngine(eng)
 	// The refusal of a voter that would leave no checkpoint to close reads
 	// the backup cursor from SQL: it waits for the database
@@ -426,11 +430,13 @@ func (r *Replicator) rejoinUnderNewID(ctx context.Context, driver consensus.Driv
 	}
 	r.auto.noteJoining(id, inc)
 	r.resetForRejoin()
-	r.setOpenedKey(r.presentedKey())
+	opened := r.presentedKey()
 	eng, err := driver.Open(r.ctx, cfg)
 	if err != nil {
+		// The key recorded stays the one of the engine that last opened.
 		return fmt.Errorf("opening under the new id %s: %w", id, err)
 	}
+	r.setOpenedKey(opened)
 	r.setEngine(eng)
 	go r.startupBarrier(r.ctx)
 	log.Warn("cluster: rejoining under the new id %s", id)

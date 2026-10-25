@@ -274,8 +274,10 @@ its key the same way, from payload version 7: a key serves one node id for
 the life of the cluster, and a node that was only out of reach returns by
 itself under a new key (see [A node that comes back](#a-node-that-comes-back)).
 Below version 7 the autopilot asks for nothing, since a member's binary
-could not withdraw a request the engine refuses, and the node still comes
-back with a new key, by its own rule. In every case the revocation is written
+could not withdraw a request the engine refuses: a node that rejoins after
+its removal still takes a new key, by its own rule, but one that comes back
+on an empty data directory without `RENEW_VAULT_ADDR` keeps the key in
+place, which the cluster then does not refuse. In every case the revocation is written
 only once no member holds the key, so a member that stays is never cut off.
 The revocation is a command of payload version 3, which an older binary cannot
 read: while a member still runs one, the cluster writes an older version,
@@ -439,8 +441,9 @@ operator gives the node its new key:
    delete the node's Secret, so that it draws a new key despite
    `rotationPolicy: Never`; by hand, as for the first certificate.
 2. Install the pair in `TLS_KEY_FILE` and `TLS_CERT_FILE`.
-3. A node the autopilot removed does not rejoin until it reads a new key,
-   and logs why; it rejoins as soon as it reads one, with no restart. A
+3. A node the autopilot removed does not rejoin until it reads a key other
+   than the one its retired id held, and logs why; it rejoins as soon as it
+   reads one, restarted or not. A
    node on an empty data directory stamps its new id with the key in
    place, which the cluster refuses when a member holds or held it:
    restart it once the new key is installed. Its consensus engine keeps

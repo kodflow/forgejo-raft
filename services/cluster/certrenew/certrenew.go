@@ -15,6 +15,7 @@
 package certrenew
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -201,6 +202,13 @@ func (r *Renewer) RenewNow(ctx context.Context) (*x509.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Another process (`forgejo cluster cert renew` beside the server) may
+	// have given the node a new key while the signer answered: this
+	// certificate is of the old one, and written it would undo that key or
+	// pair the new key with it.
+	if _, now, err := r.key(); err != nil || !bytes.Equal(now, keyPEM) {
+		return nil, errors.New("the node key changed while its certificate was renewed: nothing is written; renew again")
+	}
 	leafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
 	out := leafPEM
 	if r.sharedFile() {
@@ -280,6 +288,12 @@ func (r *Renewer) Rekey(ctx context.Context) (*x509.Certificate, error) {
 		if err := writeAtomic(r.CertFile, append(append([]byte{}, leafPEM...), keyPEM...)); err != nil {
 			return nil, err
 		}
+		// The caller stamps a new node id next: the rename is made
+		// durable first, so a power loss never leaves that id under the
+		// old key.
+		if err := syncDirs(r.CertFile); err != nil {
+			return nil, err
+		}
 		return cert, nil
 	}
 	if err := installPair(r.CertFile, r.KeyFile, leafPEM, keyPEM); err != nil {
@@ -308,11 +322,12 @@ func newKeyLike(old crypto.Signer) (crypto.Signer, error) {
 const rekeySuffix = ".rekey"
 
 // installPair puts a new key and its certificate in place when they live in
-// two files: both written aside and synced, then the key renamed in, then
-// the certificate. Between the two renames the pair on disk does not match:
-// a reader keeps the pair it holds (both the transport and the object
-// channel refuse a pair that does not match), and ResumeRekey completes it
-// after a stop.
+// two files: both written aside and synced, then the key renamed in and
+// made durable, then the certificate. The certificate's rename is never
+// durable without the key's, even on two file systems. Between the two
+// renames the pair on disk does not match: a reader keeps the pair it holds
+// (both the transport and the object channel refuse a pair that does not
+// match), and ResumeRekey completes it after a stop.
 func installPair(certFile, keyFile string, certPEM, keyPEM []byte) error {
 	if err := writeSynced(keyFile+rekeySuffix, keyPEM); err != nil {
 		return err
@@ -321,15 +336,23 @@ func installPair(certFile, keyFile string, certPEM, keyPEM []byte) error {
 		_ = os.Remove(keyFile + rekeySuffix)
 		return err
 	}
+	if err := syncDirs(certFile, keyFile); err != nil {
+		_ = os.Remove(keyFile + rekeySuffix)
+		_ = os.Remove(certFile + rekeySuffix)
+		return err
+	}
 	if err := os.Rename(keyFile+rekeySuffix, keyFile); err != nil {
 		_ = os.Remove(keyFile + rekeySuffix)
 		_ = os.Remove(certFile + rekeySuffix)
 		return err
 	}
+	if err := syncDirs(keyFile); err != nil {
+		return fmt.Errorf("the new key is in place and not made durable: %w; the next start completes it", err)
+	}
 	if err := os.Rename(certFile+rekeySuffix, certFile); err != nil {
 		return fmt.Errorf("the new key is in place and its certificate is not: %w; the next start puts it in place", err)
 	}
-	return syncDirs(certFile, keyFile)
+	return syncDirs(certFile)
 }
 
 // ResumeRekey completes a rekey a stop interrupted (installPair): when the
@@ -345,7 +368,7 @@ func ResumeRekey(certFile, keyFile string) error {
 	pending := certFile + rekeySuffix
 	certPEM, err := os.ReadFile(pending)
 	if errors.Is(err, os.ErrNotExist) {
-		return removeIfAny(keyFile + rekeySuffix)
+		return resumeKeyAside(certFile, keyFile)
 	}
 	if err != nil {
 		return err
@@ -369,6 +392,33 @@ func ResumeRekey(certFile, keyFile string) error {
 		return err
 	}
 	return removeIfAny(pending)
+}
+
+// resumeKeyAside settles a new key left aside with no certificate waiting:
+// written before the certificate was (the old pair stands, and it is
+// removed), or, should a file system have kept the certificate's rename and
+// lost the key's, the key of the certificate in place, which it then
+// joins.
+func resumeKeyAside(certFile, keyFile string) error {
+	aside := keyFile + rekeySuffix
+	keyPEM, err := os.ReadFile(aside)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	certPEM, err := os.ReadFile(certFile)
+	if err != nil {
+		return err
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return removeIfAny(aside)
+	}
+	if err := os.Rename(aside, keyFile); err != nil {
+		return fmt.Errorf("completing an interrupted key change: %w", err)
+	}
+	return syncDirs(keyFile)
 }
 
 func removeIfAny(path string) error {

@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"forgejo.org/modules/log"
+	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/reftable"
 )
 
 // A key serves one node id for the life of the cluster (#209, decision C of
@@ -101,13 +103,53 @@ func (r *Replicator) keyForNewStamp(ctx context.Context) error {
 	}
 }
 
+// retiredKey is the key the retired id of this node held, as the last
+// membership that listed it says: the open engine's, else the one the
+// autopilot kept from before a failed rejoin closed it (lastOwn). A node
+// that applied its own removal lists itself nowhere, and it is not known.
+func (r *Replicator) retiredKey() ([32]byte, bool) {
+	eng := r.Engine()
+	if eng == nil {
+		return [32]byte{}, false
+	}
+	self := eng.Status().ID
+	for _, m := range []consensus.Membership{eng.Membership(), r.auto.lastOwn} {
+		if i := Rank(m, self) - 1; i >= 0 && m.Members[i].SPKI != ([32]byte{}) {
+			return m.Members[i].SPKI, true
+		}
+	}
+	return [32]byte{}, false
+}
+
+// freshForRejoin reports whether the key on disk may serve the new id of a
+// node whose id the cluster retired: neither revoked nor asked for
+// revocation in this node's table, and another than the key the retired id
+// held. That key is the one its membership lists, whatever key the engine
+// opened with: an operator who installs a new key may restart the node
+// before it rejoins. When no membership lists the node any more, it
+// applied its own removal, and with it the request for the revocation of
+// its key, which the cluster commits before the removal from
+// reftable.WithdrawVersion: a key the table neither revoked nor asked for
+// is then another one. Below that version, or on an empty table, only a key
+// that changed since the engine opened is known to be another.
+func (r *Replicator) freshForRejoin() bool {
+	cur := r.presentedKey()
+	if cur == ([32]byte{}) || r.revokedOrAsked(cur) {
+		return false
+	}
+	if held, ok := r.retiredKey(); ok {
+		return cur != held
+	}
+	return r.table.WriteVersion() >= reftable.WithdrawVersion || r.keyChangedSinceOpen()
+}
+
 // keyForRejoin gives a node whose id the cluster retired a new key before it
-// rejoins under a new id, unless the key on disk is already another than
-// the one the retired id's engine presents: an operator installed it, or a
-// rejoin that stopped after its new key made it. Without a renewer, the
-// retired id's key is refused (errNeedsNewKey) and nothing else is done.
+// rejoins under a new id, unless the key on disk is already a fresh one
+// (freshForRejoin): an operator installed it, or a rejoin that stopped
+// after its new key made it. Without a renewer, the retired id's key is
+// refused (errNeedsNewKey) and nothing else is done.
 func (r *Replicator) keyForRejoin(ctx context.Context) error {
-	if r.keyChangedSinceOpen() {
+	if r.freshForRejoin() {
 		return nil
 	}
 	if r.renewer == nil {

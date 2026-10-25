@@ -103,6 +103,39 @@ func TestTheMarkOfADeadMemberNeverCutsALiveOne(t *testing.T) {
 	}
 }
 
+// A removal the engine keeps refusing for certain records a request and
+// its withdrawal once, then waits markBackoff before it marks the key
+// again: the replicated audit, which keeps the newest records only, is
+// not flooded at each pass.
+func TestARefusedMarkWaitsBeforeItIsTriedAgain(t *testing.T) {
+	mem, rs := NewForTesting(t.TempDir(), "node-a", "node-b", "node-c", "node-d", "node-e")
+	ctx := context.Background()
+	leader := rs[0]
+	require.NoError(t, leader.RaisePayloadVersion(ctx, "op"))
+	mem.SetLeader(leader.Engine().(*memraft.Node))
+	clock := &fakeClock{t: time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)}
+	leader.auto = &autoMode{now: clock.now}
+	idB := slotID(t, leader, "node-b")
+	real := leader.Engine()
+	leader.setEngine(refusingEngine{real})
+	require.False(t, leader.removeDead(ctx, leader.Engine(), idB))
+	records := len(leader.table.Audit())
+	for range 5 {
+		clock.advance(2 * time.Second)
+		require.False(t, leader.removeDead(ctx, leader.Engine(), idB))
+	}
+	assert.Len(t, leader.table.Audit(), records, "nothing written while it waits")
+	clock.advance(markBackoff)
+	require.False(t, leader.removeDead(ctx, leader.Engine(), idB))
+	assert.Greater(t, len(leader.table.Audit()), records, "tried again after markBackoff")
+	assert.Empty(t, leader.table.PendingRevocations(), "each refusal withdraws its request")
+	leader.setEngine(real)
+	clock.advance(markBackoff)
+	require.True(t, leader.removeDead(ctx, real, idB))
+	keyB := sha256.Sum256([]byte("node-b"))
+	assert.True(t, leader.table.KeyRevoked(hex.EncodeToString(keyB[:])))
+}
+
 // A mixed cluster: while it writes a payload version below WithdrawVersion,
 // some member's binary cannot withdraw a request, and the autopilot's
 // removal of a dead member asks nothing, as before; from it, it marks the
@@ -333,6 +366,15 @@ func (e *rejoinEngine) Barrier(context.Context) (consensus.Token, error) {
 }
 func (e *rejoinEngine) WaitApplied(context.Context, consensus.Token) error { return nil }
 
+// listedEngine is a retired id's engine whose membership still lists it,
+// under the key it held.
+type listedEngine struct {
+	rejoinEngine
+	m consensus.Membership
+}
+
+func (e *listedEngine) Membership() consensus.Membership { return e.m }
+
 // rejoinDriver records the key the node presents when its new engine
 // opens.
 type rejoinDriver struct {
@@ -388,6 +430,36 @@ func TestARetiredNodeRejoinsOnlyWithANewKey(t *testing.T) {
 		assert.Equal(t, key, d.keyAtOpen)
 		assert.Equal(t, key, n.r.openedKey())
 		assert.True(t, old.closed.Load())
+	})
+
+	// Restarted, the retired id's engine opens with the key on disk: the
+	// key the retired id held is the one its membership lists.
+	listed := func(n *keyNode) *listedEngine {
+		return &listedEngine{m: consensus.Membership{Members: []consensus.Member{{ID: 0xe2, Slot: "node-e", SPKI: n.key, Voter: true}}}}
+	}
+	t.Run("restarted on its old key", func(t *testing.T) {
+		n, _, d, cfg := setup(t)
+		old := listed(n)
+		n.r.setEngine(old)
+		require.ErrorIs(t, n.r.rejoinUnderNewID(t.Context(), d, cfg, cluster), errNeedsNewKey)
+		assert.False(t, old.closed.Load())
+	})
+	t.Run("restarted on a new key", func(t *testing.T) {
+		n, _, d, cfg := setup(t)
+		old := listed(n)
+		n.r.setEngine(old)
+		key := installKey(t, pki, cluster, "node-e")
+		n.r.setOpenedKey(key)
+		require.NoError(t, n.r.rejoinUnderNewID(t.Context(), d, cfg, cluster), "the operator's new key, then a restart")
+		assert.Equal(t, key, d.keyAtOpen)
+		assert.True(t, old.closed.Load())
+	})
+	t.Run("a key the table refuses", func(t *testing.T) {
+		n, _, d, cfg := setup(t)
+		n.r.setEngine(listed(n))
+		key := installKey(t, pki, cluster, "node-e")
+		revokeKey(t, n.r.table, key)
+		require.ErrorIs(t, n.r.rejoinUnderNewID(t.Context(), d, cfg, cluster), errNeedsNewKey, "a revoked key is no new key")
 	})
 
 	t.Run("renewer", func(t *testing.T) {

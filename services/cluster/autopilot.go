@@ -183,6 +183,18 @@ func (r *Replicator) autoChange(ctx context.Context, action Action, id consensus
 // deadWhy is what the autopilot records of the removal of a dead member.
 const deadWhy = "out of reach for DEAD_MEMBER_TIMEOUT"
 
+// markBackoff is how long the autopilot waits before it marks again the key
+// of a dead member whose removal the engine refused for certain.
+var markBackoff = time.Minute
+
+// autoNow is the autopilot's clock, the wall clock without one.
+func (r *Replicator) autoNow() time.Time {
+	if r.auto != nil && r.auto.now != nil {
+		return r.auto.now()
+	}
+	return time.Now()
+}
+
 // removeDead removes a member out of reach for DEAD_MEMBER_TIMEOUT, and
 // marks its key as one never admitted again (#209): the member comes back
 // under a new id with a new key (newkey.go), never with this one. The mark
@@ -194,6 +206,11 @@ const deadWhy = "out of reach for DEAD_MEMBER_TIMEOUT"
 // and leaves no effect (#171); one whose outcome is unknown keeps it, as it
 // may have been made (#165).
 //
+// A removal the engine refused for certain wrote a request and its
+// withdrawal: it is tried again only after markBackoff, so a refusal that
+// lasts never floods the replicated audit, which keeps the newest records
+// only.
+//
 // Below reftable.WithdrawVersion a refused change cannot withdraw its
 // request, since some member's binary does not apply the withdrawal: the
 // removal then asks nothing, as before, and the node's own rule still
@@ -201,6 +218,10 @@ const deadWhy = "out of reach for DEAD_MEMBER_TIMEOUT"
 func (r *Replicator) removeDead(ctx context.Context, eng consensus.Engine, id consensus.NodeID) bool {
 	if r.table.WriteVersion() < reftable.WithdrawVersion {
 		return r.autoChange(ctx, ActionRemove, id, deadWhy, eng.Remove)
+	}
+	now := r.autoNow()
+	if at, ok := r.markRefused[id]; ok && now.Sub(at) < markBackoff {
+		return false
 	}
 	marked := false
 	removed := r.autoChange(ctx, ActionRemove, id, deadWhy+"; its key is not admitted again", func(ctx context.Context, op consensus.Operator, id consensus.NodeID) error {
@@ -224,12 +245,21 @@ func (r *Replicator) removeDead(ctx context.Context, eng consensus.Engine, id co
 		if err := eng.Remove(ctx, op, id); err != nil {
 			if asked {
 				r.settleRefusedRevocation(ctx, eng, ActionRemove, id, k, request, err)
+				if changeRefused(err) {
+					if r.markRefused == nil {
+						r.markRefused = map[consensus.NodeID]time.Time{}
+					}
+					r.markRefused[id] = now
+				}
 			}
 			return err
 		}
 		marked = asked
 		return nil
 	})
+	if removed {
+		delete(r.markRefused, id)
+	}
 	if removed && marked {
 		// Written now that no member holds the key, else at a later pass.
 		if err := r.flushRevocations(ctx); err != nil {

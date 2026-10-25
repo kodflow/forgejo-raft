@@ -178,3 +178,58 @@ func (l *lockedSigner) Sign(ctx context.Context, csrPEM []byte, uriSAN string) (
 	defer l.mu.Unlock()
 	return l.s.Sign(ctx, csrPEM, uriSAN)
 }
+
+// A file system that kept the certificate's rename of a rekey and lost the
+// key's leaves the new certificate in place and its key aside: the next
+// start puts the key beside it rather than throwing it away.
+func TestAKeyLeftAsideBesideItsCertificateIsPutInPlace(t *testing.T) {
+	s := &localSigner{life: time.Hour}
+	r := newSplitNode(t, s)
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	cert, err := r.signed(context.Background(), key)
+	require.NoError(t, err)
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(r.CertFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}), 0o600))
+	require.NoError(t, os.WriteFile(r.KeyFile+rekeySuffix, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600))
+	require.NoError(t, ResumeRekey(r.CertFile, r.KeyFile))
+	assert.Equal(t, spki(cert), pairOnDisk(t, r), "the key joins the certificate in place")
+	_, err = os.Stat(r.KeyFile + rekeySuffix)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// rekeyingSigner signs as s does, after another process gave the node a
+// new key, as `forgejo cluster cert renew` may run beside the server.
+type rekeyingSigner struct {
+	s     *localSigner
+	other *Renewer
+	key   [32]byte
+}
+
+func (o *rekeyingSigner) Sign(ctx context.Context, csrPEM []byte, uriSAN string) ([]byte, error) {
+	if o.other != nil {
+		c, err := o.other.Rekey(ctx)
+		if err != nil {
+			return nil, err
+		}
+		o.key, o.other = spki(c), nil
+	}
+	return o.s.Sign(ctx, csrPEM, uriSAN)
+}
+
+// A renewal whose key another process replaced while the signer answered
+// writes nothing: its certificate is of the old key (#209).
+func TestARenewalNeverUndoesANewKey(t *testing.T) {
+	for name, node := range map[string]func(*testing.T, *localSigner) *Renewer{"one file": newNode, "two files": newSplitNode} {
+		t.Run(name, func(t *testing.T) {
+			s := &localSigner{life: time.Hour}
+			r := node(t, s)
+			other := &Renewer{CertFile: r.CertFile, KeyFile: r.KeyFile, CAFile: r.CAFile, Cluster: r.Cluster, Slot: r.Slot, Signer: s}
+			rs := &rekeyingSigner{s: s, other: other}
+			r.Signer = rs
+			_, err := r.RenewNow(context.Background())
+			require.ErrorContains(t, err, "changed")
+			assert.Equal(t, rs.key, pairOnDisk(t, r), "the other process's new key and its certificate stay")
+		})
+	}
+}
