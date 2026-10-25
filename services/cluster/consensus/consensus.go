@@ -536,7 +536,12 @@ var (
 	// is of a format this build does not read: the engine stops the node and
 	// refuses a restart over that snapshot (D18), instead of having the
 	// leader resend it forever. From RaiseClusterVersion, it says a member
-	// does not announce the version yet: nothing was raised.
+	// does not announce the version yet, or did not answer within the vote
+	// window (kitsunium/sdk#665): nothing was raised, and the raise may be
+	// asked again. From opening a data directory, offline or at the node's
+	// start, it says the directory holds what a newer build wrote, such as
+	// a snapshot metadata of a version this one does not know: nothing in
+	// it was removed (kitsunium/sdk#665).
 	ErrVersionUnsupported = errors.New("VERSION_UNSUPPORTED")
 )
 
