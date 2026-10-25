@@ -45,7 +45,7 @@ func (a *autoMode) admits(slot string, eng consensus.Engine) error {
 // node sees (the status's "since"), and
 //
 //   - on the leader, removes a member out of reach for DEAD_MEMBER_TIMEOUT
-//     while three voters remain (a learner always);
+//     while three voters remain (a learner always), and marks its key;
 //     adds the new id of a lost voter of three, under its slot; or
 //     promotes the eldest learner ready to vote, two at once from one
 //     voter;
@@ -97,7 +97,7 @@ func (r *Replicator) autopilotStep(ctx context.Context) {
 		return
 	}
 	if id, ok := r.deadMember(eng, m); ok {
-		r.autoChange(pctx, ActionRemove, id, "out of reach for DEAD_MEMBER_TIMEOUT", eng.Remove)
+		r.removeDead(pctx, eng, id)
 		return
 	}
 	if id, ok := r.revokedLearner(m); ok {
@@ -180,6 +180,65 @@ func (r *Replicator) autoChange(ctx context.Context, action Action, id consensus
 	return true
 }
 
+// deadWhy is what the autopilot records of the removal of a dead member.
+const deadWhy = "out of reach for DEAD_MEMBER_TIMEOUT"
+
+// removeDead removes a member out of reach for DEAD_MEMBER_TIMEOUT, and
+// marks its key as one never admitted again (#209): the member comes back
+// under a new id with a new key (newkey.go), never with this one. The mark
+// is an operator's revocation, asked the same way (revokeMember): the
+// request commits before the change, so the JOIN refuses the key from the
+// moment the member is gone, and the revocation is written once no member
+// holds the key (flushRevocations), so a member left in place is never cut
+// off (#64). A change the engine refuses for certain withdraws its request
+// and leaves no effect (#171); one whose outcome is unknown keeps it, as it
+// may have been made (#165).
+//
+// Below reftable.WithdrawVersion a refused change cannot withdraw its
+// request, since some member's binary does not apply the withdrawal: the
+// removal then asks nothing, as before, and the node's own rule still
+// keeps the key from coming back (keyForRejoin).
+func (r *Replicator) removeDead(ctx context.Context, eng consensus.Engine, id consensus.NodeID) bool {
+	if r.table.WriteVersion() < reftable.WithdrawVersion {
+		return r.autoChange(ctx, ActionRemove, id, deadWhy, eng.Remove)
+	}
+	marked := false
+	removed := r.autoChange(ctx, ActionRemove, id, deadWhy+"; its key is not admitted again", func(ctx context.Context, op consensus.Operator, id consensus.NodeID) error {
+		m := eng.Membership()
+		if i := Rank(m, id) - 1; i >= 0 && r.revokedOrAsked(m.Members[i].SPKI) {
+			// A request already open for the key, an operator's or one of
+			// an earlier pass whose outcome was unknown, refuses it at the
+			// JOIN: the removal records none of its own, so a removal
+			// retried at each pass never piles requests up, and withdraws
+			// none it did not record.
+			if err := eng.Remove(ctx, op, id); err != nil {
+				return err
+			}
+			marked = true
+			return nil
+		}
+		k, asked, request, err := r.revokeMember(ctx, eng, op, id)
+		if err != nil {
+			return err
+		}
+		if err := eng.Remove(ctx, op, id); err != nil {
+			if asked {
+				r.settleRefusedRevocation(ctx, eng, ActionRemove, id, k, request, err)
+			}
+			return err
+		}
+		marked = asked
+		return nil
+	})
+	if removed && marked {
+		// Written now that no member holds the key, else at a later pass.
+		if err := r.flushRevocations(ctx); err != nil {
+			log.Debug("cluster: autopilot: the revocation of the key of %s is written at a later pass: %v", id, err)
+		}
+	}
+	return removed
+}
+
 // replaceLost is the autonomous repair of a voter whose data directory was
 // lost while the cluster holds three voters (#186, decision A). The node
 // comes back under a new id, its old id holding the slot: the engine
@@ -199,7 +258,8 @@ func (r *Replicator) autoChange(ctx context.Context, action Action, id consensus
 // The autopilot then promotes it, four voters, and removes the old id at a
 // later pass, three again: the membership never lists fewer than three
 // voters, and no format changes. The joiner's JOIN, then answered as a
-// member's, completes.
+// member's, completes. Its key is a new one (newkey.go): the old id holds
+// its old key, and marks it once removed (removeDead).
 func (r *Replicator) replaceLost(ctx context.Context, eng consensus.Engine, m consensus.Membership) bool {
 	if len(m.Members) > r.auto.expected || r.auto.probe == nil {
 		// A replacement already stands by, or a member above the size: it
@@ -269,7 +329,7 @@ func (r *Replicator) replacement(ctx context.Context, eng consensus.Engine, m co
 	var inc consensus.Incarnation
 	b, err := hex.DecodeString(h.Incarnation)
 	if err != nil || len(b) != len(inc) {
-		return consensus.Member{}, errors.New("its hello carries no incarnation: its binary does not replace a lost voter by itself")
+		return consensus.Member{}, errors.New("its hello carries no incarnation: its binary does not replace a lost voter by itself, or its key changed since its consensus node opened and it waits for a restart")
 	}
 	copy(inc[:], b)
 	if Rank(m, id) > 0 || slices.Contains(m.Retired, id) {
@@ -280,7 +340,7 @@ func (r *Replicator) replacement(ctx context.Context, eng consensus.Engine, m co
 	}
 	spki := hex.EncodeToString(h.SPKI[:])
 	if h.SPKI == ([32]byte{}) || holdsKey(m, spki) {
-		return consensus.Member{}, errors.New("it presents the key of a member, its old id's: a node that takes a new id needs a new key, signed by the cluster's CA for its slot, and a restart")
+		return consensus.Member{}, errors.New("it presents the key of a member, its old id's: a node that takes a new id needs a new key, made by the renewer (RENEW_VAULT_ADDR) before its new id is stamped, or installed by an operator, the node then restarted")
 	}
 	// The revocations are read once this node's table applied a commit
 	// boundary a quorum confirmed, as for a JOIN (#70).

@@ -47,9 +47,10 @@ import (
 // Admission without an operator's grant rests on the cluster's CA: a node
 // presenting a CA-signed certificate for an empty slot of this cluster is
 // admitted as a learner (authorizeJoin), and the autopilot makes voters.
-// A node the autopilot removed comes back the same way, under a new id
-// (retire.go); a voter of three whose data directory was lost is replaced
-// by the leader under its slot (replaceLost).
+// A node the autopilot removed comes back the same way, under a new id and
+// with a new key (retire.go, newkey.go); a voter of three whose data
+// directory was lost is replaced by the leader under its slot
+// (replaceLost).
 
 // autoMode is the autonomous mode's view of the settings, held by the
 // replicator so tests run several nodes in one process.
@@ -83,8 +84,11 @@ type autoMode struct {
 	// revoked reports a key this node's table holds revoked: a JOIN never
 	// trusts an answer under such a key. Nil revokes nothing.
 	revoked func(spki [32]byte) bool
-	// stopNoted is set once a stopped engine's refusal to rejoin is logged.
-	stopNoted atomic.Bool
+	// stopNoted is set once a stopped engine's refusal to rejoin is logged,
+	// keyNoted once a rejoin refused for want of a new key is, and
+	// restartNoted once a joining node whose key changed under its open
+	// engine said it waits for a restart.
+	stopNoted, keyNoted, restartNoted atomic.Bool
 	// disk is what the data directory held when the node read it.
 	disk atomic.Int32
 	// stamp is the node id and incarnation of the joining stamp the data
@@ -241,6 +245,16 @@ func (r *Replicator) helloOf() hello {
 		}
 	}
 	r.auto.joiningStamp(&h)
+	if h.Incarnation != "" && eng != nil && r.keyChangedSinceOpen() {
+		// The leader adds a replacement under the key this hello comes
+		// with, the one on disk, and the open engine presents the other:
+		// that learner would never be reached. The stamp is not offered
+		// until the engine opens again, with the key on disk.
+		h.Incarnation = ""
+		if r.auto.restartNoted.CompareAndSwap(false, true) {
+			log.Warn("cluster: the certificate on disk carries another key than the one the consensus node opened with: restart this node so that it joins with it; until then the leader does not take it for the replacement of its slot")
+		}
+	}
 	return h
 }
 
@@ -438,8 +452,9 @@ func decide(self string, expected int, peerSlots []string, seen []hello) (format
 
 // form prepares the data directory of the autonomous mode before the node
 // opens: stamped on the first start, then founded or left to join, by the
-// rule above. A directory that is already a member's is left alone.
-func (r *Replicator) form(ctx context.Context, driver consensus.Driver, cfg consensus.Config, cluster consensus.ClusterID, spki [32]byte) error {
+// rule above. A directory that is already a member's is left alone. spki
+// reads the key the node presents, which a new stamp may have replaced.
+func (r *Replicator) form(ctx context.Context, driver consensus.Driver, cfg consensus.Config, cluster consensus.ClusterID, spki func() [32]byte) error {
 	rep, err := driver.Inspect(cfg.DataDir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("[cluster] reading %s: %w", cfg.DataDir, err)
@@ -448,6 +463,12 @@ func (r *Replicator) form(ctx context.Context, driver consensus.Driver, cfg cons
 		// A cluster a Recover superseded is never founded again under its
 		// id: the witnesses, when configured, are asked first.
 		if err := fenceClusterOrExit(ctx, cluster); err != nil {
+			return err
+		}
+		// The new id takes a new key, before it is stamped: a stop in
+		// between leaves no stamp, and the next start makes the key again
+		// (#209).
+		if err := r.keyForNewStamp(ctx); err != nil {
 			return err
 		}
 		id, inc, err := driver.Init(cfg.DataDir, cluster, cfg.Slot)
@@ -465,7 +486,7 @@ func (r *Replicator) form(ctx context.Context, driver consensus.Driver, cfg cons
 		if rep.Cluster != cluster {
 			return fmt.Errorf("%w: the data directory belongs to cluster %s, the certificate to %s", consensus.ErrMisconfigured, rep.Cluster, cluster)
 		}
-		self := consensus.Member{ID: rep.Node, Incarnation: rep.Incarnation, Slot: cfg.Slot, SPKI: spki, Address: cfg.ListenAddress, Voter: true}
+		self := consensus.Member{ID: rep.Node, Incarnation: rep.Incarnation, Slot: cfg.Slot, SPKI: spki(), Address: cfg.ListenAddress, Voter: true}
 		log.Warn("cluster: the founding of cluster %s was interrupted on this node; it resumes", cluster)
 		if err := driver.Bootstrap(ctx, cfg, []consensus.Member{self}); err != nil {
 			return fmt.Errorf("[cluster] resuming the founding: %w", err)
@@ -481,7 +502,7 @@ func (r *Replicator) form(ctx context.Context, driver consensus.Driver, cfg cons
 	if rep.Cluster != cluster {
 		return fmt.Errorf("%w: the data directory belongs to cluster %s, the certificate to %s", consensus.ErrMisconfigured, rep.Cluster, cluster)
 	}
-	self := consensus.Member{ID: rep.Node, Incarnation: rep.Incarnation, Slot: cfg.Slot, SPKI: spki, Address: cfg.ListenAddress, Voter: true}
+	self := consensus.Member{ID: rep.Node, Incarnation: rep.Incarnation, Slot: cfg.Slot, SPKI: spki(), Address: cfg.ListenAddress, Voter: true}
 	return r.auto.formLoop(ctx, func(ctx context.Context) error {
 		return driver.Bootstrap(ctx, cfg, []consensus.Member{self})
 	})

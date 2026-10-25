@@ -278,8 +278,9 @@ type JoinGrant struct {
 
 // RevokeKey refuses a node key for good: a JOIN presenting it is refused
 // whatever the grant or the CA says, and the object channel admits no
-// member holding it. An operator's Remove and DenyPin write it; the
-// autopilot's removal of a dead member does not, so that member returns.
+// member holding it. An operator's Remove and DenyPin write it, and so
+// does the autopilot's removal of a dead member from WithdrawVersion: that
+// member returns under a new key, never with this one (#209).
 type RevokeKey struct {
 	SPKI     string `json:"spki"`
 	Slot     string `json:"slot"`

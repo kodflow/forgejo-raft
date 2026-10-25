@@ -28,6 +28,9 @@ func (d *pendingDriver) Bootstrap(_ context.Context, _ consensus.Config, ms []co
 	return nil
 }
 
+// spkiOf is the key a node presents, fixed.
+func spkiOf(k [32]byte) func() [32]byte { return func() [32]byte { return k } }
+
 // A founder whose Bootstrap stopped half way runs it again at its start,
 // with the same one-member list, and says "member" only then (#62).
 func TestFormResumesAPendingBootstrap(t *testing.T) {
@@ -35,12 +38,12 @@ func TestFormResumesAPendingBootstrap(t *testing.T) {
 	d := &pendingDriver{rep: consensus.Report{Cluster: cluster, Node: consensus.NodeID(7), Incarnation: consensus.Incarnation{3}, Slot: "a", BootstrapPending: true}}
 	r := &Replicator{auto: &autoMode{}}
 	cfg := consensus.Config{DataDir: t.TempDir(), Slot: "a", ListenAddress: "10.0.0.1:7001"}
-	require.NoError(t, r.form(t.Context(), d, cfg, cluster, [32]byte{9}))
+	require.NoError(t, r.form(t.Context(), d, cfg, cluster, spkiOf([32]byte{9})))
 	require.Len(t, d.bootstrap, 1, "Bootstrap ran again")
 	assert.Equal(t, []consensus.Member{{ID: consensus.NodeID(7), Incarnation: consensus.Incarnation{3}, Slot: "a", SPKI: [32]byte{9}, Address: "10.0.0.1:7001", Voter: true}}, d.bootstrap[0])
 	assert.Equal(t, diskMember, r.auto.disk.Load())
 
 	other := &pendingDriver{rep: consensus.Report{Cluster: consensus.ClusterID{0x63}, BootstrapPending: true}}
-	require.ErrorIs(t, r.form(t.Context(), other, cfg, cluster, [32]byte{9}), consensus.ErrMisconfigured)
+	require.ErrorIs(t, r.form(t.Context(), other, cfg, cluster, spkiOf([32]byte{9})), consensus.ErrMisconfigured)
 	assert.Empty(t, other.bootstrap)
 }

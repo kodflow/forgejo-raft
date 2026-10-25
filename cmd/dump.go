@@ -462,7 +462,8 @@ func dumpData(ctx *cli.Command, archiveJobs chan archives.ArchiveAsyncJob, wg *s
 // The cluster's consensus data directory is one: a node whose directory is
 // restored comes back under its id and incarnation with a log that went
 // back, and an acknowledged write is lost; a lost directory is replaced by
-// an empty one, which joins under a new id, or by `forgejo cluster restore`.
+// an empty one, under which the node comes back with a new id and a new
+// key, or by `forgejo cluster restore`.
 func dataExcludes(absFileName string) []string {
 	excludes := []string{
 		setting.RepoRootPath, setting.LFS.Storage.Path, setting.Attachment.Storage.Path,

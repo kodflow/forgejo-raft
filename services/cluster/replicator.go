@@ -29,6 +29,7 @@ import (
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/storage"
+	"forgejo.org/services/cluster/certrenew"
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/nomadgate"
 	"forgejo.org/services/cluster/reftable"
@@ -70,6 +71,12 @@ type Replicator struct {
 	// auto is the autonomous mode ([cluster] EXPECTED_NODES from 3); nil
 	// in the manual mode.
 	auto *autoMode
+	// renewer renews the node certificate and makes the new key of a new
+	// node id (newkey.go); nil without RENEW_VAULT_ADDR. engineKey is the
+	// key the open engine's transport presents, read when it opened: the
+	// transport never takes another one while it runs (openedKey).
+	renewer   *certrenew.Renewer
+	engineKey atomic.Pointer[[32]byte]
 	// writerHook follows the right to write (writer.go); nil without one.
 	writerHook WriterHook
 	writer     atomic.Uint32
@@ -215,10 +222,18 @@ func Init(ctx context.Context) error {
 	clusterhook.SetHookTimeout(setting.Cluster.HookTimeout)
 	r.ctx = graceful.GetManager().ShutdownContext()
 
+	// A new key a stop left half in place is completed, or undone, before
+	// anything reads the pair (#209).
+	if err := certrenew.ResumeRekey(setting.Cluster.TLSCertFile, setting.Cluster.TLSKeyFile); err != nil {
+		return fmt.Errorf("[cluster] completing an interrupted key change: %w", err)
+	}
 	id, err := newIdentity(setting.Cluster.TLSCertFile, setting.Cluster.TLSKeyFile, setting.Cluster.TLSCAFile)
 	if err != nil {
 		return fmt.Errorf("[cluster] TLS identity: %w", err)
 	}
+	// One renewer renews and makes the new key of a new node id: the two
+	// never interleave.
+	r.renewer = NewRenewer()
 	clusterHex := setting.Cluster.ClusterID
 	var autoCluster consensus.ClusterID
 	if setting.Cluster.ExpectedNodes >= 3 {
@@ -297,7 +312,7 @@ func Init(ctx context.Context) error {
 		// The founder's list has one voter: the floor is the rule's, and
 		// the founding is checked against one.
 		cfg.MinVoters = 1
-		if err := r.form(r.ctx, driver, cfg, autoCluster, id.SPKI()); err != nil {
+		if err := r.form(r.ctx, driver, cfg, autoCluster, id.SPKI); err != nil {
 			_ = srv.Close()
 			return err
 		}
@@ -305,6 +320,9 @@ func Init(ctx context.Context) error {
 		cfg.Discover = r.auto.discoverForJoin
 		r.auto.rejoin = func(ctx context.Context) error { return r.rejoinUnderNewID(ctx, driver, cfg, autoCluster) }
 	}
+	// The transport the engine opens reads the pair now, and keeps its key
+	// for as long as it runs.
+	r.setOpenedKey(id.SPKI())
 	eng, err := driver.Open(r.ctx, cfg)
 	if err != nil {
 		_ = srv.Close()
@@ -350,8 +368,8 @@ func Init(ctx context.Context) error {
 		r.objects.rotate()
 		log.Info("cluster: node certificate changed on disk; object channel rotated, %d idle connections closed", rot.rotate())
 	})
-	if rn := NewRenewer(); rn != nil {
-		go runRenewer(r.ctx, rn)
+	if r.renewer != nil {
+		go runRenewer(r.ctx, r.renewer)
 	}
 
 	graceful.GetManager().RunAtShutdown(context.Background(), func() {
@@ -373,9 +391,14 @@ func Init(ctx context.Context) error {
 }
 
 // rejoinUnderNewID replaces the engine of a node whose id the cluster
-// retired (retire.go): the old engine closed, its data directory moved
-// aside, a new id stamped, and a new engine opened, joining.
+// retired (retire.go): a new key first, then the old engine closed, its
+// data directory moved aside, a new id stamped, and a new engine opened,
+// joining. Without a new key nothing is touched: the retired id's key
+// never joins again (#209).
 func (r *Replicator) rejoinUnderNewID(ctx context.Context, driver consensus.Driver, cfg consensus.Config, cluster consensus.ClusterID) error {
+	if err := r.keyForRejoin(ctx); err != nil {
+		return err
+	}
 	if old := r.Engine(); old != nil {
 		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		err := old.Close(cctx)
@@ -403,6 +426,7 @@ func (r *Replicator) rejoinUnderNewID(ctx context.Context, driver consensus.Driv
 	}
 	r.auto.noteJoining(id, inc)
 	r.resetForRejoin()
+	r.setOpenedKey(r.presentedKey())
 	eng, err := driver.Open(r.ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("opening under the new id %s: %w", id, err)

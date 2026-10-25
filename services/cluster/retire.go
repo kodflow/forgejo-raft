@@ -6,6 +6,7 @@ package cluster
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -26,6 +27,9 @@ import (
 //     for the operator, never deleted;
 //  3. a new id is stamped, the node joins through the CA admission and
 //     catches up as a learner; the autopilot then makes it a voter.
+//
+// Before anything moves, the node gets a new key (newkey.go): the leader
+// that removed it marked its key, which never joins again (#209).
 //
 // The repositories are not touched: the projector and the object channel
 // reconcile them with the table it catches up on.
@@ -180,8 +184,18 @@ func (r *Replicator) checkRetired(ctx context.Context, eng consensus.Engine) {
 		return
 	}
 	log.Warn("cluster: a quorum says this node's id %s is retired: it rejoins under a new id", self)
-	if err := r.auto.rejoin(ctx); err != nil {
+	err := r.auto.rejoin(ctx)
+	switch {
+	case errors.Is(err, errNeedsNewKey):
+		// Retried at each pass, logged once: only an operator's new key
+		// lets it through.
+		if r.auto.keyNoted.CompareAndSwap(false, true) {
+			log.Error("cluster: this node does not rejoin under a new id: %v", err)
+		}
+	case err != nil:
 		log.Error("cluster: rejoining under a new id: %v; retried", err)
+	default:
+		r.auto.keyNoted.Store(false)
 	}
 }
 

@@ -24,7 +24,8 @@ import (
 // lose gives a killed node an empty data directory, as a lost disk does: it
 // starts again, stamps a new id, finds a member, opens joining and runs its
 // autopilot, as Init does, from an empty table. The bench derives a key
-// from each id, so the new id comes with a new key.
+// from each id, so the new id comes with a new key, as the renewer gives it
+// (newkey.go).
 func (b *autoBench) lose(an *autoNode) consensus.NodeID {
 	t := b.t
 	require.NoError(t, os.RemoveAll(an.dir), "the disk is lost")
@@ -104,13 +105,15 @@ func auditAt(r *Replicator, action Action, target consensus.NodeID) uint64 {
 // its old id has been out of reach for DEAD_MEMBER_TIMEOUT, the leader adds
 // the new id as a learner under the same slot, promotes it, then removes
 // the old id, in that order. The membership never lists fewer than three
-// voters, and the new member follows the leader.
+// voters, the new member follows the leader, and the old id's key is never
+// admitted again (#209).
 func TestALostVoterOfThreeIsReplacedUnderItsSlot(t *testing.T) {
 	tc, b := newAutoCluster(t, 3, "node-a", "node-b", "node-c")
 	b.waitMembers(3, 3)
 	b.raisePayload()
 	victim := b.follower()
 	oldID := b.idOf(victim)
+	oldKey := sdk.MemorySPKI(sdk.NodeID(oldID))
 	var survivors []*autoNode
 	for _, an := range b.alive() {
 		if an != victim {
@@ -162,6 +165,12 @@ func TestALostVoterOfThreeIsReplacedUnderItsSlot(t *testing.T) {
 	require.True(t, ok, msg)
 	require.Eventually(t, func() bool { return gitRef(t, victim.n, "auto/replaced.git", "refs/heads/main") == sha },
 		20*time.Second, 20*time.Millisecond, "the replaced node serves the write")
+
+	// The old id's key is marked: it never joins again, under any id.
+	spki := hex.EncodeToString(oldKey[:])
+	require.Eventually(t, func() bool { return l.table.KeyRevoked(spki) }, 10*time.Second, 20*time.Millisecond)
+	_, err := l.authorizeJoin(t.Context(), consensus.JoinRequest{Slot: victim.n.slot, SPKI: oldKey, Address: victim.addr})
+	require.ErrorContains(t, err, "revoked")
 }
 
 // replaceEngine is a leader of three that adds a learner as the autopilot
@@ -315,4 +324,31 @@ func TestAJoiningHelloCarriesItsStamp(t *testing.T) {
 	h = r.helloOf()
 	assert.Equal(t, helloMember, h.State)
 	assert.Empty(t, h.Incarnation, "a member's hello")
+}
+
+// A joining node whose certificate on disk changed under its open engine,
+// as when an operator installs a new key while it runs, does not offer its
+// stamp: the leader would add it under the key on disk, which the engine's
+// transport does not present, and never reach that learner. Once the
+// engine opens again, with the key on disk, the stamp is offered (#186,
+// #209).
+func TestAJoiningHelloWaitsForARestartAfterANewKey(t *testing.T) {
+	pki := newPKI(t)
+	cluster := consensus.ClusterID{0x18, 0x6a}
+	n := newKeyNode(t, pki, cluster, "node-b")
+	n.r.auto = &autoMode{self: "node-b", listen: "b:1", expected: 3}
+	inc := consensus.Incarnation{0xb2, 2}
+	n.r.auto.noteJoining(0xb2, inc)
+	n.r.setOpenedKey(n.key)
+	n.r.setEngine(&joiningEngine{id: 0xb2})
+	require.Equal(t, inc.String(), n.r.helloOf().Incarnation, "the key on disk is the engine's")
+
+	key := installKey(t, pki, cluster, "node-b")
+	require.Equal(t, key, n.r.presentedKey(), "the object channel reads the new key")
+	h := n.r.helloOf()
+	assert.Equal(t, helloJoining, h.State)
+	assert.Empty(t, h.Incarnation, "the engine presents its old key: no stamp until it opens again")
+
+	n.r.setOpenedKey(n.r.presentedKey())
+	assert.Equal(t, inc.String(), n.r.helloOf().Incarnation, "reopened with the key on disk")
 }
