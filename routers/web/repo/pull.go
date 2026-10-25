@@ -1393,6 +1393,23 @@ func MergePullRequest(ctx *context.Context) {
 		mergeCheckType = pull_service.MergeCheckTypeManually
 	}
 
+	// In a cluster, the checks below judge the head as this node's git
+	// has it, and the merge waits for this node to serve the head: behind
+	// a push another node acknowledged, the checks would pass the commit
+	// before it, and the merge would take the pushed commit, unchecked
+	// (#247). An immediate merge waits first, and is refused while this
+	// node is behind.
+	if mergeCheckType == pull_service.MergeCheckTypeGeneral {
+		if err := pull_service.RequireFreshHeadAndBase(ctx, pr); err != nil {
+			if errors.Is(err, clusterhook.ErrBehind) {
+				ctx.Error(http.StatusServiceUnavailable, err.Error())
+			} else {
+				ctx.ServerError("RequireFreshHeadAndBase", err)
+			}
+			return
+		}
+	}
+
 	// start with merging by checking
 	if err := pull_service.CheckPullMergeable(ctx, ctx.Doer, &ctx.Repo.Permission, pr, mergeCheckType, form.ForceMerge, mergeStyle); err != nil {
 		switch {
