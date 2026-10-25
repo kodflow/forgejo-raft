@@ -42,7 +42,9 @@ type Cluster struct {
 	speaks     map[consensus.NodeID]uint32
 }
 
-// ProtocolMax is the highest cluster version the stand-in speaks, the SDK's.
+// ProtocolMax is the highest cluster version the stand-in speaks: the one
+// Forgejo raises to. The SDK speaks 3 since kitsunium/sdk#659, whose
+// retired keys the stand-in does not model.
 const ProtocolMax uint32 = 2
 
 type watcher struct {
