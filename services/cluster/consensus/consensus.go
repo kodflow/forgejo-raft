@@ -336,8 +336,10 @@ type Engine interface {
 	// ClusterGeneration): a stale one is ErrAdminPrecondition. It is refused
 	// ErrVersionUnsupported while a member of the latest configuration,
 	// voter or learner, was not heard in the leader's term announcing v: a
-	// member on an older binary would stop on the raise (D18). A raise is
-	// never undone.
+	// member on an older binary would stop on the raise (D18). It is refused
+	// so as well while such a member was last heard a vote window ago or
+	// more, whatever it announced: one that went down may come back on an
+	// older binary (kitsunium/sdk#665). A raise is never undone.
 	RaiseClusterVersion(ctx context.Context, op Operator, pre Precondition, v uint32) error
 	SaveSnapshot(ctx context.Context, op Operator, w io.Writer) (SnapshotMeta, error)
 	// Watch returns its own channel of status changes, closed when ctx ends
@@ -534,7 +536,12 @@ var (
 	// is of a format this build does not read: the engine stops the node and
 	// refuses a restart over that snapshot (D18), instead of having the
 	// leader resend it forever. From RaiseClusterVersion, it says a member
-	// does not announce the version yet: nothing was raised.
+	// does not announce the version yet, or did not answer within the vote
+	// window (kitsunium/sdk#665): nothing was raised, and the raise may be
+	// asked again. From opening a data directory, offline or at the node's
+	// start, it says the directory holds what a newer build wrote, such as
+	// a snapshot metadata of a version this one does not know: nothing in
+	// it was removed (kitsunium/sdk#665).
 	ErrVersionUnsupported = errors.New("VERSION_UNSUPPORTED")
 )
 

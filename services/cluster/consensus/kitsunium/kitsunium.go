@@ -31,9 +31,19 @@ func init() {
 // Only a test sets it, to a directory an unprivileged process can create.
 var RuntimeDir string
 
-// openDataDir opens a data directory with the marker directory above.
+// openDataDir opens a data directory with the marker directory above. The
+// engine refuses VERSION_UNSUPPORTED, before anything in it is removed, a
+// directory that holds what a newer build wrote: a snapshot metadata of a
+// version it does not know whose checksum holds (kitsunium/sdk#665), as a
+// log record of such a version. Its error names neither the directory nor
+// the remedy, which every command that opens one says here: the node's
+// start as cluster inspect, recover and restore.
 func openDataDir(dir string) (sdk.DataDir, error) {
-	return sdk.NewDataDirWith(dir, sdk.DataDirOptions{RuntimeDir: RuntimeDir})
+	d, err := sdk.NewDataDirWith(dir, sdk.DataDirOptions{RuntimeDir: RuntimeDir})
+	if errors.Is(err, sdk.VersionUnsupported) {
+		return d, fmt.Errorf("the data directory %s holds what a newer release wrote, which this one does not read: run that release, or a later one, on it: %w", dir, err)
+	}
+	return d, err
 }
 
 type driver struct{}
@@ -559,8 +569,9 @@ func (e *Engine) ClearNoSpace(ctx context.Context, op consensus.Operator, pre co
 
 // RaiseClusterVersion raises the engine's cluster version. The leader
 // refuses VERSION_UNSUPPORTED while a member of the configuration was not
-// heard announcing v in its term, and ADMIN_PRECONDITION_FAILED against
-// another lineage or generation.
+// heard announcing v in its term, or was last heard a vote window ago or
+// more (kitsunium/sdk#665), and ADMIN_PRECONDITION_FAILED against another
+// lineage or generation.
 func (e *Engine) RaiseClusterVersion(ctx context.Context, op consensus.Operator, pre consensus.Precondition, v uint32) error {
 	return mapErr(e.n.RaiseClusterVersion(ctx, sdk.Operator(op), sdk.PreconditionSpec{Log: sdkIdentity(pre.Identity), Generation: pre.Generation}, v))
 }

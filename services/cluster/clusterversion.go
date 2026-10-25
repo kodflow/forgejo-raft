@@ -24,10 +24,26 @@ import (
 // (#170). The leader raises it in both modes, as the autopilot raises the
 // payload version: it is a protocol version, not an operator's decision. An
 // SDK speaking a later protocol is raised to by a release that says so,
-// never by its pin alone. The SDK speaks 3 since kitsunium/sdk#659: the
-// raise to it waits for kitsunium/sdk#665, since a node of protocol 2 that
-// meets the snapshot metadata of protocol 3 leaves the replication silently
-// instead of stopping.
+// never by its pin alone. The SDK speaks 3 since kitsunium/sdk#659, and
+// ADR 0152's rule for the raise to 3 (D19, amendment of kitsunium/sdk#665)
+// orders three steps:
+//  1. a release with an SDK holding that amendment, still at protocol 2,
+//     runs on every member: its leader holds every member to the vote
+//     window, and withholds from a peer of protocol 2 a snapshot it cannot
+//     read;
+//  2. no binary of protocol 2, a Forgejo built before #227, can come back:
+//     none is left in the deployment, kept as a rollback target, allowed to
+//     JOIN or used for an offline command (cluster recover, restore,
+//     inspect) over a data directory of the cluster, and the floor of a
+//     rollback is the release of step 1. Such a node, back after the raise
+//     to 3, does not stop: it is withheld every snapshot it cannot read,
+//     answers the heartbeats, is counted by CheckQuorum and holds no new
+//     entry;
+//  3. only then a later release sets clusterProtocol to 3, which the
+//     engine admits once every member answers within the vote window
+//     announcing it.
+//
+// A release with this pin is step 1: clusterProtocol stays 2.
 const clusterProtocol uint32 = 2
 
 // ActionRaiseCluster is what the replicated audit records of a raise of the
@@ -37,13 +53,19 @@ const ActionRaiseCluster Action = "raise-cluster-version"
 
 // raiseClusterVersion raises, on a leader that a majority answers, the
 // cluster version to clusterProtocol, against the lineage and the
-// generation of the status it reads. The engine refuses it while a member of
-// the latest configuration, voter or learner, was not heard in this term
-// announcing the protocol: a member still on a binary of protocol 1 would
-// stop on the raise and on every format written after it. A rolling upgrade
-// is therefore raised once its last member runs this binary, and a refusal
-// is retried at the next pass. The raise is never undone: from it on, a
-// member rolled back to a binary of protocol 1 stops, it never forks.
+// generation of the status it reads. The engine refuses it
+// VERSION_UNSUPPORTED while a member of the latest configuration, voter or
+// learner, was not heard in this term announcing the protocol: a member
+// still on a binary of protocol 1 would stop on the raise and on every
+// format written after it. It refuses it as well while such a member was
+// last heard a vote window ago or more, the minimum election timeout,
+// whatever it announced: a member that announced the protocol and then went
+// down may come back on an older binary (kitsunium/sdk#665). A rolling
+// upgrade is therefore raised once its last member runs this binary and
+// answers, a raise just after the start waits for every member to be heard,
+// and a refusal is retried at the next pass: the cluster keeps writing
+// meanwhile. The raise is never undone: from it on, a member rolled back to
+// a binary of protocol 1 stops, it never forks.
 func (r *Replicator) raiseClusterVersion(ctx context.Context, eng consensus.Engine) {
 	st := eng.Status()
 	if st.Role != consensus.RoleLeader || st.ClusterVersion >= clusterProtocol || !eng.Health().QuorumReachable {

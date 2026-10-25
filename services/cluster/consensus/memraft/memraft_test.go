@@ -44,3 +44,22 @@ func TestWatchClosesItsChannel(t *testing.T) {
 	require.NoError(t, n.Close(context.Background()), "a second close is harmless")
 	closedWithin(t, n.Watch(context.Background()))
 }
+
+// A raise is refused while a member does not answer, whatever it announced,
+// as the engine holds every member to its vote window (kitsunium/sdk#665),
+// and goes through once it answers again.
+func TestARaiseWaitsForEveryMemberToAnswer(t *testing.T) {
+	c := New()
+	a := c.Add("node-a", [32]byte{1}, reftable.New())
+	c.Add("node-b", [32]byte{2}, reftable.New())
+	silent := c.Add("node-c", [32]byte{3}, reftable.New())
+	c.SetDown(silent, true)
+	st := a.Status()
+	pre := consensus.Precondition{Identity: st.Identity, Generation: st.ClusterGeneration}
+	require.ErrorIs(t, a.RaiseClusterVersion(t.Context(), "op:test", pre, ProtocolMax), consensus.ErrVersionUnsupported)
+	require.Zero(t, a.Status().ClusterVersion)
+
+	c.SetDown(silent, false)
+	require.NoError(t, a.RaiseClusterVersion(t.Context(), "op:test", pre, ProtocolMax))
+	require.Equal(t, ProtocolMax, a.Status().ClusterVersion)
+}

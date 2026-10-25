@@ -366,7 +366,9 @@ func (n *Node) ClearNoSpace(ctx context.Context, op consensus.Operator, pre cons
 
 // RaiseClusterVersion raises the cluster version as the engine does: on a
 // node that reaches a quorum, against the current lineage and generation,
-// once every member speaks v.
+// once every member speaks v and answers. The engine holds every member to
+// its vote window, whatever it announced (kitsunium/sdk#665): here, a
+// member down or closed.
 func (n *Node) RaiseClusterVersion(ctx context.Context, op consensus.Operator, pre consensus.Precondition, v uint32) error {
 	c := n.c
 	c.mu.Lock()
@@ -382,6 +384,9 @@ func (n *Node) RaiseClusterVersion(ctx context.Context, op consensus.Operator, p
 	}
 	for _, m := range c.members.Members {
 		if s, ok := c.speaks[m.ID]; ok && s < v {
+			return consensus.ErrVersionUnsupported
+		}
+		if p := c.nodes[m.ID]; p != nil && (p.down || p.closed) {
 			return consensus.ErrVersionUnsupported
 		}
 	}
