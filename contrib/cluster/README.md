@@ -241,8 +241,12 @@ grants a join.
   for revocation. The leader adds the new id as a learner under the same
   slot, promotes it once it caught up (four voters), then removes the old
   id (three again): the membership never lists fewer than three voters.
-  Fault tolerance stays at 0 until the new voter votes, as it is from the
-  moment the disk is lost.
+  Fault tolerance stays at 0 from the moment the disk is lost until the old
+  id is removed, since four voters with one dead need the three others; a
+  change of leader in between counts `DEAD_MEMBER_TIMEOUT` again. A
+  replacement the leader added and then removed before it was ever heard
+  stamps another id, with a new key, once the members say its id is
+  retired.
 - **Joining** needs no grant: a node presenting a certificate of this
   cluster's CA, for a slot `PEERS` names and that has no member, is admitted
   as a learner. A cluster admits one member above its size, for a

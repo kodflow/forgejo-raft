@@ -352,3 +352,58 @@ func TestAJoiningHelloWaitsForARestartAfterANewKey(t *testing.T) {
 	n.r.setOpenedKey(n.r.presentedKey())
 	assert.Equal(t, inc.String(), n.r.helloOf().Incarnation, "reopened with the key on disk")
 }
+
+// A replacement the leader added, then removed before it was ever heard,
+// holds a joining stamp under an id the cluster retired: its JOIN is
+// refused for good, and no membership of its own lists it. Once the members
+// that answer say by a majority that its id is retired, it stamps another
+// id; one answer of two, an answer under a revoked key, or a node whose
+// directory holds a member's log, never does (#186).
+func TestARetiredJoinerStampsAnotherID(t *testing.T) {
+	self := consensus.NodeID(0xc2)
+	retired := func(slot string, k byte) hello {
+		return hello{Slot: slot, State: helloMember, Retired: []string{self.String()}, SPKI: [32]byte{k}}
+	}
+	member := func(slot string, k byte) hello {
+		return hello{Slot: slot, State: helloMember, SPKI: [32]byte{k}}
+	}
+	for _, tc := range []struct {
+		name    string
+		member  bool
+		revoke  [][32]byte
+		answers map[string]hello
+		rejoins int
+	}{
+		{name: "both members", rejoins: 1, answers: map[string]hello{"node-a": retired("node-a", 0xa), "node-b": retired("node-b", 0xb)}},
+		{name: "one member, the other down", rejoins: 1, answers: map[string]hello{"node-a": retired("node-a", 0xa)}},
+		{name: "one of two", answers: map[string]hello{"node-a": retired("node-a", 0xa), "node-b": member("node-b", 0xb)}},
+		{name: "a revoked key", revoke: [][32]byte{{0xa}}, answers: map[string]hello{"node-a": retired("node-a", 0xa), "node-b": member("node-b", 0xb)}},
+		{name: "a member's directory", member: true, answers: map[string]hello{"node-a": retired("node-a", 0xa), "node-b": retired("node-b", 0xb)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newReplicator(t.TempDir(), newRegistry(time.Second, 8, 64))
+			for _, k := range tc.revoke {
+				revokeKey(t, r.table, k)
+			}
+			rejoins := 0
+			r.auto = &autoMode{
+				self: "node-c", tick: time.Second,
+				peers: map[string]string{"node-a": "a:1", "node-b": "b:1", "node-c": "c:1"},
+				probe: func(_ context.Context, _, slot string) (hello, error) {
+					if h, ok := tc.answers[slot]; ok {
+						return h, nil
+					}
+					return hello{}, consensus.ErrNotLeader
+				},
+				rejoin: func(context.Context) error { rejoins++; return nil },
+			}
+			if tc.member {
+				r.auto.noteDisk(true)
+			} else {
+				r.auto.noteJoining(self, consensus.Incarnation{0xc2})
+			}
+			r.checkRetired(t.Context(), &fakeRetireEngine{id: self})
+			assert.Equal(t, tc.rejoins, rejoins)
+		})
+	}
+}

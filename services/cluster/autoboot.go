@@ -206,6 +206,13 @@ func (a *autoMode) noteDisk(member bool) {
 	a.disk.Store(diskJoining)
 }
 
+// neverMember reports whether the data directory this node read holds the
+// joining stamp of id, and no member's log: no membership ever listed it.
+func (a *autoMode) neverMember(id consensus.NodeID) bool {
+	st := a.stamp.Load()
+	return a.disk.Load() == diskJoining && st != nil && st.id == id
+}
+
 // noteJoining records a joining stamp: the data directory holds no
 // member's log, and the hello carries the stamp's id and incarnation.
 func (a *autoMode) noteJoining(id consensus.NodeID, inc consensus.Incarnation) {

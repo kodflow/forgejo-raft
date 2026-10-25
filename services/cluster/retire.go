@@ -128,6 +128,25 @@ func retiredConfirmed(self consensus.NodeID, own consensus.Membership, seen []he
 	return voters > 0 && confirmed >= voters/2+1
 }
 
+// joinerRetired reports whether the members that answered a joining node,
+// one that never held a membership to count against, say by a majority
+// that its id is retired: an answer under a revoked key does not count. A
+// forged answer can at most make such a node stamp another id, and it holds
+// no data a quorum committed.
+func joinerRetired(self consensus.NodeID, seen []hello, revoked func([32]byte) bool) bool {
+	members, retired := 0, 0
+	for _, h := range seen {
+		if h.State != helloMember || revoked(h.SPKI) {
+			continue
+		}
+		members++
+		if h.retires(self.String()) {
+			retired++
+		}
+	}
+	return retired > 0 && retired > members/2
+}
+
 // trustedAnswer reports whether a hello came from member m: its slot, and
 // its key, which the handshake of the object channel proved (a node's
 // object channel and consensus share their certificate), never revoked.
@@ -180,7 +199,17 @@ func (r *Replicator) checkRetired(ctx context.Context, eng consensus.Engine) {
 	if Rank(own, self) > 0 && probeLeader(ctx, eng) {
 		return
 	}
-	if !retiredConfirmed(self, own, r.auto.round(ctx), r.trustedAnswer) {
+	seen := r.auto.round(ctx)
+	switch {
+	case len(own.Members) == 0 && r.auto.neverMember(self):
+		// A joining node that no membership ever listed: the leader may
+		// have added it as the replacement of a lost voter (#186), then
+		// removed it before it was ever heard. Its JOIN under a retired id
+		// is refused for good, and it holds no data to keep.
+		if !joinerRetired(self, seen, r.keyRevoked) {
+			return
+		}
+	case !retiredConfirmed(self, own, seen, r.trustedAnswer):
 		return
 	}
 	log.Warn("cluster: a quorum says this node's id %s is retired: it rejoins under a new id", self)
