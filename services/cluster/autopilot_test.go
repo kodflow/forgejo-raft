@@ -510,6 +510,11 @@ func TestSequentialFailuresDownToTwo(t *testing.T) {
 	assert.Len(t, b.alive(), 2)
 	push(b.leader().n, "two alive, on the leader")
 	for _, an := range b.alive() {
+		// A push through a member names the value its git holds: the
+		// last push returned once acknowledged, and a member that did
+		// not take it through its own git projects it after (#231).
+		require.Eventually(t, func() bool { return gitRef(t, an.n, "auto/down.git", "refs/heads/main") == head },
+			15*time.Second, 20*time.Millisecond, "%s projects the last push", an.n.slot)
 		push(an.n, "two alive, on "+an.n.slot)
 	}
 }
