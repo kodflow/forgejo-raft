@@ -68,6 +68,12 @@ type objectChannel struct {
 	// which asks before raising the payload version (#50).
 	hello            func() hello
 	helloMembersOnly bool
+	// projected answers GET /v1/projected to a member: the index up to
+	// which this node projects a repository (projector.Projected), which a
+	// leader asks before it hands over the leadership for a parked event
+	// it cannot project itself (#249). Nil answers 404, as a binary
+	// without the question does.
+	projected func(repo string) uint64
 
 	mu      sync.Mutex
 	clients map[string]*http.Client
@@ -112,6 +118,7 @@ func (oc *objectChannel) handler() http.Handler {
 	mux.HandleFunc("POST /v1/push", oc.handlePush)
 	mux.HandleFunc("POST /v1/fetch", oc.handleFetch)
 	mux.HandleFunc("POST /v1/have", oc.handleHave)
+	mux.HandleFunc("GET /v1/projected", oc.handleProjected)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 			http.Error(w, "client certificate required", http.StatusUnauthorized)
@@ -331,6 +338,29 @@ func (oc *objectChannel) handleHave(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(ans)
+}
+
+// projectedAnswer is a member's answer to GET /v1/projected: the index up
+// to which it projects Repo.
+type projectedAnswer struct {
+	Repo      string `json:"repo"`
+	Projected uint64 `json:"projected"`
+}
+
+// handleProjected tells a member up to which index this node projects a
+// repository. It reads the projector alone, never the disk nor SQL.
+func (oc *objectChannel) handleProjected(w http.ResponseWriter, r *http.Request) {
+	repo := r.URL.Query().Get("repo")
+	if err := reftable.ValidRepoKey(repo); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if oc.projected == nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(projectedAnswer{Repo: repo, Projected: oc.projected(repo)})
 }
 
 // Bounds of the object channel beside the hook's own budget: a transfer
@@ -738,6 +768,38 @@ func (oc *objectChannel) peerHolds(ctx context.Context, m consensus.Member, repo
 		return false
 	}
 	return ans.Missing != nil && len(ans.Missing) == 0
+}
+
+// askProjected asks member m up to which index it projects repo. A member
+// that does not answer, or runs a binary without /v1/projected, says
+// nothing: an error.
+func (oc *objectChannel) askProjected(ctx context.Context, m consensus.Member, repo string) (uint64, error) {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	u, err := oc.objectURL(m, "/v1/projected?"+url.Values{"repo": {repo}}.Encode())
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := oc.client(m).Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("%s answered %s", m.Slot, resp.Status)
+	}
+	var ans projectedAnswer
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&ans); err != nil {
+		return 0, err
+	}
+	if ans.Repo != repo {
+		return 0, fmt.Errorf("%s answered for %q, asked %q", m.Slot, ans.Repo, repo)
+	}
+	return ans.Projected, nil
 }
 
 var errNeedsFull = errors.New("peer lacks the bases of a thin pack")

@@ -116,6 +116,14 @@ type View struct {
 	SQLDurabilityChecked time.Time
 	// Parked lists the first parked entries with their error.
 	Parked []ParkedView
+	// ProjectionWait is, on the leader, the parked entry its retries have
+	// found waiting longest for its repository's projection on this node,
+	// which no retry nor reconcile changes while it leads: another member
+	// that projects the repository applies it once it leads (#249). Nil
+	// otherwise. ProjectionYield says that the autopilot hands the
+	// leadership over for it (the autonomous mode).
+	ProjectionWait  *ProjectionWaitView
+	ProjectionYield bool
 	// BackupLag is how far the PostgreSQL backup lags the cursor, and
 	// BackupHeld the bytes of the event queue it holds behind it, while it
 	// holds the trim beyond its bound; 0 otherwise.
@@ -164,6 +172,15 @@ type View struct {
 	Removed []RemovedView
 }
 
+// ProjectionWaitView is a parked entry waiting for its repository's
+// projection on the leader, and since when its retries found it so.
+type ProjectionWaitView struct {
+	Lineage string
+	Index   int64
+	Repo    string
+	Since   time.Time
+}
+
 // View collects the node's status.
 func (r *Replicator) View(ctx context.Context) View {
 	v := View{
@@ -189,6 +206,7 @@ func (r *Replicator) View(ctx context.Context) View {
 	v.BackupLag, v.EventQueueMax, v.EventQueueAlarm = ch.BackupLag, ch.EventQueueMax, ch.EventQueueAlarm
 	v.BackupHeld, v.PushRefusedBytes = ch.BackupHeld, ch.PushRefusedBytes
 	v.CheckpointsHere, v.HasBackup, v.Backup, v.CheckpointsOff = ch.CheckpointsHere, ch.HasBackup, ch.Backup, ch.CheckpointsOff
+	v.ProjectionWait, v.ProjectionYield = ch.ProjectionWait, ch.ProjectionYield
 	if v.ParkedEvents > 0 {
 		if ps, err := r.ListParked(ctx); err == nil {
 			if len(ps) > 100 {
@@ -284,6 +302,11 @@ func (r *Replicator) ConsumerHealth(ctx context.Context) View {
 			if ck, ok := r.ckState.fresh(r.clock()); ok {
 				v.CheckpointTakers, v.CheckpointUnknown, v.CheckpointsAsked = ck.On, ck.Unknown, ck.At
 				v.CheckpointTakersHeld = ck.Held
+			}
+			if ws := r.consumer.waitingProjection(); len(ws) > 0 {
+				w := ws[0]
+				v.ProjectionWait = &ProjectionWaitView{Lineage: w.Lineage, Index: w.Index, Repo: w.Repo, Since: w.Since}
+				v.ProjectionYield = r.auto != nil
 			}
 		}
 	}
