@@ -77,6 +77,9 @@ type tcpBench struct {
 	pki     *testPKI
 	cluster sdk.ClusterID
 	timing  sdk.TimingContractSpec
+	// noPilot starts the nodes without the pilot of the manual mode, which
+	// the test starts itself (pilot).
+	noPilot bool
 	mu      sync.Mutex
 	nodes   []*tcpNode
 }
@@ -137,6 +140,15 @@ func (b *tcpBench) start(n *tcpNode) {
 	require.NoError(b.t, err)
 	n.node = node
 	n.r.setEngine(kitsunium.Wrap(node, n.slot))
+	n.stop = func() {}
+	if !b.noPilot {
+		b.pilot(n)
+	}
+	n.up = true
+}
+
+// pilot runs the node's pilot of the manual mode until the node stops.
+func (b *tcpBench) pilot(n *tcpNode) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -144,7 +156,26 @@ func (b *tcpBench) start(n *tcpNode) {
 		n.r.leaderPilot(ctx, 50*time.Millisecond)
 	}()
 	n.stop = func() { cancel(); <-done }
-	n.up = true
+}
+
+// found stamps the founders of slots, bootstraps them with one another as
+// voters and starts them; it returns them with their pins.
+func (b *tcpBench) found(slots ...string) ([]*tcpNode, [][32]byte) {
+	var founders []*tcpNode
+	var members []sdk.MemberValue
+	var pins [][32]byte
+	for _, slot := range slots {
+		n := b.stamp(slot)
+		founders = append(founders, n)
+		members = append(members, sdk.MemberValue{ID: n.id, Incarnation: n.inc, Slot: slot, SPKI: n.spki, Address: n.addr, Voter: true})
+		pins = append(pins, n.spki)
+	}
+	for _, n := range founders {
+		n.r = newReplicator(b.t.TempDir(), newRegistry(time.Second, 8, 64))
+		require.NoError(b.t, sdk.Bootstrap(context.Background(), new(b.config(n)), members))
+		b.start(n)
+	}
+	return founders, pins
 }
 
 // down stops the node as a crash does: its pilot, its engine, its
@@ -186,20 +217,7 @@ func (b *tcpBench) leader() *tcpNode {
 // the next failure cost the majority.
 func TestAReturnedVoterHearsALeaderAdmittedWhileItWasDown(t *testing.T) {
 	b := newTCPBench(t, sdk.ClusterID{0x0f, 0x07, 0x9e, 0x17})
-	var founders []*tcpNode
-	var members []sdk.MemberValue
-	var pins [][32]byte
-	for _, slot := range []string{"node-1", "node-2", "node-3"} {
-		n := b.stamp(slot)
-		founders = append(founders, n)
-		members = append(members, sdk.MemberValue{ID: n.id, Incarnation: n.inc, Slot: slot, SPKI: n.spki, Address: n.addr, Voter: true})
-		pins = append(pins, n.spki)
-	}
-	for _, n := range founders {
-		n.r = newReplicator(t.TempDir(), newRegistry(time.Second, 8, 64))
-		require.NoError(t, sdk.Bootstrap(context.Background(), new(b.config(n)), members))
-		b.start(n)
-	}
+	founders, pins := b.found("node-1", "node-2", "node-3")
 	var l *tcpNode
 	require.Eventually(t, func() bool { l = b.leader(); return l != nil }, 10*time.Second, 20*time.Millisecond)
 
@@ -296,6 +314,96 @@ func TestAReturnedVoterHearsALeaderAdmittedWhileItWasDown(t *testing.T) {
 	}
 	assert.Equal(t, term, tok.Term, "the write is node-4's, in the term it was handed the leadership")
 	assert.NotZero(t, n1.node.Status().Leader, "the returned voter knows its leader")
+}
+
+// A voter heard announcing the protocol, then silent past the vote window,
+// holds the raise back on the SDK's engine (kitsunium/sdk#665): before, its
+// announcement held for the rest of the term, and the raise passed over a
+// voter that may come back on an older binary. The pilot of the manual mode
+// is refused at each pass without keeping the cluster from writing, and
+// raises the version once the voter answers again.
+func TestTheRaiseWaitsForEveryMemberToAnswer(t *testing.T) {
+	b := newTCPBench(t, sdk.ClusterID{0x0f, 0x07, 0x9e, 0x18})
+	b.noPilot = true
+	founders, _ := b.found("node-1", "node-2", "node-3")
+	var l *tcpNode
+	require.Eventually(t, func() bool { l = b.leader(); return l != nil }, 10*time.Second, 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	const op consensus.Operator = "op:test"
+	write := func(id string) {
+		t.Helper()
+		ld := b.leader()
+		require.NotNil(t, ld)
+		data, err := reftable.Encode(reftable.KindAudit, &reftable.Audit{ID: id, Operator: string(op), Action: "probe", Outcome: "ok", Time: time.Now().Unix()})
+		require.NoError(t, err)
+		_, res, err := ld.r.proposeCommand(ctx, data, func() bool { return ld.r.table.HasAudit(id) })
+		require.NoError(t, err)
+		require.True(t, res.OK, res.Reason)
+		require.Eventually(t, func() bool {
+			for _, n := range founders {
+				if n.up && !n.r.table.HasAudit(id) {
+					return false
+				}
+			}
+			return true
+		}, 10*time.Second, 10*time.Millisecond, "every running member applies %s", id)
+	}
+	// Every member applied a write of this term: the leader heard each of
+	// them announce protocol 2 in it.
+	write("heard")
+	var n1 *tcpNode
+	for _, n := range founders {
+		if n != l {
+			n1 = n
+			break
+		}
+	}
+	b.down(n1)
+	time.Sleep(2 * b.timing.ElectionTimeoutMin)
+
+	l = b.leader()
+	require.NotNil(t, l)
+	eng := l.r.Engine()
+	st := eng.Status()
+	pre := consensus.Precondition{Identity: st.Identity, Generation: st.ClusterGeneration}
+	require.ErrorIs(t, eng.RaiseClusterVersion(ctx, autopilotOperator, pre, clusterProtocol), consensus.ErrVersionUnsupported,
+		"a voter silent past the vote window")
+	for _, n := range founders {
+		if n.up {
+			b.pilot(n)
+		}
+	}
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		for _, n := range founders {
+			if n.up {
+				require.Zero(t, n.r.Engine().Status().ClusterVersion, "%s: raised over a silent voter", n.slot)
+			}
+		}
+	}
+	write("still-writing")
+	for _, n := range founders {
+		assert.False(t, n.up && raisedAudit(n.r.table), n.slot)
+	}
+
+	// n1 answers again, under its own pilot: the version is raised.
+	b.noPilot = false
+	b.restart(n1)
+	require.Eventually(t, func() bool {
+		for _, n := range founders {
+			if n.r.Engine().Status().ClusterVersion != clusterProtocol || !raisedAudit(n.r.table) {
+				return false
+			}
+		}
+		return true
+	}, 20*time.Second, 20*time.Millisecond, "raised and audited once the voter answers again")
+	count := 0
+	for _, a := range n1.r.table.Audit() {
+		if a.Action == string(ActionRaiseCluster) {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count, "raised once")
 }
 
 // While a member does not announce the protocol, the engine refuses the

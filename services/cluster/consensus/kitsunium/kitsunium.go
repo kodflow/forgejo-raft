@@ -559,8 +559,9 @@ func (e *Engine) ClearNoSpace(ctx context.Context, op consensus.Operator, pre co
 
 // RaiseClusterVersion raises the engine's cluster version. The leader
 // refuses VERSION_UNSUPPORTED while a member of the configuration was not
-// heard announcing v in its term, and ADMIN_PRECONDITION_FAILED against
-// another lineage or generation.
+// heard announcing v in its term, or was last heard a vote window ago or
+// more (kitsunium/sdk#665), and ADMIN_PRECONDITION_FAILED against another
+// lineage or generation.
 func (e *Engine) RaiseClusterVersion(ctx context.Context, op consensus.Operator, pre consensus.Precondition, v uint32) error {
 	return mapErr(e.n.RaiseClusterVersion(ctx, sdk.Operator(op), sdk.PreconditionSpec{Log: sdkIdentity(pre.Identity), Generation: pre.Generation}, v))
 }

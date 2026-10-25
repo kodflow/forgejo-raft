@@ -336,8 +336,10 @@ type Engine interface {
 	// ClusterGeneration): a stale one is ErrAdminPrecondition. It is refused
 	// ErrVersionUnsupported while a member of the latest configuration,
 	// voter or learner, was not heard in the leader's term announcing v: a
-	// member on an older binary would stop on the raise (D18). A raise is
-	// never undone.
+	// member on an older binary would stop on the raise (D18). It is refused
+	// so as well while such a member was last heard a vote window ago or
+	// more, whatever it announced: one that went down may come back on an
+	// older binary (kitsunium/sdk#665). A raise is never undone.
 	RaiseClusterVersion(ctx context.Context, op Operator, pre Precondition, v uint32) error
 	SaveSnapshot(ctx context.Context, op Operator, w io.Writer) (SnapshotMeta, error)
 	// Watch returns its own channel of status changes, closed when ctx ends
