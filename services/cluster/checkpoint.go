@@ -55,6 +55,14 @@ import (
 // What else a web request writes to SQL beside a push is reconciled after
 // a Recover (doctor, pull request heads). Nothing here waits on an
 // observer.
+//
+// The consumer that derives the SQL runs on the leader alone, and the one
+// held at B is this node's: the whole checkpoint runs in the one term this
+// node led when it started. The barrier and the position must commit in
+// that term, and this node must still lead it at each step, a quorum
+// confirming it once L is read; otherwise the period is given up. A
+// proposal the engine would forward to another leader is never made: it
+// would commit in that leader's term, whose consumer nothing holds (#218).
 
 // readToCommitBound is how long the position may take to commit once read:
 // a checkpoint that exceeds it is discarded and taken again.
@@ -191,6 +199,12 @@ func (c *coordinator) run(ctx context.Context) {
 		rec, err := c.take(ctx)
 		if err != nil {
 			checkpointsTotal.WithLabelValues("failed").Inc()
+			if errors.Is(err, errLostTerm) {
+				// The leadership moved, a transfer most often: the
+				// leader of the new term takes the next checkpoint.
+				log.Info("cluster checkpoint: %v; the next period takes another", err)
+				continue
+			}
 			log.Warn("cluster checkpoint: %v; the next period takes another", err)
 			continue
 		}
@@ -199,12 +213,23 @@ func (c *coordinator) run(ctx context.Context) {
 	}
 }
 
-// take runs one checkpoint, steps 1 to 5.
+// take runs one checkpoint, steps 1 to 5, in the term this node leads when
+// it starts.
 func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, error) {
 	r := c.r
 	r.checkpointing.Add(1)
 	defer r.checkpointing.Add(-1)
 	eng := r.Engine()
+	if eng == nil {
+		return reftable.CheckpointRecord{}, errors.New("the cluster is not running")
+	}
+	// The term of this checkpoint: coordinator.run read the role before,
+	// and a transfer may have completed since.
+	st := eng.Status()
+	if st.Role != consensus.RoleLeader {
+		return reftable.CheckpointRecord{}, fmt.Errorf("%w: it is %s in term %d", errLostTerm, st.Role, st.Term)
+	}
+	term := st.Term
 	nonce := clusterhook.NewNonce()
 	got := c.expect(nonce)
 	defer c.expect("")
@@ -228,17 +253,22 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 		}
 	}
 	defer release()
+	// The fence and the cut may have taken up to their bound.
+	if err := leads(eng, term); err != nil {
+		return reftable.CheckpointRecord{}, fmt.Errorf("before the barrier: %w", err)
+	}
 	applied, _ := r.table.Applied()
 	r.consumer.holdAt(applied.Index)
 
-	// 2. The barrier, and the table at it.
+	// 2. The barrier, and the table at it. It commits in this node's term,
+	// so this node, the leader that holds its consumer at B, appended it.
 	data, err := reftable.Encode(reftable.KindCheckpointBarrier, &reftable.CheckpointBarrier{Nonce: nonce, Time: c.now().UnixNano()})
 	if err != nil {
 		return reftable.CheckpointRecord{}, err
 	}
 	bctx, cancel := context.WithTimeout(ctx, drainBound)
 	defer cancel()
-	tok, res, err := r.proposeCommand(bctx, data, nil)
+	tok, res, err := r.proposeInTerm(bctx, eng, term, data)
 	if err != nil {
 		return reftable.CheckpointRecord{}, fmt.Errorf("barrier: %w", err)
 	}
@@ -251,6 +281,9 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 	snap, err := tableAtBarrier(bctx, got, tok.Index)
 	if err != nil {
 		return reftable.CheckpointRecord{}, err
+	}
+	if err := leads(eng, term); err != nil {
+		return reftable.CheckpointRecord{}, fmt.Errorf("after the barrier: %w", err)
 	}
 
 	// 3. The consumer up to B, and no further.
@@ -274,7 +307,12 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 	// does not wait for the old lineage's tail.
 	earlier := r.consumer.earlierDrained(bctx, tok.Identity())
 
-	// 4. PostgreSQL's position under the fence.
+	// 4. PostgreSQL's position under the fence. A consumer of another
+	// leader may have run past B since this node lost its term: the
+	// position is not read then, nor a restore point created.
+	if err := leads(eng, term); err != nil {
+		return reftable.CheckpointRecord{}, fmt.Errorf("before PostgreSQL's position: %w", err)
+	}
 	name := reftable.CheckpointName(tok.Identity().String(), tok.Index)
 	mark, err := c.wal.Mark(bctx, name)
 	if err != nil {
@@ -334,7 +372,20 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 	}
 	pctx, pcancel := context.WithTimeout(ctx, left)
 	defer pcancel()
-	_, res, err = r.proposeCommand(pctx, data, nil)
+	// A quorum confirms that this node still leads its term, L read: no
+	// leader of a later term was elected before L, so no consumer but this
+	// node's, held at B, derived an entry past B into the SQL at L. The
+	// local role is not enough: a node elected in a later term this node
+	// has not heard of yet may have derived one, and a position this node
+	// appends in its term may still commit, in that term, through a leader
+	// elected after it.
+	if err := confirmLeads(pctx, eng, term); err != nil {
+		return reftable.CheckpointRecord{}, fmt.Errorf("checkpoint %s given up before its position: %w", name, err)
+	}
+	_, res, err = r.proposeInTerm(pctx, eng, term, data)
+	if errors.Is(err, errLostTerm) {
+		return reftable.CheckpointRecord{}, fmt.Errorf("checkpoint %s given up, its position not proposed again: %w", name, err)
+	}
 	if err != nil {
 		return reftable.CheckpointRecord{}, fmt.Errorf("checkpoint %s discarded: the position did not commit within %s: %w", name, readToCommitBound, err)
 	}
@@ -358,6 +409,79 @@ func (c *coordinator) take(ctx context.Context) (reftable.CheckpointRecord, erro
 		}
 	}
 	return reftable.CheckpointRecord{}, fmt.Errorf("checkpoint %s committed and not yet applied here", name)
+}
+
+// errLostTerm says this node no longer leads the term its checkpoint
+// started in: the checkpoint is given up, never closed in another term.
+var errLostTerm = errors.New("this node no longer leads the term of its checkpoint")
+
+// leads says, as an error, that this node no longer leads term.
+func leads(eng consensus.Engine, term uint64) error {
+	if st := eng.Status(); st.Role != consensus.RoleLeader || st.Term != term {
+		return fmt.Errorf("%w: it led term %d, it is %s in term %d now", errLostTerm, term, st.Role, st.Term)
+	}
+	return nil
+}
+
+// confirmLeads confirms by a quorum that this node still leads term. The
+// engine's barrier is a linearizable read point (ADR 0152 D9): on the
+// leader, a heartbeat round started after the call, or its lease. This
+// node led term before the call and after it, so all along, a node never
+// leading a term again once it left it: a majority acknowledged term after
+// the call, and had elected no leader of a later term before it.
+func confirmLeads(ctx context.Context, eng consensus.Engine, term uint64) error {
+	if err := leads(eng, term); err != nil {
+		return err
+	}
+	if _, err := eng.Barrier(ctx); err != nil {
+		return fmt.Errorf("a quorum did not confirm that this node leads term %d: %w", term, err)
+	}
+	return leads(eng, term)
+}
+
+// proposeInTerm proposes a checkpoint's entry as the leader of term, and
+// keeps at it within ctx while this node leads term: an engine that is
+// overloaded, or that has not confirmed its leadership yet, appended
+// nothing. It proposes as nothing else: the engine forwards a follower's
+// proposal to the leader, which appends it in its own term, and a
+// checkpoint whose entries commit in a term its coordinator did not lead
+// holds the cut of no consumer (#218). A NOT_LEADER, a transfer under way
+// included, gives the checkpoint up instead of letting it be forwarded;
+// an entry that committed in another term all the same, the leadership
+// having moved between the check and the proposal, gives it up too. An
+// unknown outcome is settled as proposeCommand settles one of an
+// idempotent command; the rest of proposeCommand's callers keep its
+// forwarding.
+func (r *Replicator) proposeInTerm(ctx context.Context, eng consensus.Engine, term uint64, data []byte) (consensus.Token, reftable.Result, error) {
+	for {
+		if err := leads(eng, term); err != nil {
+			return consensus.Token{}, reftable.Result{}, err
+		}
+		tok, res, err := eng.Propose(ctx, data)
+		if err == nil {
+			if tok.Term != term {
+				return tok, reftable.Result{}, fmt.Errorf("%w: the entry committed at %d in term %d, not in term %d this node led: it was forwarded to another leader", errLostTerm, tok.Index, tok.Term, term)
+			}
+			result, _ := res.(reftable.Result)
+			return tok, result, nil
+		}
+		switch {
+		case errors.Is(err, consensus.ErrNotLeader):
+			return tok, reftable.Result{}, fmt.Errorf("%w: %w", errLostTerm, err)
+		case retryable(err):
+		case consensus.Certain(err):
+			return tok, reftable.Result{}, err
+		default:
+			if _, cerr := r.confirm(ctx); cerr != nil {
+				return tok, reftable.Result{}, fmt.Errorf("%w: %w (unresolved: %v)", clusterhook.ErrOutcomeUnresolved, err, cerr)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return tok, reftable.Result{}, fmt.Errorf("not committed in time: %w", err)
+		case <-time.After(retryDelay):
+		}
+	}
 }
 
 // tableAtBarrier is the table captured at the barrier that committed at
@@ -519,8 +643,13 @@ func (c *consumer) earlierDrained(ctx context.Context, id consensus.LogIdentity)
 // maybe long after it read PostgreSQL's position: a trim decided on the
 // cursor before it could pass what that backup replays (#205). Read after
 // b, in this order:
-//   - No checkpoint is in flight here. Only the leader of a term commits
-//     that term's barrier and position, and its coordinator runs here.
+//   - No checkpoint is in flight here. A checkpoint closes only on a
+//     barrier and a position that commit in the term its coordinator led,
+//     both appended by that coordinator's node (take, proposeInTerm): a
+//     coordinator that lost its term gives its checkpoint up rather than
+//     have its entries forwarded to the next leader (#218). So only the
+//     leader of a term closes that term's checkpoints, and its coordinator
+//     runs here.
 //   - The table applied an entry of the engine's current term: it holds
 //     every checkpoint an earlier term's leader closed, whose backup
 //     cursor that leader may still be writing. A position commits in its

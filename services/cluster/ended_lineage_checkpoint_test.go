@@ -239,3 +239,63 @@ func TestAnEndedLineageIsNotTrimmedUnderACheckpointInFlight(t *testing.T) {
 		"its backup replays the old lineage's event from the log")
 	e.releasedBy(t)
 }
+
+// Right after a Recover, the coordinator loses the leadership during its
+// cut. Its barrier and its position used to be forwarded to the new
+// leader, and the checkpoint closed in the new leader's term. That leader,
+// with no checkpoint in flight of its own, an entry of its term applied
+// and no checkpoint closed, took the backup as settled and trimmed the old
+// lineage to its end while the deposed coordinator had read PostgreSQL's
+// position with that lineage behind its end: the backup cursor it recorded
+// next replays a tail the log no longer holds (#218, #214). A coordinator
+// that no longer leads its term now closes no checkpoint, so none of an
+// earlier leader's can close in the current term: the new leader's count
+// of its own checkpoints in flight, and the guard of its term, settle the
+// backup, and it trims the ended lineage once it applied an entry of its
+// term.
+func TestADeposedCoordinatorLeavesTheEndedLineageToTheNewLeader(t *testing.T) {
+	e := newEndedCluster(t)
+	ctx := context.Background()
+	a, b := e.leader, e.tc.nodes[1]
+	a.r.cut = &moveOnCut{cutLock: e.pg.cut, move: func() { e.tc.mem.SetLeader(b.node) }}
+	e.coord.wal = &markHook{fakePG: e.pg, after: func() {
+		// PostgreSQL's position is read with the old lineage behind its
+		// end; it drains now, and the new leader trims it if it takes its
+		// backup as settled.
+		e.drainOld(t)
+		for deadline := time.Now().Add(3 * time.Second); e.holds(b) && time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		}
+	}}
+	_, err := e.coord.take(ctx)
+	if err == nil {
+		bk := e.backup(t)
+		for _, n := range e.tc.nodes {
+			assert.True(t, bk.Closed || e.holds(n),
+				"%s trimmed the old lineage to its end, and a checkpoint that read it behind its end closed: a restore to it cannot replay its tail", n.slot)
+		}
+	}
+	require.Error(t, err, "a coordinator that lost the leadership during its cut closes no checkpoint")
+	require.ErrorContains(t, err, "term")
+	for _, n := range e.tc.nodes {
+		assert.Empty(t, n.r.table.Checkpoints(), "%s holds a checkpoint of a coordinator that lost the leadership", n.slot)
+	}
+	bk, _ := e.tc.cursors.get(ctx, cluster_model.CursorBackup)
+	require.Empty(t, bk.Lineage, "no backup cursor before the new leader's")
+	assert.False(t, b.r.backupSettled(bk), "the new leader applied no entry of its term yet")
+
+	// An entry of the new leader's term commits, and the old lineage
+	// drains: no checkpoint can record a backup that replays the old
+	// lineage's tail any more, and the new leader trims it to its end.
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	sha := commit(t, work, "after the move")
+	require.True(t, e.tc.pushVia(b, work, "alice/after.git", "refs/heads/main", strings.Repeat("0", 40), sha).OK)
+	e.drainOld(t)
+	require.Eventually(t, func() bool { return b.r.backupSettled(bk) }, 10*time.Second, 20*time.Millisecond,
+		"the new leader applied an entry of its term, and takes no checkpoint")
+	for _, n := range e.tc.nodes {
+		require.Eventually(t, func() bool { return !e.holds(n) }, 10*time.Second, 20*time.Millisecond,
+			"%s trims the ended lineage to its end", n.slot)
+		assert.Empty(t, n.r.table.Checkpoints(), "%s", n.slot)
+	}
+}
