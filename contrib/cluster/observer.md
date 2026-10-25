@@ -384,6 +384,19 @@ key and the new lineage (`observe accept`).
 - A recovery starts a new lineage through `init`, `bootstrap` and `import`:
   the replicated audit and grants of the old cluster are not carried (the
   SDK draft `ImportObserved` will keep the lineage chain).
+- Nor are its renames: the new table does not know where a repository
+  went in the old lineage. A push the old cluster parked is retried in the
+  new lineage by its repository's ID; when that repository was renamed or
+  transferred, or its owner renamed, after the push, SQL's redirects
+  (`repo_redirect`, `user_redirect`) lead the push to its name now, and its
+  work runs there. A push they do not lead (another repository or account
+  took the old name since, or the old cluster had reissued the ID) is never
+  applied to the repository holding the ID now: it stays parked, the later
+  pushes of that repository behind it, and its error, in `forgejo cluster
+  parked list`, names the `forgejo cluster parked resolve <index> --lineage
+  <old lineage>` that gives up its work (push actions, webhooks, CI, pull
+  request updates), kept in `cluster_parked_resolution`. Its branch rows
+  were already derived from the restored refs at step 6.
 - The SQL a web request writes beside a push is reconciled after a
   recovery, not fenced.
 - One export call, a base backup included, may run for 6 hours at most

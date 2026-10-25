@@ -87,6 +87,12 @@ with its error on the administration page and warned under
 of its bound (64 MiB), `cluster:event_queue` warns and the administration
 says so, before pushes are refused.
 
+A parked event of another lineage than the table's (one a Recover, a
+restore or a recovery from an observer ended) is also followed to its
+repository through SQL's redirects: the table may not hold the renames it
+went through, and a recovery from an observer starts a new table with none.
+The table alone judges the events of its own lineage.
+
 A parked event that can never succeed (its repository or pusher ID was
 reissued) is given up by an operator, never silently:
 

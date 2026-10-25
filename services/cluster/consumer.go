@@ -79,6 +79,9 @@ type consumer struct {
 	listParked func(ctx context.Context) ([]*cluster_model.ParkedEvent, error)
 	unpark     func(ctx context.Context, lineage string, index int64, want int) error
 	noteParked func(ctx context.Context, lineage string, index int64, reason string) error
+	// rekey follows through SQL the repository of a parked entry of another
+	// lineage than the table's (rekeyByRedirects); nil leaves it as it is.
+	rekey func(ctx context.Context, lineage string, evs []reftable.Event) ([]reftable.Event, string, error)
 
 	// gate holds the dispatch at an index while a checkpoint reads
 	// PostgreSQL's position (checkpoint.go).
@@ -214,6 +217,7 @@ func newConsumer(r *Replicator) *consumer {
 		durable: sqlDurable,
 		park:    cluster_model.ParkEvents, hasParked: cluster_model.RepoHasParked, minParked: cluster_model.MinParkedIndex,
 		listParked: cluster_model.ListParked, unpark: cluster_model.UnparkEntry, noteParked: cluster_model.NoteParkedFailure,
+		rekey:   rekeyByRedirects,
 		lastAck: map[string]uint64{}, failures: map[uint64]int{}, reasons: map[uint64]string{}, seen: map[string]int64{},
 		stalledOut: map[string]bool{}, settled: r.backupSettled,
 	}
@@ -1184,6 +1188,16 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 			blocked[key] = true
 			continue
 		}
+		// The table follows the renames of its own lineage only (#238).
+		doubt := ""
+		if lineage != now && now != "" && c.rekey != nil {
+			var rerr error
+			if evs, doubt, rerr = c.rekey(ctx, lineage, evs); rerr != nil {
+				blocked[key] = true
+				_ = c.noteParked(ctx, lineage, index, "following its repository through SQL's redirects: "+rerr.Error())
+				continue
+			}
+		}
 		// As in dispatch: the commits its work reads, fetched first (#224).
 		lost := c.obtain(ctx, evs)[evs[0].Repo]
 		wctx, effects := clusterhook.WithAfterCommit(ctx)
@@ -1220,7 +1234,11 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 		}
 		if err != nil {
 			blocked[key] = true
-			if nerr := c.noteParked(ctx, lineage, index, err.Error()); nerr != nil {
+			reason := err.Error()
+			if doubt != "" {
+				reason += "; " + doubt
+			}
+			if nerr := c.noteParked(ctx, lineage, index, reason); nerr != nil {
 				log.Warn("cluster consumer: noting the failed retry of %s at %d: %v", repo, index, nerr)
 			}
 			continue
