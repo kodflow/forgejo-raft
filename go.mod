@@ -17,7 +17,7 @@ require (
 	code.gitea.io/sdk/gitea v0.21.0
 	codeberg.org/gusted/mcaptcha v0.0.0-20220723083913-4f3072e1d570
 	connectrpc.com/connect v1.21.1
-	github.com/42wim/httpsig v1.2.3
+	github.com/42wim/httpsig v1.3.0
 	github.com/42wim/sshsig v0.0.0-20250502153856-5100632e8920
 	github.com/Azure/go-ntlmssp v0.1.1
 	github.com/ProtonMail/go-crypto v1.4.1
@@ -41,7 +41,7 @@ require (
 	github.com/gliderlabs/ssh v0.3.8
 	github.com/go-ap/activitypub v0.0.0-20260208110334-902f6cf8c2cc
 	github.com/go-ap/jsonld v0.0.0-20251216162253-e38fa664ea77
-	github.com/go-chi/chi/v5 v5.3.2
+	github.com/go-chi/chi/v5 v5.4.0
 	github.com/go-chi/cors v1.2.2
 	github.com/go-co-op/gocron/v2 v2.22.0
 	github.com/go-enry/go-enry/v2 v2.9.6
@@ -94,7 +94,7 @@ require (
 	github.com/stretchr/testify v1.12.1
 	github.com/syndtr/goleveldb v1.0.0
 	github.com/ulikunitz/xz v0.5.17
-	github.com/urfave/cli/v3 v3.12.0
+	github.com/urfave/cli/v3 v3.9.1
 	github.com/valyala/fastjson v1.6.10
 	github.com/yohcop/openid-go v1.0.1
 	github.com/yuin/goldmark v1.8.6
