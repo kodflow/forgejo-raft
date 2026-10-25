@@ -123,10 +123,15 @@ says it to the others), once that voter answers and is caught up, at most
 once every five minutes. A leader that takes them never hands the
 leadership over for them, so it does not go back and forth; and a member
 that gave the leadership away because it could not derive the SQL is not
-handed it back for its checkpoints within the hour. `cluster:checkpoints`
-says which voters take them and, for each one the leader does not hand the
-leadership to yet, why (behind, out of contact, receiving a snapshot, gave
-it away for the SQL); or that none does.
+handed it back for its checkpoints within the hour. In the manual mode,
+nothing makes a leader that cannot derive the SQL give the leadership
+away: transfer it away from it. A member whose consumer kept failing while
+it led then says so until it leads again and derives the SQL, so the
+leadership is not handed back to it and the transfer stands. Once its
+database is repaired, transfer the leadership to it, or restart it.
+`cluster:checkpoints` says which voters take them and, for each one the
+leader does not hand the leadership to yet, why (behind, out of contact,
+receiving a snapshot, could not derive the SQL); or that none does.
 
 A voter whose `CHECKPOINT_INTERVAL` is 0 does not start when the backup
 cursor of its lineage exists and every other voter answers that it takes
