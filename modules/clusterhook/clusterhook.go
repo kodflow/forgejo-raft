@@ -478,7 +478,9 @@ func IsOutcomeUnresolved(err error) bool { return errors.Is(err, ErrOutcomeUnres
 // RepoRenamed records a repository and its wiki moving, after Forgejo moved
 // them locally. Both moves are one replicated command, applied together or
 // not at all. An error means the other members did not follow: the caller
-// moves them back, unless it is ErrOutcomeUnresolved.
+// moves them back, unless it is ErrOutcomeUnresolved. A repository whose
+// key left the table since Forgejo loaded it is refused, as by
+// RepoRenameRefusal (#220).
 func RepoRenamed(ctx context.Context, oldOwner, oldName, newOwner, newName string) error {
 	lifecycleMu.RLock()
 	f := onRenamed
@@ -564,6 +566,38 @@ func OwnerRenameRefusal(ctx context.Context, oldOwner, newOwner string) error {
 		return nil
 	}
 	return f(ctx, strings.ToLower(oldOwner), strings.ToLower(newOwner))
+}
+
+var checkRepoRename func(ctx context.Context, key string) error
+
+// SetRepoRenameCheck registers the replicator's check of a repository's
+// rename or transfer, nil when the cluster can record it.
+func SetRepoRenameCheck(f func(ctx context.Context, key string) error) {
+	lifecycleMu.Lock()
+	checkRepoRename = f
+	lifecycleMu.Unlock()
+}
+
+// RepoRenameRefusal refuses the rename or the transfer of the repository
+// owner/name when its key left the replicated table, deleted or renamed
+// away: an owner's rename through another node committed after Forgejo
+// loaded the repository, and this node's disk, behind it, still holds the
+// directory Forgejo would move. The cluster would record a move of
+// nothing, and the repository would stay under a key the database no
+// longer knows (#220). Forgejo asks it before it writes the move to SQL
+// or moves the directories, rather than undo both once the proposal is
+// refused. It reads this node's table once a commit boundary a quorum
+// confirmed is applied, and refuses the move when the node cannot confirm
+// one within ctx; RepoRenamed checks again what it proposes, for an
+// owner's rename committed meanwhile. It is always nil without a cluster.
+func RepoRenameRefusal(ctx context.Context, owner, name string) error {
+	lifecycleMu.RLock()
+	f := checkRepoRename
+	lifecycleMu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	return f(ctx, RepoKey(owner, name, false))
 }
 
 // ---- the checkpoint's cut ----

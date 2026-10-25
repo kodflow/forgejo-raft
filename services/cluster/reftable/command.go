@@ -74,7 +74,20 @@ import (
 // RepoRename listing every key was refused past the engine's entry bound,
 // at every attempt, and the owner could never be renamed (#182). Below
 // version 8 an owner's rename is that RepoRename, as before.
-const PayloadVersion = 8
+//
+// Version 9 refuses a repository's rename whose source left its key
+// (RenameSourceVersion): a RepoRename that names no owner, whose first
+// source was deleted, or renamed away, with no live ref written under it
+// since, is refused at its index. It moved nothing, set the rename mark
+// and the departure, and was answered OK: a transfer or a rename served
+// by a node whose disk was behind its owner's rename was recorded empty,
+// the database naming the new key and the table holding the repository
+// under a key the database no longer knows (#220). The proposer refuses
+// such a source in its confirmed table at every version; only Apply sees
+// an owner's rename that commits between that check and the entry. A wiki
+// moved beside its repository, and a key the table never held, are not
+// checked. Below version 9 the rename applies as before.
+const PayloadVersion = 9
 
 // RevokeVersion is the payload version that carries KindRevokeKey.
 const RevokeVersion = 3
@@ -97,6 +110,10 @@ const WithdrawVersion = 7
 
 // OwnerRenameVersion is the payload version that carries KindOwnerRename.
 const OwnerRenameVersion = 8
+
+// RenameSourceVersion is the payload version from which Apply refuses a
+// repository's rename whose source left its key (Table.RenameSourceRefusal).
+const RenameSourceVersion = 9
 
 // MaxPusherName bounds a pusher's name, from PusherVersion: a longer one
 // is refused, on every node alike.

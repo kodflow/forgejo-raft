@@ -745,6 +745,14 @@ func (t *Table) applyRepoRename(e consensus.Entry, version uint8, rn *RepoRename
 			return refuse("a rename chains through %s", m[0]), Change{}
 		}
 	}
+	if version >= RenameSourceVersion && rn.Owner == [2]string{} {
+		// An owner's rename moves the keys its owner holds at this index,
+		// checked by ownerRenameRefuses; a repository's rename moves the
+		// one it names, which must still be there (#220).
+		if why := t.renameSourceRefusesLocked(moves[0][0]); why != "" {
+			return refuse("%s", why), Change{}
+		}
+	}
 	if version >= GenerationVersion && rn.Owner != [2]string{} {
 		if why := t.ownerRenameRefuses(rn.Owner, moves, sources); why != "" {
 			return refuse("%s", why), Change{}
@@ -763,6 +771,34 @@ func (t *Table) applyRepoRename(e consensus.Entry, version uint8, rn *RepoRename
 		ch.Renamed = append(ch.Renamed, [2]string{m[0], m[1]})
 	}
 	return Result{OK: true}, ch
+}
+
+// RenameSourceRefusal says why a repository's rename from key would move
+// nothing the database names, "" when it may be proposed: the repository
+// under key was deleted, or renamed away, and no live ref was written
+// under key since. Forgejo moved the directory of a repository it loaded
+// before that, on a node whose disk was behind, and the rename recorded
+// empty left the repository under a key the database no longer knows
+// (#220). A key the table never held passes: there is nothing to lose.
+// It is Apply's check from RenameSourceVersion, which the proposer makes
+// on its confirmed table at every version.
+func (t *Table) RenameSourceRefusal(key string) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.renameSourceRefusesLocked(key)
+}
+
+// renameSourceRefusesLocked is RenameSourceRefusal; the caller holds the
+// lock. Its reason reads the same on every node: movedAwayLocked picks the
+// newest rename, the smallest key on a tie.
+func (t *Table) renameSourceRefusesLocked(key string) string {
+	if _, deleted := t.deleted[key]; deleted {
+		return fmt.Sprintf("the repository %s was deleted", key)
+	}
+	if to, moved := t.movedAwayLocked(key); moved {
+		return fmt.Sprintf("the repository %s was renamed to %s", key, to)
+	}
+	return ""
 }
 
 // ownerRenameRefuses checks an owner's rename against the table at its
@@ -1401,13 +1437,18 @@ type persisted struct {
 	Renamed  map[string]renameMark           `json:"renamed"`
 	Grants   map[string]JoinGrant            `json:"grants,omitempty"`
 	Revoked  map[string]RevokeKey            `json:"revoked,omitempty"`
-	// PendingRevoke is absent from a snapshot an older member cut: it is
-	// then read back from the audit records kept.
-	PendingRevoke map[string]RevokeKey `json:"pending_revoke,omitempty"`
+	// PendingRevoke is written even empty: an empty map left out read as a
+	// snapshot of a binary older than it, and a request withdrawn on the
+	// log came back from the audit records kept (#223). It is absent from
+	// a snapshot an older member cut, and from one that left it out empty:
+	// below WithdrawVersion it is then read back from the audit records
+	// kept, from it it is empty (Restore).
+	PendingRevoke map[string]RevokeKey `json:"pending_revoke"`
 	// RevokeRequests is absent from a snapshot an older binary cut, which
 	// numbered no request: each key it asked for has one request, 0,
-	// which no withdrawal names, as on a table that replayed the log.
-	RevokeRequests map[string][]uint64 `json:"revoke_requests,omitempty"`
+	// which no withdrawal names, as on a table that replayed the log. It
+	// is written even empty, beside PendingRevoke.
+	RevokeRequests map[string][]uint64 `json:"revoke_requests"`
 	// Pending and Checkpoints are absent from snapshots older than the
 	// checkpoints, which then restore with none.
 	Pending     *pendingCheckpoint `json:"pending,omitempty"`
@@ -1613,9 +1654,22 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	if p.Revoked != nil {
 		nt.revoked = p.Revoked
 	}
-	if p.PendingRevoke != nil {
+	// The map is absent from a snapshot of a binary older than it, and
+	// from one an earlier binary cut empty, which it left out. Below
+	// WithdrawVersion a request left pendingRevoke only once its
+	// revocation was written, in revoked: the audit records kept then say
+	// which requests are pending (#50). From WithdrawVersion a withdrawal
+	// closes a request as well, and leaves no record of it: every binary
+	// that applies it writes the map whenever a request is open, so its
+	// absence means none, and the withdrawn request, whose record the
+	// audit keeps, is not read back (#223). The snapshot's own payload
+	// version tells the two apart: a withdrawal is written once the
+	// cluster raised its version to WithdrawVersion, which every table
+	// that applies it adopted first, at an earlier index.
+	switch {
+	case p.PendingRevoke != nil:
 		nt.pendingRevoke = p.PendingRevoke
-	} else {
+	case p.Payload < WithdrawVersion:
 		for i := range nt.audit {
 			if k, ok := pendingRevocation(&nt.audit[i].Audit); ok {
 				if _, done := nt.revoked[k.SPKI]; !done {

@@ -67,6 +67,16 @@ func TransferOwnership(ctx context.Context, doer, newOwner *user_model.User, rep
 
 // transferOwnership transfers all corresponding repository items from old user to new one.
 func transferOwnership(ctx context.Context, doer *user_model.User, newOwnerName string, repo *repo_model.Repository) (err error) {
+	// In a cluster, a repository whose key left the replicated table since
+	// it was loaded, its owner renamed through another node, is refused
+	// before anything is written: this node's disk, behind that rename, may
+	// still hold the directory under the old name (#220). The proposal
+	// checks again, for an owner's rename committed while the transaction
+	// below waits on its rows.
+	if err := clusterhook.RepoRenameRefusal(ctx, repo.Owner.Name, repo.Name); err != nil {
+		return fmt.Errorf("transfer repository in the cluster: %w", err)
+	}
+
 	// In a cluster, the move recorded in the replicated table and the SQL
 	// committed below fall on the same side of a checkpoint (#88). It is
 	// released last, after any undo.
@@ -337,6 +347,13 @@ func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newR
 			Uname: repo.Owner.Name,
 			Name:  newRepoName,
 		}
+	}
+
+	// In a cluster, a repository whose key left the replicated table since
+	// it was loaded, its owner renamed through another node, is refused
+	// before anything is written (#220).
+	if err := clusterhook.RepoRenameRefusal(ctx, repo.Owner.Name, oldRepoName); err != nil {
+		return fmt.Errorf("rename repository in the cluster: %w", err)
 	}
 
 	// In a cluster, the move recorded in the replicated table and the SQL
