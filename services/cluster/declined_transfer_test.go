@@ -4,6 +4,7 @@
 package cluster
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -19,7 +20,8 @@ import (
 // the SQL asked that voter again at every yieldBackoff, and never the other
 // one: the SQL of the whole cluster stayed frozen for as long as that apply
 // did. The next try goes to another voter, and to the same one only when
-// no other is in reach.
+// no other is in reach. A try the pass's deadline cut short says nothing of
+// its voter, which stays the first choice.
 func TestALeaderThatCannotDeriveTheSQLTriesAnotherVoterAfterADeclinedTransfer(t *testing.T) {
 	stuck := func(t *testing.T) (*Replicator, *leaderEngine, *fakeClock) {
 		r, e, clock := newLeaderBench(t, 3)
@@ -52,11 +54,24 @@ func TestALeaderThatCannotDeriveTheSQLTriesAnotherVoterAfterADeclinedTransfer(t 
 	assert.False(t, r.yieldIfStuck(ctx, e, e.Membership()))
 	assert.Equal(t, []consensus.NodeID{0xb, 0xb}, e.transferred(), "node-b alone, asked again past yieldBackoff")
 	assert.Zero(t, r.sqlYield.Load(), "the leadership never went")
+
+	// The engine answers TRANSFER_FAILED too once the pass's context ends,
+	// whatever node-b does: node-b, which does not decline, is not passed
+	// over at the next try.
+	r, e, clock = stuck(t)
+	delete(e.declines, 0xb)
+	expired, cancel := context.WithCancel(ctx)
+	cancel()
+	assert.False(t, r.yieldIfStuck(expired, e, e.Membership()), "the pass's context ended")
+	clock.advance(yieldBackoff)
+	assert.True(t, r.yieldIfStuck(ctx, e, e.Membership()), "node-b takes it")
+	assert.Equal(t, []consensus.NodeID{0xb, 0xb}, e.transferred(), "a try cut short does not pass node-b over")
 }
 
 // The same for a leader that takes no checkpoint (#176): a taker that
 // declines the transfer is passed over at the next try when another taker
-// is caught up, and asked again when it is the only one.
+// is caught up, and asked again when it is the only one; one whose try the
+// pass's deadline cut short is not passed over.
 func TestALeaderWithoutCheckpointsTriesAnotherTakerAfterADeclinedTransfer(t *testing.T) {
 	takers := func(t *testing.T) (*Replicator, *leaderEngine, *fakeClock) {
 		r, e, clock, answers := checkpointBench(t)
@@ -85,4 +100,13 @@ func TestALeaderWithoutCheckpointsTriesAnotherTakerAfterADeclinedTransfer(t *tes
 	clock.advance(yieldBackoff)
 	r.autopilotStep(ctx)
 	assert.Equal(t, []consensus.NodeID{0xb, 0xb}, e.transferred(), "node-b, the only taker caught up, asked again past yieldBackoff")
+
+	r, e, clock = takers(t)
+	delete(e.declines, 0xb)
+	expired, cancel := context.WithCancel(ctx)
+	cancel()
+	assert.False(t, r.maybeYieldForCheckpoints(expired, e, e.Membership()), "the pass's context ended")
+	clock.advance(yieldBackoff)
+	r.autopilotStep(ctx)
+	assert.Equal(t, []consensus.NodeID{0xb, 0xb}, e.transferred(), "a try cut short does not pass node-b over")
 }

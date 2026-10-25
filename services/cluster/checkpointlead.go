@@ -279,7 +279,8 @@ func takerHold(h hello, p consensus.PeerHealth, known bool, now time.Time) strin
 // away for want of the SQL within checkpointHandBack: the least behind,
 // the eldest on a tie. At most once per yieldBackoff, as yieldIfStuck, and
 // past the taker that did not take the last try when another qualifies, as
-// yieldIfStuck too (kitsunium/sdk#674). It reports whether it did.
+// yieldIfStuck too (kitsunium/sdk#674), a try the pass's context cut short
+// not counting. It reports whether it did.
 func (r *Replicator) yieldForCheckpoints(ctx context.Context, eng consensus.Engine, m consensus.Membership, seen []hello) bool {
 	if r.checkpoints.Load() != nil {
 		return false
@@ -318,7 +319,9 @@ func (r *Replicator) yieldForCheckpoints(ctx context.Context, eng consensus.Engi
 	}
 	r.checkpointYielded = now
 	if err := eng.TransferLeadership(ctx, autopilotOperator, to.ID); err != nil {
-		r.checkpointDeclined = to.ID
+		if ctx.Err() == nil {
+			r.checkpointDeclined = to.ID
+		}
 		log.Warn("cluster: this leader takes no checkpoint; transferring the leadership to %s (%s), which does: %v", to.ID, to.Slot, err)
 		return false
 	}

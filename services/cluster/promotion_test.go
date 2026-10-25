@@ -40,16 +40,17 @@ type leaderEngine struct {
 	// transfers are the leadership transfers asked for, and declines the
 	// voters that do not take one: the engine's TRANSFER_FAILED for a voter
 	// that handed its own leadership over for an apply that has not moved
-	// since (kitsunium/sdk#674).
+	// since (kitsunium/sdk#674). It answers the same once ctx ends, before
+	// the target leads, whatever the target does.
 	transfers []consensus.NodeID
 	declines  map[consensus.NodeID]bool
 }
 
-func (e *leaderEngine) TransferLeadership(_ context.Context, _ consensus.Operator, to consensus.NodeID) error {
+func (e *leaderEngine) TransferLeadership(ctx context.Context, _ consensus.Operator, to consensus.NodeID) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.transfers = append(e.transfers, to)
-	if e.declines[to] {
+	if ctx.Err() != nil || e.declines[to] {
 		return consensus.ErrTransferFailed
 	}
 	return nil

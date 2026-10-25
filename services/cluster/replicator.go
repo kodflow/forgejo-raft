@@ -95,8 +95,8 @@ type Replicator struct {
 	// hookFails counts the writer hook's failed promotions in a row,
 	// yielded is when this leader last gave the leadership away because it
 	// could not derive the SQL, and yieldDeclined the voter that did not
-	// take the last try, 0 when it was taken (autopilot.go). Only the
-	// autopilot's goroutine touches them.
+	// take the last try that ran its course, 0 when it was taken
+	// (autopilot.go). Only the autopilot's goroutine touches them.
 	hookFails     int
 	yielded       time.Time
 	yieldDeclined consensus.NodeID
@@ -108,9 +108,9 @@ type Replicator struct {
 	// checkpointProbe is when the leader next asks the members whether they
 	// take the checkpoints, checkpointYielded when it last handed the
 	// leadership to one that does, checkpointDeclined the taker that did
-	// not take the last try, 0 when it was taken, and ckState what it found,
-	// for the health. Only the autopilot's goroutine, or the manual mode's
-	// pilot, touches the first three.
+	// not take the last try that ran its course, 0 when it was taken, and
+	// ckState what it found, for the health. Only the autopilot's goroutine,
+	// or the manual mode's pilot, touches the first three.
 	checkpointProbe    time.Time
 	checkpointYielded  time.Time
 	checkpointDeclined consensus.NodeID

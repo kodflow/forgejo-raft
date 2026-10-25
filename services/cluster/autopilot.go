@@ -472,7 +472,10 @@ func appliesVersion(h hello, v uint8) bool {
 // at the next one when another is in reach: a voter that handed its own
 // leadership over for an apply that has not moved since declines every
 // transfer to it (TRANSFER_FAILED, kitsunium/sdk#674), and stays the least
-// behind, since its log works.
+// behind, since its log works. A try the pass's context cut short says
+// nothing of its voter: the engine answers TRANSFER_FAILED too once ctx
+// ends, before the voter could take it, and that voter stays the first
+// choice.
 var (
 	yieldAfterPromotions = 5
 	yieldAfterPasses     = 60
@@ -501,7 +504,9 @@ func (r *Replicator) yieldIfStuck(ctx context.Context, eng consensus.Engine, m c
 	}
 	r.yielded = now
 	if err := eng.TransferLeadership(ctx, autopilotOperator, to); err != nil {
-		r.yieldDeclined = to
+		if ctx.Err() == nil {
+			r.yieldDeclined = to
+		}
 		log.Warn("cluster: autopilot: this leader cannot derive the SQL (%s); transferring the leadership to %s: %v", why, to, err)
 		return false
 	}
