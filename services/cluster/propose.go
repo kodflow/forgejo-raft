@@ -623,7 +623,7 @@ const retryDelay = 150 * time.Millisecond
 // leader lost to a stopped node must not fail a push the two survivors can
 // commit. Retrying is safe because the proposal names the revisions it
 // expects: a copy of an attempt that did commit is refused by Apply, and
-// the table then shows our values, which is success. An unknown outcome is
+// the table then holds its nonce, which is success. An unknown outcome is
 // resolved from the table after a barrier, never by retrying blindly (R1-04).
 // When the table no longer tells (txnLanded), the write is answered as
 // unknown, never as refused: it may have committed (#234).
@@ -725,14 +725,23 @@ func (r *Replicator) confirm(ctx context.Context) (consensus.Token, error) {
 }
 
 // committed reports whether tx committed: its nonce among the accepted
-// transactions, or else every ref of tx holding its new value at the
-// revision it expected plus one. The nonce answers even when a later write
-// already moved a ref, where the values alone would call a committed push
-// refused.
+// transactions, or else its values (holds). The nonce answers even when a
+// later write already moved a ref, where the values alone would call a
+// committed push refused. The import settles its chunks with it: they
+// carry no nonce and create refs the table never held, at revision 0,
+// which a deletion only tombstones and a rename moves in at a revision
+// above 1. A push is settled by txnLanded.
 func (r *Replicator) committed(repo string, tx *reftable.RefTxn) bool {
 	if _, ok := r.table.CommittedNonce(tx.Nonce); ok {
 		return true
 	}
+	return r.holds(repo, tx)
+}
+
+// holds reports whether every ref of tx holds its new value at the
+// revision it expected plus one: where tx would have left it, or where a
+// command that rewrote the key left it (reftable.Table.RewrittenSince).
+func (r *Replicator) holds(repo string, tx *reftable.RefTxn) bool {
 	for _, u := range tx.Updates {
 		v, ok := r.table.Get(repo, u.Ref)
 		if !ok || v.Rev != u.ExpectRev+1 {
@@ -748,21 +757,44 @@ func (r *Replicator) committed(repo string, tx *reftable.RefTxn) bool {
 	return true
 }
 
-// txnLanded is committed for a ref transaction proposed from start, once
-// this node applied a commit boundary a quorum confirmed: a transaction
-// neither found by its nonce nor by its values is certainly not committed
-// only while the ring of nonces covers the proposal. Past it, a push that
+// txnLanded says whether a ref transaction proposed from start committed,
+// once this node applied a commit boundary a quorum confirmed. Its nonce
+// answers first: found, it committed; absent while the ring of nonces
+// covers the proposal, it certainly did not, whatever the values show. A
+// rename, a transfer or an owner's rename tombstones every live ref of its
+// source at its revision plus one, and a deletion of the repository does
+// the same: a branch's deletion whose proposal was lost, or refused
+// because the repository had left the key, read as committed from those
+// tombstones, and the client was told the branch deleted while the
+// cluster served it under the new name. A rename's HEAD in its target
+// reads the same as git init's there (#252). Past the ring, a push that
 // committed and whose ref another write moved since reads as refused
-// (#234): it is landingUnknown instead. A transaction without a nonce is
-// told by its values alone, as before: the ring holds nothing of it.
+// (#234): the values tell then, but not on a key one of those commands
+// rewrote since the transaction read its revisions, where the outcome
+// stays unknown. A transaction without a nonce is told by its values
+// alone, with the same reservation: the ring holds nothing of it.
 func (r *Replicator) txnLanded(repo string, tx *reftable.RefTxn, start proposalStart) landing {
-	if r.committed(repo, tx) {
-		return landingYes
+	if tx.Nonce != "" {
+		if _, ok := r.table.CommittedNonce(tx.Nonce); ok {
+			return landingYes
+		}
+		if r.nonceAbsent(start) == landingNo {
+			return landingNo
+		}
 	}
-	if tx.Nonce == "" {
-		return landingNo
+	if !r.holds(repo, tx) {
+		if tx.Nonce == "" {
+			return landingNo
+		}
+		return landingUnknown
 	}
-	return r.nonceAbsent(start)
+	// Read after the values: a command that wrote them is seen. The
+	// revisions were read at tx.ReadAt, before start; indexes compare in
+	// the proposal's lineage only.
+	if !r.sameLineage(start) || r.table.RewrittenSince(repo, min(tx.ReadAt, start.index)) {
+		return landingUnknown
+	}
+	return landingYes
 }
 
 func (r *Replicator) proposed(repo, nonce string, tok consensus.Token) *clusterhook.Response {
