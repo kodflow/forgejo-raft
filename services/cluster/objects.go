@@ -257,8 +257,18 @@ func (oc *objectChannel) handleFetch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A 404 says that this member does not hold them, which a leader counts
+	// toward declaring them lost (#224): a check that failed says nothing.
 	missing, err := missingObjects(r.Context(), dir, req.Wants)
-	if err != nil || len(missing) > 0 {
+	if err != nil {
+		if _, serr := os.Stat(dir); errors.Is(serr, os.ErrNotExist) {
+			http.Error(w, "objects not held here", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "checking the objects: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(missing) > 0 {
 		http.Error(w, "objects not held here", http.StatusNotFound)
 		return
 	}

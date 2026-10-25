@@ -4,8 +4,10 @@
 package cluster
 
 import (
+	"bytes"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	git_model "forgejo.org/models/git"
 	"forgejo.org/models/unittest"
 	"forgejo.org/modules/clusterhook"
+	"forgejo.org/modules/json"
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/test"
 	"forgejo.org/services/cluster/reftable"
@@ -241,4 +244,28 @@ func TestACommitAMemberThatDoesNotAnswerMayHoldIsNotLost(t *testing.T) {
 	n, err := cluster_model.CountParked(db.DefaultContext)
 	require.NoError(t, err)
 	assert.Zero(t, n)
+}
+
+// A member answers /v1/fetch's 404, which a leader counts toward declaring
+// the objects lost, only when it does not hold them: no repository under
+// the key, or a repository without them. A check that fails on its
+// directory says nothing about them, and answers otherwise.
+func TestAMemberAnswersNotHeldOnlyForObjectsItLacks(t *testing.T) {
+	root := t.TempDir()
+	oc := &objectChannel{root: root}
+	ask := func(repo string, wants ...string) int {
+		t.Helper()
+		body, err := json.Marshal(fetchRequest{Repo: repo, Wants: wants})
+		require.NoError(t, err)
+		rec := httptest.NewRecorder()
+		oc.handleFetch(rec, httptest.NewRequest(http.MethodPost, "/v1/fetch", bytes.NewReader(body)))
+		return rec.Code
+	}
+	sha := strings.Repeat("a", 40)
+	assert.Equal(t, http.StatusNotFound, ask("a/b.git", sha), "no repository under the key")
+	run(t, root, "init", "-q", "--bare", filepath.Join(root, "a", "b.git"))
+	assert.Equal(t, http.StatusNotFound, ask("a/b.git", sha), "a repository without them")
+	// git cannot run in it: whether it holds them is not known.
+	require.NoError(t, os.WriteFile(filepath.Join(root, "a", "c.git"), []byte("not a directory"), 0o644))
+	assert.Equal(t, http.StatusInternalServerError, ask("a/c.git", sha), "a check that failed")
 }
