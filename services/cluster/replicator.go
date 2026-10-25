@@ -92,12 +92,14 @@ type Replicator struct {
 	// engine to raise the cluster version (clusterversion.go).
 	payloadProbe time.Time
 	clusterProbe time.Time
-	// hookFails counts the writer hook's failed promotions in a row, and
+	// hookFails counts the writer hook's failed promotions in a row,
 	// yielded is when this leader last gave the leadership away because it
-	// could not derive the SQL (autopilot.go). Only the autopilot's
-	// goroutine touches them.
-	hookFails int
-	yielded   time.Time
+	// could not derive the SQL, and yieldDeclined the voter that did not
+	// take the last try, 0 when it was taken (autopilot.go). Only the
+	// autopilot's goroutine touches them.
+	hookFails     int
+	yielded       time.Time
+	yieldDeclined consensus.NodeID
 	// sqlYield is when, in Unix seconds, this node last gave the leadership
 	// away because it could not derive the SQL; its hello says it, so the
 	// leadership is not handed back to it for its checkpoints
@@ -105,12 +107,14 @@ type Replicator struct {
 	sqlYield atomic.Int64
 	// checkpointProbe is when the leader next asks the members whether they
 	// take the checkpoints, checkpointYielded when it last handed the
-	// leadership to one that does, and ckState what it found, for the
-	// health. Only the autopilot's goroutine, or the manual mode's pilot,
-	// touches the first two.
-	checkpointProbe   time.Time
-	checkpointYielded time.Time
-	ckState           checkpointState
+	// leadership to one that does, checkpointDeclined the taker that did
+	// not take the last try, 0 when it was taken, and ckState what it found,
+	// for the health. Only the autopilot's goroutine, or the manual mode's
+	// pilot, touches the first three.
+	checkpointProbe    time.Time
+	checkpointYielded  time.Time
+	checkpointDeclined consensus.NodeID
+	ckState            checkpointState
 	// consumerFails counts the consumer's failed passes in a row, which
 	// the autopilot reads (consumer.go).
 	consumerFails atomic.Int32

@@ -277,8 +277,9 @@ func takerHold(h hello, p consensus.PeerHealth, known bool, now time.Time) strin
 // checkpoint, to the voter that takes them, answers, receives no snapshot,
 // is at most checkpointYieldLag behind, and has not given the leadership
 // away for want of the SQL within checkpointHandBack: the least behind,
-// the eldest on a tie. At most once per yieldBackoff, as yieldIfStuck. It
-// reports whether it did.
+// the eldest on a tie. At most once per yieldBackoff, as yieldIfStuck, and
+// past the taker that did not take the last try when another qualifies, as
+// yieldIfStuck too (kitsunium/sdk#674). It reports whether it did.
 func (r *Replicator) yieldForCheckpoints(ctx context.Context, eng consensus.Engine, m consensus.Membership, seen []hello) bool {
 	if r.checkpoints.Load() != nil {
 		return false
@@ -289,9 +290,9 @@ func (r *Replicator) yieldForCheckpoints(ctx context.Context, eng consensus.Engi
 	}
 	peers := peerHealth(eng)
 	self := eng.Status().ID
-	var to consensus.Member
+	var to, past consensus.Member
 	var best consensus.PeerHealth
-	found := false
+	found, pastFound := false, false
 	for _, x := range m.Members {
 		if !x.Voter || x.ID == self {
 			continue
@@ -301,21 +302,27 @@ func (r *Replicator) yieldForCheckpoints(ctx context.Context, eng consensus.Engi
 			continue
 		}
 		p, known := peers[x.ID]
-		if takerHold(h, p, known, now) != "" {
-			continue
-		}
-		if !found || p.Lag < best.Lag {
+		switch {
+		case takerHold(h, p, known, now) != "":
+		case x.ID == r.checkpointDeclined:
+			past, pastFound = x, true
+		case !found || p.Lag < best.Lag:
 			to, best, found = x, p, true
 		}
+	}
+	if !found && pastFound {
+		to, found = past, true
 	}
 	if !found {
 		return false
 	}
 	r.checkpointYielded = now
 	if err := eng.TransferLeadership(ctx, autopilotOperator, to.ID); err != nil {
+		r.checkpointDeclined = to.ID
 		log.Warn("cluster: this leader takes no checkpoint; transferring the leadership to %s (%s), which does: %v", to.ID, to.Slot, err)
 		return false
 	}
+	r.checkpointDeclined = 0
 	why := "this leader takes no checkpoint ([cluster] CHECKPOINT_INTERVAL is 0 here), " + to.Slot + " does"
 	log.Warn("cluster: the leadership goes to %s (%s): %s", to.ID, to.Slot, why)
 	r.audit(ctx, autopilotOperator, Operation{Action: ActionTransfer, Target: to.ID.String()}, "ok", why)

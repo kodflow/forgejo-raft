@@ -468,7 +468,11 @@ func appliesVersion(h hello, v uint8) bool {
 // of the whole cluster, then every write once the event queue is full
 // (#47). It yields to the voter least behind, at most once per
 // yieldBackoff, so a database down for every node does not make the
-// leadership spin.
+// leadership spin. A voter that did not take the last try is passed over
+// at the next one when another is in reach: a voter that handed its own
+// leadership over for an apply that has not moved since declines every
+// transfer to it (TRANSFER_FAILED, kitsunium/sdk#674), and stays the least
+// behind, since its log works.
 var (
 	yieldAfterPromotions = 5
 	yieldAfterPasses     = 60
@@ -491,15 +495,17 @@ func (r *Replicator) yieldIfStuck(ctx context.Context, eng consensus.Engine, m c
 	if !r.yielded.IsZero() && now.Sub(r.yielded) < yieldBackoff {
 		return false
 	}
-	to, ok := successor(eng, m)
+	to, ok := successor(eng, m, r.yieldDeclined)
 	if !ok {
 		return false
 	}
 	r.yielded = now
 	if err := eng.TransferLeadership(ctx, autopilotOperator, to); err != nil {
+		r.yieldDeclined = to
 		log.Warn("cluster: autopilot: this leader cannot derive the SQL (%s); transferring the leadership to %s: %v", why, to, err)
 		return false
 	}
+	r.yieldDeclined = 0
 	r.sqlYield.Store(now.Unix())
 	log.Error("cluster: autopilot: this leader cannot derive the SQL (%s): the leadership goes to %s", why, to)
 	r.audit(ctx, autopilotOperator, Operation{Action: ActionTransfer, Target: to.String()}, "ok", "the leader cannot derive the SQL: "+why)
@@ -507,19 +513,23 @@ func (r *Replicator) yieldIfStuck(ctx context.Context, eng consensus.Engine, m c
 }
 
 // successor is the voter other than the leader the leader hears and that
-// is least behind.
-func successor(eng consensus.Engine, m consensus.Membership) (consensus.NodeID, bool) {
+// is least behind, past passed over when another voter qualifies.
+func successor(eng consensus.Engine, m consensus.Membership, past consensus.NodeID) (consensus.NodeID, bool) {
 	self := eng.Status().ID
 	var best consensus.PeerHealth
-	found := false
+	found, pastFound := false, false
 	for _, p := range eng.Health().Peers {
 		i := Rank(m, p.ID) - 1
-		if p.ID == self || i < 0 || !m.Members[i].Voter || p.Unreachable || p.Snapshot {
-			continue
-		}
-		if !found || p.Lag < best.Lag {
+		switch {
+		case p.ID == self || i < 0 || !m.Members[i].Voter || p.Unreachable || p.Snapshot:
+		case p.ID == past:
+			pastFound = true
+		case !found || p.Lag < best.Lag:
 			best, found = p, true
 		}
+	}
+	if !found && pastFound {
+		return past, true
 	}
 	return best.ID, found
 }

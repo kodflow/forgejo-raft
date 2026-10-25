@@ -37,14 +37,21 @@ type leaderEngine struct {
 	version  uint32
 	raises   []uint32
 	raiseErr error
-	// transfers are the leadership transfers asked for.
+	// transfers are the leadership transfers asked for, and declines the
+	// voters that do not take one: the engine's TRANSFER_FAILED for a voter
+	// that handed its own leadership over for an apply that has not moved
+	// since (kitsunium/sdk#674).
 	transfers []consensus.NodeID
+	declines  map[consensus.NodeID]bool
 }
 
 func (e *leaderEngine) TransferLeadership(_ context.Context, _ consensus.Operator, to consensus.NodeID) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.transfers = append(e.transfers, to)
+	if e.declines[to] {
+		return consensus.ErrTransferFailed
+	}
 	return nil
 }
 
@@ -131,7 +138,7 @@ func newLeaderBench(t *testing.T, expected int) (*Replicator, *leaderEngine, *fa
 		deadTimeout: 5 * time.Minute, downAfter: 10 * time.Second,
 		probe: func(context.Context, string, string) (hello, error) { return hello{}, consensus.ErrNotLeader },
 	}
-	e := &leaderEngine{id: 0xa, peers: map[consensus.NodeID]consensus.PeerHealth{}, refuse: map[consensus.NodeID]bool{}}
+	e := &leaderEngine{id: 0xa, peers: map[consensus.NodeID]consensus.PeerHealth{}, refuse: map[consensus.NodeID]bool{}, declines: map[consensus.NodeID]bool{}}
 	e.m.Members = []consensus.Member{{ID: 0xa, Slot: "node-a", SPKI: [32]byte{0xa}, Voter: true}}
 	r.setEngine(e)
 	return r, e, clock
