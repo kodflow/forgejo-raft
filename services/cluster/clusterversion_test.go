@@ -215,6 +215,12 @@ func TestAReturnedVoterHearsALeaderAdmittedWhileItWasDown(t *testing.T) {
 	l = b.leader()
 	require.NotNil(t, l)
 	require.Eventually(t, func() bool { return raisedAudit(l.r.table) }, 10*time.Second, 20*time.Millisecond, "the raise is audited")
+	// The pilot raises to clusterProtocol, never to the highest protocol
+	// the engine speaks, 3 since kitsunium/sdk#659: only a release raises
+	// clusterProtocol.
+	for _, n := range founders {
+		require.Equal(t, clusterProtocol, n.r.Engine().Status().ClusterVersion, n.slot)
+	}
 
 	// The engine's refusals reach Forgejo under its own sentinels.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -222,7 +228,8 @@ func TestAReturnedVoterHearsALeaderAdmittedWhileItWasDown(t *testing.T) {
 	eng := l.r.Engine()
 	st := eng.Status()
 	pre := consensus.Precondition{Identity: st.Identity, Generation: st.ClusterGeneration}
-	require.ErrorIs(t, eng.RaiseClusterVersion(ctx, autopilotOperator, pre, 3), consensus.ErrVersionUnsupported, "a protocol this engine does not speak")
+	beyond := l.node.Status().Versions.ProtocolMax + 1
+	require.ErrorIs(t, eng.RaiseClusterVersion(ctx, autopilotOperator, pre, beyond), consensus.ErrVersionUnsupported, "a protocol this engine does not speak")
 	require.ErrorIs(t, eng.RaiseClusterVersion(ctx, autopilotOperator, consensus.Precondition{Identity: st.Identity}, 2), consensus.ErrAdminPrecondition, "a stale generation")
 
 	// n1, a follower, stops.

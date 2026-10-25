@@ -24,7 +24,10 @@ import (
 // (#170). The leader raises it in both modes, as the autopilot raises the
 // payload version: it is a protocol version, not an operator's decision. An
 // SDK speaking a later protocol is raised to by a release that says so,
-// never by its pin alone.
+// never by its pin alone. The SDK speaks 3 since kitsunium/sdk#659: the
+// raise to it waits for kitsunium/sdk#665, since a node of protocol 2 that
+// meets the snapshot metadata of protocol 3 leaves the replication silently
+// instead of stopping.
 const clusterProtocol uint32 = 2
 
 // ActionRaiseCluster is what the replicated audit records of a raise of the
