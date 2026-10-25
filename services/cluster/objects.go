@@ -775,6 +775,16 @@ func (oc *objectChannel) pushFile(ctx context.Context, m consensus.Member, repo,
 	}
 }
 
+// errNotHeld is a member's answer to a fetch that it does not hold every
+// object asked: /v1/fetch's 404, which every binary gives.
+var errNotHeld = errors.New("the member does not hold them")
+
+// errHeldNowhere is the failure of fetchMissing when every other member
+// answered that it does not hold the objects: no member could provide them
+// now. A member that did not answer, or answered otherwise, may hold them,
+// and the failure is another one.
+var errHeldNowhere = errors.New("no member holds them")
+
 // fetchMissing brings objects this node lacks from any member holding them.
 func (oc *objectChannel) fetchMissing(ctx context.Context, repo, dir string, shas []string) error {
 	eng := oc.engine()
@@ -798,21 +808,32 @@ func (oc *objectChannel) fetchMissing(ctx context.Context, repo, dir string, sha
 	}
 	self := oc.self()
 	var lastErr error
+	// nowhere stays true while every member asked answers that it does not
+	// hold them (#224).
+	nowhere := true
 	for _, m := range eng.Membership().Members {
 		if m.ID == self {
 			continue
 		}
 		if err := oc.fetchFrom(ctx, m, repo, dir, shas, haves); err != nil {
 			lastErr = err
+			nowhere = nowhere && errors.Is(err, errNotHeld)
 			continue
 		}
 		missing, err := missingObjects(ctx, dir, shas)
 		if err == nil && len(missing) == 0 {
 			return nil
 		}
+		nowhere = false
+	}
+	if nowhere {
+		if lastErr != nil {
+			return fmt.Errorf("%w: %v", errHeldNowhere, lastErr)
+		}
+		return errHeldNowhere
 	}
 	if lastErr == nil {
-		lastErr = errors.New("no member holds them")
+		lastErr = errors.New("no member's pack held them")
 	}
 	return lastErr
 }
@@ -839,6 +860,9 @@ func (oc *objectChannel) fetchFrom(ctx context.Context, m consensus.Member, repo
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("%s answered %s: %w", m.Slot, resp.Status, errNotHeld)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s answered %s", m.Slot, resp.Status)
 	}
