@@ -54,6 +54,80 @@ const checkpointYieldLag = 64
 // again, at most once in that time.
 var checkpointHandBack = time.Hour
 
+// In the manual mode no autopilot runs: nothing makes a leader that cannot
+// derive the SQL give the leadership away, and an operator's transfer is the
+// remedy (#47). yieldIfStuck, whose time the hello says (sql_yield), never
+// runs there either, so the pilot of the leader handed the leadership back,
+// for its checkpoints, to the very taker the operator had moved it away
+// from, and the SQL stayed frozen for the whole cluster (#217). Each member
+// therefore says it in the manual mode: from the pass of its consumer, as
+// the leader, that makes yieldAfterPasses failed in a row while events wait,
+// until one of its passes, as the leader again, goes through while events
+// are there, its hello's sql_yield is the time of its last failed pass or of
+// its pilot's last tick. Only the leader runs the consumer, so a follower
+// cannot know better, and its pilot keeps the time fresh. takerHold then
+// keeps the leadership away from it for as long as it says so, on a leader
+// of this binary or of the previous one alike, and the operator's transfer
+// stands. The memory is the process's: a member that restarts is handed the
+// leadership again, and so is one the operator transfers it to that derives
+// the SQL. The autonomous mode's sql_yield stays yieldIfStuck's alone.
+
+// sqlState is whether this node, when it last led, could not derive the
+// SQL. The consumer's passes set and clear it, the pilot reads it; the
+// manual mode's writes of sql_yield are made under mu, so a pilot's refresh
+// never lands after the pass that cleared it.
+type sqlState struct {
+	mu    sync.Mutex
+	stuck bool
+}
+
+// cannotDeriveSQL reports whether this node's consumer failed
+// yieldAfterPasses passes in a row while events wait, as yieldIfStuck
+// counts them.
+func (r *Replicator) cannotDeriveSQL() bool {
+	return int(r.consumerFails.Load()) >= yieldAfterPasses && r.table.EventCount() > 0
+}
+
+// noteLeaderPass is, in the manual mode, the word of the consumer's pass on
+// this node, as the leader, that ended with err (consumerFails counted): it
+// cannot derive the SQL once yieldAfterPasses failed in a row while events
+// wait, and it can again once a pass goes through while events are there.
+func (r *Replicator) noteLeaderPass(err error) {
+	if r.auto != nil {
+		return
+	}
+	s := &r.ckState.sql
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case err != nil && r.cannotDeriveSQL():
+		if !s.stuck {
+			log.Error("cluster: this leader cannot derive the SQL (its consumer failed %d passes in a row with %d events waiting): in the manual mode only an operator's transfer moves the leadership away from it; until it derives the SQL again as the leader, its hello says so, and it is not handed the leadership for its checkpoints", r.consumerFails.Load(), r.table.EventCount())
+		}
+		s.stuck = true
+		r.sqlYield.Store(r.clock().Unix())
+	case err == nil && s.stuck && r.table.EventCount() > 0:
+		s.stuck = false
+		r.sqlYield.Store(0)
+		log.Warn("cluster: this leader derives the SQL again: its hello no longer says it cannot")
+	}
+}
+
+// keepSQLYield is, in the manual mode, the pilot's tick on every member: it
+// keeps sql_yield at now while this node could not derive the SQL when it
+// last led, so the hold of takerHold never lapses before it can.
+func (r *Replicator) keepSQLYield(now time.Time) {
+	if r.auto != nil {
+		return
+	}
+	s := &r.ckState.sql
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stuck {
+		r.sqlYield.Store(now.Unix())
+	}
+}
+
 // checkpointProbeEvery paces the leader's question "do you take the
 // checkpoints", as payloadProbeEvery paces the payload's.
 var checkpointProbeEvery = payloadProbeEvery
@@ -72,9 +146,12 @@ type checkpointView struct {
 // checkpointViewFresh is how long the leader's view of the takers stands.
 const checkpointViewFresh = 2 * payloadProbeEvery
 
+// checkpointState is the leader's view of the takers, and this node's SQL
+// as the manual mode's hand-over reads it (sqlState).
 type checkpointState struct {
 	mu   sync.Mutex
 	view checkpointView
+	sql  sqlState
 }
 
 func (s *checkpointState) set(v checkpointView) {
@@ -168,14 +245,16 @@ func peerHealth(eng consensus.Engine) map[consensus.NodeID]consensus.PeerHealth 
 
 // takerHold is why the leader does not hand the leadership, for the
 // checkpoints, to a voter that takes them and answered h, "" when it would:
-// it gave the leadership away for want of the SQL within
-// checkpointHandBack, or its replication health p (known when the engine
-// has one) says it is unreachable, receives a snapshot, lags more than
-// checkpointYieldLag or was last heard of more than checkpointContact ago.
+// it could not derive the SQL within checkpointHandBack (it gave the
+// leadership away for it, or, in the manual mode, says it has not derived
+// it since it last led: noteLeaderPass), or its replication health p
+// (known when the engine has one) says it is unreachable, receives a
+// snapshot, lags more than checkpointYieldLag or was last heard of more
+// than checkpointContact ago.
 func takerHold(h hello, p consensus.PeerHealth, known bool, now time.Time) string {
 	switch {
 	case h.SQLYield != 0 && now.Sub(time.Unix(h.SQLYield, 0)) < checkpointHandBack:
-		return fmt.Sprintf("gave the leadership away for want of the SQL at %s, not handed it back within %s", time.Unix(h.SQLYield, 0).UTC().Format(time.RFC3339), checkpointHandBack)
+		return fmt.Sprintf("could not derive the SQL as of %s, not handed the leadership back within %s of it", time.Unix(h.SQLYield, 0).UTC().Format(time.RFC3339), checkpointHandBack)
 	case !known:
 		return "no replication health for it"
 	case p.Unreachable:

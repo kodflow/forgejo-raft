@@ -15,6 +15,7 @@ import (
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/test"
 	"forgejo.org/services/cluster/consensus"
+	"forgejo.org/services/cluster/consensus/memraft"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -112,7 +113,7 @@ func TestTakerHoldSaysWhyTheLeadershipIsNotHandedOver(t *testing.T) {
 		why   string
 	}{
 		{"caught up", hello{}, ok, true, ""},
-		{"gave it away for the SQL", hello{SQLYield: now.Add(-time.Minute).Unix()}, ok, true, "gave the leadership away for want of the SQL at 2027-01-15T07:59:00Z"},
+		{"gave it away for the SQL", hello{SQLYield: now.Add(-time.Minute).Unix()}, ok, true, "could not derive the SQL as of 2027-01-15T07:59:00Z"},
 		{"gave it away long ago", hello{SQLYield: now.Add(-2 * checkpointHandBack).Unix()}, ok, true, ""},
 		{"no health", hello{}, ok, false, "no replication health for it"},
 		{"unreachable", hello{}, consensus.PeerHealth{Unreachable: true}, true, "unreachable"},
@@ -337,4 +338,251 @@ func TestThePilotGivesTheLeadershipToTheMemberThatTakesCheckpoints(t *testing.T)
 	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
 		require.True(t, takerLeads(), "the leadership stays with the member that takes the checkpoints")
 	}
+}
+
+// manualBench is the manual mode on the in-process log: node-a leads,
+// node-b alone takes the checkpoints ([cluster] CHECKPOINT_INTERVAL set on
+// it alone, as replicator.go admits), every member answers the others with
+// its own hello, an event waits for its SQL, and every member's pilot runs,
+// every 5 ms unless pilotEvery says otherwise. No consumer runs: each member plays, every 5 ms, what the consumer's step
+// does with a pass, a follower's count starting over, and a leader's pass
+// failing while down says its database does not answer.
+type manualBench struct {
+	bySlot map[string]*Replicator
+	down   map[string]*atomic.Bool
+}
+
+func newManualBench(t *testing.T, pilotEvery map[string]time.Duration) *manualBench {
+	mem, rs := NewForTesting(t.TempDir(), "node-a", "node-b", "node-c")
+	mem.SetLeader(rs[0].Engine().(*memraft.Node))
+	require.Nil(t, rs[0].auto, "the manual mode: no autopilot, no yieldIfStuck")
+	b := &manualBench{bySlot: map[string]*Replicator{}, down: map[string]*atomic.Bool{}}
+	for i, slot := range []string{"node-a", "node-b", "node-c"} {
+		b.bySlot[slot], b.down[slot] = rs[i], &atomic.Bool{}
+	}
+	b.bySlot["node-b"].checkpoints.Store(&coordinator{r: b.bySlot["node-b"]})
+	for _, r := range rs {
+		r.memberProbe = func(_ context.Context, _, slot string) (hello, error) {
+			h := b.bySlot[slot].memberHello()
+			h.Slot = slot
+			for _, m := range r.Engine().Membership().Members {
+				if m.Slot == slot {
+					h.SPKI = m.SPKI
+				}
+			}
+			return h, nil
+		}
+	}
+	require.NoError(t, rs[0].proposeRepoDelete(t.Context(), "alice/waiting.git", 1))
+	require.Positive(t, b.bySlot["node-b"].table.EventCount(), "an event waits for its SQL")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	var wg sync.WaitGroup
+	for slot, r := range b.bySlot {
+		every := 5 * time.Millisecond
+		if d, ok := pilotEvery[slot]; ok {
+			every = d
+		}
+		wg.Go(func() { r.leaderPilot(ctx, every) })
+		wg.Go(func() {
+			c := &consumer{r: r}
+			tick := time.NewTicker(5 * time.Millisecond)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+				}
+				if r.Engine().Status().Role != consensus.RoleLeader {
+					c.notePass(nil)
+					continue
+				}
+				var err error
+				if b.down[slot].Load() {
+					err = errors.New("the database does not answer")
+				}
+				c.notePass(err)
+				r.noteLeaderPass(err)
+			}
+		})
+	}
+	t.Cleanup(func() { cancel(); wg.Wait() })
+	return b
+}
+
+func (b *manualBench) leader() string {
+	for slot, r := range b.bySlot {
+		if r.Engine().Status().Role == consensus.RoleLeader {
+			return slot
+		}
+	}
+	return ""
+}
+
+// In the manual mode nothing makes a leader that cannot derive the SQL give
+// the leadership away: an operator's transfer is the remedy (#47). The
+// pilot of the leader it was transferred to handed it back, for its
+// checkpoints, to the taker whose consumer kept failing, once yieldBackoff
+// passed: only the autonomous mode's yieldIfStuck said in the hello that a
+// member could not derive the SQL. The SQL stayed frozen for the whole
+// cluster. The taker now says it, as a follower too, and the operator's
+// transfer stands, past yieldBackoff and past checkpointHandBack (#217).
+func TestAnOperatorsTransferAwayFromATakerThatCannotDeriveTheSQLStands(t *testing.T) {
+	t.Cleanup(test.MockVariableValue(&checkpointProbeEvery, 10*time.Millisecond))
+	t.Cleanup(test.MockVariableValue(&yieldBackoff, 300*time.Millisecond))
+	t.Cleanup(test.MockVariableValue(&yieldAfterPasses, 5))
+	// sql_yield is in seconds: the hold is measured past four of them.
+	t.Cleanup(test.MockVariableValue(&checkpointHandBack, 4*time.Second))
+	bench := newManualBench(t, nil)
+	a, b := bench.bySlot["node-a"], bench.bySlot["node-b"]
+	ctx := t.Context()
+	// node-b cannot derive the SQL: its database does not answer.
+	bench.down["node-b"].Store(true)
+
+	require.Eventually(t, func() bool { return bench.leader() == "node-b" }, 5*time.Second, 5*time.Millisecond,
+		"node-a's pilot hands the leadership to node-b, which takes the checkpoints")
+	assert.Eventually(t, func() bool { return b.memberHello().SQLYield != 0 }, 5*time.Second, 5*time.Millisecond,
+		"node-b, leading, says it cannot derive the SQL")
+	time.Sleep(200 * time.Millisecond)
+	require.Equal(t, "node-b", bench.leader(), "in the manual mode nothing makes node-b give the leadership away")
+
+	// The operator moves the leadership away from node-b, to node-a.
+	require.NoError(t, b.Operate(ctx, OperatorFor(1), Operation{Action: ActionTransfer, Target: slotID(t, a, "node-a").String()}))
+	require.Equal(t, "node-a", bench.leader())
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		require.Equal(t, "node-a", bench.leader(), "the operator's transfer away from a taker that cannot derive the SQL stands")
+	}
+	assert.Zero(t, b.consumerFails.Load(), "node-b's consumer count started over as a follower")
+	view, ok := a.ckState.fresh(time.Now())
+	require.True(t, ok)
+	require.Len(t, view.Held, 1)
+	assert.Contains(t, view.Held[0], "node-b: could not derive the SQL as of", "the health says why node-b is not handed it")
+}
+
+// The consumer says it at the pass that makes yieldAfterPasses failed in a
+// row: an operator's transfer right after it, before any tick of node-b's
+// pilot, stands too, although node-b's consumer count starts over as a
+// follower (#217).
+func TestATransferRightAfterTheFailingPassStands(t *testing.T) {
+	t.Cleanup(test.MockVariableValue(&checkpointProbeEvery, 10*time.Millisecond))
+	t.Cleanup(test.MockVariableValue(&yieldBackoff, 300*time.Millisecond))
+	t.Cleanup(test.MockVariableValue(&yieldAfterPasses, 5))
+	bench := newManualBench(t, map[string]time.Duration{"node-b": time.Hour})
+	a, b := bench.bySlot["node-a"], bench.bySlot["node-b"]
+	ctx := t.Context()
+	require.Eventually(t, func() bool { return bench.leader() == "node-b" }, 5*time.Second, 5*time.Millisecond)
+
+	bench.down["node-b"].Store(true)
+	require.Eventually(t, func() bool { return int(b.consumerFails.Load()) >= yieldAfterPasses }, 5*time.Second, time.Millisecond)
+	require.NoError(t, b.Operate(ctx, OperatorFor(1), Operation{Action: ActionTransfer, Target: slotID(t, a, "node-a").String()}))
+	for deadline := time.Now().Add(3 * yieldBackoff); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		require.Equal(t, "node-a", bench.leader(), "the transfer right after the failing pass stands")
+	}
+	assert.Zero(t, b.consumerFails.Load(), "node-b's consumer count started over as a follower")
+}
+
+// A taker that can derive the SQL is handed the leadership back for its
+// checkpoints, as before (#176): after an operator's transfer away from it,
+// and after it could not derive the SQL for a while, once it leads again
+// (the operator's transfer to it, once its database is repaired) and a pass
+// of its consumer goes through (#217).
+func TestTheLeadershipGoesBackToATakerThatDerivesTheSQL(t *testing.T) {
+	t.Cleanup(test.MockVariableValue(&checkpointProbeEvery, 10*time.Millisecond))
+	t.Cleanup(test.MockVariableValue(&yieldBackoff, 300*time.Millisecond))
+	t.Cleanup(test.MockVariableValue(&yieldAfterPasses, 5))
+	bench := newManualBench(t, nil)
+	a, b := bench.bySlot["node-a"], bench.bySlot["node-b"]
+	idA, idB := slotID(t, a, "node-a").String(), slotID(t, b, "node-b").String()
+	ctx := t.Context()
+	bLeads := func() bool { return bench.leader() == "node-b" }
+
+	require.Eventually(t, bLeads, 5*time.Second, 5*time.Millisecond, "the leadership goes to node-b, which takes the checkpoints")
+	require.NoError(t, b.Operate(ctx, OperatorFor(1), Operation{Action: ActionTransfer, Target: idA}))
+	require.Equal(t, "node-a", bench.leader())
+	require.Eventually(t, bLeads, 5*time.Second, 5*time.Millisecond, "node-b, which derives the SQL, is handed it back")
+	assert.Zero(t, b.memberHello().SQLYield)
+
+	// node-b's database fails, then the operator moves the leadership away.
+	bench.down["node-b"].Store(true)
+	assert.Eventually(t, func() bool { return b.memberHello().SQLYield != 0 }, 5*time.Second, 5*time.Millisecond,
+		"node-b, leading, says it cannot derive the SQL")
+	require.NoError(t, b.Operate(ctx, OperatorFor(1), Operation{Action: ActionTransfer, Target: idA}))
+	for deadline := time.Now().Add(3 * yieldBackoff); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		require.Equal(t, "node-a", bench.leader(), "not handed back while node-b cannot derive the SQL")
+	}
+
+	// Its database repaired, the operator transfers the leadership to it,
+	// and a pass of its consumer goes through: it says so, and is handed the
+	// leadership back after the next transfer away from it.
+	bench.down["node-b"].Store(false)
+	require.NoError(t, a.Operate(ctx, OperatorFor(1), Operation{Action: ActionTransfer, Target: idB}))
+	require.Eventually(t, func() bool { return b.memberHello().SQLYield == 0 }, 5*time.Second, 5*time.Millisecond,
+		"node-b, leading and deriving the SQL, no longer says it cannot")
+	require.NoError(t, b.Operate(ctx, OperatorFor(1), Operation{Action: ActionTransfer, Target: idA}))
+	require.Equal(t, "node-a", bench.leader())
+	require.Eventually(t, bLeads, 5*time.Second, 5*time.Millisecond, "node-b is handed the leadership back")
+}
+
+// In the manual mode, the hello's sql_yield says this node could not
+// derive the SQL from the consumer's pass, as the leader, that makes
+// yieldAfterPasses failed in a row while events wait; the pilot keeps it
+// fresh, as a follower too, long past checkpointHandBack; a pass that goes
+// through while events are there ends it. The autonomous mode's sql_yield
+// is yieldIfStuck's alone (#217).
+func TestTheManualModeSaysTheNodeCannotDeriveTheSQLUntilItDoes(t *testing.T) {
+	_, reps := NewForTesting(t.TempDir(), "node-a")
+	r := reps[0]
+	ctx := t.Context()
+	caughtUp := consensus.PeerHealth{Lag: 0}
+	held := func(at time.Time) string { return takerHold(r.memberHello(), caughtUp, true, at) }
+	down := errors.New("the database does not answer")
+
+	// The consumer's own step, on the leader: its pass fails reading the
+	// cursor of the waiting event.
+	c := &consumer{
+		r: r, dbReady: func() bool { return true }, events: r.table.Events,
+		cursor: func(context.Context, string) (*cluster_model.Cursor, error) { return nil, down },
+	}
+	require.NoError(t, r.proposeRepoDelete(ctx, "alice/waiting.git", 1))
+	for range yieldAfterPasses - 1 {
+		require.ErrorIs(t, c.step(ctx), down)
+	}
+	assert.Zero(t, r.memberHello().SQLYield, "fewer failed passes in a row say nothing")
+	require.ErrorIs(t, c.step(ctx), down)
+	assert.NotZero(t, r.memberHello().SQLYield, "the pass that makes yieldAfterPasses failed in a row says it")
+	assert.Contains(t, held(time.Now()), "could not derive the SQL")
+
+	// A follower's consumer count starts over; its pilot keeps it fresh.
+	r.consumerFails.Store(0)
+	later := time.Now().Add(3 * checkpointHandBack)
+	r.keepSQLYield(later)
+	assert.Equal(t, later.Unix(), r.memberHello().SQLYield, "past checkpointHandBack")
+	assert.Contains(t, held(later), "could not derive the SQL")
+
+	// With no event, failed passes freeze nothing, and a pass that goes
+	// through read nothing of the SQL; one with events there ends it, and
+	// the pilot keeps it ended.
+	_, empty := NewForTesting(t.TempDir(), "node-z")
+	z := empty[0]
+	z.consumerFails.Store(int32(yieldAfterPasses))
+	z.noteLeaderPass(down)
+	assert.False(t, z.ckState.sql.stuck, "no event waits: the SQL is not frozen")
+	z.ckState.sql.stuck = true
+	z.noteLeaderPass(nil)
+	assert.True(t, z.ckState.sql.stuck, "a pass with no event read nothing of the SQL")
+	r.noteLeaderPass(nil)
+	assert.Zero(t, r.memberHello().SQLYield)
+	r.keepSQLYield(later)
+	assert.Zero(t, r.memberHello().SQLYield)
+	assert.Empty(t, held(later))
+
+	// The autonomous mode: yieldIfStuck's time stands.
+	r.auto = &autoMode{}
+	r.sqlYield.Store(42)
+	r.consumerFails.Store(int32(yieldAfterPasses))
+	r.noteLeaderPass(down)
+	r.keepSQLYield(later)
+	assert.EqualValues(t, 42, r.memberHello().SQLYield)
+	assert.False(t, r.ckState.sql.stuck)
 }

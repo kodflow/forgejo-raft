@@ -69,7 +69,9 @@ func (r *Replicator) maybeRaiseCluster(ctx context.Context, eng consensus.Engine
 // leaderPilot is what the leader does by itself outside the autonomous
 // mode, where no autopilot runs, at every tick: raise the cluster version
 // (#170), and hand the leadership to a member that takes the checkpoints
-// when this one takes none (#176).
+// when this one takes none (#176). On every member, it keeps the hello
+// saying that this node could not derive the SQL when it last led, so the
+// leadership is not handed back to it for its checkpoints (#217).
 func (r *Replicator) leaderPilot(ctx context.Context, every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()
@@ -79,6 +81,7 @@ func (r *Replicator) leaderPilot(ctx context.Context, every time.Duration) {
 			return
 		case <-t.C:
 		}
+		r.keepSQLYield(r.clock())
 		eng := r.Engine()
 		if eng == nil || eng.Status().Role != consensus.RoleLeader {
 			continue

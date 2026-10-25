@@ -514,6 +514,7 @@ func (c *consumer) step(ctx context.Context) error {
 	err := c.pass(ctx)
 	if ctx.Err() == nil {
 		c.notePass(err)
+		c.r.noteLeaderPass(err) // the manual mode's hand-over (#217)
 	}
 	return err
 }
