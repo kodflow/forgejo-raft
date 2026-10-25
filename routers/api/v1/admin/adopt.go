@@ -4,6 +4,7 @@
 package admin
 
 import (
+	"errors"
 	"net/http"
 
 	repo_model "forgejo.org/models/repo"
@@ -142,6 +143,8 @@ func DeleteUnadoptedRepository(ctx *context.APIContext) {
 	//     "$ref": "#/responses/empty"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "409":
+	//     "$ref": "#/responses/conflict"
 	ownerName := ctx.Params(":username")
 	repoName := ctx.Params(":reponame")
 
@@ -172,6 +175,13 @@ func DeleteUnadoptedRepository(ctx *context.APIContext) {
 	}
 
 	if err := repo_service.DeleteUnadoptedRepository(ctx, ctx.Doer(), ctxUser, repoName); err != nil {
+		// In a cluster, the files of a repository the cluster holds are
+		// refused, with the procedure that deletes it from the cluster
+		// (#245).
+		if errors.Is(err, repo_service.ErrUnadoptedInCluster) {
+			ctx.Error(http.StatusConflict, "DeleteUnadoptedRepository", err)
+			return
+		}
 		ctx.InternalServerError(err)
 		return
 	}

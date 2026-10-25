@@ -6,6 +6,7 @@ package repository
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -220,6 +221,10 @@ func CreateRepositoryDirectly(ctx context.Context, doer, u *user_model.User, opt
 		opts.ObjectFormatName = git.Sha1ObjectFormat.Name()
 	}
 
+	if err := clusterCreateRefusal(ctx, u, opts.Name); err != nil {
+		return nil, err
+	}
+
 	repo := &repo_model.Repository{
 		OwnerID:                         u.ID,
 		Owner:                           u,
@@ -329,7 +334,7 @@ func CreateRepositoryDirectly(ctx context.Context, doer, u *user_model.User, opt
 			}
 		}
 		if initialized {
-			if errDelete := removeAbandonedRepo(ctx, u.Name, repo.Name); errDelete != nil {
+			if errDelete := removeAbandonedRepo(ctx, u.Name, repo.Name, err); errDelete != nil {
 				log.Error("CreateRepository: %v", errDelete)
 				return nil, fmt.Errorf("%w; and the repository's files were not removed: %v", err, errDelete)
 			}
@@ -341,6 +346,40 @@ func CreateRepositoryDirectly(ctx context.Context, doer, u *user_model.User, opt
 	return repo, nil
 }
 
+// clusterCreateRefusal refuses, before anything is written, a repository
+// created under a name whose key the cluster holds, as the files of the
+// name on this node's disk refuse it: an orphan the database does not
+// know, kept on every member, which this node may have lost its copy of,
+// or not projected yet. Created into that key, the repository inherited
+// the orphan's refs and objects, served under its own rights, or was
+// refused on every node for the orphan's ID (#245). The name is checked
+// in SQL first, so a name SQL has keeps its own error. Without a cluster
+// it does nothing.
+func clusterCreateRefusal(ctx context.Context, u *user_model.User, name string) error {
+	if !clusterhook.Enabled() {
+		return nil
+	}
+	if err := repo_model.IsUsableRepoName(name); err != nil {
+		return err
+	}
+	has, err := repo_model.IsRepositoryModelExist(ctx, u, name)
+	if err != nil {
+		return fmt.Errorf("IsRepositoryExist: %w", err)
+	}
+	if has {
+		return repo_model.ErrRepoAlreadyExist{Uname: u.Name, Name: name}
+	}
+	err = clusterhook.RepoCreateRefusal(ctx, u.Name, name)
+	if errors.Is(err, clusterhook.ErrRepoHeld) {
+		log.Warn("Refusing to create %s/%s: %v", u.Name, name, err)
+		return repo_model.ErrRepoFilesAlreadyExist{Uname: u.Name, Name: name}
+	}
+	if err != nil {
+		return fmt.Errorf("the cluster cannot take the repository %s/%s: %w", u.Name, name, err)
+	}
+	return nil
+}
+
 // removeAbandonedRepo removes the files of a repository whose creation
 // failed, its rows rolled back. In a cluster, `git init` already wrote HEAD
 // into the replicated table, and every member created the directory: the
@@ -349,7 +388,16 @@ func CreateRepositoryDirectly(ctx context.Context, doer, u *user_model.User, opt
 // cluster does not record it, the files stay, matching the table, until
 // `forgejo cluster reconcile --delete-orphan` deletes it. It
 // runs on a context detached from the failed request.
-func removeAbandonedRepo(ctx context.Context, owner, name string) error {
+//
+// When the cluster refused `git init` itself, the key holding another
+// repository's refs (clusterhook.IsKeyHeld in cause), the creation wrote
+// nothing to the table, and the key is that repository's: only the
+// directory `git init` began on this node is removed. Deleted from the
+// table, the orphan lost its refs on every member (#245).
+func removeAbandonedRepo(ctx context.Context, owner, name string, cause error) error {
+	if clusterhook.IsKeyHeld(cause) {
+		return util.RemoveAll(repo_model.RepoPath(owner, name))
+	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clusterhook.DefaultTimeout)
 	defer cancel()
 	if err := clusterhook.RepoDeleted(ctx, owner, name, 0); err != nil {

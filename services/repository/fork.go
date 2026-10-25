@@ -73,6 +73,12 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 		}
 	}
 
+	// In a cluster, a name whose key the cluster holds is refused before
+	// anything is written, as a creation's (#245).
+	if err := clusterCreateRefusal(ctx, owner, opts.Name); err != nil {
+		return nil, err
+	}
+
 	defaultBranch := opts.BaseRepo.DefaultBranch
 	if opts.SingleBranch != "" {
 		defaultBranch = opts.SingleBranch
@@ -95,7 +101,7 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 	oldRepoPath := opts.BaseRepo.RepoPath()
 
 	needsRollback := false
-	rollbackFn := func() {
+	rollbackFn := func(cause error) {
 		if !needsRollback {
 			return
 		}
@@ -108,7 +114,7 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 
 		// As the transaction will be failed and hence database changes will be destroyed we only need
 		// to delete the related repository on the filesystem, and from the cluster's table
-		if errDelete := removeAbandonedRepo(ctx, owner.Name, repo.Name); errDelete != nil {
+		if errDelete := removeAbandonedRepo(ctx, owner.Name, repo.Name, cause); errDelete != nil {
 			log.Error("Failed to remove fork repo: %v", errDelete)
 		}
 	}
@@ -132,7 +138,7 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 		}
 
 		if needsRollbackInPanic {
-			rollbackFn()
+			rollbackFn(nil)
 		}
 		panic(panicErr)
 	}()
@@ -199,7 +205,7 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 	})
 	needsRollbackInPanic = false
 	if err != nil {
-		rollbackFn()
+		rollbackFn(err)
 		return nil, err
 	}
 

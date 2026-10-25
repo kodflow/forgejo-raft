@@ -5,6 +5,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -262,6 +263,12 @@ func adoptRepository(ctx context.Context, repoPath string, repo *repo_model.Repo
 	return nil
 }
 
+// ErrUnadoptedInCluster refuses deleting, on one node of a cluster, the
+// files of an unadopted repository the cluster holds: every member keeps
+// them, and the deletion of one node's copy deletes nothing from the
+// cluster (#245).
+var ErrUnadoptedInCluster = errors.New("in a cluster, the files of this unadopted repository are the cluster's, on every member: deleting this node's copy would not delete it, and this node would no longer serve it")
+
 // DeleteUnadoptedRepository deletes unadopted repository files from the filesystem
 func DeleteUnadoptedRepository(ctx context.Context, doer, u *user_model.User, repoName string) error {
 	if err := repo_model.IsUsableRepoName(repoName); err != nil {
@@ -288,6 +295,22 @@ func DeleteUnadoptedRepository(ctx context.Context, doer, u *user_model.User, re
 			Uname: u.Name,
 			Name:  repoName,
 		}
+	}
+
+	// In a cluster, the files of a repository the replicated table holds
+	// (an orphan, after a deletion the cluster did not record or a loss on
+	// the SQL side) are refused: removed from this node alone, the table
+	// kept the repository, this node never projected it again, and a
+	// repository created here under the name inherited its refs and
+	// objects (#245). They are adopted, or deleted from the whole cluster
+	// by `forgejo cluster reconcile --delete-orphan`, which the refusal
+	// names. Files the cluster does not hold, on this node's disk alone,
+	// are still deleted.
+	if err := clusterhook.UnadoptedDeleteRefusal(ctx, u.Name, repoName); err != nil {
+		if errors.Is(err, clusterhook.ErrRepoHeld) {
+			return fmt.Errorf("%w: %w", ErrUnadoptedInCluster, err)
+		}
+		return fmt.Errorf("delete unadopted repository in the cluster: %w", err)
 	}
 
 	return util.RemoveAll(repoPath)

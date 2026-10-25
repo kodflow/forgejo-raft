@@ -4,6 +4,7 @@
 package setting
 
 import (
+	"errors"
 	"path/filepath"
 
 	repo_model "forgejo.org/models/repo"
@@ -50,10 +51,16 @@ func AdoptOrDeleteRepository(ctx *context.Context) {
 		ctx.Flash.Success(ctx.Tr("repo.adopt_preexisting_success", dir))
 	} else if action == "delete" && allowDelete {
 		if err := repo_service.DeleteUnadoptedRepository(ctx, ctxUser, ctxUser, dir); err != nil {
-			ctx.ServerError("repository.AdoptRepository", err)
-			return
+			// In a cluster, the files of a repository the cluster holds are
+			// refused (#245).
+			if !errors.Is(err, repo_service.ErrUnadoptedInCluster) {
+				ctx.ServerError("repository.AdoptRepository", err)
+				return
+			}
+			ctx.Flash.Error(err.Error())
+		} else {
+			ctx.Flash.Success(ctx.Tr("repo.delete_preexisting_success", dir))
 		}
-		ctx.Flash.Success(ctx.Tr("repo.delete_preexisting_success", dir))
 	}
 
 	ctx.Redirect(setting.AppSubURL + "/user/settings/repos")

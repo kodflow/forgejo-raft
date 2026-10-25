@@ -72,6 +72,12 @@ func GenerateRepository(ctx context.Context, doer, owner *user_model.User, templ
 		}
 	}
 
+	// In a cluster, a name whose key the cluster holds is refused before
+	// anything is written, as a creation's (#245).
+	if err := clusterCreateRefusal(ctx, owner, opts.Name); err != nil {
+		return nil, err
+	}
+
 	var generateRepo *repo_model.Repository
 	// initialized is set once git may have written the repository: a
 	// failed generation then removes it, from the cluster's table too,
@@ -145,7 +151,7 @@ func GenerateRepository(ctx context.Context, doer, owner *user_model.User, templ
 		return nil
 	}); err != nil {
 		if initialized {
-			if errDelete := removeAbandonedRepo(ctx, owner.Name, generateRepo.Name); errDelete != nil {
+			if errDelete := removeAbandonedRepo(ctx, owner.Name, generateRepo.Name, err); errDelete != nil {
 				log.Error("GenerateRepository: %v", errDelete)
 				return nil, fmt.Errorf("%w; and the repository's files were not removed: %v", err, errDelete)
 			}

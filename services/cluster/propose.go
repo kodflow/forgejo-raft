@@ -286,6 +286,62 @@ func (e errStaleCreate) Error() string {
 	return fmt.Sprintf("%s %s, this node had not shown it yet; nothing was written, retry shortly", e.ref, clusterhook.StaleCreateMark)
 }
 
+// errKeyHeld refuses git init's HEAD, in a directory that holds no ref,
+// under a key whose refs the table holds alive: a repository the database
+// does not know (an orphan), or one this node lost its copy of, or a copy
+// behind its projection. Taken as a creation, the new repository would
+// inherit the other one's refs and objects (#245).
+type errKeyHeld struct{ repo, ref string }
+
+func (e errKeyHeld) Error() string {
+	return fmt.Sprintf("%s %s (%s): it is an orphan `forgejo cluster reconcile` reports, or this node's copy is missing or behind; a repository is not created over it, nothing was written", e.repo, clusterhook.KeyHeldMark, e.ref)
+}
+
+// heldRef is the smallest live ref under repo other than HEAD, "" when it
+// holds none: a key a deletion or a rename left holds tombstones only, and
+// a key holding HEAD alone is a repository git init just created, or
+// whose migration clones into it again.
+func heldRef(refs map[string]reftable.RefValue) string {
+	held := ""
+	for name, v := range refs {
+		if name != "HEAD" && v.Live() && (held == "" || name < held) {
+			held = name
+		}
+	}
+	return held
+}
+
+// heldRefusal is clusterhook's check of the keys of a repository Forgejo
+// creates, or whose unadopted files it deletes, nil when the table holds
+// no repository under any of them, a live ref at least. The table is read
+// once this node applied a commit boundary a quorum confirmed: a node
+// behind the log would miss a repository created through another node,
+// and a node that cannot confirm refuses. The refusal names the index
+// `forgejo cluster reconcile --delete-orphan` expects (#245).
+func (r *Replicator) heldRefusal(ctx context.Context, keys []string) error {
+	if err := r.confirmTable(ctx); err != nil {
+		return err
+	}
+	for _, key := range keys {
+		refs, _ := r.table.Refs(key)
+		live := false
+		for _, v := range refs {
+			if v.Live() {
+				live = true
+				break
+			}
+		}
+		if !live {
+			continue
+		}
+		_, last := r.table.RepoHash(key)
+		name := strings.TrimSuffix(key, ".git")
+		return fmt.Errorf("%w: %s, on every member, last changed at index %d; adopt it, or delete it from the cluster with `forgejo cluster reconcile --delete-orphan %s --expect-index %d --reason \"...\"`",
+			clusterhook.ErrRepoHeld, key, last, name, last)
+	}
+	return nil
+}
+
 // buildTxn turns the hook's lines into a proposal, reading each ref's
 // revision from the table.
 //
@@ -307,6 +363,15 @@ func (e errStaleCreate) Error() string {
 // create, which check the absence against this node's git alone, are
 // refused the same way (#189). Forgejo's other updates without an old
 // value (update-ref, a forced rewrite) keep their meaning.
+//
+// git init's HEAD (RefTxn.Init) is refused likewise under a key whose refs
+// the table holds alive, HEAD aside (errKeyHeld): its directory holds none,
+// so they are not this repository's. Forgejo found the name free on this
+// node's disk alone, and Apply took the creation into the live key of an
+// orphan, whose refs and objects the new repository inherited (#245).
+// Forgejo refuses such a name before it writes anything
+// (clusterhook.RepoCreateRefusal); this is the proposer's own check, for a
+// path that did not ask.
 func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook.Request) (*reftable.RefTxn, []string, error) {
 	// Read before the revisions: Apply refuses the transaction when the
 	// repository left the key after this index (reftable.RefTxn.ReadAt).
@@ -360,6 +425,12 @@ func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook
 		}
 	}
 	tx.Init = initsRepo(ctx, req.GitDir, tx.Updates)
+	if tx.Init {
+		cur, _ := r.table.Refs(repo)
+		if ref := heldRef(cur); ref != "" {
+			return nil, nil, errKeyHeld{repo: repo, ref: ref}
+		}
+	}
 	if tx.Format == "" {
 		// A new repository's first entry is often HEAD alone: ask git.
 		tx.Format = "sha1"

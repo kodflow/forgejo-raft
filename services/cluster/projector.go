@@ -936,11 +936,25 @@ func (p *projector) departed(repo string, s stamp) (key string, at uint64, delet
 
 // Verify compares a repository's git state with the table under the
 // projection rules, and schedules a reprojection on a difference.
+//
+// A directory this node lost while the table holds the repository is one:
+// git cannot read it, and Verify failed without scheduling anything, so
+// `forgejo cluster reproject` never gave a node back the copy that "delete
+// unadopted", or an operator, removed from its disk alone. The projector
+// creates it again from the table and the other members' objects, as it
+// does at the node's start (#245).
 func (p *projector) Verify(ctx context.Context, repo string) (bool, error) {
 	dir := filepath.Join(p.root, filepath.FromSlash(repo))
 	refs, _ := p.table.Refs(repo)
 	withRenamedAway(p.table, repo, refs)
 	want := tableProjection(refs)
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		if len(want) == 0 {
+			return true, nil
+		}
+		p.markDirty(repo)
+		return false, nil
+	}
 	have, err := readGitRefs(ctx, dir)
 	if err != nil {
 		return false, err

@@ -574,12 +574,38 @@ These commands run with the server stopped, on the data directory.
   answer (no quorum, a leader change), the adoption fails and is rolled back,
   and the repository stays in the unadopted list, to adopt again once the
   cluster has a leader.
-  Never use "delete unadopted" in a cluster: it removes one node's files and
-  the projector brings them back. "Delete all repositories missing their Git
-  files" and "Reinitialize all missing Git repositories" are not offered in
-  a cluster, and refused: they judge a repository missing from one node's
-  disk, which a node behind on its projection is, and would delete it, or
-  rewrite its HEAD, on every member.
+  "Delete unadopted" (Site administration > Repositories > Unadopted,
+  `DELETE /api/v1/admin/unadopted/{owner}/{repo}`, or a user's own settings
+  with `ALLOW_DELETION_OF_UNADOPTED_REPOSITORIES`) is refused for a
+  repository the table holds, and the refusal names the
+  `reconcile --delete-orphan` that deletes it from the cluster. It used to remove the
+  files of the node serving the request only: the table kept the
+  repository, the other members their copy, and nothing brought that
+  node's copy back. Files the table does not hold, on one node's disk
+  alone (an init the cluster never recorded), are still deleted. A node
+  that lost its copy of a repository the table holds, removed by hand or by
+  "delete unadopted" before this release, projects it again from the other
+  members at its next start. `forgejo cluster reproject <owner>/<repo>.git`,
+  run on that node, schedules that projection without a restart: the
+  node's projector takes it at its next pass, and the copy is back once it
+  fetched the objects from the other members.
+  A repository is not created, forked, generated from a template or
+  migrated under a name the table holds a repository under, its own or its
+  wiki's: the node serving the request reads its table once it applied the
+  log as far as a majority confirms, before anything is written, and the
+  creation fails as for files already on its disk, whatever its own disk
+  holds. Before, a node that had lost its copy, or not projected it yet,
+  found the name free, and the new repository took the orphan's key: it
+  served the deleted repository's refs and objects under its own rights,
+  or every node refused it for the orphan's ID. Adopt the orphan, or
+  delete it with `reconcile --delete-orphan`, first. A `git init` that
+  reaches the cluster with no such check, under a key holding refs, is
+  refused too, and the orphan is left as it was.
+  "Delete all repositories missing their Git files" and "Reinitialize all
+  missing Git repositories" are not offered in a cluster, and refused: they
+  judge a repository missing from one node's disk, which a node behind on
+  its projection is, and would delete it, or rewrite its HEAD, on every
+  member.
 - Only a deletion or a failed creation the cluster did not record is
   deleted, explicitly, one repository at a time:
   `forgejo cluster reconcile --delete-orphan <owner>/<repo> --expect-index <index> --reason "..."`.
@@ -590,10 +616,10 @@ These commands run with the server stopped, on the data directory.
 - A deletion is two entries, the wiki's first, the repository's only once the
   wiki's committed. When the wiki's is lost, both stay; when the repository's
   is, the repository stays without its wiki. Either way it is an orphan as
-  above. A wiki left alive
-  by an older deletion beside a repository created again under the name
-  belongs to the deleted one, and every node refuses the new repository while
-  it stays. `reconcile` reports it (`"kind": "wiki"`), and only it is deleted
+  above. A wiki left alive by an older deletion belongs to the deleted
+  repository: no repository is created again under the name while it stays,
+  and one created beside it before this release is refused by every node
+  while it stays. `reconcile` reports it (`"kind": "wiki"`), and only it is deleted
   by `forgejo cluster reconcile --delete-orphan <owner>/<repo>.wiki --expect-index <index> --reason "..."`,
   refused when it is the wiki of the repository SQL has.
 - `forgejo cluster recover --from-observer <checkpoint> ...` rebuilds a
