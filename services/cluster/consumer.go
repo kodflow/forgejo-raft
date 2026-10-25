@@ -1622,22 +1622,88 @@ const pusherClockSkew = 5 * time.Minute
 //
 // From payload version 4 the event names the pusher, and the name decides,
 // with no clock: the same name, or a name that redirects to u (a rename
-// since), is the pusher; any other name is not. An event written before
-// carries no name and falls back to the account's creation time against
-// the push's, two nodes' clocks: a skew beyond pusherClockSkew between
-// them can still park a legitimate push.
+// since), is the pusher. Any other name is not, unless pusherRenamedSince
+// shows that u renamed itself since the push and lost that redirect (#235).
+// An event written before carries no name and falls back to the account's
+// creation time against the push's, two nodes' clocks: a skew beyond
+// pusherClockSkew between them can still park a legitimate push.
 func pusherReissued(ctx context.Context, u *user_model.User, ev reftable.Event) bool {
 	if ev.PusherName != "" {
 		if strings.EqualFold(u.Name, ev.PusherName) {
 			return false
 		}
 		r, err := user_model.GetUserRedirect(ctx, ev.PusherName)
-		return err != nil || r.RedirectUserID != u.ID
+		if err == nil && r.RedirectUserID == u.ID {
+			return false
+		}
+		if err != nil && !user_model.IsErrUserRedirectNotExist(err) {
+			return true
+		}
+		return !pusherRenamedSince(ctx, u, ev, err == nil)
 	}
 	if ev.Time <= 0 || u.CreatedUnix <= 0 {
 		return false
 	}
 	return time.Unix(int64(u.CreatedUnix), 0).After(time.Unix(0, ev.Time).Add(pusherClockSkew))
+}
+
+// pusherRenamedSince reports whether u, under another name than the
+// event's and without a redirect from that name, is still the account
+// that pushed: renamed since the push, its redirect removed afterwards.
+// Forgejo removes it once another account takes the old name (created
+// under it, or renamed into it: USERNAME_COOLDOWN_PERIOD is 0 by default)
+// and once the account's redirects pass MAX_USER_REDIRECTS. Taken for a
+// reissued ID, that push failed at every attempt, parked for good, the
+// repository's later events behind it and the trim of the queue below it.
+//
+// A reissued ID names an account created after SQL lost the pusher's row,
+// so after the push. u must therefore predate the push beyond
+// pusherClockSkew, and the redirect must have a reason to be gone: the old
+// name is another account's, or redirects to another account (one that
+// took it, then left it), or u holds as many redirects as
+// MAX_USER_REDIRECTS keeps, all made since the push. An organization never
+// pushed. Anything else stays a reissued ID: an account created around or
+// after the push, an old name nobody took. Left uncaught: a reissued ID
+// whose account seems to predate the push (SQL restored from a backup of
+// another timeline, clocks more than pusherClockSkew apart, a creation time
+// an administrator set) while another account took the event's name since.
+func pusherRenamedSince(ctx context.Context, u *user_model.User, ev reftable.Event, redirectedElsewhere bool) bool {
+	if u.IsOrganization() || ev.Time <= 0 || u.CreatedUnix <= 0 {
+		return false
+	}
+	pushed := time.Unix(0, ev.Time)
+	if !time.Unix(int64(u.CreatedUnix), 0).Add(pusherClockSkew).Before(pushed) {
+		return false
+	}
+	if redirectedElsewhere {
+		return true
+	}
+	taken, err := user_model.IsUserExist(ctx, u.ID, ev.PusherName)
+	if err != nil {
+		return false
+	}
+	return taken || redirectsPruned(ctx, u, pushed)
+}
+
+// redirectsPruned reports whether LimitUserRedirects may have dropped a
+// redirect of u made after pushed: it keeps the newest MAX_USER_REDIRECTS,
+// so the one made when u left its name at the push went only if u holds
+// that many, every one of them made since the push.
+func redirectsPruned(ctx context.Context, u *user_model.User, pushed time.Time) bool {
+	limit := setting.Service.MaxUserRedirects
+	if limit <= 0 {
+		return false
+	}
+	var kept []*user_model.Redirect
+	if err := db.GetEngine(ctx).Where("redirect_user_id = ?", u.ID).Find(&kept); err != nil || int64(len(kept)) < limit {
+		return false
+	}
+	for _, r := range kept {
+		if !time.Unix(int64(r.CreatedUnix), 0).Add(pusherClockSkew).After(pushed) {
+			return false
+		}
+	}
+	return true
 }
 
 // eventLeadsTo reports whether the repository an event was written for is
