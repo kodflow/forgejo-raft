@@ -673,8 +673,9 @@ var ErrRevocationPending = errors.New("the key is not revoked yet: some members 
 // revokeMember asks for the revocation of the key of member id before an
 // operator removes it or denies its pin, and reports whether it did: a
 // removed node presenting that key, under any id, is refused at the JOIN.
-// The autopilot's removal of a dead member does not come here, so that
-// member returns.
+// The autopilot's removal of a dead member comes here too, from
+// reftable.WithdrawVersion (removeDead): that member returns under a new id
+// with a new key, never with this one (#209).
 //
 // Only the request is written here, as a pending revocation (a version 1
 // audit record every binary applies alike): the JOIN refuses its key from
@@ -734,8 +735,8 @@ func changeRefused(err error) bool {
 // Remove or DenyPin recorded (revokeMember) once the engine refused the
 // change. A change refused for certain, of a member that still holds the
 // key, leaves no effect: its request is withdrawn, by the index the table
-// numbered it, and the key joins again if the member leaves another way,
-// as a dead member the autopilot removed does (#171). Any other refusal
+// numbered it, and the key is then only what the member's next departure
+// makes of it (#171). Any other refusal
 // keeps the request, which is written once no member holds the key: the
 // change may have committed (#64, #165). A request numbered 0, committed
 // before reftable.WithdrawVersion, stays too. The withdrawal is proposed

@@ -211,8 +211,9 @@ func TestAutonomousAdmission(t *testing.T) {
 
 // A member an operator removes has its key revoked: under a new id, with
 // the same CA-signed certificate, it is refused at the JOIN and on the
-// object channel, while the autopilot's removal of a dead member leaves
-// the key alone so the member returns.
+// object channel. The autopilot's removal of a dead member marks its key
+// the same way (#209): the member returns under a new key, never with
+// this one.
 func TestRemovedKeyIsRevoked(t *testing.T) {
 	mem, rs := NewForTesting(t.TempDir(), "node-a")
 	r := rs[0]
@@ -247,10 +248,12 @@ func TestRemovedKeyIsRevoked(t *testing.T) {
 	_, err = r.authorizeJoin(ctx, consensus.JoinRequest{Slot: "node-b", SPKI: sha256.Sum256([]byte("node-b, new key"))})
 	require.NoError(t, err, "a new key for the slot is admitted")
 
-	// The autopilot's removal revokes nothing.
-	r.autoChange(ctx, ActionRemove, idC, "out of reach", r.Engine().Remove)
+	// The autopilot's removal of a dead member marks the key too.
+	require.True(t, r.removeDead(ctx, r.Engine(), idC))
 	_, err = r.authorizeJoin(ctx, consensus.JoinRequest{Slot: "node-c", SPKI: keyC})
-	require.NoError(t, err)
+	require.ErrorContains(t, err, "revoked", "the dead member's key, under a new id")
+	_, err = r.authorizeJoin(ctx, consensus.JoinRequest{Slot: "node-c", SPKI: sha256.Sum256([]byte("node-c, new key"))})
+	require.NoError(t, err, "a new key for the slot is admitted")
 }
 
 // A grant that admits a node is bound to its key: another key does not

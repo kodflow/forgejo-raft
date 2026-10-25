@@ -46,7 +46,7 @@ func cmdCluster() *cli.Command {
 		Commands: []*cli.Command{
 			{
 				Name:   "init",
-				Usage:  "Offline: stamp an empty data directory as a joining node and print its member line",
+				Usage:  "Offline: stamp an empty data directory as a joining node, under a new key when RENEW_VAULT_ADDR is set, and print its member line",
 				Flags:  []cli.Flag{&cli.StringFlag{Name: "cluster", Usage: "cluster id, 32 hex digits (default: [cluster] CLUSTER_ID)"}},
 				Action: runClusterInit,
 			},
@@ -279,6 +279,18 @@ func runClusterInit(ctx context.Context, c *cli.Command) error {
 	cid, err := consensus.ParseClusterID(idHex)
 	if err != nil {
 		return err
+	}
+	// A key serves one node id (#209): an empty directory takes a new key
+	// before its new id is stamped, when a renewer is configured, so the
+	// line printed carries a key no member holds or held. A stamped
+	// directory is left to Init, which refuses it, its key untouched.
+	if rep, err := d.Inspect(setting.Cluster.DataDir); errors.Is(err, os.ErrNotExist) || err == nil && rep.Cluster.IsZero() {
+		switch _, err := cluster.RekeyForNewID(ctx); {
+		case errors.Is(err, cluster.ErrNoRenewer):
+			fmt.Fprintln(c.Root().ErrWriter, "RENEW_VAULT_ADDR is empty, so no new key is made: the line carries the key of TLS_KEY_FILE; if a member of the cluster holds or held that key, install a new key and its certificate first")
+		case err != nil:
+			return fmt.Errorf("making a new key before stamping a new node id: %w", err)
+		}
 	}
 	spki, err := certSPKI()
 	if err != nil {

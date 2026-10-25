@@ -165,7 +165,7 @@ on at least one voter.
 | `TLS_CERT_FILE` | none, required | The node's certificate. It may hold the key too. |
 | `TLS_KEY_FILE` | `TLS_CERT_FILE` | The node's key. |
 | `TLS_CA_FILE` | none, required | The cluster's CA. |
-| `DATA_DIR` | `<APP_DATA_PATH>/cluster` | The log and snapshots, never on a tmpfs, and never restored from a backup: a restored directory comes back under the same id and incarnation with a log that went back, and an acknowledged write is lost. A lost directory is replaced by an empty one, which joins under a new id, or by `forgejo cluster restore`. `forgejo dump` leaves it out. |
+| `DATA_DIR` | `<APP_DATA_PATH>/cluster` | The log and snapshots, never on a tmpfs, and never restored from a backup: a restored directory comes back under the same id and incarnation with a log that went back, and an acknowledged write is lost. A lost directory is replaced by an empty one: the node comes back under a new id and with a new key (see [A node that comes back](#a-node-that-comes-back)), or by `forgejo cluster restore`. `forgejo dump` leaves it out. |
 | `HOOK_SOCKET` | `<APP_DATA_PATH>/cluster-run/hook.sock` | The private socket of the git hooks and of `forgejo cluster`. 103 bytes at most. |
 | `OPERATORS` | empty | Bootstrap only: these site administrators get the operator permission while nobody holds it. |
 | `STEP_UP_MAX_AGE` | `5m` | How long a re-authentication allows further operations. |
@@ -181,7 +181,7 @@ on at least one voter.
 | `DEAD_MEMBER_TIMEOUT` | `5m`, one minute at least | Autonomous mode: how long a member stays out of the leader's reach before it is removed. |
 | `WITNESSES`, `WITNESS_KEYS` | empty | The Recover witnesses (one per witness host) and their Ed25519 public keys, in the same order. |
 | `WITNESS_OVERRIDE_SHA256` | empty | The hash of the operator's boot override, read from `FORGEJO_CLUSTER_WITNESS_OVERRIDE`. |
-| `RENEW_VAULT_ADDR` | empty | Vault, for the in-process certificate renewal. Off while empty. |
+| `RENEW_VAULT_ADDR` | empty | Vault, for the in-process certificate renewal, and for the new key a node takes before each new id it stamps. Off while empty: an operator then installs that key. |
 | `RENEW_VAULT_MOUNT`, `RENEW_VAULT_ROLE`, `RENEW_TTL` | `pki-consensus`, `SLOT`, `720h` | The PKI mount, the slot's role and the lifetime asked for. |
 | `RENEW_VAULT_JWT_FILE` | empty | The Nomad allocation's workload identity, read again at each login. |
 | `RENEW_VAULT_AUTH_MOUNT`, `RENEW_VAULT_AUTH_ROLE` | `jwt-consensus`, `SLOT` | Vault's JWT auth mount and the slot's role. |
@@ -219,7 +219,8 @@ grants a join.
   status` prints each member as voter, learner or removed, its rank (the
   order it entered the membership) and since when this node sees it so.
 - **Dead members.** The leader removes a member it has not heard from for
-  `DEAD_MEMBER_TIMEOUT`, as long as three voters remain without it. The
+  `DEAD_MEMBER_TIMEOUT`, as long as three voters remain without it, and
+  marks its key, which never joins again (from payload version 7). The
   removal is a committed membership change, so it happens only while a
   majority of the voters answers the leader. At five nodes: the first
   failure is removed (four voters), the second too (three voters); after
@@ -228,11 +229,29 @@ grants a join.
   a member returns. If a majority is lost at once, there is no leader:
   nothing is removed and nothing is written until a member returns.
 - **A removed node that comes back** has an id the cluster retired. Once a
-  majority of the voters of the newest membership confirm it, the node moves
-  its consensus data directory aside (`<DATA_DIR>.retired-<UTC time>`, kept,
-  never deleted), stamps a new id, joins as a learner through the CA
-  admission, catches up, and is made a voter again. Its repositories are
-  left as they are; the projector and the object channel bring them in line.
+  majority of the voters of the newest membership confirm it, the node takes
+  a new key, moves its consensus data directory aside
+  (`<DATA_DIR>.retired-<UTC time>`, kept, never deleted), stamps a new id,
+  joins as a learner through the CA admission, catches up, and is made a
+  voter again. Its repositories are left as they are; the projector and the
+  object channel bring them in line. See
+  [A node that comes back](#a-node-that-comes-back).
+- **A voter of three whose data directory is lost** comes back on an empty
+  directory under a new id, while its old id still holds the slot: the
+  engine refuses its JOIN, and the floor of three voters keeps the old id
+  from being removed. The leader replaces it by itself, once the old id has
+  been out of its reach for `DEAD_MEMBER_TIMEOUT`, the node at the slot's
+  address in `PEERS` answers as joining under a certificate of the CA for
+  that slot, and its key is new: neither a member's, nor revoked, nor asked
+  for revocation. The leader adds the new id as a learner under the same
+  slot, promotes it once it caught up (four voters), then removes the old
+  id (three again): the membership never lists fewer than three voters.
+  Fault tolerance stays at 0 from the moment the disk is lost until the old
+  id is removed, since four voters with one dead need the three others; a
+  change of leader in between counts `DEAD_MEMBER_TIMEOUT` again. A
+  replacement the leader added and then removed before it was ever heard
+  stamps another id, with a new key, once the members say its id is
+  retired.
 - **Joining** needs no grant: a node presenting a certificate of this
   cluster's CA, for a slot `PEERS` names and that has no member, is admitted
   as a learner. A cluster admits one member above its size, for a
@@ -255,9 +274,17 @@ certificate per expected slot.
 revokes its key: the revocation is a replicated entry, so every member
 refuses that key at the JOIN, under any id and whatever grant the slot has,
 and the object channel no longer admits it. The node comes back only with a
-new key, which the CA signs. The autopilot's removal of a dead member revokes
-nothing, so a node that was only out of reach returns by itself. The
-revocation is a command of payload version 3, which an older binary cannot
+new key, which the CA signs. The autopilot's removal of a dead member marks
+its key the same way, from payload version 7: a key serves one node id for
+the life of the cluster, and a node that was only out of reach returns by
+itself under a new key (see [A node that comes back](#a-node-that-comes-back)).
+Below version 7 the autopilot asks for nothing, since a member's binary
+could not withdraw a request the engine refuses: a node that rejoins after
+its removal still takes a new key, by its own rule, but one that comes back
+on an empty data directory without `RENEW_VAULT_ADDR` keeps the key in
+place, which the cluster then does not refuse. In every case the revocation is written
+only once no member holds the key, so a member that stays is never cut off.
+The revocation is a command of payload version 3, which an older binary cannot
 read: while a member still runs one, the cluster writes an older version,
 the Remove or Deny pin goes through without the revocation, and the
 administration says the key is not revoked yet. The request is kept in the
@@ -284,10 +311,10 @@ past the bound as before.
 for certain leave no effect. The revocation is asked for before the
 change, so that the removed node never joins again in between. When the
 engine refuses the change (another change in flight, no answering
-majority without the member), the request is withdrawn, and the key joins
-again if the member later leaves another way, for instance when the
-autopilot removes it as a dead member. Before version 7 the request
-stayed, and that member was refused for good. A change whose outcome is
+majority without the member), the request is withdrawn, and the key is
+only what the member's next departure makes of it: revoked again if an
+operator removes it, marked if the autopilot removes it as a dead member.
+Before version 7 the request stayed, and that member was refused for good. A change whose outcome is
 unknown keeps its request, written once no member holds the key. The
 autopilot neither promotes nor keeps a learner whose key is asked for
 revocation. A request made before the raise stays as it was.
@@ -363,6 +390,81 @@ The steps for the node that joins:
    objects are missing.
 4. "Promote" the learner once it caught up.
 5. "Transfer leadership" if the old node leads, then "Remove" the old one.
+
+**The data directory of a voter is lost** (a disk replaced, or
+`forgejo cluster quarantine clear --exit wipe-and-rejoin`). The node keeps
+its slot and comes back under a new id and a new key, while its old id
+still holds the slot: the JOIN of the new id is refused, and at three
+voters the old id cannot be removed first. In the autonomous mode the
+leader replaces it by itself (see [The autonomous mode](#the-autonomous-mode)).
+Otherwise, in the manual mode, or when the autopilot does not (a joiner on
+an older binary, a slot `PEERS` does not name, a key the cluster refuses,
+which its leader logs), replace it by hand, addition first:
+
+1. Stop the node and give it a new key (see
+   [A node that comes back](#a-node-that-comes-back)).
+2. On its empty data directory, `forgejo cluster init` (with `--cluster`
+   when `CLUSTER_ID` is empty); it prints the member line, then start the
+   server.
+3. In the administration, "Add a learner" with that line: the engine adds
+   it under the slot the old id still holds.
+4. "Promote" it once it caught up: four voters.
+5. "Remove" the old id: three voters again, and its key is revoked.
+
+In the autonomous mode the autopilot does steps 4 and 5 once the learner
+is added. The cluster never lists fewer than three voters.
+
+## A node that comes back
+
+A key serves one node id for the life of the cluster. A node that takes a
+new id takes a new key first, whatever the reason: its data directory was
+lost or wiped, the autopilot removed it as a dead member and it rejoins, or
+it replaces a lost voter of three. The cluster refuses the old key at the
+JOIN, under any id: an operator's Remove or Deny pin revokes it, and the
+autopilot's removal of a dead member marks it (from payload version 7). A
+node that came back with the key of a removed member would otherwise be
+refused as leader by every node whose configuration still lists the
+removed member under that key (kitsunium/sdk#648); from the engine's
+protocol 3, the engine refuses that key too.
+
+**With `RENEW_VAULT_ADDR`** the node does it by itself. Before it stamps a
+new id (at start-up on an empty data directory in the autonomous mode,
+before it rejoins under a new id, and in `forgejo cluster init`), it makes
+a new key on the host, of the kind of the old one, has Vault sign it for
+its slot under the same URI SAN, checks the certificate as a renewal does,
+and installs both. While Vault refuses, nothing is stamped and the node
+asks again; at start-up its hello says meanwhile that it has not read its
+data directory, so nothing is founded without it. A key kept in a file of
+its own is replaced key first, both written aside beforehand: a stop in
+between is completed at the next start, and a stop before leaves the old
+pair whole. This includes the first start of a founder.
+
+**Without `RENEW_VAULT_ADDR`** (cert-manager, keys installed by hand) the
+operator gives the node its new key:
+
+1. Make a new key and have the CA sign it for the slot: with cert-manager,
+   delete the node's Secret, so that it draws a new key despite
+   `rotationPolicy: Never`; by hand, as for the first certificate.
+2. Install the pair in `TLS_KEY_FILE` and `TLS_CERT_FILE`.
+3. A node the autopilot removed does not rejoin until it reads a key other
+   than the one its retired id held, and logs why; it rejoins as soon as it
+   reads one, restarted or not. A
+   node on an empty data directory stamps its new id with the key in
+   place, which the cluster refuses when a member holds or held it:
+   restart it once the new key is installed. Its consensus engine keeps
+   the key it opened with, so only a restart makes it present the new one,
+   and until then the leader does not take it for the replacement of its
+   slot.
+
+A node that stamped its new id under its old key, by an older binary or
+before `RENEW_VAULT_ADDR` was set, keeps it: install a new key and restart
+it, or empty its data directory again once `RENEW_VAULT_ADDR` is set.
+Update `PEER_PINS` on the nodes that pin a key that changed.
+
+While a member still runs a binary from before this rule, the autopilot of
+a leader on this version still marks the key of a dead member it removes:
+a node of the older binary removed so does not come back with its old key.
+Upgrade it, and empty its data directory or give it a new key.
 
 ## The administration page
 

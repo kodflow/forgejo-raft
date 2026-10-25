@@ -5,8 +5,10 @@ package cluster
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"time"
 
@@ -43,8 +45,10 @@ func (a *autoMode) admits(slot string, eng consensus.Engine) error {
 // node sees (the status's "since"), and
 //
 //   - on the leader, removes a member out of reach for DEAD_MEMBER_TIMEOUT
-//     while three voters remain (a learner always), or promotes the eldest
-//     learner ready to vote, two at once from one voter;
+//     while three voters remain (a learner always), and marks its key;
+//     adds the new id of a lost voter of three, under its slot; or
+//     promotes the eldest learner ready to vote, two at once from one
+//     voter;
 //   - elsewhere, rejoins under a new id once a quorum says this node's id
 //     is retired.
 //
@@ -93,11 +97,14 @@ func (r *Replicator) autopilotStep(ctx context.Context) {
 		return
 	}
 	if id, ok := r.deadMember(eng, m); ok {
-		r.autoChange(pctx, ActionRemove, id, "out of reach for DEAD_MEMBER_TIMEOUT", eng.Remove)
+		r.removeDead(pctx, eng, id)
 		return
 	}
 	if id, ok := r.revokedLearner(m); ok {
 		r.autoChange(pctx, ActionRemove, id, "its key was revoked", eng.Remove)
+		return
+	}
+	if r.replaceLost(pctx, eng, m) {
 		return
 	}
 	if ids := NextPromotion(m, r.promotable(pctx, eng)); len(ids) > 0 {
@@ -171,6 +178,232 @@ func (r *Replicator) autoChange(ctx context.Context, action Action, id consensus
 	log.Warn("cluster: autopilot: %s %s: %s", action, id, why)
 	r.audit(ctx, autopilotOperator, Operation{Action: action, Target: id.String()}, "ok", why)
 	return true
+}
+
+// deadWhy is what the autopilot records of the removal of a dead member.
+const deadWhy = "out of reach for DEAD_MEMBER_TIMEOUT"
+
+// markBackoff is how long the autopilot waits before it marks again the key
+// of a dead member whose removal the engine refused for certain.
+var markBackoff = time.Minute
+
+// autoNow is the autopilot's clock, the wall clock without one.
+func (r *Replicator) autoNow() time.Time {
+	if r.auto != nil && r.auto.now != nil {
+		return r.auto.now()
+	}
+	return time.Now()
+}
+
+// removeDead removes a member out of reach for DEAD_MEMBER_TIMEOUT, and
+// marks its key as one never admitted again (#209): the member comes back
+// under a new id with a new key (newkey.go), never with this one. The mark
+// is an operator's revocation, asked the same way (revokeMember): the
+// request commits before the change, so the JOIN refuses the key from the
+// moment the member is gone, and the revocation is written once no member
+// holds the key (flushRevocations), so a member left in place is never cut
+// off (#64). A change the engine refuses for certain withdraws its request
+// and leaves no effect (#171); one whose outcome is unknown keeps it, as it
+// may have been made (#165).
+//
+// A removal the engine refused for certain wrote a request and its
+// withdrawal: it is tried again only after markBackoff, so a refusal that
+// lasts never floods the replicated audit, which keeps the newest records
+// only.
+//
+// Below reftable.WithdrawVersion a refused change cannot withdraw its
+// request, since some member's binary does not apply the withdrawal: the
+// removal then asks nothing, as before, and the node's own rule still
+// keeps the key from coming back (keyForRejoin).
+func (r *Replicator) removeDead(ctx context.Context, eng consensus.Engine, id consensus.NodeID) bool {
+	if r.table.WriteVersion() < reftable.WithdrawVersion {
+		return r.autoChange(ctx, ActionRemove, id, deadWhy, eng.Remove)
+	}
+	now := r.autoNow()
+	if at, ok := r.markRefused[id]; ok && now.Sub(at) < markBackoff {
+		return false
+	}
+	marked := false
+	removed := r.autoChange(ctx, ActionRemove, id, deadWhy+"; its key is not admitted again", func(ctx context.Context, op consensus.Operator, id consensus.NodeID) error {
+		m := eng.Membership()
+		if i := Rank(m, id) - 1; i >= 0 && r.revokedOrAsked(m.Members[i].SPKI) {
+			// A request already open for the key, an operator's or one of
+			// an earlier pass whose outcome was unknown, refuses it at the
+			// JOIN: the removal records none of its own, so a removal
+			// retried at each pass never piles requests up, and withdraws
+			// none it did not record.
+			if err := eng.Remove(ctx, op, id); err != nil {
+				return err
+			}
+			marked = true
+			return nil
+		}
+		k, asked, request, err := r.revokeMember(ctx, eng, op, id)
+		if err != nil {
+			return err
+		}
+		if err := eng.Remove(ctx, op, id); err != nil {
+			if asked {
+				r.settleRefusedRevocation(ctx, eng, ActionRemove, id, k, request, err)
+				if changeRefused(err) {
+					if r.markRefused == nil {
+						r.markRefused = map[consensus.NodeID]time.Time{}
+					}
+					r.markRefused[id] = now
+				}
+			}
+			return err
+		}
+		marked = asked
+		return nil
+	})
+	if removed {
+		delete(r.markRefused, id)
+	}
+	if removed && marked {
+		// Written now that no member holds the key, else at a later pass.
+		if err := r.flushRevocations(ctx); err != nil {
+			log.Debug("cluster: autopilot: the revocation of the key of %s is written at a later pass: %v", id, err)
+		}
+	}
+	return removed
+}
+
+// replaceLost is the autonomous repair of a voter whose data directory was
+// lost while the cluster holds three voters (#186, decision A). The node
+// comes back under a new id, its old id holding the slot: the engine
+// refuses its JOIN (one slot, one member), and the floor of three voters
+// keeps the old id from being removed (Removable), so the cluster would
+// stay at a fault tolerance of 0 for good. The leader adds the new id
+// itself, as a learner under the same slot, once
+//
+//   - the node at the slot's address in PEERS answers as joining, over the
+//     object channel under a certificate of the cluster's CA for that slot,
+//     with the id and incarnation of its stamp (replaceVoter);
+//   - the voter holding the slot has been out of the leader's reach for
+//     DEAD_MEMBER_TIMEOUT;
+//   - its key is neither revoked nor asked for revocation, no member holds
+//     it, and it passes what a JOIN through the CA passes (replacement).
+//
+// The autopilot then promotes it, four voters, and removes the old id at a
+// later pass, three again: the membership never lists fewer than three
+// voters, and no format changes. The joiner's JOIN, then answered as a
+// member's, completes. Its key is a new one (newkey.go): the old id holds
+// its old key, and marks it once removed (removeDead).
+func (r *Replicator) replaceLost(ctx context.Context, eng consensus.Engine, m consensus.Membership) bool {
+	if len(m.Members) > r.auto.expected || r.auto.probe == nil {
+		// A replacement already stands by, or a member above the size: it
+		// is promoted, and the old id removed, before anything else.
+		return false
+	}
+	now := r.auto.now()
+	for _, old := range m.Members {
+		since, ok := r.dead[old.ID]
+		if !ok || !old.Voter || now.Sub(since) < r.auto.deadTimeout || Removable(m, old.ID) {
+			continue
+		}
+		if r.replaceVoter(ctx, eng, m, old) {
+			return true
+		}
+	}
+	return false
+}
+
+// replaceVoter asks the node at the address PEERS gives the slot of old, a
+// lost voter, who it is, and adds it as old's replacement when it is one.
+// Only that slot is asked: the voter that does not answer is the one whose
+// address may keep the probe waiting, at each pass.
+func (r *Replicator) replaceVoter(ctx context.Context, eng consensus.Engine, m consensus.Membership, old consensus.Member) bool {
+	addr, ok := r.auto.peers[old.Slot]
+	if !ok {
+		r.noteReplace(fmt.Sprintf("cluster: autopilot: %s, out of reach for DEAD_MEMBER_TIMEOUT, holds slot %s, which PEERS does not name: it is not replaced by itself", old.ID, old.Slot))
+		return false
+	}
+	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	h, err := r.auto.probe(pctx, addr, old.Slot)
+	cancel()
+	if err != nil || h.Slot != old.Slot || h.State != helloJoining {
+		// Nothing joins under that slot yet, or the certificate at that
+		// address names another slot.
+		return false
+	}
+	if h.Address == "" {
+		h.Address = addr
+	}
+	x, err := r.replacement(ctx, eng, m, h)
+	if err != nil {
+		r.noteReplace(fmt.Sprintf("cluster: autopilot: the node joining slot %s does not replace %s, out of reach for DEAD_MEMBER_TIMEOUT: %v", h.Slot, old.ID, err))
+		return false
+	}
+	why := fmt.Sprintf("replaces %s of slot %s, out of reach for DEAD_MEMBER_TIMEOUT", old.ID, old.Slot)
+	var refused error
+	if r.autoChange(ctx, ActionAddLearner, x.ID, why, func(ctx context.Context, op consensus.Operator, _ consensus.NodeID) error {
+		refused = eng.AddLearner(ctx, op, x)
+		return refused
+	}) {
+		r.auto.replaceNoted = ""
+		return true
+	}
+	r.noteReplace(fmt.Sprintf("cluster: autopilot: adding %s, the node joining slot %s, in place of %s: %v; retried", x.ID, h.Slot, old.ID, refused))
+	return false
+}
+
+// replacement checks a joining hello for the replacement of a lost voter,
+// as authorizeJoin checks a JOIN admitted on the CA, and returns the
+// learner to add.
+func (r *Replicator) replacement(ctx context.Context, eng consensus.Engine, m consensus.Membership, h hello) (consensus.Member, error) {
+	id, err := ParseNodeID(h.Node)
+	if err != nil {
+		return consensus.Member{}, fmt.Errorf("its hello names no node id: %w", err)
+	}
+	var inc consensus.Incarnation
+	b, err := hex.DecodeString(h.Incarnation)
+	if err != nil || len(b) != len(inc) {
+		return consensus.Member{}, errors.New("its hello carries no incarnation: its binary does not replace a lost voter by itself, or its key changed since its consensus node opened and it waits for a restart")
+	}
+	copy(inc[:], b)
+	if Rank(m, id) > 0 || slices.Contains(m.Retired, id) {
+		return consensus.Member{}, fmt.Errorf("node id %s is a member, or retired", id)
+	}
+	if _, _, err := net.SplitHostPort(h.Address); err != nil {
+		return consensus.Member{}, fmt.Errorf("its address: %w", err)
+	}
+	spki := hex.EncodeToString(h.SPKI[:])
+	if h.SPKI == ([32]byte{}) || holdsKey(m, spki) {
+		return consensus.Member{}, errors.New("it presents the key of a member, its old id's: a node that takes a new id needs a new key, made by the renewer (RENEW_VAULT_ADDR) before its new id is stamped, or installed by an operator, the node then restarted")
+	}
+	// The revocations are read once this node's table applied a commit
+	// boundary a quorum confirmed, as for a JOIN (#70).
+	if err := r.appliedToBoundary(ctx); err != nil {
+		return consensus.Member{}, fmt.Errorf("the cluster state cannot be confirmed on this node: %w", err)
+	}
+	if r.table.KeyRevoked(spki) || r.revocationAsked(spki) {
+		return consensus.Member{}, errors.New("its key was revoked, or its revocation is asked")
+	}
+	if g, ok := r.table.JoinGrant(h.Slot); ok && g.SPKI != "" && g.SPKI != spki {
+		return consensus.Member{}, fmt.Errorf("slot %s was granted to another key", h.Slot)
+	}
+	if err := r.auto.admits(h.Slot, eng); err != nil {
+		return consensus.Member{}, err
+	}
+	if v := r.table.WriteVersion(); v > reftable.BaseVersion && !appliesVersion(h, v) {
+		return consensus.Member{}, fmt.Errorf("its binary applies payload version %d, the cluster writes %d", max(h.Payload, reftable.BaseVersion), v)
+	}
+	if gate := r.nomadGate(); gate != nil {
+		if err := gate.CheckJoin(ctx, h.Slot, h.Address); err != nil {
+			return consensus.Member{}, err
+		}
+	}
+	return consensus.Member{ID: id, Incarnation: inc, Slot: h.Slot, SPKI: h.SPKI, Address: h.Address}, nil
+}
+
+// noteReplace logs why a lost voter is not replaced, once for each reason.
+func (r *Replicator) noteReplace(why string) {
+	if why == r.auto.replaceNoted {
+		return
+	}
+	r.auto.replaceNoted = why
+	log.Warn("%s", why)
 }
 
 // revokedLearner names a learner whose key this node's table holds revoked:

@@ -8,13 +8,22 @@
 // jitter, and replaced atomically together with its key when both share one
 // file, so a reload never pairs a new certificate with an old key. Who signs
 // is behind Signer: Vault's pki-consensus/sign/<slot> in production.
+//
+// Rekey is the one exception to the kept key: a node about to take a new
+// node id is given a new key first, made on the host like the old one, so
+// a key serves one node id for the life of the cluster (#209).
 package certrenew
 
 import (
+	"bytes"
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -25,6 +34,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -59,6 +69,11 @@ type Renewer struct {
 	Jitter float64
 	// Now is the clock, time.Now when nil.
 	Now func() time.Time
+
+	// mu keeps a renewal and a rekey of this renewer apart: a renewal that
+	// read the old key and wrote its certificate after a rekey would pair
+	// the new key with a certificate of the old one.
+	mu sync.Mutex
 }
 
 // URISAN is the canonical single URI SAN of a node certificate (D4, R7-41).
@@ -174,10 +189,40 @@ func (r *Renewer) uriSAN() (string, error) {
 // and installs it. The new certificate must carry the same SPKI, the one
 // URI SAN, and chain to the CA.
 func (r *Renewer) RenewNow(ctx context.Context) (*x509.Certificate, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := ResumeRekey(r.CertFile, r.KeyFile); err != nil {
+		return nil, err
+	}
 	key, keyPEM, err := r.key()
 	if err != nil {
 		return nil, err
 	}
+	cert, err := r.signed(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	// Another process (`forgejo cluster cert renew` beside the server) may
+	// have given the node a new key while the signer answered: this
+	// certificate is of the old one, and written it would undo that key or
+	// pair the new key with it.
+	if _, now, err := r.key(); err != nil || !bytes.Equal(now, keyPEM) {
+		return nil, errors.New("the node key changed while its certificate was renewed: nothing is written; renew again")
+	}
+	leafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	out := leafPEM
+	if r.sharedFile() {
+		out = append(append([]byte{}, leafPEM...), keyPEM...)
+	}
+	if err := writeAtomic(r.CertFile, out); err != nil {
+		return nil, err
+	}
+	return cert, nil
+}
+
+// signed has a certificate signed for key, under the URI SAN to ask for,
+// and checks it.
+func (r *Renewer) signed(ctx context.Context, key crypto.Signer) (*x509.Certificate, error) {
 	san, err := r.uriSAN()
 	if err != nil {
 		return nil, err
@@ -196,19 +241,234 @@ func (r *Renewer) RenewNow(ctx context.Context) (*x509.Certificate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("signing the CSR: %w", err)
 	}
-	cert, err := r.check(certPEM, key.Public(), san)
+	return r.check(certPEM, key.Public(), san)
+}
+
+func (r *Renewer) sharedFile() bool {
+	return filepath.Clean(r.CertFile) == filepath.Clean(r.KeyFile)
+}
+
+// Rekey gives the node a new key and its certificate: a key of the kind of
+// the one in use, made on the host, a CSR from it, signed and checked as a
+// renewal is, then both installed. It is for a node about to take a new
+// node id, and only before that id is stamped (#209): a member's own key
+// never changes, since its peers pin it, and the consensus transport of a
+// running engine keeps the key it opened with.
+//
+// Nothing is installed unless the signer's certificate passed every check.
+// One file holding both is replaced at once; two files are replaced key
+// first, both written aside beforehand, so a stop between the two renames
+// leaves the new key and its certificate beside it, which ResumeRekey puts
+// in place, and a stop before them leaves the old pair whole.
+func (r *Renewer) Rekey(ctx context.Context) (*x509.Certificate, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := ResumeRekey(r.CertFile, r.KeyFile); err != nil {
+		return nil, err
+	}
+	old, _, err := r.key()
 	if err != nil {
 		return nil, err
 	}
-	leafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
-	out := leafPEM
-	if filepath.Clean(r.CertFile) == filepath.Clean(r.KeyFile) {
-		out = append(append([]byte{}, leafPEM...), keyPEM...)
+	key, err := newKeyLike(old)
+	if err != nil {
+		return nil, err
 	}
-	if err := writeAtomic(r.CertFile, out); err != nil {
+	cert, err := r.signed(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	leafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	if r.sharedFile() {
+		if err := writeAtomic(r.CertFile, append(append([]byte{}, leafPEM...), keyPEM...)); err != nil {
+			return nil, err
+		}
+		// The caller stamps a new node id next: the rename is made
+		// durable first, so a power loss never leaves that id under the
+		// old key.
+		if err := syncDirs(r.CertFile); err != nil {
+			return nil, err
+		}
+		return cert, nil
+	}
+	if err := installPair(r.CertFile, r.KeyFile, leafPEM, keyPEM); err != nil {
 		return nil, err
 	}
 	return cert, nil
+}
+
+// newKeyLike makes a new key of the kind of old: the same curve, the same
+// modulus size, or Ed25519.
+func newKeyLike(old crypto.Signer) (crypto.Signer, error) {
+	switch k := old.(type) {
+	case *ecdsa.PrivateKey:
+		return ecdsa.GenerateKey(k.Curve, rand.Reader)
+	case *rsa.PrivateKey:
+		return rsa.GenerateKey(rand.Reader, k.N.BitLen())
+	case ed25519.PrivateKey:
+		_, n, err := ed25519.GenerateKey(rand.Reader)
+		return n, err
+	}
+	return nil, fmt.Errorf("the node key is a %T: a new one of that kind cannot be made", old)
+}
+
+// rekeySuffix names the new key and certificate written aside before a
+// rekey puts them in place.
+const rekeySuffix = ".rekey"
+
+// installPair puts a new key and its certificate in place when they live in
+// two files: both written aside and synced, then the key renamed in and
+// made durable, then the certificate. The certificate's rename is never
+// durable without the key's, even on two file systems. Between the two
+// renames the pair on disk does not match: a reader keeps the pair it holds
+// (both the transport and the object channel refuse a pair that does not
+// match), and ResumeRekey completes it after a stop.
+func installPair(certFile, keyFile string, certPEM, keyPEM []byte) error {
+	if err := writeSynced(keyFile+rekeySuffix, keyPEM); err != nil {
+		return err
+	}
+	if err := writeSynced(certFile+rekeySuffix, certPEM); err != nil {
+		_ = os.Remove(keyFile + rekeySuffix)
+		return err
+	}
+	if err := syncDirs(certFile, keyFile); err != nil {
+		_ = os.Remove(keyFile + rekeySuffix)
+		_ = os.Remove(certFile + rekeySuffix)
+		return err
+	}
+	if err := os.Rename(keyFile+rekeySuffix, keyFile); err != nil {
+		_ = os.Remove(keyFile + rekeySuffix)
+		_ = os.Remove(certFile + rekeySuffix)
+		return err
+	}
+	if err := syncDirs(keyFile); err != nil {
+		return fmt.Errorf("the new key is in place and not made durable: %w; the next start completes it", err)
+	}
+	if err := os.Rename(certFile+rekeySuffix, certFile); err != nil {
+		return fmt.Errorf("the new key is in place and its certificate is not: %w; the next start puts it in place", err)
+	}
+	return syncDirs(certFile)
+}
+
+// ResumeRekey completes a rekey a stop interrupted (installPair): when the
+// key file holds the new key and its certificate waits aside, the
+// certificate is put in place. Any other leftover of a rekey is removed:
+// the pair in place is then the old one, whole. It does nothing when no
+// rekey was interrupted, or when the key and the certificate share a file,
+// which a rekey replaces at once.
+func ResumeRekey(certFile, keyFile string) error {
+	if filepath.Clean(certFile) == filepath.Clean(keyFile) {
+		return nil
+	}
+	pending := certFile + rekeySuffix
+	certPEM, err := os.ReadFile(pending)
+	if errors.Is(err, os.ErrNotExist) {
+		return resumeKeyAside(certFile, keyFile)
+	}
+	if err != nil {
+		return err
+	}
+	keyPEM, err := os.ReadFile(keyFile)
+	if err != nil {
+		return err
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err == nil {
+		// The key was renamed in: its certificate follows it.
+		if err := os.Rename(pending, certFile); err != nil {
+			return fmt.Errorf("completing an interrupted key change: %w", err)
+		}
+		if err := removeIfAny(keyFile + rekeySuffix); err != nil {
+			return err
+		}
+		return syncDirs(certFile, keyFile)
+	}
+	// The key was not renamed in: the old pair stands.
+	if err := removeIfAny(keyFile + rekeySuffix); err != nil {
+		return err
+	}
+	return removeIfAny(pending)
+}
+
+// resumeKeyAside settles a new key left aside with no certificate waiting:
+// written before the certificate was (the old pair stands, and it is
+// removed), or, should a file system have kept the certificate's rename and
+// lost the key's, the key of the certificate in place, which it then
+// joins.
+func resumeKeyAside(certFile, keyFile string) error {
+	aside := keyFile + rekeySuffix
+	keyPEM, err := os.ReadFile(aside)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	certPEM, err := os.ReadFile(certFile)
+	if err != nil {
+		return err
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return removeIfAny(aside)
+	}
+	if err := os.Rename(aside, keyFile); err != nil {
+		return fmt.Errorf("completing an interrupted key change: %w", err)
+	}
+	return syncDirs(keyFile)
+}
+
+func removeIfAny(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func writeSynced(path string, b []byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(b)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = os.Remove(path)
+	}
+	return err
+}
+
+// syncDirs makes the renames of a rekey durable, in each directory they
+// happened in.
+func syncDirs(files ...string) error {
+	done := map[string]bool{}
+	for _, f := range files {
+		dir := filepath.Dir(f)
+		if done[dir] {
+			continue
+		}
+		done[dir] = true
+		d, err := os.Open(dir)
+		if err != nil {
+			return err
+		}
+		err = d.Sync()
+		if cerr := d.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *Renewer) check(certPEM []byte, pub crypto.PublicKey, san string) (*x509.Certificate, error) {
