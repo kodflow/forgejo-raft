@@ -585,8 +585,10 @@ These commands run with the server stopped, on the data directory.
   alone (an init the cluster never recorded), are still deleted. A node
   that lost its copy of a repository the table holds, removed by hand or by
   "delete unadopted" before this release, projects it again from the other
-  members at its next start, or at once with
-  `forgejo cluster reproject <owner>/<repo>.git` run on that node.
+  members at its next start. `forgejo cluster reproject <owner>/<repo>.git`,
+  run on that node, schedules that projection without a restart: the
+  node's projector takes it at its next pass, and the copy is back once it
+  fetched the objects from the other members.
   A repository is not created, forked, generated from a template or
   migrated under a name the table holds a repository under, its own or its
   wiki's: the node serving the request reads its table once it applied the
