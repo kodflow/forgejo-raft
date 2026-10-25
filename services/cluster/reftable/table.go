@@ -1401,13 +1401,18 @@ type persisted struct {
 	Renamed  map[string]renameMark           `json:"renamed"`
 	Grants   map[string]JoinGrant            `json:"grants,omitempty"`
 	Revoked  map[string]RevokeKey            `json:"revoked,omitempty"`
-	// PendingRevoke is absent from a snapshot an older member cut: it is
-	// then read back from the audit records kept.
-	PendingRevoke map[string]RevokeKey `json:"pending_revoke,omitempty"`
+	// PendingRevoke is written even empty: an empty map left out read as a
+	// snapshot of a binary older than it, and a request withdrawn on the
+	// log came back from the audit records kept (#223). It is absent from
+	// a snapshot an older member cut, and from one that left it out empty:
+	// below WithdrawVersion it is then read back from the audit records
+	// kept, from it it is empty (Restore).
+	PendingRevoke map[string]RevokeKey `json:"pending_revoke"`
 	// RevokeRequests is absent from a snapshot an older binary cut, which
 	// numbered no request: each key it asked for has one request, 0,
-	// which no withdrawal names, as on a table that replayed the log.
-	RevokeRequests map[string][]uint64 `json:"revoke_requests,omitempty"`
+	// which no withdrawal names, as on a table that replayed the log. It
+	// is written even empty, beside PendingRevoke.
+	RevokeRequests map[string][]uint64 `json:"revoke_requests"`
 	// Pending and Checkpoints are absent from snapshots older than the
 	// checkpoints, which then restore with none.
 	Pending     *pendingCheckpoint `json:"pending,omitempty"`
@@ -1613,9 +1618,22 @@ func (t *Table) Restore(r io.Reader, _ consensus.SnapshotMeta) error {
 	if p.Revoked != nil {
 		nt.revoked = p.Revoked
 	}
-	if p.PendingRevoke != nil {
+	// The map is absent from a snapshot of a binary older than it, and
+	// from one an earlier binary cut empty, which it left out. Below
+	// WithdrawVersion a request left pendingRevoke only once its
+	// revocation was written, in revoked: the audit records kept then say
+	// which requests are pending (#50). From WithdrawVersion a withdrawal
+	// closes a request as well, and leaves no record of it: every binary
+	// that applies it writes the map whenever a request is open, so its
+	// absence means none, and the withdrawn request, whose record the
+	// audit keeps, is not read back (#223). The snapshot's own payload
+	// version tells the two apart: a withdrawal is written once the
+	// cluster raised its version to WithdrawVersion, which every table
+	// that applies it adopted first, at an earlier index.
+	switch {
+	case p.PendingRevoke != nil:
 		nt.pendingRevoke = p.PendingRevoke
-	} else {
+	case p.Payload < WithdrawVersion:
 		for i := range nt.audit {
 			if k, ok := pendingRevocation(&nt.audit[i].Audit); ok {
 				if _, done := nt.revoked[k.SPKI]; !done {
