@@ -12,12 +12,15 @@ import (
 
 	"forgejo.org/models/unittest"
 	"forgejo.org/modules/clusterhook"
+	"forgejo.org/modules/git"
 	api "forgejo.org/modules/structs"
 	"forgejo.org/modules/test"
 	"forgejo.org/modules/web"
+	"forgejo.org/services/authz"
 	"forgejo.org/services/contexttest"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // A branch created through the API on a node of the cluster that reaches no
@@ -91,4 +94,102 @@ func TestRenameBranchRefusedOnANodeBehind(t *testing.T) {
 	assert.Contains(t, resp.Body.String(), "may be behind")
 	assert.True(t, ctx.Repo().GitRepo.IsBranchExist("branch2"))
 	assert.False(t, ctx.Repo().GitRepo.IsBranchExist("renamed-behind"))
+}
+
+// A branch created through the API on a node of the cluster behind on the
+// repository is refused with 503 before its source is read from the node's
+// git: a source the node does not show yet is not answered 500, and nothing
+// is written (#226).
+func TestCreateBranchRefusedOnANodeBehind(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	defer test.MockVariableValue(&clusterWriteRefusal, func(context.Context) error { return nil })()
+	defer test.MockVariableValue(&clusterFresh, behind)()
+
+	ctx, resp := contexttest.MockAPIContext(t, "POST /api/v1/repos/user2/repo1/branches")
+	contexttest.LoadRepo(t, ctx, 1)
+	contexttest.LoadUser(t, ctx, 2)
+	contexttest.LoadGitRepo(t, ctx)
+	defer ctx.Repo().GitRepo.Close()
+	web.SetForm(ctx, &api.CreateBranchRepoOption{BranchName: "refused-behind", OldRefName: "pushed-through-another-node"})
+
+	CreateBranch(ctx)
+
+	assert.Equal(t, http.StatusServiceUnavailable, ctx.Resp.Status())
+	assert.Contains(t, resp.Body.String(), "may be behind")
+	assert.False(t, ctx.Repo().GitRepo.IsBranchExist("refused-behind"))
+}
+
+// The source of a branch created through the API is read once the node
+// serves the repository at the cluster's commit index: the push another
+// node acknowledged, which this node projects while it waits, is the
+// source, not the commit before it (#226).
+func TestCreateBranchReadsItsSourceOnceFresh(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	defer test.MockVariableValue(&clusterWriteRefusal, func(context.Context) error { return nil })()
+
+	for _, opt := range []*api.CreateBranchRepoOption{
+		{BranchName: "from-ref", OldRefName: "master"},
+		{BranchName: "from-branch", OldBranchName: "master"},
+		{BranchName: "from-default"},
+	} {
+		ctx, resp := contexttest.MockAPIContext(t, "POST /api/v1/repos/user2/repo1/branches")
+		contexttest.LoadRepo(t, ctx, 1)
+		contexttest.LoadUser(t, ctx, 2)
+		contexttest.LoadGitRepo(t, ctx)
+		// What the API's authorization sets for a token with full access.
+		ctx.SetReducer(&authz.AllAccessAuthorizationReducer{})
+		gitRepo := ctx.Repo().GitRepo
+		dir := ctx.Repo().Repository.RepoPath()
+		setMaster := func(c context.Context, sha string) error {
+			_, _, err := git.NewCommand(c, "update-ref", "refs/heads/master").AddDynamicArguments(sha).RunStdString(&git.RunOpts{Dir: dir})
+			return err
+		}
+		before, err := gitRepo.GetBranchCommitID("branch2")
+		require.NoError(t, err)
+		pushed, err := gitRepo.GetBranchCommitID("master")
+		require.NoError(t, err)
+		require.NotEqual(t, before, pushed)
+		// This node's git shows master before the push; the push reaches
+		// it while it waits to serve the repository at the cluster's
+		// commit index.
+		require.NoError(t, setMaster(t.Context(), before))
+		restore := test.MockVariableValue(&clusterFresh, func(c context.Context, _ string) error { return setMaster(c, pushed) })
+		web.SetForm(ctx, opt)
+
+		CreateBranch(ctx)
+
+		restore()
+		require.Equal(t, http.StatusCreated, ctx.Resp.Status(), "%s: %s", opt.BranchName, resp.Body.String())
+		got, err := gitRepo.GetBranchCommitID(opt.BranchName)
+		require.NoError(t, err)
+		assert.Equal(t, pushed, got, "%s starts from the commit the push acknowledged", opt.BranchName)
+		gitRepo.Close()
+	}
+}
+
+// Files committed through the API to a new branch, on a node of the
+// cluster behind on the repository, are refused with 503 before the old
+// branch is read from the node's git: the new branch would start from the
+// commit before a push another node acknowledged. Nothing is written
+// (#226).
+func TestChangeFilesRefusedOnANodeBehind(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	clusterhook.SetFreshWaiter(func(context.Context, string) bool { return false })
+	t.Cleanup(func() { clusterhook.SetFreshWaiter(nil) })
+
+	ctx, resp := contexttest.MockAPIContext(t, "POST /api/v1/repos/user2/repo1/contents")
+	contexttest.LoadUser(t, ctx, 2)
+	contexttest.LoadRepo(t, ctx, 1)
+	contexttest.LoadGitRepo(t, ctx)
+	defer ctx.Repo().GitRepo.Close()
+	web.SetForm(ctx, &api.ChangeFilesOptions{
+		BranchName: "master", NewBranchName: "refused-behind",
+		Files: []*api.ChangeFileOperation{{Operation: "create", Path: "refused.txt", ContentBase64: "cmVmdXNlZAo="}},
+	})
+
+	ChangeFiles(ctx)
+
+	assert.Equal(t, http.StatusServiceUnavailable, ctx.Resp.Status())
+	assert.Contains(t, resp.Body.String(), "may be behind")
+	assert.False(t, ctx.Repo().GitRepo.IsBranchExist("refused-behind"))
 }

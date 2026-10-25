@@ -6,6 +6,8 @@ package cluster
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +25,7 @@ import (
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/reftable"
 	repo_service "forgejo.org/services/repository"
+	files_service "forgejo.org/services/repository/files"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -160,6 +163,79 @@ func TestABranchRenamedRightAfterAPushKeepsItsCommitInSQL(t *testing.T) {
 	assert.Positive(t, found, "the consumer's update of the pull requests of the pushed branch passes over pull request 2")
 	pr := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: 2})
 	assert.Equal(t, "lag-to", pr.HeadBranch)
+}
+
+// main moves from c2 to c3 through node-b, acknowledged. A branch created
+// from main right after it started from c2, for the whole cluster (#226):
+// the web form's "create branch from branch" (CreateNewBranch) read the
+// commit in main's SQL row, which the consumer writes after the push, on
+// any node; the files API with a new branch (ChangeRepoFiles) cloned main
+// from node-a's git, behind. Now the form waits for the consumer to derive
+// the push, and the files API for node-a to serve it; each is refused
+// while it does not.
+func TestABranchCreatedRightAfterAPushStartsFromIt(t *testing.T) {
+	tc, a, b, work, _, c2, hold := laggingCluster(t)
+	ctx := db.DefaultContext
+	// The row of main the consumer derived for the push of c2.
+	require.NoError(t, db.Insert(ctx, &git_model.Branch{RepoID: 1, Name: "main", CommitID: c2, CommitMessage: "two", PusherID: 2}))
+	c3 := commit(t, work, "three")
+	push := holdDerivation(t, tc, "refs/heads/main", c3, nil)
+	pushOnB(t, tc, a, b, work, "refs/heads/main", c2, c3)
+
+	withGitThroughReplicator(t, a)
+	freshFrom(t, a)
+	sqlRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	gitRepo, err := gitrepo.OpenRepository(ctx, sqlRepo)
+	require.NoError(t, err)
+	defer gitRepo.Close()
+	changeFiles := func(branch string) error {
+		_, err := files_service.ChangeRepoFiles(ctx, sqlRepo, doer, &files_service.ChangeRepoFilesOptions{
+			OldBranch: "main", NewBranch: branch, Message: "add " + branch,
+			Files: []*files_service.ChangeRepoFile{{Operation: "create", TreePath: branch + ".txt", ContentReader: strings.NewReader(branch)}},
+		})
+		return err
+	}
+	dirA := filepath.Join(a.r.root, filepath.FromSlash(laggingRepo))
+	parent := func(branch string) string {
+		out, err := gitIn(dirA, "rev-parse", "refs/heads/"+branch+"^")
+		require.NoError(t, err)
+		return strings.TrimSpace(out)
+	}
+
+	t.Run("node-a has not projected the push", func(t *testing.T) {
+		err := repo_service.CreateNewBranch(ctx, doer, sqlRepo, gitRepo, "main", "lag-web")
+		require.ErrorIs(t, err, clusterhook.ErrBehind, "the branch was created from main's row, at c2")
+		err = changeFiles("lag-files")
+		require.ErrorIs(t, err, clusterhook.ErrBehind, "the new branch was built on node-a's main, at c2")
+		t.Logf("main: c2=%.10s before the push, c3=%.10s acknowledged", c2, c3)
+		logRefState(t, tc, laggingRepo, "refs/heads/lag-web", "refs/heads/lag-files")
+		for _, ref := range []string{"refs/heads/lag-web", "refs/heads/lag-files"} {
+			v, ok := a.r.table.Get(laggingRepo, ref)
+			assert.False(t, ok && v.Live(), "%s was written", ref)
+		}
+	})
+
+	caughtUp(t, a, hold, "refs/heads/main", c3)
+	t.Run("the consumer has not derived the push", func(t *testing.T) {
+		err := repo_service.CreateNewBranch(ctx, doer, sqlRepo, gitRepo, "main", "lag-web")
+		require.ErrorIs(t, err, clusterhook.ErrBehind, "the branch was created from main's row, at c2")
+		// The files API reads git, which node-a serves now.
+		require.NoError(t, changeFiles("lag-files"))
+		assert.Equal(t, c3, parent("lag-files"), "the new branch is built on the pushed commit")
+	})
+
+	push.derived(t)
+	require.NoError(t, repo_service.CreateNewBranch(ctx, doer, sqlRepo, gitRepo, "main", "lag-web"))
+	for _, m := range tc.nodes {
+		require.Eventually(t, func() bool {
+			v, ok := m.r.table.Get(laggingRepo, "refs/heads/lag-web")
+			return ok && v.Live()
+		}, 10*time.Second, 20*time.Millisecond, "%s", m.slot)
+	}
+	tableAt(t, tc, "refs/heads/lag-web", c3, "the branch created from main starts from the pushed commit")
+	row := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: 1, Name: "main"})
+	assert.Equal(t, c3, row.CommitID, "the consumer derived the push")
 }
 
 // A branch row at another commit than the table's (a push derived under a
