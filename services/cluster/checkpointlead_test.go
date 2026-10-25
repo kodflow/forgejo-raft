@@ -16,6 +16,7 @@ import (
 	"forgejo.org/modules/test"
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/consensus/memraft"
+	"forgejo.org/services/cluster/reftable"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -398,12 +399,13 @@ func newManualBench(t *testing.T, pilotEvery map[string]time.Duration) *manualBe
 					c.notePass(nil)
 					continue
 				}
+				waited := r.table.EventCount() > 0
 				var err error
 				if b.down[slot].Load() {
 					err = errors.New("the database does not answer")
 				}
 				c.notePass(err)
-				r.noteLeaderPass(err)
+				r.noteLeaderPass(err, waited)
 			}
 		})
 	}
@@ -561,17 +563,17 @@ func TestTheManualModeSaysTheNodeCannotDeriveTheSQLUntilItDoes(t *testing.T) {
 	assert.Contains(t, held(later), "could not derive the SQL")
 
 	// With no event, failed passes freeze nothing, and a pass that goes
-	// through read nothing of the SQL; one with events there ends it, and
-	// the pilot keeps it ended.
+	// through read nothing of the SQL; one that began with events ends it,
+	// and the pilot keeps it ended.
 	_, empty := NewForTesting(t.TempDir(), "node-z")
 	z := empty[0]
 	z.consumerFails.Store(int32(yieldAfterPasses))
-	z.noteLeaderPass(down)
+	z.noteLeaderPass(down, false)
 	assert.False(t, z.ckState.sql.stuck, "no event waits: the SQL is not frozen")
 	z.ckState.sql.stuck = true
-	z.noteLeaderPass(nil)
+	z.noteLeaderPass(nil, false)
 	assert.True(t, z.ckState.sql.stuck, "a pass with no event read nothing of the SQL")
-	r.noteLeaderPass(nil)
+	r.noteLeaderPass(nil, true)
 	assert.Zero(t, r.memberHello().SQLYield)
 	r.keepSQLYield(later)
 	assert.Zero(t, r.memberHello().SQLYield)
@@ -581,8 +583,63 @@ func TestTheManualModeSaysTheNodeCannotDeriveTheSQLUntilItDoes(t *testing.T) {
 	r.auto = &autoMode{}
 	r.sqlYield.Store(42)
 	r.consumerFails.Store(int32(yieldAfterPasses))
-	r.noteLeaderPass(down)
+	r.noteLeaderPass(down, true)
 	r.keepSQLYield(later)
 	assert.EqualValues(t, 42, r.memberHello().SQLYield)
+	assert.False(t, r.ckState.sql.stuck)
+}
+
+// The pass that goes through may trim the last event itself: with no
+// margin (AckMargin = 0, or an ended lineage), maybeAck acks the cursor it
+// just moved, and the table holds no event once the pass returns. That
+// pass read the SQL all the same, and ends the claim that the node cannot
+// derive it: what counts is that events waited when it began (#217).
+func TestAPassThatTrimsTheLastEventEndsTheClaim(t *testing.T) {
+	t.Cleanup(test.MockVariableValue(&setting.Cluster.AckMargin, 0))
+	t.Cleanup(test.MockVariableValue(&ackEvery, 1))
+	_, reps := NewForTesting(t.TempDir(), "node-a")
+	r := reps[0]
+	ctx := t.Context()
+	require.NoError(t, r.proposeRepoDelete(ctx, "alice/waiting.git", 1))
+	require.Equal(t, 1, r.table.EventCount())
+
+	store, parked := newSQLStore(), &memParked{}
+	var dbDown atomic.Bool
+	down := errors.New("the database does not answer")
+	c := &consumer{
+		r: r, dbReady: func() bool { return true }, events: r.table.Events,
+		work: func(context.Context, []reftable.Event) error { return nil },
+		cursor: func(ctx context.Context, name string) (*cluster_model.Cursor, error) {
+			if dbDown.Load() {
+				return nil, down
+			}
+			return store.get(ctx, name)
+		},
+		advance:     store.advance,
+		tx:          func(ctx context.Context, f func(context.Context) error) error { return f(ctx) },
+		durable:     func(context.Context) (bool, string) { return true, "" },
+		projectedAt: func(string) uint64 { return 1 << 62 },
+		lastAck:     map[string]uint64{}, failures: map[uint64]int{}, reasons: map[uint64]string{}, seen: map[string]int64{},
+	}
+	c.ack = func(ctx context.Context, lineage string, index uint64) error {
+		data, err := reftable.Encode(reftable.KindAck, &reftable.Ack{Identity: lineage, Index: index})
+		if err != nil {
+			return err
+		}
+		_, _, err = r.proposeCommand(ctx, data, nil)
+		return err
+	}
+	parked.wire(c)
+
+	dbDown.Store(true)
+	for range yieldAfterPasses {
+		require.ErrorIs(t, c.step(ctx), down)
+	}
+	require.NotZero(t, r.memberHello().SQLYield, "the node says it cannot derive the SQL")
+
+	dbDown.Store(false)
+	require.NoError(t, c.step(ctx))
+	require.Zero(t, r.table.EventCount(), "the pass that went through trimmed the last event")
+	assert.Zero(t, r.memberHello().SQLYield, "and it ends the claim")
 	assert.False(t, r.ckState.sql.stuck)
 }

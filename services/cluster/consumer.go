@@ -511,10 +511,11 @@ func (c *consumer) step(ctx context.Context) error {
 	if !c.dbReady() || c.r.writerGate(eng) != nil {
 		return nil
 	}
+	waited := c.r.table.EventCount() > 0
 	err := c.pass(ctx)
 	if ctx.Err() == nil {
 		c.notePass(err)
-		c.r.noteLeaderPass(err) // the manual mode's hand-over (#217)
+		c.r.noteLeaderPass(err, waited) // the manual mode's hand-over (#217)
 	}
 	return err
 }

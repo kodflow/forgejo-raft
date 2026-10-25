@@ -62,8 +62,8 @@ var checkpointHandBack = time.Hour
 // from, and the SQL stayed frozen for the whole cluster (#217). Each member
 // therefore says it in the manual mode: from the pass of its consumer, as
 // the leader, that makes yieldAfterPasses failed in a row while events wait,
-// until one of its passes, as the leader again, goes through while events
-// are there, its hello's sql_yield is the time of its last failed pass or of
+// until one of its passes, as the leader again, that began with events goes
+// through, its hello's sql_yield is the time of its last failed pass or of
 // its pilot's last tick. Only the leader runs the consumer, so a follower
 // cannot know better, and its pilot keeps the time fresh. takerHold then
 // keeps the leadership away from it for as long as it says so, on a leader
@@ -89,10 +89,14 @@ func (r *Replicator) cannotDeriveSQL() bool {
 }
 
 // noteLeaderPass is, in the manual mode, the word of the consumer's pass on
-// this node, as the leader, that ended with err (consumerFails counted): it
-// cannot derive the SQL once yieldAfterPasses failed in a row while events
-// wait, and it can again once a pass goes through while events are there.
-func (r *Replicator) noteLeaderPass(err error) {
+// this node, as the leader, that ended with err (consumerFails counted),
+// waited saying whether events were in the table when it began: it cannot
+// derive the SQL once yieldAfterPasses failed in a row while events wait,
+// and it can again once a pass that began with events goes through. Not
+// the table once it returns: with no margin (AckMargin = 0, or an ended
+// lineage), that pass may trim the last event itself, after reading the
+// SQL all the same.
+func (r *Replicator) noteLeaderPass(err error, waited bool) {
 	if r.auto != nil {
 		return
 	}
@@ -106,7 +110,7 @@ func (r *Replicator) noteLeaderPass(err error) {
 		}
 		s.stuck = true
 		r.sqlYield.Store(r.clock().Unix())
-	case err == nil && s.stuck && r.table.EventCount() > 0:
+	case err == nil && s.stuck && waited:
 		s.stuck = false
 		r.sqlYield.Store(0)
 		log.Warn("cluster: this leader derives the SQL again: its hello no longer says it cannot")
