@@ -73,6 +73,18 @@ func IsStaleCreate(err error) bool {
 	return err != nil && strings.Contains(err.Error(), StaleCreateMark)
 }
 
+// KeyHeldMark is in the replicator's refusal of git init's HEAD, written
+// in a directory that holds no ref, under a key whose refs the table
+// holds alive: the message reaches Forgejo only as git's error output.
+const KeyHeldMark = "holds refs in the cluster that this directory does not"
+
+// IsKeyHeld reports whether err is a git command's failure on that
+// refusal: the cluster wrote nothing of it, and the key is another
+// repository's, which a failed creation's cleanup must not delete.
+func IsKeyHeld(err error) bool {
+	return err != nil && strings.Contains(err.Error(), KeyHeldMark)
+}
+
 // NewNonce draws a 128-bit nonce from crypto/rand.
 func NewNonce() string {
 	var b [16]byte
@@ -598,6 +610,60 @@ func RepoRenameRefusal(ctx context.Context, owner, name string) error {
 		return nil
 	}
 	return f(ctx, RepoKey(owner, name, false))
+}
+
+// ErrRepoHeld is the refusal of a name the replicated table holds a
+// repository under, a live ref at least, which the database does not
+// know: an orphan `forgejo cluster reconcile` reports, its refs and
+// objects kept on every member (#245).
+var ErrRepoHeld = errors.New("the cluster holds a repository under this name, which the database does not know")
+
+var checkHeld func(ctx context.Context, keys []string) error
+
+// SetRepoHeldCheck registers the replicator's check that the table holds
+// no repository under keys: nil when it holds none, an error wrapping
+// ErrRepoHeld when it holds one.
+func SetRepoHeldCheck(f func(ctx context.Context, keys []string) error) {
+	lifecycleMu.Lock()
+	checkHeld = f
+	lifecycleMu.Unlock()
+}
+
+func heldRefusal(ctx context.Context, keys ...string) error {
+	lifecycleMu.RLock()
+	f := checkHeld
+	lifecycleMu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	return f(ctx, keys)
+}
+
+// RepoCreateRefusal refuses the creation of the repository owner/name,
+// an error wrapping ErrRepoHeld, while the replicated table holds a
+// repository under its key or its wiki's. Forgejo checks the name against
+// its own disk only, and a node that lost its copy of an orphan, or whose
+// projection is behind, finds it free: the new repository took the
+// orphan's live key, served its refs and objects under its own rights,
+// or was refused on every node for the orphan's ID (#245). Forgejo asks
+// it before it writes anything, once SQL found the name free. It reads
+// this node's table once a commit boundary a quorum confirmed is applied,
+// and refuses the creation when the node cannot confirm one within ctx.
+// It is always nil without a cluster.
+func RepoCreateRefusal(ctx context.Context, owner, name string) error {
+	return heldRefusal(ctx, RepoKey(owner, name, false), RepoKey(owner, name, true))
+}
+
+// UnadoptedDeleteRefusal refuses the deletion of the files of the
+// unadopted repository owner/name, an error wrapping ErrRepoHeld, while
+// the replicated table holds it: they are the cluster's, on every member,
+// and removing this node's copy deletes nothing from the cluster. The
+// node, its copy gone and the key unchanged, would not project it again,
+// and would take the name for free (#245). Files the table does not hold,
+// on this node's disk alone, are not refused. It reads the table as
+// RepoCreateRefusal does. It is always nil without a cluster.
+func UnadoptedDeleteRefusal(ctx context.Context, owner, name string) error {
+	return heldRefusal(ctx, RepoKey(owner, name, false))
 }
 
 // ---- the checkpoint's cut ----

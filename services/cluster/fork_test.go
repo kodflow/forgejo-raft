@@ -107,9 +107,11 @@ func withGitThroughReplicator(t *testing.T, n *testNode) {
 
 	clusterhook.SetEnabled(true)
 	clusterhook.SetRepoLifecycle(n.r.proposeRepoDelete, n.r.proposeRepoMoves)
+	clusterhook.SetRepoHeldCheck(n.r.heldRefusal)
 	t.Cleanup(func() {
 		clusterhook.SetEnabled(false)
 		clusterhook.SetRepoLifecycle(nil, nil)
+		clusterhook.SetRepoHeldCheck(nil)
 	})
 	t.Cleanup(test.MockVariableValue(&setting.RepoRootPath, n.r.root))
 }

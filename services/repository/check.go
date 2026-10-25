@@ -198,7 +198,7 @@ func gatherMissingRepoRecords(ctx context.Context) (repo_model.RepositoryList, e
 
 // ErrMissingReposInCluster refuses the maintenance of repositories whose
 // Git files are missing on a node of a cluster.
-var ErrMissingReposInCluster = errors.New("in a cluster, a repository missing from this node's disk is not missing: the cluster projects it again from the other members. Deleting or reinitializing it here would act on every member (forgejo cluster reconcile compares the database with the cluster instead)")
+var ErrMissingReposInCluster = errors.New("in a cluster, a repository missing from this node's disk is not missing: the other members keep it, and this node projects it again from them, at its start or with `forgejo cluster reproject <owner>/<repo>.git`. Deleting or reinitializing it here would act on every member (forgejo cluster reconcile compares the database with the cluster instead)")
 
 // missingReposRefused refuses, on a node of a cluster, to judge a
 // repository missing from the local disk alone: a member that lags, was

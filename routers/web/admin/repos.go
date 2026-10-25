@@ -4,6 +4,7 @@
 package admin
 
 import (
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -154,10 +155,17 @@ func AdoptOrDeleteRepository(ctx *context.Context) {
 		ctx.Flash.Success(ctx.Tr("repo.adopt_preexisting_success", dir))
 	} else if action == "delete" {
 		if err := repo_service.DeleteUnadoptedRepository(ctx, ctx.Doer, ctxUser, dirSplit[1]); err != nil {
-			ctx.ServerError("repository.AdoptRepository", err)
-			return
+			// In a cluster, the files of a repository the cluster holds are
+			// refused, with the procedure that deletes it from the cluster
+			// (#245).
+			if !errors.Is(err, repo_service.ErrUnadoptedInCluster) {
+				ctx.ServerError("repository.AdoptRepository", err)
+				return
+			}
+			ctx.Flash.Error(err.Error())
+		} else {
+			ctx.Flash.Success(ctx.Tr("repo.delete_preexisting_success", dir))
 		}
-		ctx.Flash.Success(ctx.Tr("repo.delete_preexisting_success", dir))
 	}
 	ctx.Redirect(setting.AppSubURL + "/admin/repos/unadopted?search=true&q=" + url.QueryEscape(q) + "&page=" + url.QueryEscape(page))
 }
