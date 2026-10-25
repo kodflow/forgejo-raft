@@ -160,7 +160,7 @@ on at least one voter.
 | `TLS_CERT_FILE` | none, required | The node's certificate. It may hold the key too. |
 | `TLS_KEY_FILE` | `TLS_CERT_FILE` | The node's key. |
 | `TLS_CA_FILE` | none, required | The cluster's CA. |
-| `DATA_DIR` | `<APP_DATA_PATH>/cluster` | The log and snapshots, never on a tmpfs, and never restored from a backup: a restored directory comes back under the same id and incarnation with a log that went back, and an acknowledged write is lost. A lost directory is replaced by an empty one, which joins under a new id, or by `forgejo cluster restore`. `forgejo dump` leaves it out. |
+| `DATA_DIR` | `<APP_DATA_PATH>/cluster` | The log and snapshots, never on a tmpfs, and never restored from a backup: a restored directory comes back under the same id and incarnation with a log that went back, and an acknowledged write is lost. A lost directory is replaced by an empty one, under which the node comes back with a new id (see [Adding or replacing a node](#adding-or-replacing-a-node)), or by `forgejo cluster restore`. `forgejo dump` leaves it out. |
 | `HOOK_SOCKET` | `<APP_DATA_PATH>/cluster-run/hook.sock` | The private socket of the git hooks and of `forgejo cluster`. 103 bytes at most. |
 | `OPERATORS` | empty | Bootstrap only: these site administrators get the operator permission while nobody holds it. |
 | `STEP_UP_MAX_AGE` | `5m` | How long a re-authentication allows further operations. |
@@ -228,6 +228,18 @@ grants a join.
   never deleted), stamps a new id, joins as a learner through the CA
   admission, catches up, and is made a voter again. Its repositories are
   left as they are; the projector and the object channel bring them in line.
+- **A voter of three whose data directory is lost** comes back on an empty
+  directory under a new id, while its old id still holds the slot: the
+  engine refuses its JOIN, and the floor of three voters keeps the old id
+  from being removed. The leader replaces it by itself, once the old id has
+  been out of its reach for `DEAD_MEMBER_TIMEOUT`, the node at the slot's
+  address in `PEERS` answers as joining under a certificate of the CA for
+  that slot, and its key is new: neither a member's, nor revoked, nor asked
+  for revocation. The leader adds the new id as a learner under the same
+  slot, promotes it once it caught up (four voters), then removes the old
+  id (three again): the membership never lists fewer than three voters.
+  Fault tolerance stays at 0 until the new voter votes, as it is from the
+  moment the disk is lost.
 - **Joining** needs no grant: a node presenting a certificate of this
   cluster's CA, for a slot `PEERS` names and that has no member, is admitted
   as a learner. A cluster admits one member above its size, for a
@@ -358,6 +370,29 @@ The steps for the node that joins:
    objects are missing.
 4. "Promote" the learner once it caught up.
 5. "Transfer leadership" if the old node leads, then "Remove" the old one.
+
+**The data directory of a voter is lost** (a disk replaced, or
+`forgejo cluster quarantine clear --exit wipe-and-rejoin`). The node keeps
+its slot and comes back under a new id and a new key, while its old id
+still holds the slot: the JOIN of the new id is refused, and at three
+voters the old id cannot be removed first. In the autonomous mode the
+leader replaces it by itself (see [The autonomous mode](#the-autonomous-mode)).
+Otherwise, in the manual mode, or when the autopilot does not (a joiner on
+an older binary, a slot `PEERS` does not name, a key the cluster refuses,
+which its leader logs), replace it by hand, addition first:
+
+1. Stop the node. Its new id needs a key no member holds: install a new
+   key and its certificate, signed by the cluster's CA for the slot.
+2. On its empty data directory, `forgejo cluster init` (with `--cluster`
+   when `CLUSTER_ID` is empty); it prints the member line, then start the
+   server.
+3. In the administration, "Add a learner" with that line: the engine adds
+   it under the slot the old id still holds.
+4. "Promote" it once it caught up: four voters.
+5. "Remove" the old id: three voters again, and its key is revoked.
+
+In the autonomous mode the autopilot does steps 4 and 5 once the learner
+is added. The cluster never lists fewer than three voters.
 
 ## The administration page
 

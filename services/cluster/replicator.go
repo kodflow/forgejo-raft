@@ -397,11 +397,11 @@ func (r *Replicator) rejoinUnderNewID(ctx context.Context, driver consensus.Driv
 		return err
 	}
 	log.Warn("cluster: the retired data directory is kept at %s", moved)
-	id, _, err := driver.Init(cfg.DataDir, cluster, cfg.Slot)
+	id, inc, err := driver.Init(cfg.DataDir, cluster, cfg.Slot)
 	if err != nil {
 		return fmt.Errorf("stamping a new id: %w", err)
 	}
-	r.auto.noteDisk(false)
+	r.auto.noteJoining(id, inc)
 	r.resetForRejoin()
 	eng, err := driver.Open(r.ctx, cfg)
 	if err != nil {
