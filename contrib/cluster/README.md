@@ -93,6 +93,22 @@ repository through SQL's redirects: the table may not hold the renames it
 went through, and a recovery from an observer starts a new table with none.
 The table alone judges the events of its own lineage.
 
+A parked event whose repository the leader alone cannot project (its own
+copy damaged while the other members project it) is applied by no retry,
+nor by `reconcile --apply`, for as long as that node leads, and the whole
+queue waits behind it. The leader logs it once, `cluster:parked_events`
+names it, and `forgejo cluster parked list`, asked on the leader, says it
+under `waits`. Once the leader's retries have found it so for five minutes,
+the autopilot of the autonomous mode hands the leadership to a voter that
+answers, on its object channel, that it projects the repository at the
+event's index, at most once every five minutes, and that voter applies it.
+It never hands it to a voter that does not say so, a member on an older
+binary included: the leadership does not go round for a repository no
+member projects. In the manual mode, transfer the leadership to a member
+that projects it: the leader's hello says, from then on, that it could not
+derive the SQL, so the leadership is not handed back to it for its
+checkpoints within the hour.
+
 A parked event that can never succeed (its repository or pusher ID was
 reissued) is given up by an operator, never silently:
 

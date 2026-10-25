@@ -126,6 +126,13 @@ type consumer struct {
 		waited time.Duration
 		last   time.Time
 	}
+	// unprojected are the parked entries of the table's lineage that this
+	// node's last retry, as the leader, left parked because their
+	// repository is not projected here at their index, each since when it
+	// first found it so (#249); reset when the node stops leading, and at
+	// each term it leads (unprojectedTerm).
+	unprojected     []parkedWait
+	unprojectedTerm uint64
 	// waitsBehind reports a repository whose projection waits behind
 	// another repository's in the projector's serial pass; nil in tests.
 	waitsBehind func(repo string) bool
@@ -339,6 +346,7 @@ func (c *consumer) forget() {
 	c.stalledOut = map[string]bool{}
 	c.stall.index, c.stall.repo = 0, ""
 	c.lacking = nil
+	c.unprojected = nil
 }
 
 // projected reports whether the events of one entry are projected on this
@@ -552,8 +560,19 @@ func (c *consumer) step(ctx context.Context) error {
 		c.offNoted = false
 		// The members' answers are asked again by the next leadership.
 		c.lacking = nil
+		// Only the leader's own retries say what waits for its projection.
+		c.unprojected = nil
 		c.mu.Unlock()
 		return nil
+	}
+	if term := eng.Status().Term; term != 0 {
+		c.mu.Lock()
+		if c.unprojectedTerm != term {
+			// A leadership won again, lost in between: its retries find
+			// again what waits for its projection, from now.
+			c.unprojected, c.unprojectedTerm = nil, term
+		}
+		c.mu.Unlock()
 	}
 	if !c.dbReady() || c.r.writerGate(eng) != nil {
 		return nil
@@ -670,8 +689,11 @@ func (c *consumer) pass(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 	if due {
-		if _, err := c.retryParked(ctx); err != nil {
+		var waits []parkedWait
+		if _, err := c.retryParkedNoting(ctx, &waits); err != nil {
 			log.Warn("cluster consumer: retrying the parked events: %v", err)
+		} else if ctx.Err() == nil {
+			c.noteUnprojected(waits)
 		}
 	}
 	tails := lastIndexes(events)
@@ -1136,6 +1158,13 @@ func lostCommitsOf(ctx context.Context) map[string]bool {
 // it is applied exactly once. A repository whose entry fails or is not
 // projected yet keeps its later entries parked, in order.
 func (c *consumer) retryParked(ctx context.Context) (int, error) {
+	return c.retryParkedNoting(ctx, nil)
+}
+
+// retryParkedNoting is retryParked, and appends to waits, when it is not
+// nil, each entry of the table's lineage it left parked because its
+// repository is not projected on this node at its index.
+func (c *consumer) retryParkedNoting(ctx context.Context, waits *[]parkedWait) (int, error) {
 	c.retryMu.Lock()
 	defer c.retryMu.Unlock()
 	rows, err := c.listParked(ctx)
@@ -1186,6 +1215,9 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 		}
 		if lineage == now && c.projectedAt != nil && c.projectedAt(repo) < uint64(index) {
 			blocked[key] = true
+			if waits != nil {
+				*waits = append(*waits, parkedWait{Lineage: lineage, Index: index, Repo: repo})
+			}
 			continue
 		}
 		// The table follows the renames of its own lineage only (#238).
@@ -1246,9 +1278,96 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 		effects.Run()
 		applied += len(entry)
 		unparkedTotal.Add(float64(len(entry)))
+		c.dropUnprojected(lineage, index)
 		log.Info("cluster consumer: applied the parked event of %s at %d", repo, index)
 	}
 	return applied, nil
+}
+
+// parkedWait is a parked entry of the table's lineage whose retry waits
+// for its repository's projection on this node, the leader, and since when
+// the leader's retries found it so.
+type parkedWait struct {
+	Lineage string
+	Index   int64
+	Repo    string
+	Since   time.Time
+}
+
+// unprojectedYieldAfter is how long the leader's retries go on finding a
+// parked event that waits for its repository's projection on this node
+// before the autopilot hands the leadership to a voter that projects it,
+// and the manual mode's hello says that this node could not derive the
+// SQL (#249). The event was parked after projectionStallBound already:
+// past this, the projection that fails here is not one that only needed a
+// little more time.
+var unprojectedYieldAfter = 5 * time.Minute
+
+// noteUnprojected keeps what a retry of this leader found waiting for its
+// repository's projection here: an entry found so again keeps the time it
+// was first found, the others are forgotten. A new one is logged once.
+func (c *consumer) noteUnprojected(found []parkedWait) {
+	now := time.Now()
+	c.mu.Lock()
+	next := make([]parkedWait, 0, len(found))
+	var fresh []parkedWait
+	for _, w := range found {
+		w.Since = now
+		if i := slices.IndexFunc(c.unprojected, func(p parkedWait) bool { return p.Lineage == w.Lineage && p.Index == w.Index }); i >= 0 {
+			w.Since = c.unprojected[i].Since
+		} else {
+			fresh = append(fresh, w)
+		}
+		next = append(next, w)
+	}
+	c.unprojected = next
+	c.mu.Unlock()
+	for _, w := range fresh {
+		log.Error("cluster consumer: the parked event of %s at %d waits for the projection of %s on this node, the leader, which no retry or `forgejo cluster reconcile --apply` changes while it leads; another member that projects it applies it: %s", w.Repo, w.Index, w.Repo, c.r.projectionRemedy())
+	}
+}
+
+// dropUnprojected forgets an entry a retry applied.
+func (c *consumer) dropUnprojected(lineage string, index int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.unprojected = slices.DeleteFunc(c.unprojected, func(p parkedWait) bool { return p.Lineage == lineage && p.Index == index })
+}
+
+// waitingProjection lists what this leader's last retry found waiting for
+// its repository's projection here, oldest first.
+func (c *consumer) waitingProjection() []parkedWait {
+	c.mu.Lock()
+	out := slices.Clone(c.unprojected)
+	c.mu.Unlock()
+	slices.SortStableFunc(out, func(a, b parkedWait) int { return a.Since.Compare(b.Since) })
+	return out
+}
+
+// stuckProjection is the parked entry that has waited longest, and at
+// least unprojectedYieldAfter, for its repository's projection on this
+// node, the leader, and that the projector still has not projected now: a
+// retry runs every parkedRetryEvery only.
+func (c *consumer) stuckProjection() (parkedWait, bool) {
+	for _, w := range c.waitingProjection() {
+		if time.Since(w.Since) < unprojectedYieldAfter {
+			break
+		}
+		if c.projectedAt != nil && c.projectedAt(w.Repo) < uint64(w.Index) {
+			return w, true
+		}
+	}
+	return parkedWait{}, false
+}
+
+// projectionRemedy is the way out of a parked event that waits for its
+// repository's projection on the leader: the leadership of a member that
+// projects it, which the autopilot hands over by itself.
+func (r *Replicator) projectionRemedy() string {
+	if r != nil && r.auto != nil {
+		return fmt.Sprintf("the autopilot hands the leadership to a voter that says it projects it after %s", unprojectedYieldAfter)
+	}
+	return "transfer the leadership to a member that projects it"
 }
 
 // parkedRepo is the repository a parked row holds back: its id when the

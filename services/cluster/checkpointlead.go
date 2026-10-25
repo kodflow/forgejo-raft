@@ -96,9 +96,24 @@ func (r *Replicator) cannotDeriveSQL() bool {
 // the table once it returns: with no margin (AckMargin = 0, or an ended
 // lineage), that pass may trim the last event itself, after reading the
 // SQL all the same.
+//
+// A leader whose passes go through may still hold a parked event its
+// retries find waiting, for unprojectedYieldAfter, for its repository's
+// projection here, which another member's leadership would apply (#249):
+// it cannot derive that repository's SQL, and its hello says so from each
+// such pass, so that the operator's transfer away from it stands. The
+// pilot does not keep that time fresh, unlike the failed passes': this
+// node derives every other repository's SQL, and holding it away for good
+// would hold back its checkpoints, and the trim, when it is the only voter
+// that takes them. Past checkpointHandBack of its last such pass, it may
+// be handed the leadership back, as in the autonomous mode.
 func (r *Replicator) noteLeaderPass(err error, waited bool) {
 	if r.auto != nil {
 		return
+	}
+	unprojected := false
+	if r.consumer != nil {
+		_, unprojected = r.consumer.stuckProjection()
 	}
 	s := &r.ckState.sql
 	s.mu.Lock()
@@ -114,6 +129,9 @@ func (r *Replicator) noteLeaderPass(err error, waited bool) {
 		s.stuck = false
 		r.sqlYield.Store(0)
 		log.Warn("cluster: this leader derives the SQL again: its hello no longer says it cannot")
+	}
+	if unprojected && !s.stuck {
+		r.sqlYield.Store(r.clock().Unix())
 	}
 }
 

@@ -100,6 +100,12 @@ type Replicator struct {
 	hookFails     int
 	yielded       time.Time
 	yieldDeclined consensus.NodeID
+	// projectionProbe is when the autopilot next asks the voters whether
+	// they project the repository a parked event waits for on this leader,
+	// and projectionNoted what it last logged of finding none (#249). Only
+	// the autopilot's goroutine touches them.
+	projectionProbe time.Time
+	projectionNoted string
 	// sqlYield is when, in Unix seconds, this node last gave the leadership
 	// away because it could not derive the SQL; its hello says it, so the
 	// leadership is not handed back to it for its checkpoints
@@ -252,6 +258,7 @@ func Init(ctx context.Context) error {
 		root: r.root, port: setting.Cluster.ObjectPort, cluster: clusterHex, id: id,
 		engine: r.Engine, self: r.selfID, repoKnown: r.repoKnown, revoked: r.table.KeyRevoked,
 		leavesKey: r.projector.leavesKey, awaitsRename: r.projector.awaitsRename,
+		projected: r.projector.Projected,
 	}
 	if setting.Cluster.ExpectedNodes >= 3 {
 		r.auto = newAutoMode(r.objects)

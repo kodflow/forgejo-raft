@@ -171,3 +171,26 @@ func TestTheWayOutOfAHeldBackupFollowsTheCheckpoints(t *testing.T) {
 		}
 	}
 }
+
+// A parked event that waits for its repository's projection on the leader
+// is applied by neither a retry nor reconcile while that node leads: the
+// health names it and says the way out, the leadership of a member that
+// projects it, which the autopilot hands over by itself (#249).
+func TestCheckClusterParkedEventWaitingForTheLeadersProjection(t *testing.T) {
+	assert.Contains(t, parkedEvents(cluster.View{ParkedEvents: 2}).Output, "see `forgejo cluster reconcile`")
+
+	since := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	w := &cluster.ProjectionWaitView{Lineage: "l", Index: 14, Repo: "o/broken.git", Since: since}
+	manual := parkedEvents(cluster.View{ParkedEvents: 2, ProjectionWait: w})
+	assert.Equal(t, warn, manual.Status)
+	assert.Contains(t, manual.Output, "the event of o/broken.git at 14 waits for its projection on this node, the leader, since 2026-10-25T12:00:00Z")
+	assert.Contains(t, manual.Output, "`forgejo cluster reconcile` does not change")
+	assert.Contains(t, manual.Output, "transfer the leadership to a member that projects it")
+
+	auto := parkedEvents(cluster.View{ParkedEvents: 2, ProjectionWait: w, ProjectionYield: true})
+	assert.Contains(t, auto.Output, "the autopilot hands the leadership to a voter that says it projects it")
+
+	assert.Contains(t, queueHolder(cluster.View{ParkedEvents: 2, ProjectionWait: w}), "waiting for its projection on this leader")
+	assert.Equal(t, "unknown", parkedEvents(cluster.View{ParkedEvents: -1, ProjectionWait: w}).Output)
+	assert.Equal(t, Pass, parkedEvents(cluster.View{}).Status)
+}

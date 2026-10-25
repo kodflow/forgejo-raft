@@ -28,6 +28,9 @@ type ParkedView struct {
 	Error    string    `json:"error"`
 	Attempts int       `json:"attempts"`
 	Since    time.Time `json:"since"`
+	// Waits says, on the leader, that the entry waits for its repository's
+	// projection on this node, and the way out (#249).
+	Waits string `json:"waits,omitempty"`
 }
 
 // ListParked lists the parked entries, oldest first.
@@ -39,6 +42,12 @@ func (r *Replicator) ListParked(ctx context.Context) ([]ParkedView, error) {
 	if err != nil {
 		return nil, err
 	}
+	var waits []parkedWait
+	if r.consumer != nil {
+		if eng := r.Engine(); eng != nil && eng.Status().Role == consensus.RoleLeader {
+			waits = r.consumer.waitingProjection()
+		}
+	}
 	var out []ParkedView
 	for _, p := range rows {
 		if n := len(out); n > 0 && out[n-1].Lineage == p.Lineage && out[n-1].Index == p.LogIndex {
@@ -49,6 +58,11 @@ func (r *Replicator) ListParked(ctx context.Context) ([]ParkedView, error) {
 			Lineage: p.Lineage, Index: p.LogIndex, Repo: p.Repo, Events: 1,
 			Error: p.Reason, Attempts: p.Attempts, Since: p.CreatedUnix.AsTime(),
 		})
+		for _, w := range waits {
+			if w.Lineage == p.Lineage && w.Index == p.LogIndex {
+				out[len(out)-1].Waits = fmt.Sprintf("the projection of %s on this node, the leader, since %s, which no retry changes while it leads: %s", w.Repo, w.Since.UTC().Format(time.RFC3339), r.projectionRemedy())
+			}
+		}
 	}
 	return out, nil
 }
@@ -64,6 +78,9 @@ func (r *Replicator) ResolveParked(ctx context.Context, op consensus.Operator, l
 	res, err := cluster_model.ResolveParked(ctx, lineage, index, string(op), reason)
 	if err != nil {
 		return nil, err
+	}
+	if r.consumer != nil {
+		r.consumer.dropUnprojected(res[0].Lineage, index)
 	}
 	target := fmt.Sprintf("%s@%d %s", res[0].Lineage, index, res[0].Repo)
 	for _, p := range res {

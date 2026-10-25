@@ -188,16 +188,7 @@ func checkClusterSQL(r *cluster_service.Replicator, checks checks) {
 		du.Output = v.SQLDurability
 	}
 	checks["cluster:sql_durability"] = []componentStatus{du}
-	pk := componentStatus{Status: Pass, Time: getCheckTime()}
-	switch {
-	case v.ParkedEvents < 0:
-		pk.Output = "unknown"
-	case v.ParkedEvents > 0:
-		pk.Status, pk.Output = warn, fmt.Sprintf("%d events wait parked for their post-receive work; the event queue is not trimmed past them; see `forgejo cluster reconcile`", v.ParkedEvents)
-	default:
-		pk.Output = "none"
-	}
-	checks["cluster:parked_events"] = []componentStatus{pk}
+	checks["cluster:parked_events"] = []componentStatus{parkedEvents(v)}
 	bk := componentStatus{Status: Pass, Time: getCheckTime()}
 	if v.BackupLag > 0 {
 		bk.Status, bk.Output = warn, fmt.Sprintf("the PostgreSQL backup of the last checkpoint holds the trim: %d entries and %d bytes of the event queue behind it, pushes are refused at %d bytes; %s",
@@ -221,6 +212,27 @@ func checkClusterSQL(r *cluster_service.Replicator, checks checks) {
 	checks["cluster:event_queue"] = []componentStatus{q}
 }
 
+// parkedEvents is the check of the parked events: a warning while some
+// wait, which names, on the leader, one waiting for its repository's
+// projection on it, that neither a retry nor reconcile applies (#249).
+func parkedEvents(v cluster_service.View) componentStatus {
+	pk := componentStatus{Status: Pass, Time: getCheckTime()}
+	switch {
+	case v.ParkedEvents < 0:
+		pk.Output = "unknown"
+	case v.ParkedEvents > 0 && v.ProjectionWait != nil:
+		// No retry nor reconcile applies it while this node leads (#249).
+		w := v.ProjectionWait
+		pk.Status, pk.Output = warn, fmt.Sprintf("%d events wait parked for their post-receive work; the event queue is not trimmed past them; the event of %s at %d waits for its projection on this node, the leader, since %s, which `forgejo cluster reconcile` does not change: %s",
+			v.ParkedEvents, w.Repo, w.Index, w.Since.UTC().Format(time.RFC3339), projectionRemedy(v))
+	case v.ParkedEvents > 0:
+		pk.Status, pk.Output = warn, fmt.Sprintf("%d events wait parked for their post-receive work; the event queue is not trimmed past them; see `forgejo cluster reconcile`", v.ParkedEvents)
+	default:
+		pk.Output = "none"
+	}
+	return pk
+}
+
 // checkpointRemedy is the way out of a trim held by the backup cursor; the
 // status page chooses its text the same way (View.CheckpointsUntaken).
 func checkpointRemedy(v cluster_service.View) string {
@@ -228,6 +240,16 @@ func checkpointRemedy(v cluster_service.View) string {
 		return "set [cluster] CHECKPOINT_INTERVAL on the leader, or transfer the leadership to a member whose CHECKPOINT_INTERVAL is set"
 	}
 	return "no checkpoint closed since it: see why in the leader's log (cluster checkpoint)"
+}
+
+// projectionRemedy is the way out of a parked event waiting for its
+// repository's projection on the leader: the leadership of a member that
+// projects it.
+func projectionRemedy(v cluster_service.View) string {
+	if v.ProjectionYield {
+		return "the autopilot hands the leadership to a voter that says it projects it"
+	}
+	return "transfer the leadership to a member that projects it"
 }
 
 // takersNote says who may take the checkpoints, from what the leader last
@@ -258,6 +280,8 @@ func queueHolder(v cluster_service.View) string {
 	switch {
 	case v.BackupLag > 0:
 		return "the backup of the last checkpoint holds the trim (cluster:backup_lag)"
+	case v.ParkedEvents > 0 && v.ProjectionWait != nil:
+		return "a parked event waiting for its projection on this leader holds the trim (cluster:parked_events): " + projectionRemedy(v)
 	case v.ParkedEvents > 0:
 		return "parked events hold the trim (cluster:parked_events)"
 	case !v.SQLDurable && !v.SQLDurabilityChecked.IsZero():

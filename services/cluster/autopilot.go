@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"strings"
+	"sync"
 	"time"
 
 	"forgejo.org/modules/log"
@@ -476,21 +478,43 @@ func appliesVersion(h hello, v uint8) bool {
 // nothing of its voter: the engine answers TRANSFER_FAILED too once ctx
 // ends, before the voter could take it, and that voter stays the first
 // choice.
+//
+// A leader whose passes all go through may still be unable to derive the
+// SQL of one repository: one it cannot project, its own copy damaged
+// (#39's case), while the other members project it. The event waits
+// parked, every retry of this leader skips it, the queue is not trimmed
+// past it and every write is refused once it is full, while the other
+// members would apply it at once (#249). Once its retries found it so for
+// unprojectedYieldAfter, it yields too, with the same backoff and the same
+// mark, but only to a voter that answers that it projects the repository
+// at the event's index: never for a repository no member projects, where
+// the leadership would only go round.
 var (
 	yieldAfterPromotions = 5
 	yieldAfterPasses     = 60
 	yieldBackoff         = 5 * time.Minute
+	// projectionProbeEvery paces the question "do you project it" while
+	// no voter says it does.
+	projectionProbeEvery = payloadProbeEvery
 )
 
 // yieldIfStuck transfers the leadership when this leader cannot derive the
 // SQL, and reports whether it did.
 func (r *Replicator) yieldIfStuck(ctx context.Context, eng consensus.Engine, m consensus.Membership) bool {
 	var why string
+	var wait parkedWait
+	waiting := false
 	switch {
 	case r.writerHook != nil && r.hookFails >= yieldAfterPromotions:
 		why = fmt.Sprintf("its writer hook failed %d times in a row", r.hookFails)
 	case int(r.consumerFails.Load()) >= yieldAfterPasses && r.table.EventCount() > 0:
 		why = fmt.Sprintf("its consumer failed %d passes in a row with %d events waiting", r.consumerFails.Load(), r.table.EventCount())
+	case r.consumer != nil:
+		if wait, waiting = r.consumer.stuckProjection(); !waiting {
+			r.projectionNoted = ""
+			return false
+		}
+		why = fmt.Sprintf("it does not project %s, whose parked event at %d its retries find waiting for it since %s", wait.Repo, wait.Index, wait.Since.UTC().Format(time.RFC3339))
 	default:
 		return false
 	}
@@ -498,7 +522,13 @@ func (r *Replicator) yieldIfStuck(ctx context.Context, eng consensus.Engine, m c
 	if !r.yielded.IsZero() && now.Sub(r.yielded) < yieldBackoff {
 		return false
 	}
-	to, ok := successor(eng, m, r.yieldDeclined)
+	var to consensus.NodeID
+	var ok bool
+	if waiting {
+		to, ok = r.projectingSuccessor(ctx, eng, m, wait, why)
+	} else {
+		to, ok = successor(eng, m, r.yieldDeclined)
+	}
 	if !ok {
 		return false
 	}
@@ -520,6 +550,12 @@ func (r *Replicator) yieldIfStuck(ctx context.Context, eng consensus.Engine, m c
 // successor is the voter other than the leader the leader hears and that
 // is least behind, past passed over when another voter qualifies.
 func successor(eng consensus.Engine, m consensus.Membership, past consensus.NodeID) (consensus.NodeID, bool) {
+	return successorAmong(eng, m, past, nil)
+}
+
+// successorAmong is successor among the voters accept takes, every one
+// when accept is nil.
+func successorAmong(eng consensus.Engine, m consensus.Membership, past consensus.NodeID, accept func(consensus.Member) bool) (consensus.NodeID, bool) {
 	self := eng.Status().ID
 	var best consensus.PeerHealth
 	found, pastFound := false, false
@@ -527,6 +563,7 @@ func successor(eng consensus.Engine, m consensus.Membership, past consensus.Node
 		i := Rank(m, p.ID) - 1
 		switch {
 		case p.ID == self || i < 0 || !m.Members[i].Voter || p.Unreachable || p.Snapshot:
+		case accept != nil && !accept(m.Members[i]):
 		case p.ID == past:
 			pastFound = true
 		case !found || p.Lag < best.Lag:
@@ -537,6 +574,73 @@ func successor(eng consensus.Engine, m consensus.Membership, past consensus.Node
 		return past, true
 	}
 	return best.ID, found
+}
+
+// projectingSuccessor is the successor of a leader whose parked event w
+// waits for its repository's projection on it: among the voters successor
+// would take, those that answer, on their object channel, that they
+// project w's repository at its index, so that the new leader's retry
+// applies it. A voter that does not answer, answers below the index, or
+// runs a binary without the question, is passed over: with none, the
+// leadership stays, and the voters are asked again after
+// projectionProbeEvery.
+func (r *Replicator) projectingSuccessor(ctx context.Context, eng consensus.Engine, m consensus.Membership, w parkedWait, why string) (consensus.NodeID, bool) {
+	now := r.clock()
+	if now.Before(r.projectionProbe) {
+		return 0, false
+	}
+	r.projectionProbe = now.Add(projectionProbeEvery)
+	peers := peerHealth(eng)
+	self := eng.Status().ID
+	var asked []consensus.Member
+	for _, x := range m.Members {
+		if p, ok := peers[x.ID]; ok && x.Voter && x.ID != self && !p.Unreachable && !p.Snapshot {
+			asked = append(asked, x)
+		}
+	}
+	at := make([]uint64, len(asked))
+	answered := make([]bool, len(asked))
+	var wg sync.WaitGroup
+	for i, x := range asked {
+		wg.Go(func() {
+			n, err := r.memberProjected(ctx, x, w.Repo)
+			at[i], answered[i] = n, err == nil
+			if err != nil {
+				log.Debug("cluster: autopilot: %s (%s) did not say whether it projects %s: %v", x.ID, x.Slot, w.Repo, err)
+			}
+		})
+	}
+	wg.Wait()
+	projects := map[consensus.NodeID]bool{}
+	var said []string
+	for i, x := range asked {
+		if answered[i] {
+			projects[x.ID] = at[i] >= uint64(w.Index)
+			said = append(said, fmt.Sprintf("%s at %d", x.Slot, at[i]))
+		}
+	}
+	to, ok := successorAmong(eng, m, r.yieldDeclined, func(x consensus.Member) bool { return projects[x.ID] })
+	if !ok {
+		note := fmt.Sprintf("cluster: autopilot: this leader cannot derive the SQL (%s), and no voter in reach says it projects %s at %d (%s): the leadership stays; it is asked again every %s", why, w.Repo, w.Index, strings.Join(said, ", "), projectionProbeEvery)
+		if len(said) == 0 {
+			note = fmt.Sprintf("cluster: autopilot: this leader cannot derive the SQL (%s), and no voter in reach answered whether it projects %s: the leadership stays; it is asked again every %s", why, w.Repo, projectionProbeEvery)
+		}
+		if note != r.projectionNoted {
+			r.projectionNoted = note
+			log.Warn("%s", note)
+		}
+		return 0, false
+	}
+	r.projectionNoted = ""
+	return to, true
+}
+
+// memberProjected asks member x up to which index it projects repo.
+func (r *Replicator) memberProjected(ctx context.Context, x consensus.Member, repo string) (uint64, error) {
+	if r.objects == nil {
+		return 0, errors.New("no object channel")
+	}
+	return r.objects.askProjected(ctx, x, repo)
 }
 
 // deadClock is when the leader first found each member out of reach. Only
