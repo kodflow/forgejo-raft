@@ -10,9 +10,11 @@ import (
 	"path"
 	"strings"
 
+	"forgejo.org/models"
 	git_model "forgejo.org/models/git"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/lfs"
 	"forgejo.org/modules/setting"
@@ -92,6 +94,15 @@ func UploadRepoFiles(ctx context.Context, repo *repo_model.Repository, doer *use
 		infos[i] = uploadInfo{upload: uploads[i]}
 	}
 
+	// In a cluster, this node's git may not show yet a push another node
+	// acknowledged: the old branch is cloned from it, and a new branch
+	// would start from the commit before the push, for the whole cluster
+	// (#239, as #226 for ChangeRepoFiles). It is cloned once this node
+	// serves the repository at the cluster's commit index.
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
+		return err
+	}
+
 	t, err := NewTemporaryUploadRepository(ctx, repo)
 	if err != nil {
 		return err
@@ -112,6 +123,30 @@ func UploadRepoFiles(ctx context.Context, repo *repo_model.Repository, doer *use
 	if hasOldBranch {
 		if err = t.SetDefaultIndex(); err != nil {
 			return err
+		}
+		// LastCommitID is the parent of the new commit, whose tree is built
+		// on the old branch as cloned now: it must be that branch's head,
+		// as ApplyDiffPatch and CherryPick require. The web form reads it
+		// in this node's git when the request starts, before the wait
+		// above: in a cluster, a node that caught up with a push meanwhile
+		// would otherwise commit on the tree after the push with the commit
+		// before it for parent, and the new branch would miss the push in
+		// its history (#239).
+		if opts.LastCommitID != "" {
+			head, err := t.GetBranchCommit(opts.OldBranch)
+			if err != nil {
+				return err
+			}
+			lastCommitID, err := t.gitRepo.ConvertToGitID(opts.LastCommitID)
+			if err != nil {
+				return fmt.Errorf("UploadRepoFiles: Invalid last commit ID: %w", err)
+			}
+			if head.ID.String() != lastCommitID.String() {
+				return models.ErrCommitIDDoesNotMatch{
+					GivenCommitID:   lastCommitID.String(),
+					CurrentCommitID: head.ID.String(),
+				}
+			}
 		}
 	}
 

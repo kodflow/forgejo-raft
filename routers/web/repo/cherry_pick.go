@@ -12,6 +12,7 @@ import (
 	git_model "forgejo.org/models/git"
 	"forgejo.org/models/unit"
 	"forgejo.org/modules/base"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/util"
@@ -140,6 +141,12 @@ func CherryPickPost(ctx *context.Context) {
 			return
 		} else if models.IsErrCommitIDDoesNotMatch(err) {
 			ctx.RenderWithErr(ctx.Tr("repo.editor.file_changed_while_editing", ctx.Repo.RepoLink+"/compare/"+form.LastCommit+"..."+ctx.Repo.CommitID), tplPatchFile, &form)
+			return
+		} else if errors.Is(err, clusterhook.ErrBehind) {
+			// A node of the cluster behind on the repository: nothing was
+			// written, and the patch would be applied on the same stale
+			// branch; the user retries (#239).
+			ctx.RenderWithErr(ctx.Tr("repo.editor.fail_to_apply_patch", err), tplCherryPick, &form)
 			return
 		}
 		// Drop through to the apply technique

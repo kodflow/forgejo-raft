@@ -6,6 +6,7 @@ package clusterhook
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -143,22 +144,40 @@ func TestCheckRepoKey(t *testing.T) {
 // Without a cluster, nothing waits for the consumer: RequireDerived is nil
 // at once. In a cluster, a node that cannot confirm the repository's rows
 // derived from the cluster's last writes refuses, ErrBehind naming the
-// repository, a refusal the API answers 503.
+// repository, a refusal the API answers 503. A parked event of the
+// repository refuses too, saying so and how it is retried (#239); the
+// reason of another refusal stays inside.
 func TestRequireDerived(t *testing.T) {
 	require.NoError(t, RequireDerived(context.Background(), "alice/demo.git"))
+	assert.True(t, WaitDerived(context.Background(), "alice/demo.git"))
 
 	var asked []string
-	derived := false
-	SetDerivedWaiter(func(_ context.Context, key string) bool {
+	var refusal error
+	SetDerivedWaiter(func(_ context.Context, key string) error {
 		asked = append(asked, key)
-		return derived
+		return refusal
 	})
 	defer SetDerivedWaiter(nil)
 
+	refusal = errors.New("context deadline exceeded")
 	err := RequireDerived(context.Background(), "alice/demo.git")
 	require.ErrorIs(t, err, ErrBehind)
+	require.NotErrorIs(t, err, ErrParked)
 	assert.Contains(t, err.Error(), "alice/demo.git")
-	derived = true
+	assert.NotContains(t, err.Error(), "deadline")
+	assert.False(t, WaitDerived(context.Background(), "alice/demo.git"))
+
+	refusal = fmt.Errorf("%w (it is retried by `forgejo cluster reconcile --apply`)", ErrParked)
+	err = RequireDerived(context.Background(), "alice/demo.git")
+	require.ErrorIs(t, err, ErrBehind)
+	require.ErrorIs(t, err, ErrParked)
+	assert.Contains(t, err.Error(), "alice/demo.git")
+	assert.Contains(t, err.Error(), "is parked")
+	assert.Contains(t, err.Error(), "forgejo cluster reconcile --apply")
+	assert.False(t, WaitDerived(context.Background(), "alice/demo.git"))
+
+	refusal = nil
 	require.NoError(t, RequireDerived(context.Background(), "alice/demo.git"))
-	assert.Equal(t, []string{"alice/demo.git", "alice/demo.git"}, asked)
+	assert.True(t, WaitDerived(context.Background(), "alice/demo.git"))
+	assert.Len(t, asked, 6)
 }

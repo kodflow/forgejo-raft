@@ -683,7 +683,7 @@ func WaitWrites(ctx context.Context, c *Collector) bool {
 
 var (
 	waitFresh   func(ctx context.Context, key string) bool
-	waitDerived func(ctx context.Context, key string) bool
+	waitDerived func(ctx context.Context, key string) error
 	readRefuse  func(key string, repoID int64) error
 )
 
@@ -750,12 +750,33 @@ func RequireFresh(ctx context.Context, key string) error {
 	return fmt.Errorf("%w to %s; nothing was written, retry shortly or through another node", ErrBehind, key)
 }
 
+// ErrParked is the reason a derived wait gives when an event of the
+// repository is parked: the consumer could not run its work, and moved
+// past it without deriving its SQL. The repository's later events are
+// parked behind it, so its rows stay as they were before the parked push
+// until the event is retried and applied. RequireDerived returns it
+// wrapped in ErrBehind: the request is refused, and retried later.
+var ErrParked = errors.New("a push to the repository is parked, its database rows are not derived from it")
+
 // SetDerivedWaiter registers the replicator's wait for a repository's SQL
-// rows to be derived from the writes the cluster confirms.
-func SetDerivedWaiter(f func(ctx context.Context, key string) bool) {
+// rows to be derived from the writes the cluster confirms: nil once they
+// are, an error wrapping ErrParked when an event of the repository is
+// parked, another error when the node may be behind.
+func SetDerivedWaiter(f func(ctx context.Context, key string) error) {
 	lifecycleMu.Lock()
 	waitDerived = f
 	lifecycleMu.Unlock()
+}
+
+// derivedRefusal asks the registered derived wait; nil without a cluster.
+func derivedRefusal(ctx context.Context, key string) error {
+	lifecycleMu.RLock()
+	f := waitDerived
+	lifecycleMu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	return f(ctx, key)
 }
 
 // WaitDerived is WaitFresh, and then waits, within the same
@@ -766,25 +787,26 @@ func SetDerivedWaiter(f func(ctx context.Context, key string) bool) {
 // reads a branch row for its commit, or renames the row and the head of
 // its pull requests, would otherwise act on the row as it was before the
 // push, and the push's own work, derived later, would miss what the
-// request changed (#225, #226). It reports false on a timeout or without a
-// leader; without a cluster it returns true at once.
+// request changed (#225, #226). An event the consumer parked is not
+// derived, though its cursor moved past it (#239). It reports false on a
+// timeout, without a leader, or while an event of the repository is
+// parked; without a cluster it returns true at once.
 func WaitDerived(ctx context.Context, key string) bool {
-	lifecycleMu.RLock()
-	f := waitDerived
-	lifecycleMu.RUnlock()
-	if f == nil {
-		return true
-	}
-	return f(ctx, key)
+	return derivedRefusal(ctx, key) == nil
 }
 
 // RequireDerived is WaitDerived as an error: nil once this node serves the
 // repository, and the consumer derived its SQL, at the commit index the
-// cluster confirms at the call, else ErrBehind naming the repository.
-// Without a cluster it returns nil.
+// cluster confirms at the call, else ErrBehind naming the repository, and
+// ErrParked too when an event of the repository is parked. Without a
+// cluster it returns nil.
 func RequireDerived(ctx context.Context, key string) error {
-	if WaitDerived(ctx, key) {
+	err := derivedRefusal(ctx, key)
+	if err == nil {
 		return nil
+	}
+	if errors.Is(err, ErrParked) {
+		return fmt.Errorf("%w to %s: %w; nothing was written, retry once the parked event is applied", ErrBehind, key, err)
 	}
 	return fmt.Errorf("%w to %s, or its database rows are not derived from them yet; nothing was written, retry shortly", ErrBehind, key)
 }

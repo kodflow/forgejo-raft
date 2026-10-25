@@ -12,6 +12,7 @@ import (
 	"forgejo.org/models"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/structs"
@@ -20,6 +21,13 @@ import (
 
 // CherryPick cherrypicks or reverts a commit to the given repository
 func CherryPick(ctx context.Context, repo *repo_model.Repository, doer *user_model.User, revert bool, opts *ApplyDiffPatchOptions) (*structs.FileResponse, error) {
+	// In a cluster, the old branch is read and cloned from this node's
+	// git, which may not show yet a push another node acknowledged: it is
+	// read once this node serves the repository at the cluster's commit
+	// index, as ApplyDiffPatch does (#239).
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
+		return nil, err
+	}
 	if err := opts.Validate(ctx, repo, doer); err != nil {
 		return nil, err
 	}

@@ -806,7 +806,9 @@ func UploadFilePost(ctx *context.Context) {
 			ctx.Data["Err_NewBranchName"] = true
 			branchErr := err.(git_model.ErrBranchAlreadyExists)
 			ctx.RenderWithErr(ctx.Tr("repo.editor.branch_already_exists", branchErr.BranchName), tplUploadFile, &form)
-		} else if git.IsErrPushOutOfDate(err) {
+		} else if git.IsErrPushOutOfDate(err) || models.IsErrCommitIDDoesNotMatch(err) {
+			// The branch moved since the request read its head (in a
+			// cluster, a push this node caught up with meanwhile, #239).
 			ctx.RenderWithErr(ctx.Tr("repo.editor.file_changed_while_editing", ctx.Repo.RepoLink+"/compare/"+util.PathEscapeSegments(ctx.Repo.CommitID)+"..."+util.PathEscapeSegments(form.NewBranchName)), tplUploadFile, &form)
 		} else if git.IsErrPushRejected(err) {
 			errPushRej := err.(*git.ErrPushRejected)

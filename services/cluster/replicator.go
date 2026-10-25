@@ -654,20 +654,55 @@ func (r *Replicator) WaitFresh(ctx context.Context, repo string) bool {
 // or renamed with the head of its pull requests, right after a push would
 // otherwise be the row from before the push, and the push's work, derived
 // later under the branch's old name, would find neither (#225, #226). The
-// cursor is in SQL: any node reads it. It reports false when the node may
-// be behind, or the consumer has not derived the events yet.
-func (r *Replicator) WaitDerived(ctx context.Context, repo string) bool {
+// cursor is in SQL: any node reads it.
+//
+// The cursor also moves past an event the consumer parked, its work not
+// run, and the repository's later events are parked behind it: its rows
+// stay as they were before the parked push until a retry applies it. A
+// branch renamed meanwhile is #225 again, at the retry (#239). So once the
+// cursor passed, the repository must have no parked event either, read in
+// SQL too, after the cursor: an event is parked in the transaction that
+// moves the cursor past it. A parked event later than the index waited
+// for refuses as well: its retry would miss the rename just the same.
+//
+// It returns nil once the SQL is derived, an error wrapping
+// clusterhook.ErrParked while an event of the repository is parked, and
+// another error when the node may be behind or the consumer has not
+// derived the events yet.
+func (r *Replicator) WaitDerived(ctx context.Context, repo string) error {
 	ctx, cancel := context.WithTimeout(ctx, setting.Cluster.ReadAfterWriteTimeout)
 	defer cancel()
 	at, ok := r.freshAt(ctx, repo)
 	if !ok {
-		return false
+		return errors.New("this node may be behind the repository")
 	}
-	ev, ok := r.table.LastEventOf(repo, at.Identity(), at.Index)
-	if !ok {
-		return true
+	if ev, ok := r.table.LastEventOf(repo, at.Identity(), at.Index); ok {
+		if err := r.consumer.waitCursor(ctx, ev); err != nil {
+			return err
+		}
 	}
-	return r.consumer.waitCursor(ctx, ev) == nil
+	return r.parkedRefusal(ctx, repo)
+}
+
+// parkedRefusal reports, wrapping clusterhook.ErrParked, a parked event of
+// repo: by the repository's id the table holds under the key, which a
+// rename of the repository keeps, and by the key for an event without one.
+func (r *Replicator) parkedRefusal(ctx context.Context, repo string) error {
+	c := r.consumer
+	if c == nil || c.hasParked == nil {
+		return nil
+	}
+	if !c.dbReady() {
+		return errors.New("database not ready")
+	}
+	parked, err := c.hasParked(ctx, repo, r.table.RepoID(repo))
+	if err != nil {
+		return fmt.Errorf("reading the parked events of %s: %w", repo, err)
+	}
+	if parked {
+		return fmt.Errorf("%w (it is retried every %s and by `forgejo cluster reconcile --apply`; `forgejo cluster parked list` says why)", clusterhook.ErrParked, parkedRetryEvery)
+	}
+	return nil
 }
 
 // freshAt waits until this node serves repo at least at the commit index a

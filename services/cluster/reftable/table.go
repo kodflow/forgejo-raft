@@ -1123,6 +1123,14 @@ func (t *Table) RefsWithID(repo string) (map[string]RefValue, int64, uint64) {
 	return out, t.ids[repo], t.applied.Index
 }
 
+// RepoID is the database ID of the repository the key holds, as
+// RefsWithID reports it, without copying the refs.
+func (t *Table) RepoID(repo string) int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.ids[repo]
+}
+
 // RepoHash returns a repository's checksum and the index of its last change.
 func (t *Table) RepoHash(repo string) (Sum, uint64) {
 	t.mu.RLock()
