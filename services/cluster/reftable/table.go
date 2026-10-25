@@ -1317,6 +1317,31 @@ func (t *Table) Events() []Event {
 	return append([]Event(nil), t.events...)
 }
 
+// LastEventOf returns the token of the newest pending event of repo at or
+// below index upTo of lineage id, an event of an earlier lineage counting
+// as below: the last event whose post-receive work a read of repo's SQL as
+// of upTo waits for. An event trimmed from the queue was dispatched
+// already. It reads the queue in place, without copying it, and changes
+// nothing.
+func (t *Table) LastEventOf(repo string, id consensus.LogIdentity, upTo uint64) (consensus.Token, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var last consensus.Token
+	found := false
+	for i := range t.events {
+		ev := &t.events[i]
+		if ev.Token.Index > upTo && ev.Token.Identity() == id {
+			// The queue is in log order: every event from here on is
+			// later than upTo.
+			break
+		}
+		if ev.Repo == repo {
+			last, found = ev.Token, true
+		}
+	}
+	return last, found
+}
+
 // EventCount is the number of events not yet trimmed, without copying them.
 func (t *Table) EventCount() int {
 	t.mu.RLock()

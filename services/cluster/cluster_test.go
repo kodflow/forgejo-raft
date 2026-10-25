@@ -126,13 +126,31 @@ type testNode struct {
 type recordingWork struct {
 	mu     sync.Mutex
 	events []reftable.Event
+	// through, when set, does the work of the groups it claims, which are
+	// not recorded: a test runs Forgejo's real post-receive work for them.
+	through func(ctx context.Context, evs []reftable.Event) (bool, error)
 }
 
 func (w *recordingWork) do(ctx context.Context, evs []reftable.Event) error {
 	w.mu.Lock()
+	through := w.through
+	w.mu.Unlock()
+	if through != nil {
+		if claimed, err := through(ctx, evs); claimed {
+			return err
+		}
+	}
+	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.events = append(w.events, evs...)
 	return nil
+}
+
+// setThrough sets the work a test does itself, nil for none.
+func (w *recordingWork) setThrough(f func(ctx context.Context, evs []reftable.Event) (bool, error)) {
+	w.mu.Lock()
+	w.through = f
+	w.mu.Unlock()
 }
 
 func (w *recordingWork) count() int {

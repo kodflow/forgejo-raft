@@ -18,6 +18,7 @@ import (
 	git_model "forgejo.org/models/git"
 	issues_model "forgejo.org/models/issues"
 	repo_model "forgejo.org/models/repo"
+	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/optional"
@@ -194,43 +195,44 @@ func (r *Replicator) Reconcile(ctx context.Context, apply bool) ([]Mismatch, err
 			continue
 		}
 		refs, at := r.table.Refs(key)
-		table := map[string]bool{}
+		table := map[string]string{}
 		for name, v := range refs {
 			if v.Live() && v.SHA != "" && strings.HasPrefix(name, "refs/heads/") {
-				table[strings.TrimPrefix(name, "refs/heads/")] = true
+				table[strings.TrimPrefix(name, "refs/heads/")] = v.SHA
 			}
 		}
-		rows, err := git_model.FindBranchNames(ctx, git_model.FindBranchOptions{RepoID: repo.ID, IsDeletedBranch: optional.Some(false)})
+		rows, err := branchCommits(ctx, repo.ID)
 		if err != nil {
 			return out, err
 		}
-		sqlSet := map[string]bool{}
-		for _, b := range rows {
-			sqlSet[b] = true
-		}
 		var stale []string
 		var repoMismatches []Mismatch
-		for b := range table {
-			if !sqlSet[b] {
+		for b, sha := range table {
+			// A row at another commit than the table's is as stale as a
+			// missing one: a push derived under a branch's old name, the
+			// branch renamed meanwhile, left the row at the commit before
+			// the push, and nothing else revisits it (#225).
+			if commit, ok := rows[b]; !ok || commit != sha {
 				repoMismatches = append(repoMismatches, Mismatch{Repo: key, Category: RefsAheadOfSQL, Kind: "branch", Ref: b, Regenerable: true})
 				stale = append(stale, b)
 			}
 		}
-		for b := range sqlSet {
-			if !table[b] {
+		for b := range rows {
+			if _, ok := table[b]; !ok {
 				repoMismatches = append(repoMismatches, Mismatch{Repo: key, Category: SQLAheadOfRefs, Kind: "branch", Ref: b, Regenerable: true})
 			}
 		}
 		sort.Slice(repoMismatches, func(i, j int) bool { return repoMismatches[i].Ref < repoMismatches[j].Ref })
 		if apply && len(stale) > 0 && r.projector.Projected(key) >= at {
+			synced := map[string]bool{}
 			gitRepo, err := gitrepo.OpenRepository(ctx, repo)
 			if err == nil {
-				err = repo_service.SyncBranchesToDB(ctx, repo.ID, 0, stale, gitRepo.GetBranchCommit)
+				err = repo_service.SyncBranchesToDB(ctx, repo.ID, 0, stale, r.branchCommitAsTable(key, gitRepo, synced))
 				gitRepo.Close()
 			}
 			if err == nil {
 				for i := range repoMismatches {
-					if repoMismatches[i].Category == RefsAheadOfSQL {
+					if repoMismatches[i].Category == RefsAheadOfSQL && synced[repoMismatches[i].Ref] {
 						repoMismatches[i].Applied = true
 					}
 				}
@@ -245,6 +247,42 @@ func (r *Replicator) Reconcile(ctx context.Context, apply bool) ([]Mismatch, err
 	}
 	r.forgetOrphans(orphans)
 	return out, nil
+}
+
+// branchCommits returns the commit of each branch row of a repository not
+// marked deleted, by name.
+func branchCommits(ctx context.Context, repoID int64) (map[string]string, error) {
+	var rows []*git_model.Branch
+	cond := git_model.FindBranchOptions{RepoID: repoID, IsDeletedBranch: optional.Some(false)}.ToConds()
+	if err := db.GetEngine(ctx).Cols("name", "commit_id").Where(cond).Find(&rows); err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(rows))
+	for _, b := range rows {
+		out[b.Name] = b.CommitID
+	}
+	return out, nil
+}
+
+// branchCommitAsTable reads a branch's commit in this node's git for the
+// rebuild of its row, and records it in synced, only while the table holds
+// the branch at that same commit. A write the table applied after
+// reconcile read it, which this node's git may not show yet, would
+// otherwise bring a row the consumer derived since back to an older
+// commit. Such a branch reads as removed, which the rebuild skips, and is
+// left to the next pass.
+func (r *Replicator) branchCommitAsTable(key string, gitRepo *git.Repository, synced map[string]bool) func(string) (*git.Commit, error) {
+	return func(name string) (*git.Commit, error) {
+		commit, err := gitRepo.GetBranchCommit(name)
+		if err != nil {
+			return nil, err
+		}
+		if v, ok := r.table.Get(key, git.BranchPrefix+name); !ok || !v.Live() || v.SHA != commit.ID.String() {
+			return nil, git.ErrNotExist{ID: name}
+		}
+		synced[name] = true
+		return commit, nil
+	}
 }
 
 // orphanMark is when this node's reconcile first saw an orphaned

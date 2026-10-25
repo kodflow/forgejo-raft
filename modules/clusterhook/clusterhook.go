@@ -682,8 +682,9 @@ func WaitWrites(ctx context.Context, c *Collector) bool {
 }
 
 var (
-	waitFresh  func(ctx context.Context, key string) bool
-	readRefuse func(key string, repoID int64) error
+	waitFresh   func(ctx context.Context, key string) bool
+	waitDerived func(ctx context.Context, key string) bool
+	readRefuse  func(key string, repoID int64) error
 )
 
 // SetReadGuard registers the replicator's check of a repository's
@@ -747,6 +748,45 @@ func RequireFresh(ctx context.Context, key string) error {
 		return nil
 	}
 	return fmt.Errorf("%w to %s; nothing was written, retry shortly or through another node", ErrBehind, key)
+}
+
+// SetDerivedWaiter registers the replicator's wait for a repository's SQL
+// rows to be derived from the writes the cluster confirms.
+func SetDerivedWaiter(f func(ctx context.Context, key string) bool) {
+	lifecycleMu.Lock()
+	waitDerived = f
+	lifecycleMu.Unlock()
+}
+
+// WaitDerived is WaitFresh, and then waits, within the same
+// read-after-write bound, until the cluster's log consumer has derived the
+// SQL of every write to the repository the cluster confirms at the call:
+// its branch rows, the pull requests a push updates. The consumer writes
+// them asynchronously, after the push was acknowledged: a request that
+// reads a branch row for its commit, or renames the row and the head of
+// its pull requests, would otherwise act on the row as it was before the
+// push, and the push's own work, derived later, would miss what the
+// request changed (#225, #226). It reports false on a timeout or without a
+// leader; without a cluster it returns true at once.
+func WaitDerived(ctx context.Context, key string) bool {
+	lifecycleMu.RLock()
+	f := waitDerived
+	lifecycleMu.RUnlock()
+	if f == nil {
+		return true
+	}
+	return f(ctx, key)
+}
+
+// RequireDerived is WaitDerived as an error: nil once this node serves the
+// repository, and the consumer derived its SQL, at the commit index the
+// cluster confirms at the call, else ErrBehind naming the repository.
+// Without a cluster it returns nil.
+func RequireDerived(ctx context.Context, key string) error {
+	if WaitDerived(ctx, key) {
+		return nil
+	}
+	return fmt.Errorf("%w to %s, or its database rows are not derived from them yet; nothing was written, retry shortly", ErrBehind, key)
 }
 
 var refLive func(key, ref string) bool

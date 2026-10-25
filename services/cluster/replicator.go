@@ -351,6 +351,7 @@ func Init(ctx context.Context) error {
 	clusterhook.SetGarbageCollectionGate(r.projector.MayCollectGarbage)
 	clusterhook.SetWriteWaiter(r.waitWrites)
 	clusterhook.SetFreshWaiter(r.WaitFresh)
+	clusterhook.SetDerivedWaiter(r.WaitDerived)
 	clusterhook.SetReadGuard(r.ReadRefusal)
 	clusterhook.SetRefLookup(r.refLive)
 
@@ -640,9 +641,42 @@ func (r *Replicator) WaitReadAfterWrite(ctx context.Context, tok consensus.Token
 // may read the refs from before the push on a node the load balancer
 // picked. It reports false when the node may be behind.
 func (r *Replicator) WaitFresh(ctx context.Context, repo string) bool {
+	_, ok := r.freshAt(ctx, repo)
+	return ok
+}
+
+// WaitDerived is WaitFresh, then waits, within the same
+// READ_AFTER_WRITE_TIMEOUT, until the consumer's cursor passed the newest
+// event of repo up to the commit index WaitFresh reached: the SQL the
+// consumer derives from every write acknowledged before the call (branch
+// rows, the pull requests a push updates) is then committed, its work and
+// its cursor moving in one transaction. A branch row read for its commit,
+// or renamed with the head of its pull requests, right after a push would
+// otherwise be the row from before the push, and the push's work, derived
+// later under the branch's old name, would find neither (#225, #226). The
+// cursor is in SQL: any node reads it. It reports false when the node may
+// be behind, or the consumer has not derived the events yet.
+func (r *Replicator) WaitDerived(ctx context.Context, repo string) bool {
+	ctx, cancel := context.WithTimeout(ctx, setting.Cluster.ReadAfterWriteTimeout)
+	defer cancel()
+	at, ok := r.freshAt(ctx, repo)
+	if !ok {
+		return false
+	}
+	ev, ok := r.table.LastEventOf(repo, at.Identity(), at.Index)
+	if !ok {
+		return true
+	}
+	return r.consumer.waitCursor(ctx, ev) == nil
+}
+
+// freshAt waits until this node serves repo at least at the commit index a
+// quorum confirms now, within READ_AFTER_WRITE_TIMEOUT, and returns the
+// barrier's token at the index it waited for.
+func (r *Replicator) freshAt(ctx context.Context, repo string) (consensus.Token, bool) {
 	eng := r.Engine()
 	if eng == nil || reftable.ValidRepoKey(repo) != nil {
-		return false
+		return consensus.Token{}, false
 	}
 	// Without a leader no barrier completes within the bound: every git
 	// request would wait READ_AFTER_WRITE_TIMEOUT to be served as the node
@@ -651,13 +685,13 @@ func (r *Replicator) WaitFresh(ctx context.Context, repo string) bool {
 	// probe: the engine reports it known only then (kitsunium/sdk#541),
 	// and right after an election the barrier is the read that proves it.
 	if !eng.Health().LeaderKnown && eng.Status().Leader == 0 {
-		return false
+		return consensus.Token{}, false
 	}
 	ctx, cancel := context.WithTimeout(ctx, setting.Cluster.ReadAfterWriteTimeout)
 	defer cancel()
 	tok, err := eng.Barrier(ctx)
 	if err != nil {
-		return false
+		return consensus.Token{}, false
 	}
 	// The barrier's index counts the entries that are not commands (a new
 	// term's no-op, a membership change), which never reach the table: on
@@ -666,11 +700,13 @@ func (r *Replicator) WaitFresh(ctx context.Context, repo string) bool {
 	// a command is in the table before the engine counts it applied: every
 	// command up to the barrier is at or below the table's position read
 	// now, and what lies above it touches no repository.
-	target := tok.Index
-	if pos, _ := r.table.Applied(); pos.Index < target {
-		target = pos.Index
+	if pos, _ := r.table.Applied(); pos.Index < tok.Index {
+		tok.Index = pos.Index
 	}
-	return r.projector.Wait(ctx, repo, target) == nil
+	if r.projector.Wait(ctx, repo, tok.Index) != nil {
+		return consensus.Token{}, false
+	}
+	return tok, true
 }
 
 // ReadRefusal refuses a read of repo while its directory here holds
