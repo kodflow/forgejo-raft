@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/json"
@@ -132,7 +133,8 @@ func TestExportLogFollowsAndDetectsDivergence(t *testing.T) {
 	assert.Equal(t, clusterhook.CodeCompacted, clusterhook.ExportCode(err))
 }
 
-// Packs are bounded to ref values: an object no ref names is not served.
+// Packs are bounded to ref values: an object no ref names is not served,
+// and a follower that holds the objects of a ref value serves them.
 func TestExportPacksAreBoundToRefs(t *testing.T) {
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	work := t.TempDir()
@@ -141,6 +143,13 @@ func TestExportPacksAreBoundToRefs(t *testing.T) {
 	require.True(t, tc.pushVia(tc.nodes[0], work, "alice/packs.git", "refs/heads/main", strings.Repeat("0", 40), c1).OK)
 	tree := run(t, work, "rev-parse", "HEAD^{tree}")
 
+	// The push returns once a majority holds its objects (shipToMajority):
+	// node-b may be the member left behind, whose table names c1 at once but
+	// whose disk holds it only when its shipment, or its projector's fetch,
+	// ends. Until then it answers "objects not held here", as it should
+	// (#231). The follower is asked once it holds the objects.
+	require.Eventually(t, func() bool { return hasObject(tc.nodes[1], "alice/packs.git", c1) },
+		15*time.Second, 20*time.Millisecond, "node-b holds the push's objects")
 	_, pack, err := exportOf(t, tc.nodes[1], &clusterhook.ExportRequest{Op: clusterhook.OpExportPacks, Repo: "alice/packs.git", Wants: []string{c1}})
 	require.NoError(t, err, "any member serves packs")
 	assert.True(t, bytes.HasPrefix(pack, []byte("PACK")))

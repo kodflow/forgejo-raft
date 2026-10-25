@@ -62,6 +62,10 @@ func TestAReadOfANameARenameFreedWaitsForTheProjection(t *testing.T) {
 	require.Error(t, err, "node-c serves the renamed repository under the new one's name")
 	assert.Contains(t, err.Error(), "has not projected the last rename")
 	for _, n := range tc.nodes[:2] {
+		// The rename and the push returned once acknowledged: node-b
+		// holds the right directories once its projector moved them
+		// (#231).
+		settle(t, n)
 		assert.NoError(t, n.r.ReadRefusal("alice/secret.git", 0), n.slot)
 		assert.NoError(t, n.r.ReadRefusal("alice/secret2.git", 0), n.slot)
 	}

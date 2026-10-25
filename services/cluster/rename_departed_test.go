@@ -229,6 +229,10 @@ func TestARepositoryRenamedAwayIsNotReusedByTheOneCreatedUnderItsName(t *testing
 	renamedAwayThenTaken(t, tc, tc.createVia, func(n *testNode) {
 		require.True(t, tc.pushVia(n, work, "o/r.git", "refs/heads/main", zero, c2).OK)
 	})
+	// The push returned once acknowledged: node-b holds c2, and its
+	// projector writes the ref after (#231).
+	peer := tc.nodes[1]
+	require.Eventually(t, func() bool { return gitRef(t, peer, "o/r.git", "refs/heads/main") == c2 }, 10*time.Second, 20*time.Millisecond)
 
 	catchUp(t, origin, lag)
 	for _, n := range tc.nodes {
