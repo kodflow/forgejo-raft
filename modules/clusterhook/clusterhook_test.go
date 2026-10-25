@@ -139,3 +139,26 @@ func TestCheckRepoKey(t *testing.T) {
 	require.NoError(t, CheckRepoKey("User4", "Demo"))
 	assert.Equal(t, []string{"user4/.profile.git", "user4/demo.git", "user4/demo.wiki.git"}, asked)
 }
+
+// Without a cluster, nothing waits for the consumer: RequireDerived is nil
+// at once. In a cluster, a node that cannot confirm the repository's rows
+// derived from the cluster's last writes refuses, ErrBehind naming the
+// repository, a refusal the API answers 503.
+func TestRequireDerived(t *testing.T) {
+	require.NoError(t, RequireDerived(context.Background(), "alice/demo.git"))
+
+	var asked []string
+	derived := false
+	SetDerivedWaiter(func(_ context.Context, key string) bool {
+		asked = append(asked, key)
+		return derived
+	})
+	defer SetDerivedWaiter(nil)
+
+	err := RequireDerived(context.Background(), "alice/demo.git")
+	require.ErrorIs(t, err, ErrBehind)
+	assert.Contains(t, err.Error(), "alice/demo.git")
+	derived = true
+	require.NoError(t, RequireDerived(context.Background(), "alice/demo.git"))
+	assert.Equal(t, []string{"alice/demo.git", "alice/demo.git"}, asked)
+}

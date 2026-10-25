@@ -219,6 +219,13 @@ func CreateBranch(ctx *context.APIContext) {
 
 	opt := web.GetForm(ctx).(*api.CreateBranchRepoOption)
 
+	// Before the source is read: a node of a cluster behind on the
+	// repository would branch from what its own git shows, the commit
+	// before a push another node acknowledged (#226, as #189 for tags).
+	if refWritesRefused(ctx) {
+		return
+	}
+
 	var oldCommit *git.Commit
 	var err error
 
@@ -247,9 +254,6 @@ func CreateBranch(ctx *context.APIContext) {
 		}
 	}
 
-	if refWritesRefused(ctx) {
-		return
-	}
 	err = repo_service.CreateNewBranchFromCommit(ctx, ctx.Doer(), ctx.Repo().Repository, ctx.Repo().GitRepo, oldCommit.ID.String(), opt.BranchName)
 	if err != nil {
 		if git_model.IsErrBranchNotExist(err) {

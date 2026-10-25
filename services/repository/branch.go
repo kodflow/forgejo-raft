@@ -40,6 +40,13 @@ import (
 
 // CreateNewBranch creates a new repository branch
 func CreateNewBranch(ctx context.Context, doer *user_model.User, repo *repo_model.Repository, gitRepo *git.Repository, oldBranchName, branchName string) (err error) {
+	// The source is the old branch's SQL row, which the cluster's consumer
+	// writes after a push was acknowledged, on any node: it is read once
+	// the consumer derived every write the cluster confirms now, or the new
+	// branch would start from the commit before the push (#226).
+	if err := clusterhook.RequireDerived(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
+		return err
+	}
 	branch, err := git_model.GetBranch(ctx, repo.ID, oldBranchName)
 	if err != nil {
 		return err
@@ -379,8 +386,13 @@ func RenameBranch(ctx context.Context, repo *repo_model.Repository, doer *user_m
 	// In a cluster, this node's git may not show yet a branch another node
 	// wrote: both names are read once this node serves the repository at
 	// the cluster's commit index, and the cluster refuses a new name it
-	// holds already (#189).
-	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
+	// holds already (#189). The rename moves the branch's SQL row and the
+	// head of its pull requests, which the cluster's consumer writes after
+	// a push was acknowledged: it waits for the consumer too. Renamed
+	// before, the row would keep the commit from before the push, and the
+	// push's work, derived later under the old name, would find neither
+	// the row nor the pull requests (#225).
+	if err := clusterhook.RequireDerived(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
 		return "", err
 	}
 

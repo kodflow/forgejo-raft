@@ -16,6 +16,7 @@ import (
 	git_model "forgejo.org/models/git"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/lfs"
@@ -85,6 +86,15 @@ func ChangeRepoFiles(ctx context.Context, repo *repo_model.Repository, doer *use
 	}
 	if opts.NewBranch == "" {
 		opts.NewBranch = opts.OldBranch
+	}
+
+	// In a cluster, this node's git may not show yet a push another node
+	// acknowledged: the old branch is cloned from it, and a new branch
+	// would start from the commit before the push, for the whole cluster
+	// (#226). Both branches are read once this node serves the repository
+	// at the cluster's commit index.
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
+		return nil, err
 	}
 
 	gitRepo, closer, err := gitrepo.RepositoryFromContextOrOpen(ctx, repo)

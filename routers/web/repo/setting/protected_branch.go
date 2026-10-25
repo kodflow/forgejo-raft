@@ -16,6 +16,7 @@ import (
 	"forgejo.org/models/perm"
 	access_model "forgejo.org/models/perm/access"
 	"forgejo.org/modules/base"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/web"
 	"forgejo.org/routers/web/repo"
 	"forgejo.org/services/context"
@@ -324,6 +325,11 @@ func RenameBranchPost(ctx *context.Context) {
 		} else if git_model.IsErrBranchAlreadyExists(err) {
 			ctx.Flash.Error(ctx.Tr("repo.branch.branch_already_exists", form.To))
 			ctx.Redirect(fmt.Sprintf("%s/branches", ctx.Repo.RepoLink))
+		} else if errors.Is(err, clusterhook.ErrBehind) {
+			// A node of the cluster behind on the repository, or whose
+			// branch rows are not derived yet from the last push: nothing
+			// was renamed, the user retries (#225).
+			ctx.Error(http.StatusServiceUnavailable, err.Error())
 		} else {
 			ctx.ServerError("RenameBranch", err)
 		}

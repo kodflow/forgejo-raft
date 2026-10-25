@@ -218,6 +218,39 @@ func TestAckTrimsEvents(t *testing.T) {
 	assert.Equal(t, []string{sha1B}, h.table.PinnedObjects("a/b.git"))
 }
 
+// LastEventOf names the newest pending event of a repository up to an index
+// of the current lineage: what a read of the repository's SQL as of that
+// index waits for the consumer to derive.
+func TestLastEventOf(t *testing.T) {
+	h := newHarness(t)
+	id := consensus.LogIdentity{Cluster: consensus.ClusterID{1}, Epoch: 1}
+	_, ok := h.table.LastEventOf("a/b.git", id, 10)
+	assert.False(t, ok, "no event")
+	require.True(t, h.apply(KindRefTxn, push("a/b.git", RefUpdate{Ref: "refs/heads/x", New: sha1A})).OK)
+	require.True(t, h.apply(KindRefTxn, push("c/d.git", RefUpdate{Ref: "refs/heads/x", New: sha1A})).OK)
+	require.True(t, h.apply(KindRefTxn, push("a/b.git", RefUpdate{Ref: "refs/heads/y", New: sha1B})).OK)
+
+	tok, ok := h.table.LastEventOf("a/b.git", id, 10)
+	require.True(t, ok)
+	assert.EqualValues(t, 3, tok.Index)
+	tok, ok = h.table.LastEventOf("a/b.git", id, 2)
+	require.True(t, ok)
+	assert.EqualValues(t, 1, tok.Index, "an event after the index is not waited for")
+	_, ok = h.table.LastEventOf("a/b.git", id, 0)
+	assert.False(t, ok)
+	_, ok = h.table.LastEventOf("e/f.git", id, 10)
+	assert.False(t, ok, "another repository's events are not waited for")
+	// The events of an earlier lineage come before any index of a later
+	// one.
+	tok, ok = h.table.LastEventOf("a/b.git", consensus.LogIdentity{Cluster: consensus.ClusterID{1}, Epoch: 2}, 0)
+	require.True(t, ok)
+	assert.EqualValues(t, 3, tok.Index)
+	// An event trimmed from the queue was dispatched: nothing waits for it.
+	require.True(t, h.apply(KindAck, &Ack{Identity: id.String(), Index: 3}).OK)
+	_, ok = h.table.LastEventOf("a/b.git", id, 10)
+	assert.False(t, ok)
+}
+
 func TestAuditRecords(t *testing.T) {
 	h := newHarness(t)
 	assert.False(t, h.apply(KindAudit, &Audit{Operator: "has space", Action: "x", Outcome: "ok"}).OK)

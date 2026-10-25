@@ -81,9 +81,11 @@ func pushOnB(t *testing.T, tc *testCluster, a, b *testNode, work, ref, old, sha 
 func freshFrom(t *testing.T, n *testNode) {
 	t.Helper()
 	clusterhook.SetFreshWaiter(n.r.WaitFresh)
+	clusterhook.SetDerivedWaiter(n.r.WaitDerived)
 	clusterhook.SetRefLookup(n.r.refLive)
 	t.Cleanup(func() {
 		clusterhook.SetFreshWaiter(nil)
+		clusterhook.SetDerivedWaiter(nil)
 		clusterhook.SetRefLookup(nil)
 	})
 }
