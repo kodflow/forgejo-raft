@@ -4,6 +4,7 @@
 package repo
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/base"
 	"forgejo.org/modules/charset"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/json"
 	"forgejo.org/modules/log"
@@ -806,8 +808,14 @@ func UploadFilePost(ctx *context.Context) {
 			ctx.Data["Err_NewBranchName"] = true
 			branchErr := err.(git_model.ErrBranchAlreadyExists)
 			ctx.RenderWithErr(ctx.Tr("repo.editor.branch_already_exists", branchErr.BranchName), tplUploadFile, &form)
-		} else if git.IsErrPushOutOfDate(err) {
+		} else if git.IsErrPushOutOfDate(err) || models.IsErrCommitIDDoesNotMatch(err) {
+			// The branch moved since the request read its head (in a
+			// cluster, a push this node caught up with meanwhile, #239).
 			ctx.RenderWithErr(ctx.Tr("repo.editor.file_changed_while_editing", ctx.Repo.RepoLink+"/compare/"+util.PathEscapeSegments(ctx.Repo.CommitID)+"..."+util.PathEscapeSegments(form.NewBranchName)), tplUploadFile, &form)
+		} else if errors.Is(err, clusterhook.ErrBehind) {
+			// A node of the cluster behind on the repository: nothing was
+			// written, the user retries, as for the other writes (#239).
+			ctx.Error(http.StatusServiceUnavailable, err.Error())
 		} else if git.IsErrPushRejected(err) {
 			errPushRej := err.(*git.ErrPushRejected)
 			if len(errPushRej.Message) == 0 {

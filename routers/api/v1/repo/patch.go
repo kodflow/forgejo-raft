@@ -107,6 +107,11 @@ func ApplyDiffPatch(ctx *context.APIContext) {
 			ctx.Error(http.StatusNotFound, "BranchDoesNotExist", err)
 			return
 		}
+		// A node of the cluster behind on the repository: nothing was
+		// written, the client retries (#239).
+		if clusterBehind(ctx, err) {
+			return
+		}
 		ctx.Error(http.StatusInternalServerError, "ApplyPatch", err)
 	} else {
 		ctx.JSON(http.StatusCreated, fileResponse)

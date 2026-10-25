@@ -13,6 +13,7 @@ import (
 	git_model "forgejo.org/models/git"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/log"
@@ -99,6 +100,15 @@ func (opts *ApplyDiffPatchOptions) Validate(ctx context.Context, repo *repo_mode
 func ApplyDiffPatch(ctx context.Context, repo *repo_model.Repository, doer *user_model.User, opts *ApplyDiffPatchOptions) (*structs.FileResponse, error) {
 	err := repo.MustNotBeArchived()
 	if err != nil {
+		return nil, err
+	}
+
+	// In a cluster, this node's git may not show yet a push another node
+	// acknowledged: the old branch is read and cloned from it, and a new
+	// branch would start from the commit before the push, for the whole
+	// cluster (#239, as #226 for ChangeRepoFiles). Both branches are read
+	// once this node serves the repository at the cluster's commit index.
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
 		return nil, err
 	}
 

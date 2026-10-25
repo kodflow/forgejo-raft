@@ -41,7 +41,7 @@ func createBranchFromMaster(t *testing.T, name string) (*http.Response, string, 
 // reason, and nothing is written (#226).
 func TestCreateBranchFromABranchRefusedWhileItsRowLags(t *testing.T) {
 	unittest.PrepareTestEnv(t)
-	clusterhook.SetDerivedWaiter(func(context.Context, string) bool { return false })
+	clusterhook.SetDerivedWaiter(func(context.Context, string) error { return clusterhook.ErrBehind })
 	t.Cleanup(func() { clusterhook.SetDerivedWaiter(nil) })
 
 	resp, body, created := createBranchFromMaster(t, "refused-behind")

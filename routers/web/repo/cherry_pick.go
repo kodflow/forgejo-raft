@@ -6,12 +6,14 @@ package repo
 import (
 	"bytes"
 	"errors"
+	"net/http"
 	"strings"
 
 	"forgejo.org/models"
 	git_model "forgejo.org/models/git"
 	"forgejo.org/models/unit"
 	"forgejo.org/modules/base"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/util"
@@ -141,6 +143,12 @@ func CherryPickPost(ctx *context.Context) {
 		} else if models.IsErrCommitIDDoesNotMatch(err) {
 			ctx.RenderWithErr(ctx.Tr("repo.editor.file_changed_while_editing", ctx.Repo.RepoLink+"/compare/"+form.LastCommit+"..."+ctx.Repo.CommitID), tplPatchFile, &form)
 			return
+		} else if errors.Is(err, clusterhook.ErrBehind) {
+			// A node of the cluster behind on the repository: nothing was
+			// written, and the patch would be applied on the same stale
+			// branch; the user retries (#239).
+			ctx.Error(http.StatusServiceUnavailable, err.Error())
+			return
 		}
 		// Drop through to the apply technique
 
@@ -177,6 +185,11 @@ func CherryPickPost(ctx *context.Context) {
 				return
 			} else if models.IsErrCommitIDDoesNotMatch(err) {
 				ctx.RenderWithErr(ctx.Tr("repo.editor.file_changed_while_editing", ctx.Repo.RepoLink+"/compare/"+form.LastCommit+"..."+ctx.Repo.CommitID), tplPatchFile, &form)
+				return
+			} else if errors.Is(err, clusterhook.ErrBehind) {
+				// The cherry-pick above found the node fresh, the patch's
+				// own wait did not: nothing was written (#239).
+				ctx.Error(http.StatusServiceUnavailable, err.Error())
 				return
 			}
 			ctx.RenderWithErr(ctx.Tr("repo.editor.fail_to_apply_patch", err), tplPatchFile, &form)

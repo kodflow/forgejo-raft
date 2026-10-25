@@ -65,10 +65,15 @@ func TestARenameIntoAFreedKeyKeepsTheEarlierOne(t *testing.T) {
 
 // The table keeps the database ID of the repository each key holds: a ref
 // transaction carrying one sets it, one without leaves it, a rename moves
-// it, a deletion forgets it, and a snapshot keeps it (#82).
+// it, a deletion forgets it, and a snapshot keeps it (#82). RepoID reads
+// it as RefsWithID does (#239).
 func TestTheTableKeepsEachKeysRepositoryID(t *testing.T) {
 	h := newHarness(t)
-	id := func(tbl *Table, repo string) int64 { _, id, _ := tbl.RefsWithID(repo); return id }
+	id := func(tbl *Table, repo string) int64 {
+		_, id, _ := tbl.RefsWithID(repo)
+		assert.Equal(t, id, tbl.RepoID(repo), "%s", repo)
+		return id
+	}
 	require.True(t, h.apply(KindRefTxn, push("o/a.git", RefUpdate{Ref: "refs/heads/main", New: sha1A})).OK)
 	assert.EqualValues(t, 7, id(h.table, "o/a.git"))
 	noID := push("o/a.git", RefUpdate{Ref: "refs/heads/x", New: sha1B})

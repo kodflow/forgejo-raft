@@ -10,9 +10,11 @@ import (
 	"net/http"
 	"testing"
 
+	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unittest"
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
+	"forgejo.org/modules/gitrepo"
 	api "forgejo.org/modules/structs"
 	"forgejo.org/modules/test"
 	"forgejo.org/modules/web"
@@ -192,4 +194,69 @@ func TestChangeFilesRefusedOnANodeBehind(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, ctx.Resp.Status())
 	assert.Contains(t, resp.Body.String(), "may be behind")
 	assert.False(t, ctx.Repo().GitRepo.IsBranchExist("refused-behind"))
+}
+
+// applyDiffPatchToANewBranch applies, through the API, a patch adding a
+// file to master of repo1, on the new branch name. It returns the status,
+// the body, and the new branch's parent, empty when it was not created.
+func applyDiffPatchToANewBranch(t *testing.T, name string) (int, string, string) {
+	t.Helper()
+	ctx, resp := contexttest.MockAPIContext(t, "POST /api/v1/repos/user2/repo1/diffpatch")
+	contexttest.LoadUser(t, ctx, 2)
+	contexttest.LoadRepo(t, ctx, 1)
+	contexttest.LoadGitRepo(t, ctx)
+	defer ctx.Repo().GitRepo.Close()
+	web.SetForm(ctx, &api.ApplyDiffPatchFileOptions{
+		BranchName: "master", NewBranchName: name,
+		Content: "diff --git a/" + name + ".txt b/" + name + ".txt\n" +
+			"new file mode 100644\n" +
+			"--- /dev/null\n" +
+			"+++ b/" + name + ".txt\n" +
+			"@@ -0,0 +1 @@\n" +
+			"+patch\n",
+	})
+
+	ApplyDiffPatch(ctx)
+
+	parent := ""
+	if commit, err := ctx.Repo().GitRepo.GetBranchCommit(name); err == nil {
+		if id, err := commit.ParentID(0); err == nil {
+			parent = id.String()
+		}
+	}
+	return ctx.Resp.Status(), resp.Body.String(), parent
+}
+
+// A patch applied through the API to a new branch, on a node of the
+// cluster behind on the repository, is refused with 503 before the old
+// branch is read from the node's git: the new branch would start from the
+// commit before a push another node acknowledged. Nothing is written
+// (#239).
+func TestApplyDiffPatchRefusedOnANodeBehind(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	clusterhook.SetFreshWaiter(func(context.Context, string) bool { return false })
+	t.Cleanup(func() { clusterhook.SetFreshWaiter(nil) })
+
+	status, body, parent := applyDiffPatchToANewBranch(t, "refused-behind")
+
+	assert.Equal(t, http.StatusServiceUnavailable, status, body)
+	assert.Contains(t, body, "may be behind")
+	assert.Empty(t, parent, "the new branch was written")
+}
+
+// Without a cluster the patch is applied to the new branch, on master, as
+// before.
+func TestApplyDiffPatchOutsideACluster(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+
+	status, body, parent := applyDiffPatchToANewBranch(t, "outside-a-cluster")
+
+	require.Equal(t, http.StatusCreated, status, body)
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	gitRepo, err := gitrepo.OpenRepository(t.Context(), repo)
+	require.NoError(t, err)
+	defer gitRepo.Close()
+	master, err := gitRepo.GetBranchCommitID("master")
+	require.NoError(t, err)
+	assert.Equal(t, master, parent)
 }
