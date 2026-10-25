@@ -208,7 +208,12 @@ type NonceMark struct {
 }
 
 // NoncesKept is how many committed nonces the table retains: far more than
-// the transactions in flight at once, which the registry caps.
+// the transactions in flight at once, which the registry caps. It does not
+// bound the commits that may land while an outcome stays open, a proposer
+// cut off from the majority included: a proposer reads the absence of its
+// nonce as a refusal only while NoncesKeptSince says the ring still covers
+// its proposal (#234). The ring is replicated state, in the snapshot: a
+// change of the bound follows the payload version rule.
 const NoncesKept = 4096
 
 func (t *Table) keepNonce(nonce string, index uint64) {
@@ -234,6 +239,62 @@ func (t *Table) CommittedNonce(nonce string) (uint64, bool) {
 	defer t.mu.RUnlock()
 	i, ok := t.byNonce[nonce]
 	return i, ok && nonce != ""
+}
+
+// NoncesKeptSince reports whether the table still holds the nonce of every
+// command it accepted after index of lineage id: the ring dropped none of
+// them. Only then does a nonce's absence say its command was not accepted.
+// Every accepted ref transaction adds its own nonce, so a command whose
+// outcome stayed open while more than NoncesKept of them committed may
+// have committed with its nonce already dropped (#234). The ring keeps one
+// nonce per entry, in the order of their indexes, and drops the oldest
+// only once it holds NoncesKept, which a snapshot carries whole: a ring
+// below that bound never dropped one. A table that applies another lineage
+// than id answers false, its indexes not comparing with index; a zero id,
+// read on a table that had applied nothing, compares with any.
+func (t *Table) NoncesKeptSince(id consensus.LogIdentity, index uint64) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if id != (consensus.LogIdentity{}) && id != t.identity {
+		return false
+	}
+	return len(t.nonces) < NoncesKept || t.nonces[0].Index <= index+1
+}
+
+// MovedSince reports whether one entry applied after index moved every key
+// of moves to its target, and the table still shows it: each move is the
+// newest rename into its target, all at that entry's index, and no target
+// was deleted or renamed away since. A proposer whose rename's nonce the
+// ring dropped (NoncesKeptSince) tells by it that its rename committed: an
+// entry past the proposal's start that made the same moves left the table
+// where its own would, and the database must follow it. It reads the
+// departures GenerationVersion entries record, the version from which a
+// rename carries a nonce.
+func (t *Table) MovedSince(moves [][2]string, index uint64) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var at uint64
+	for i, m := range moves {
+		mark, ok := t.renamed[m[1]]
+		if !ok || mark.From != m[0] || mark.Index <= index || (i > 0 && mark.Index != at) {
+			return false
+		}
+		at = mark.Index
+		if _, deleted := t.deleted[m[1]]; deleted || t.departedAt[m[1]] > at {
+			return false
+		}
+	}
+	return len(moves) > 0
+}
+
+// DeletedSince reports whether repo is deleted, by a deletion applied after
+// index, and no ref was written under it since: MovedSince for a
+// deletion.
+func (t *Table) DeletedSince(repo string, index uint64) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	at, ok := t.deleted[repo]
+	return ok && at > index
 }
 
 // WriteVersion is the payload version a proposer writes: BaseVersion until
