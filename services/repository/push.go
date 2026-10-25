@@ -36,7 +36,7 @@ var pushQueue *queue.WorkerPoolQueue[[]*repo_module.PushUpdateOptions]
 // handle passed PR IDs and test the PRs
 func handler(items ...[]*repo_module.PushUpdateOptions) [][]*repo_module.PushUpdateOptions {
 	for _, opts := range items {
-		if err := pushUpdates(graceful.GetManager().HammerContext(), opts); err != nil {
+		if err := pushUpdates(graceful.GetManager().HammerContext(), opts, nil); err != nil {
 			// Username and repository stays the same between items in opts.
 			pushUpdate := opts[0]
 			log.Error("pushUpdate[%s/%s] failed: %v", pushUpdate.RepoUserName, pushUpdate.RepoName, err)
@@ -79,12 +79,66 @@ func PushUpdates(opts []*repo_module.PushUpdateOptions) error {
 // SQL is derived from the replicated log and not from a node's hooks.
 // ctx carries the replicated command's identity, which the webhook tasks
 // derive theirs from.
-func PushUpdatesNow(ctx context.Context, opts []*repo_module.PushUpdateOptions) error {
-	return pushUpdates(ctx, opts)
+//
+// lost holds the commits of the push that are lost: this node's git does not
+// hold them and no member of the cluster can provide them any more, a push
+// forced over them before this node received them and git gc, or the loss
+// of the members that held them (#224). nil for none. Their push is derived
+// from what git still shows rather than failing at every retry:
+//
+//   - a branch update whose new commit is lost: the branch was rewritten or
+//     deleted since, and its row follows git as for any push
+//     (SyncBranchesToDB, by the caller). Nothing describes the commit: no
+//     push or creation notification (webhooks, Actions, the activity feed),
+//     no issue reference from its messages, no pull request
+//     synchronization, which the later write of the branch runs for what it
+//     holds now. A first branch still makes its repository non-empty, its
+//     default branch. Upstream drops the notifications of a tag whose commit
+//     is missing the same way.
+//   - a branch update whose old commit is lost, the new one held: the
+//     commits between are unknown. The push is described by its new commit
+//     alone, as head commit and only commit, with no compare URL, and runs
+//     its notifications and its pull request synchronization; the issue
+//     references of the commits between are not made.
+//
+// A commit lost but held by git after all is read as usual; any other
+// missing commit fails the work as before.
+func PushUpdatesNow(ctx context.Context, opts []*repo_module.PushUpdateOptions, lost map[string]bool) error {
+	return pushUpdates(ctx, opts, lost)
+}
+
+// isLost reports whether the commit id, which the caller declared lost, is
+// still missing from git.
+func isLost(gitRepo *git.Repository, lost map[string]bool, id string) bool {
+	if !lost[id] {
+		return false
+	}
+	_, err := gitRepo.GetCommit(id)
+	return git.IsErrNotExist(err)
+}
+
+// markFirstBranch makes refName, pushed to an empty repository, its default
+// branch, and the repository non-empty.
+func markFirstBranch(ctx context.Context, repo *repo_model.Repository, refName string) error {
+	if !repo.IsEmpty {
+		return nil
+	}
+	repo.DefaultBranch = refName
+	repo.IsEmpty = false
+	if repo.DefaultBranch != setting.Repository.DefaultBranch {
+		if err := gitrepo.SetDefaultBranch(ctx, repo, repo.DefaultBranch); err != nil {
+			return err
+		}
+	}
+	// Update the is empty and default_branch columns
+	if err := repo_model.UpdateRepositoryCols(ctx, repo, "default_branch", "is_empty"); err != nil {
+		return fmt.Errorf("UpdateRepositoryCols: %w", err)
+	}
+	return nil
 }
 
 // pushUpdates generates push action history feeds for push updating multiple refs
-func pushUpdates(parent context.Context, optsList []*repo_module.PushUpdateOptions) error {
+func pushUpdates(parent context.Context, optsList []*repo_module.PushUpdateOptions, lost map[string]bool) error {
 	if len(optsList) == 0 {
 		return nil
 	}
@@ -182,7 +236,14 @@ func pushUpdates(parent context.Context, optsList []*repo_module.PushUpdateOptio
 			}
 
 			branch := opts.RefFullName.BranchName()
-			if !opts.IsDelRef() {
+			if !opts.IsDelRef() && isLost(gitRepo, lost, opts.NewCommitID) {
+				log.Warn("pushUpdates: the commit %s pushed to %s of %s is lost (no member of the cluster holds it any more, the branch was rewritten since): the branch row follows git, the push's notifications, issue references and pull request synchronization are not run", opts.NewCommitID, branch, repo.FullName())
+				if opts.IsNewRef() {
+					if err := markFirstBranch(ctx, repo, opts.RefName()); err != nil {
+						return err
+					}
+				}
+			} else if !opts.IsDelRef() {
 				log.Trace("TriggerTask '%s/%s' by %s", repo.Name, branch, pusher.Name)
 				// In a cluster, only once the consumer's batch commits: a
 				// replay must not comment on or notify a pull request again.
@@ -200,19 +261,11 @@ func pushUpdates(parent context.Context, optsList []*repo_module.PushUpdateOptio
 
 				// Push new branch.
 				var l []*git.Commit
+				oldLost := false
 				if opts.IsNewRef() {
-					if repo.IsEmpty { // Change default branch and empty status only if pushed ref is non-empty branch.
-						repo.DefaultBranch = refName
-						repo.IsEmpty = false
-						if repo.DefaultBranch != setting.Repository.DefaultBranch {
-							if err := gitrepo.SetDefaultBranch(ctx, repo, repo.DefaultBranch); err != nil {
-								return err
-							}
-						}
-						// Update the is empty and default_branch columns
-						if err := repo_model.UpdateRepositoryCols(ctx, repo, "default_branch", "is_empty"); err != nil {
-							return fmt.Errorf("UpdateRepositoryCols: %w", err)
-						}
+					// Change default branch and empty status only if pushed ref is non-empty branch.
+					if err := markFirstBranch(ctx, repo, refName); err != nil {
+						return err
 					}
 
 					l, err = newCommit.CommitsBeforeLimit(10)
@@ -220,6 +273,10 @@ func pushUpdates(parent context.Context, optsList []*repo_module.PushUpdateOptio
 						return fmt.Errorf("newCommit.CommitsBeforeLimit: %w", err)
 					}
 					notify_service.CreateRef(ctx, pusher, repo, opts.RefFullName, opts.NewCommitID)
+				} else if oldLost = isLost(gitRepo, lost, opts.OldCommitID); oldLost {
+					log.Warn("pushUpdates: the commit %s that %s of %s held before the push of %s is lost (no member of the cluster holds it any more): the push is described by %s alone", opts.OldCommitID, branch, repo.FullName(), opts.NewCommitID, opts.NewCommitID)
+					l = []*git.Commit{newCommit}
+					cache.Remove(repo.GetCommitsCountCacheKey(opts.RefName(), true))
 				} else {
 					l, err = newCommit.CommitsBeforeUntil(opts.OldCommitID)
 					if err != nil {
@@ -269,7 +326,8 @@ func pushUpdates(parent context.Context, optsList []*repo_module.PushUpdateOptio
 					oldCommitID = repo.DefaultBranch
 				}
 
-				if oldCommitID != objectFormat.EmptyObjectID().String() {
+				// A lost old commit has nothing to compare with.
+				if oldCommitID != objectFormat.EmptyObjectID().String() && !oldLost {
 					commits.CompareURL = repo.ComposeCompareURL(oldCommitID, opts.NewCommitID)
 				} else {
 					commits.CompareURL = ""

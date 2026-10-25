@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -125,7 +126,40 @@ type consumer struct {
 	// waitsBehind reports a repository whose projection waits behind
 	// another repository's in the projector's serial pass; nil in tests.
 	waitsBehind func(repo string) bool
+
+	// fetch brings objects this node lacks from the members holding them:
+	// the object channel's fetchMissing; nil without one, in unit tests.
+	fetch func(ctx context.Context, repo, dir string, shas []string) error
+	// lacking is what the members answered about each commit the work of
+	// an event reads that this node lacks, by directory and id; fetching
+	// holds the directories a fetch of such commits runs for, and fetches
+	// counts those fetches (#224).
+	lacking  map[lackKey]*lackState
+	fetching map[string]bool
+	fetches  sync.WaitGroup
 }
+
+// lackKey is a commit a repository's directory lacks.
+type lackKey struct{ dir, id string }
+
+// lackState is what the fetches of a commit this node lacks found: since
+// when every member asked answered that it does not hold it, and when it
+// last answered so; zero once one answered otherwise.
+type lackState struct {
+	nowhere, confirmed time.Time
+}
+
+// obtainWait is how long a dispatch waits for the fetch it started of the
+// commits its work reads: past it the work runs, fails as before, and is
+// tried again while the fetch goes on in the background. The single
+// dispatcher must not wait for a large pack, nor on a member that stalls.
+var obtainWait = 5 * time.Second
+
+// lostConfirm is how long every member must go on answering that it does
+// not hold a commit before the consumer declares it lost: a member that
+// has not projected a rename yet serves the repository under its old name
+// only, and answers so for a while.
+var lostConfirm = 5 * time.Minute
 
 // projectionStallBound is how long the dispatcher waits for a repository
 // to be projected before it parks that event: a repository that never
@@ -182,6 +216,9 @@ func newConsumer(r *Replicator) *consumer {
 		listParked: cluster_model.ListParked, unpark: cluster_model.UnparkEntry, noteParked: cluster_model.NoteParkedFailure,
 		lastAck: map[string]uint64{}, failures: map[uint64]int{}, reasons: map[uint64]string{}, seen: map[string]int64{},
 		stalledOut: map[string]bool{}, settled: r.backupSettled,
+	}
+	if r.objects != nil {
+		c.fetch = r.objects.fetchMissing
 	}
 	c.ack = func(ctx context.Context, lineage string, index uint64) error {
 		data, err := reftable.Encode(reftable.KindAck, &reftable.Ack{Identity: lineage, Index: index})
@@ -297,6 +334,7 @@ func (c *consumer) forget() {
 	c.reasons = map[uint64]string{}
 	c.stalledOut = map[string]bool{}
 	c.stall.index, c.stall.repo = 0, ""
+	c.lacking = nil
 }
 
 // projected reports whether the events of one entry are projected on this
@@ -454,6 +492,9 @@ const checkpointRemedy = "set [cluster] CHECKPOINT_INTERVAL on the leader, or tr
 func (c *consumer) run(ctx context.Context) {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
+	// A fetch of a work's commits writes into a repository's directory: it
+	// ends, cancelled with ctx, before the consumer does.
+	defer c.fetches.Wait()
 	checked := false
 	for {
 		select {
@@ -505,6 +546,8 @@ func (c *consumer) step(ctx context.Context) error {
 		c.notePass(nil)
 		c.mu.Lock()
 		c.offNoted = false
+		// The members' answers are asked again by the next leadership.
+		c.lacking = nil
 		c.mu.Unlock()
 		return nil
 	}
@@ -657,6 +700,9 @@ func (c *consumer) pass(ctx context.Context) error {
 // with a parked event are parked behind it, so its work keeps its order.
 func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_model.Cursor, batch []reftable.Event) error {
 	next := cluster_model.Cursor{Lineage: lineage, Position: int64(batch[len(batch)-1].Token.Index)}
+	// The commits the work reads that this node lacks are fetched from the
+	// members first, outside the transaction (#224).
+	lost := c.obtain(ctx, batch)
 	// Side effects outside SQL (pull request tests, webhook deliveries) run
 	// only once this transaction commits: a rolled-back attempt is replayed,
 	// and its effects would otherwise happen twice.
@@ -719,7 +765,7 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 				parked += len(group)
 				continue
 			}
-			err := c.work(ctx, group)
+			err := c.work(withLostCommits(ctx, lost[group[0].Repo]), group)
 			if err == nil {
 				err = waits.take()
 			}
@@ -828,6 +874,259 @@ func (c *consumer) parkGroup(ctx context.Context, lineage string, group []reftab
 	return nil
 }
 
+// commitsRead lists the commits the post-receive work of ev reads in git
+// (services/repository/push.go): the new commit of a branch or a tag it
+// does not delete, and the old commit of a branch it updates.
+func commitsRead(ev reftable.Event) []string {
+	if ev.Kind != reftable.EventRef || ev.IsWiki || ev.PusherID == 0 || ev.Trigger == TriggerImport || !isHex(ev.New) || strings.Trim(ev.New, "0") == "" {
+		return nil
+	}
+	ref := git.RefName(ev.Ref)
+	switch {
+	case ref.IsBranch():
+		if isHex(ev.Old) && strings.Trim(ev.Old, "0") != "" {
+			return []string{ev.New, ev.Old}
+		}
+		return []string{ev.New}
+	case ref.IsTag():
+		return []string{ev.New}
+	}
+	return nil
+}
+
+// commitsNeed is the commits the work of some events reads in one
+// repository's directory, which the members know under key.
+type commitsNeed struct {
+	key, dir string
+	ids      []string
+	// events are the events' keys, which the work's lost commits go by.
+	events []string
+}
+
+// obtain makes sure this node, the leader, holds the commits the
+// post-receive work of evs reads, before the work's transaction (#224).
+// The projector fetches only what the table's refs name now: a commit no
+// ref names any more, a push forced over it before this node received it,
+// would be missing at every attempt of the work, parked, and every retry
+// would fail the same while this node leads. A commit missing from the
+// repository is fetched from the members in the background; the dispatch
+// waits obtainWait for it, the work runs either way, and fails as before
+// while the commit is missing. A member that holds it keeps it from git gc
+// while its event is in the table (PinnedObjects).
+//
+// It returns, by event key, the commits declared lost: every member asked
+// answered that it does not hold them, and went on answering so for
+// lostConfirm. No member can provide them, and the work derives its push
+// without them (repo_service.PushUpdatesNow) rather than park it for good.
+// A member that does not answer may hold them: they are not lost, and the
+// event waits for it, parked, as for any failure.
+func (c *consumer) obtain(ctx context.Context, evs []reftable.Event) map[string]map[string]bool {
+	if c.fetch == nil || c.r == nil {
+		return nil
+	}
+	type eventRepo struct {
+		id  int64
+		key string
+	}
+	var needs []*commitsNeed
+	byDir := map[string]*commitsNeed{}
+	looked := map[eventRepo]*commitsNeed{}
+	for _, ev := range evs {
+		ids := commitsRead(ev)
+		if len(ids) == 0 {
+			continue
+		}
+		c.mu.Lock()
+		parking := c.failures[ev.Token.Index] >= maxAttempts
+		c.mu.Unlock()
+		if parking {
+			continue // parked without its work
+		}
+		er := eventRepo{id: ev.RepoID, key: ev.Repo}
+		n, ok := looked[er]
+		if !ok {
+			// The directory the work opens: the repository's name now.
+			if repo, err := lookupRepo(ctx, ev); err == nil {
+				key := clusterhook.RepoKey(repo.OwnerName, repo.Name, false)
+				dir := filepath.Join(c.r.root, filepath.FromSlash(key))
+				if n = byDir[dir]; n == nil {
+					n = &commitsNeed{key: key, dir: dir}
+					byDir[dir] = n
+					needs = append(needs, n)
+				}
+			}
+			// A repository not found: the work says what becomes of it.
+			looked[er] = n
+		}
+		if n == nil {
+			continue
+		}
+		for _, id := range ids {
+			if !slices.Contains(n.ids, id) {
+				n.ids = append(n.ids, id)
+			}
+		}
+		if !slices.Contains(n.events, ev.Repo) {
+			n.events = append(n.events, ev.Repo)
+		}
+	}
+	var lost map[string]map[string]bool
+	for _, n := range needs {
+		missing, err := missingObjects(ctx, n.dir, n.ids)
+		if err != nil {
+			// The directory is not there, or git fails: the work opens the
+			// same one, and says why.
+			continue
+		}
+		if len(missing) == 0 {
+			c.settle(n.dir, n.ids, nil)
+			continue
+		}
+		if done := c.startFetch(ctx, n.key, n.dir, missing); done != nil {
+			select {
+			case <-done:
+			case <-time.After(obtainWait):
+			case <-ctx.Done():
+			}
+		}
+		still, err := missingObjects(ctx, n.dir, missing)
+		if err != nil {
+			continue
+		}
+		gone := c.settle(n.dir, missing, still)
+		if len(gone) == 0 {
+			continue
+		}
+		log.Error("cluster consumer: the commits %v of %s are lost: no member of the cluster holds them any more; the post-receive work of its events derives their pushes without them", gone, n.key)
+		if lost == nil {
+			lost = map[string]map[string]bool{}
+		}
+		for _, k := range n.events {
+			if lost[k] == nil {
+				lost[k] = map[string]bool{}
+			}
+			for _, id := range gone {
+				lost[k][id] = true
+			}
+		}
+	}
+	return lost
+}
+
+// startFetch fetches the commits ids into dir from the members, in the
+// background, and notes what they answered; it returns a channel closed
+// when that fetch ended, or nil when a fetch for dir runs already. The
+// fetch is bounded by the object channel's own bounds and by ctx.
+func (c *consumer) startFetch(ctx context.Context, key, dir string, ids []string) <-chan struct{} {
+	c.mu.Lock()
+	if c.fetching[dir] {
+		c.mu.Unlock()
+		return nil
+	}
+	if c.fetching == nil {
+		c.fetching = map[string]bool{}
+	}
+	c.fetching[dir] = true
+	c.fetches.Add(1)
+	c.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		defer c.fetches.Done()
+		fetched := false
+		for _, id := range ids {
+			// One commit at a time: a member holding one of them only
+			// answers that it does not hold them all.
+			if m, err := missingObjects(ctx, dir, []string{id}); err == nil && len(m) == 0 {
+				continue
+			}
+			err := c.fetch(ctx, key, dir, []string{id})
+			c.noteFetch(dir, id, err)
+			switch {
+			case err == nil:
+				fetched = true
+				log.Info("cluster consumer: fetched %s of %s, which the post-receive work of its events reads", id, key)
+			case errors.Is(err, errHeldNowhere):
+				log.Warn("cluster consumer: %s of %s, which the post-receive work of its events reads, is held by no member: %v", id, key, err)
+			default:
+				log.Warn("cluster consumer: fetching %s of %s, which the post-receive work of its events reads: %v", id, key, err)
+			}
+		}
+		c.mu.Lock()
+		delete(c.fetching, dir)
+		c.mu.Unlock()
+		close(done)
+		if fetched && c.r != nil {
+			c.r.signalConsumer()
+		}
+	}()
+	return done
+}
+
+// noteFetch keeps what a fetch of the commit id found.
+func (c *consumer) noteFetch(dir, id string, err error) {
+	k := lackKey{dir: dir, id: id}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err == nil {
+		delete(c.lacking, k)
+		return
+	}
+	if c.lacking == nil {
+		c.lacking = map[lackKey]*lackState{}
+	}
+	s := c.lacking[k]
+	if s == nil {
+		s = &lackState{}
+		c.lacking[k] = s
+	}
+	if !errors.Is(err, errHeldNowhere) {
+		s.nowhere, s.confirmed = time.Time{}, time.Time{}
+		return
+	}
+	if s.nowhere.IsZero() {
+		s.nowhere = now
+	}
+	s.confirmed = now
+}
+
+// settle forgets the commits among asked that dir holds now, still being
+// those it lacks, and returns those of still that are lost: every member
+// answered that it does not hold them, and went on answering so for
+// lostConfirm.
+func (c *consumer) settle(dir string, asked, still []string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, id := range asked {
+		if !slices.Contains(still, id) {
+			delete(c.lacking, lackKey{dir: dir, id: id})
+		}
+	}
+	var lost []string
+	for _, id := range still {
+		if s := c.lacking[lackKey{dir: dir, id: id}]; s != nil && !s.nowhere.IsZero() && s.confirmed.Sub(s.nowhere) >= lostConfirm {
+			lost = append(lost, id)
+		}
+	}
+	return lost
+}
+
+// lostCommitsKey carries, to the post-receive work of a group, the commits
+// declared lost for it (obtain).
+type lostCommitsKey struct{}
+
+func withLostCommits(ctx context.Context, lost map[string]bool) context.Context {
+	if len(lost) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, lostCommitsKey{}, lost)
+}
+
+func lostCommitsOf(ctx context.Context) map[string]bool {
+	lost, _ := ctx.Value(lostCommitsKey{}).(map[string]bool)
+	return lost
+}
+
 // retryParked runs the work of the parked events, entry by entry, in
 // order; an entry's work and the removal of its rows commit together, so
 // it is applied exactly once. A repository whose entry fails or is not
@@ -885,13 +1184,15 @@ func (c *consumer) retryParked(ctx context.Context) (int, error) {
 			blocked[key] = true
 			continue
 		}
+		// As in dispatch: the commits its work reads, fetched first (#224).
+		lost := c.obtain(ctx, evs)[evs[0].Repo]
 		wctx, effects := clusterhook.WithAfterCommit(ctx)
 		waits := &lockWaits{}
 		wctx = db.OnSavepointRollback(wctx, waits.see)
 		ran := false
 		err := c.tx(wctx, func(ctx context.Context) error {
 			ran = false
-			if err := c.work(ctx, evs); err != nil {
+			if err := c.work(withLostCommits(ctx, lost), evs); err != nil {
 				return err
 			}
 			if err := waits.take(); err != nil {
@@ -1288,7 +1589,7 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		log.Warn("cluster consumer: the pusher %d of %s at %d is gone; the notifications of its push are dropped", first.PusherID, first.Repo, first.Token.Index)
 		return nil
 	}
-	return repo_service.PushUpdatesNow(clusterhook.WithCommand(ctx, first.Token.String()), updates)
+	return repo_service.PushUpdatesNow(clusterhook.WithCommand(ctx, first.Token.String()), updates, lostCommitsOf(ctx))
 }
 
 // tagGone reports whether a tag update has nothing left to land on: a new
