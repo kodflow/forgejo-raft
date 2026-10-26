@@ -13,6 +13,7 @@ import (
 	issues_model "forgejo.org/models/issues"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/git/pushoptions"
 	"forgejo.org/modules/log"
@@ -261,6 +262,22 @@ func procReceivePullRequest(ctx context.Context,
 		return nil, fmt.Errorf("unable to load base repository for PR[%d]: %w", pr.ID, err)
 	}
 
+	// The update is decided against the head read from this node's git
+	// below. In a cluster, a node behind an AGit update another node
+	// acknowledged shows the head before it, takes a push that drops the
+	// acknowledged commits for a fast-forward, and writes it over them
+	// for the whole cluster (#263). The head is read once this node serves
+	// the repository at the cluster's commit index; while it does not,
+	// the push is refused and nothing is written.
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(pr.BaseRepo.OwnerName, pr.BaseRepo.Name, false)); err != nil {
+		return &private.HookProcReceiveRefResult{
+			OriginalRef: refFullName,
+			OldOID:      oldCommitID,
+			NewOID:      newCommitID,
+			Err:         err.Error(),
+		}, nil
+	}
+
 	currentCommitID, err := gitRepo.GetRefCommitID(pr.GetGitRefName())
 	if err != nil {
 		return nil, fmt.Errorf("unable to get commit id of reference[%s] in base repository for PR[%d]: %w", pr.GetGitRefName(), pr.ID, err)
@@ -273,6 +290,22 @@ func procReceivePullRequest(ctx context.Context,
 			OldOID:      oldCommitID,
 			NewOID:      newCommitID,
 			Err:         "The new commit is the same as the old commit",
+		}, nil
+	}
+
+	// A push straight to refs/pull/N/head is taken as forced: the client
+	// checked the fast-forward, or was told to force, against the head it
+	// was advertised, its old value. A head that moved since then (an
+	// AGit update acknowledged through another node of a cluster, while
+	// this one advertised the head before it) would be overwritten
+	// unseen: the push is refused, as git refuses the update of any ref
+	// that moved since the client read it (#263).
+	if refFullName.IsPull() && !git.IsEmptyCommitID(oldCommitID, nil) && oldCommitID != currentCommitID {
+		return &private.HookProcReceiveRefResult{
+			OriginalRef: refFullName,
+			OldOID:      oldCommitID,
+			NewOID:      newCommitID,
+			Err:         "Updates were rejected because the pull request's head moved since you fetched it. Fetch it, then push again.",
 		}, nil
 	}
 
@@ -291,9 +324,11 @@ func procReceivePullRequest(ctx context.Context,
 		}
 	}
 
-	// Set the new commit as reference of the pull request.
+	// Set the new commit as reference of the pull request, over the head
+	// the update was decided against only: a head that moved meanwhile,
+	// on this node or, in a cluster, through another node, refuses it.
 	pr.HeadCommitID = newCommitID
-	if err = pull_service.UpdateRef(ctx, pr); err != nil {
+	if err = pull_service.UpdateRefFrom(ctx, pr, currentCommitID); err != nil {
 		return nil, fmt.Errorf("failed to update the reference of the pull request: %w", err)
 	}
 
