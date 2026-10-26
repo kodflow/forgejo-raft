@@ -18,6 +18,7 @@ import (
 	api "forgejo.org/modules/structs"
 	"forgejo.org/modules/test"
 	"forgejo.org/modules/web"
+	"forgejo.org/services/auth"
 	"forgejo.org/services/authz"
 	"forgejo.org/services/contexttest"
 
@@ -259,4 +260,26 @@ func TestApplyDiffPatchOutsideACluster(t *testing.T) {
 	master, err := gitRepo.GetBranchCommitID("master")
 	require.NoError(t, err)
 	assert.Equal(t, master, parent)
+}
+
+// A repository generated through the API from a template on a node of the
+// cluster that does not serve the template yet is refused with 503 and the
+// reason, before anything is written (#261).
+func TestGenerateRefusedOnANodeBehind(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	clusterhook.SetFreshWaiter(func(context.Context, string) bool { return false })
+	t.Cleanup(func() { clusterhook.SetFreshWaiter(nil) })
+
+	ctx, resp := contexttest.MockAPIContext(t, "POST /api/v1/repos/user27/template1/generate")
+	contexttest.LoadRepo(t, ctx, 44)
+	contexttest.LoadUser(t, ctx, 2)
+	// Signed in without a token: no scope restricts the request.
+	ctx.SetAuthentication(&auth.UnauthenticatedResult{})
+	web.SetForm(ctx, &api.GenerateRepoOption{Owner: "user2", Name: "generated-behind", GitContent: true})
+
+	Generate(ctx)
+
+	assert.Equal(t, http.StatusServiceUnavailable, ctx.Resp.Status())
+	assert.Contains(t, resp.Body.String(), "may be behind")
+	unittest.AssertNotExistsBean(t, &repo_model.Repository{OwnerID: 2, LowerName: "generated-behind"})
 }

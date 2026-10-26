@@ -64,6 +64,37 @@ func GenerateProtectedBranch(ctx context.Context, templateRepo, generateRepo *re
 	return db.Insert(ctx, newBranches)
 }
 
+// clusterTemplateRefusal refuses, in a cluster, a generation that reads the
+// template's directory on this node, for its git content or its git hooks,
+// while this node may not serve the template as the cluster holds it. The
+// template is loaded by its ID, by the web form outside RepoAssignment and
+// its guard (#82): the directory under its name may still hold another
+// repository, a private one renamed away whose rename this node has not
+// projected yet, whose tree the generation committed into a new repository
+// of the requester, replicated to every member. Or it may show the
+// template's branches from before a push another node acknowledged, on
+// which the new repository was built for good (#261). The generation first
+// waits for this node to serve the template at the commit index the cluster
+// confirms at the call, as the services that write from this node's git do
+// (#189, #226, #239), then checks that the directory holds the template, as
+// git's reads do. Either refusal wraps clusterhook.ErrBehind and comes
+// before anything is written: the caller retries. A generation that reads
+// only SQL is not refused. Without a cluster it returns nil.
+func clusterTemplateRefusal(ctx context.Context, templateRepo *repo_model.Repository, opts GenerateRepoOptions) error {
+	readsDirectory := (opts.GitContent && !templateRepo.IsEmpty) || opts.GitHooks
+	if !readsDirectory {
+		return nil
+	}
+	key := clusterhook.RepoKey(templateRepo.OwnerName, templateRepo.Name, false)
+	if err := clusterhook.RequireFresh(ctx, key); err != nil {
+		return err
+	}
+	if err := clusterhook.ReadRefusal(key, templateRepo.ID); err != nil {
+		return fmt.Errorf("%w: %w; nothing was written", clusterhook.ErrBehind, err)
+	}
+	return nil
+}
+
 // GenerateRepository generates a repository from a template
 func GenerateRepository(ctx context.Context, doer, owner *user_model.User, templateRepo *repo_model.Repository, opts GenerateRepoOptions) (_ *repo_model.Repository, err error) {
 	if !doer.IsAdmin && !owner.CanCreateRepo() {
@@ -75,6 +106,11 @@ func GenerateRepository(ctx context.Context, doer, owner *user_model.User, templ
 	// In a cluster, a name whose key the cluster holds is refused before
 	// anything is written, as a creation's (#245).
 	if err := clusterCreateRefusal(ctx, owner, opts.Name); err != nil {
+		return nil, err
+	}
+	// And so is a generation that would read the template's directory on
+	// a node that does not serve the template yet (#261).
+	if err := clusterTemplateRefusal(ctx, templateRepo, opts); err != nil {
 		return nil, err
 	}
 

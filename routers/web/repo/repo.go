@@ -23,6 +23,7 @@ import (
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/base"
 	"forgejo.org/modules/cache"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/optional"
@@ -215,6 +216,10 @@ func handleCreateError(ctx *context.Context, owner *user_model.User, err error, 
 	case db.IsErrNamePatternNotAllowed(err):
 		ctx.Data["Err_RepoName"] = true
 		ctx.RenderWithErr(ctx.Tr("repo.form.name_pattern_not_allowed", err.(db.ErrNamePatternNotAllowed).Pattern), tpl, form)
+	case errors.Is(err, clusterhook.ErrBehind):
+		// A node of the cluster that does not serve the template yet:
+		// nothing was written, the user retries (#261).
+		ctx.Error(http.StatusServiceUnavailable, err.Error())
 	default:
 		ctx.ServerError(name, err)
 	}
