@@ -278,17 +278,16 @@ func newTestClusterWith(t *testing.T, clusterID consensus.ClusterID, start func(
 			leavesKey:    r.projector.leavesKey,
 			awaitsRename: r.projector.awaitsRename,
 			projected:    r.projector.Projected,
+			holds:        r.projector.holds,
 		}
 		r.projector.fetch = r.objects.fetchMissing
 		srv := &http.Server{Handler: r.objects.handler(), TLSConfig: id.serverConfig(), ReadHeaderTimeout: 5 * time.Second}
 		go func() { _ = srv.ServeTLS(ln, "", "") }()
-		tc.nodes = append(tc.nodes, &testNode{slot: slot, r: r, addr: addrs[slot], srv: srv, work: &recordingWork{}})
-	}
-
-	start(tc, pins)
-
-	for _, n := range tc.nodes {
-		r := n.r
+		n := &testNode{slot: slot, r: r, addr: addrs[slot], srv: srv, work: &recordingWork{}}
+		tc.nodes = append(tc.nodes, n)
+		// The consumer is wired before start, as Init wires it before the
+		// engine opens: the autopilots start launches read it from their
+		// first pass (#260).
 		r.consumer = newConsumer(r)
 		r.consumer.work = n.work.do
 		r.consumer.dbReady = func() bool { return true }
@@ -298,6 +297,12 @@ func newTestClusterWith(t *testing.T, clusterID consensus.ClusterID, start func(
 		r.consumer.inTx = nil
 		r.consumer.durable = func(context.Context) (bool, string) { return true, "test" }
 		tc.parked.wire(r.consumer)
+	}
+
+	start(tc, pins)
+
+	for _, n := range tc.nodes {
+		r := n.r
 		tc.loops.Add(3)
 		go func() { defer tc.loops.Done(); r.projector.run(ctx) }()
 		go func() { defer tc.loops.Done(); r.startupBarrier(ctx) }()

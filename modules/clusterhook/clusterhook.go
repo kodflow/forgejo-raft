@@ -580,6 +580,45 @@ func OwnerRenameRefusal(ctx context.Context, oldOwner, newOwner string) error {
 	return f(ctx, strings.ToLower(oldOwner), strings.ToLower(newOwner))
 }
 
+var holdOwnerDirs func(ctx context.Context, owners []string) (func(), error)
+
+// SetOwnerDirectoryHold registers the replicator's hold of owners'
+// directories on this node.
+func SetOwnerDirectoryHold(f func(ctx context.Context, owners []string) (func(), error)) {
+	lifecycleMu.Lock()
+	holdOwnerDirs = f
+	lifecycleMu.Unlock()
+}
+
+// HoldOwnerDirectories keeps the cluster from writing under the directories
+// of owners on this node until release is called. An owner's rename moves
+// the owner's directory before OwnerRenamed proposes it, and moves it back
+// when the cluster refuses it, while the replicated table still names the
+// owner's repositories under the old owner: a directory the cluster created
+// there meanwhile refused the next rename to that name (#257). Forgejo
+// holds both owners from before the move until the rename ends, its move
+// back included. It returns once what the cluster was writing there ended,
+// or an error, nothing held, when that did not end within ctx. Without a
+// cluster it does nothing.
+func HoldOwnerDirectories(ctx context.Context, owners ...string) (func(), error) {
+	lifecycleMu.RLock()
+	f := holdOwnerDirs
+	lifecycleMu.RUnlock()
+	if f == nil {
+		return func() {}, nil
+	}
+	lower := make([]string, len(owners))
+	for i, o := range owners {
+		lower[i] = strings.ToLower(o)
+	}
+	release, err := f(ctx, lower)
+	if err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	return func() { once.Do(release) }, nil
+}
+
 var checkRepoRename func(ctx context.Context, key string) error
 
 // SetRepoRenameCheck registers the replicator's check of a repository's

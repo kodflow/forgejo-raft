@@ -1195,6 +1195,29 @@ func (r *Replicator) ownerRenameRefusal(ctx context.Context, oldOwner, newOwner 
 	return nil
 }
 
+// ownerHoldWait bounds how long an owner's rename waits for what the
+// cluster writes under the two owners' directories on this node to end.
+var ownerHoldWait = clusterhook.DefaultTimeout
+
+// holdOwnerDirectories is clusterhook.HoldOwnerDirectories: until release,
+// neither the projector, nor its fetches, nor the object channel writes
+// under the owners' directories on this node, while Forgejo moves them
+// before the rename is proposed, and back when the cluster refuses it. The
+// table names the repositories under the old owner until the rename is
+// applied: a projection meanwhile created their directories again there,
+// which refused the next rename to that name (#257). A projection or a
+// shipment under way there is waited for, within ownerHoldWait; past it,
+// nothing is held and the rename is refused before anything is written.
+func (r *Replicator) holdOwnerDirectories(ctx context.Context, owners []string) (func(), error) {
+	hctx, cancel := context.WithTimeout(ctx, ownerHoldWait)
+	defer cancel()
+	release, err := r.projector.holdOwners(hctx, owners)
+	if err != nil {
+		return nil, fmt.Errorf("the cluster still writes under the directory of %s on this node: %w; retry", strings.Join(owners, " or "), err)
+	}
+	return release, nil
+}
+
 // ownerTooLarge explains the refusal of an owner's rename too large for
 // one entry, which every attempt meets again.
 func ownerTooLarge(owner string, keys int, err error) error {

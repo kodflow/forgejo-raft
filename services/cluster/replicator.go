@@ -258,7 +258,7 @@ func Init(ctx context.Context) error {
 		root: r.root, port: setting.Cluster.ObjectPort, cluster: clusterHex, id: id,
 		engine: r.Engine, self: r.selfID, repoKnown: r.repoKnown, revoked: r.table.KeyRevoked,
 		leavesKey: r.projector.leavesKey, awaitsRename: r.projector.awaitsRename,
-		projected: r.projector.Projected,
+		projected: r.projector.Projected, holds: r.projector.holds,
 	}
 	if setting.Cluster.ExpectedNodes >= 3 {
 		r.auto = newAutoMode(r.objects)
@@ -355,6 +355,7 @@ func Init(ctx context.Context) error {
 	clusterhook.SetRepoLifecycle(r.proposeRepoDelete, r.proposeRepoMoves)
 	clusterhook.SetOwnerLifecycle(r.proposeOwnerRename)
 	clusterhook.SetOwnerRenameCheck(r.ownerRenameRefusal)
+	clusterhook.SetOwnerDirectoryHold(r.holdOwnerDirectories)
 	clusterhook.SetRepoRenameCheck(r.renameSourceRefusal)
 	clusterhook.SetRepoHeldCheck(r.heldRefusal)
 	clusterhook.SetCutHold(r.holdCut)

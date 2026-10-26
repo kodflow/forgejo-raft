@@ -53,6 +53,9 @@ type objectChannel struct {
 	// awaitsRename reports a key whose renamed repository's directory the
 	// projector has not moved in yet.
 	awaitsRename func(repo string) bool
+	// holds are the projector's: the objects of a key under an owner whose
+	// directory Forgejo moves on this node are not taken (#257).
+	holds *dirHolds
 	// revoked reports a key an operator revoked (hex SPKI): a member
 	// holding it is not admitted, even before its removal commits.
 	revoked func(spki string) bool
@@ -198,6 +201,15 @@ func (oc *objectChannel) handlePush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), code)
 		return
 	}
+	// Taken now, they would create the repository's directory again under
+	// an owner whose directory Forgejo moved, or land in the one it moves:
+	// the sender counts another member (#257).
+	leave, ok := oc.holds.enter(repo)
+	if !ok {
+		http.Error(w, fmt.Sprintf("the directory of %s moves with its owner's rename on this node", repo), http.StatusServiceUnavailable)
+		return
+	}
+	defer leave()
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
 		if oc.awaitsRename != nil && oc.awaitsRename(repo) {
 			// The renamed repository's directory is still under its old

@@ -5,6 +5,7 @@ package user
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -87,4 +88,47 @@ func TestRenameUserRefusedByTheClusterChangesNothing(t *testing.T) {
 	require.NoError(t, err, "the owner's directory stays")
 	_, err = os.Stat(user_model.UserPath("Too-Many-Repositories"))
 	assert.True(t, os.IsNotExist(err), "no directory under the new name")
+}
+
+// An owner's rename holds the two owners' directories on this node from
+// before Forgejo moves the directory until the rename ends, its move back
+// after a refusal of the cluster included: nothing of the cluster writes
+// there in between (#257).
+func TestRenameUserHoldsTheOwnersDirectoriesUntilTheyStopMoving(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	u := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	oldDir := user_model.UserPath(u.Name)
+	held := 0
+	var owners []string
+	var backAtRelease []bool
+	clusterhook.SetOwnerDirectoryHold(func(_ context.Context, o []string) (func(), error) {
+		_, err := os.Stat(oldDir)
+		assert.NoError(t, err, "held before the directory moves")
+		held++
+		owners = o
+		return func() {
+			held--
+			_, err := os.Stat(oldDir)
+			backAtRelease = append(backAtRelease, err == nil)
+		}, nil
+	})
+	var proposedHeld []int
+	clusterhook.SetOwnerLifecycle(func(context.Context, string, string) error {
+		_, err := os.Stat(oldDir)
+		assert.True(t, os.IsNotExist(err), "proposed once the directory moved")
+		proposedHeld = append(proposedHeld, held)
+		return errors.New("the cluster refused it: test")
+	})
+	t.Cleanup(func() {
+		clusterhook.SetOwnerDirectoryHold(nil)
+		clusterhook.SetOwnerLifecycle(nil)
+	})
+
+	err := RenameUser(db.DefaultContext, u, "Refused-Rename")
+	require.ErrorContains(t, err, "the cluster refused it")
+	assert.Equal(t, []string{"user2", "refused-rename"}, owners)
+	assert.Equal(t, []int{1}, proposedHeld, "proposed under the hold")
+	assert.Zero(t, held, "released")
+	assert.Equal(t, []bool{true}, backAtRelease, "released once the directory moved back")
+	unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2, LowerName: "user2"})
 }
