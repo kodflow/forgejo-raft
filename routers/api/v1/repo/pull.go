@@ -24,6 +24,7 @@ import (
 	"forgejo.org/models/unit"
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/base"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/log"
@@ -1093,6 +1094,11 @@ func MergePullRequest(ctx *context.APIContext) {
 
 		if err := repo_service.DeleteBranchAfterMerge(ctx, ctx.Doer(), pr, headRepo); err != nil {
 			switch {
+			case errors.Is(err, clusterhook.ErrBehind):
+				// A node of the cluster whose branch rows are not derived
+				// yet from the head repository's last writes: the pull
+				// request is merged, its head branch is left (#267).
+				ctx.Error(http.StatusServiceUnavailable, "DeleteBranchAfterMerge", fmt.Errorf("the pull request was merged, its head branch was not deleted: %w", err))
 			case errors.Is(err, repo_service.ErrBranchIsDefault):
 				ctx.Error(http.StatusForbidden, "DefaultBranch", errors.New("the head branch is the default branch"))
 			case errors.Is(err, git_model.ErrBranchIsProtected):

@@ -1607,6 +1607,12 @@ func MergePullRequest(ctx *context.Context) {
 				ctx.Flash.Error(ctx.Tr("repo.pulls.delete_after_merge.head_branch.is_protected"))
 			case errors.Is(err, util.ErrPermissionDenied):
 				ctx.Flash.Error(ctx.Tr("repo.pulls.delete_after_merge.head_branch.insufficient_branch"))
+			case errors.Is(err, clusterhook.ErrBehind):
+				// A node of the cluster whose branch rows are not derived
+				// yet from the head repository's last writes: the pull
+				// request is merged, its head branch is left (#267).
+				log.Warn("DeleteBranchAfterMerge: %v", err)
+				ctx.Flash.Error(ctx.Tr("repo.branch.deletion_behind", pr.HeadRepo.FullName()+":"+pr.HeadBranch))
 			default:
 				ctx.ServerError("DeleteBranchAfterMerge", err)
 				return
@@ -1860,6 +1866,19 @@ func CleanUpPullRequest(ctx *context.Context) {
 		ctx.JSONRedirect(issue.Link())
 	}()
 
+	// In a cluster, this node's git may not show yet a push to the head
+	// branch that another node acknowledged: the branch would read as
+	// holding no commit beyond the merged head, and be deleted with the
+	// pushed ones. The branch is read once this node serves the head
+	// repository, and the consumer derived its rows, at the cluster's
+	// commit index, as the deletion requires (#267); nothing is
+	// retargeted nor deleted before.
+	if err := clusterhook.RequireDerived(ctx, clusterhook.RepoKey(pr.HeadRepo.OwnerName, pr.HeadRepo.Name, false)); err != nil {
+		log.Warn("CleanUpPullRequest: %v", err)
+		ctx.Flash.Error(ctx.Tr("repo.branch.deletion_behind", fullBranchName))
+		return
+	}
+
 	// Check if branch has no new commits
 	headCommitID, err := gitBaseRepo.GetRefCommitID(pr.GetGitRefName())
 	if err != nil {
@@ -1897,6 +1916,12 @@ func deleteBranch(ctx *context.Context, pr *issues_model.PullRequest, gitRepo *g
 			ctx.Flash.Error(ctx.Tr("repo.branch.deletion_failed", fullBranchName))
 		case errors.Is(err, git_model.ErrBranchIsProtected):
 			ctx.Flash.Error(ctx.Tr("repo.branch.deletion_failed", fullBranchName))
+		case errors.Is(err, clusterhook.ErrBehind):
+			// A write to the head repository the consumer has not derived
+			// yet, acknowledged since the wait above: nothing was deleted
+			// (#267).
+			log.Warn("DeleteBranch: %v", err)
+			ctx.Flash.Error(ctx.Tr("repo.branch.deletion_behind", fullBranchName))
 		default:
 			log.Error("DeleteBranch: %v", err)
 			ctx.Flash.Error(ctx.Tr("repo.branch.deletion_failed", fullBranchName))

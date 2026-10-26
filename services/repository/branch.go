@@ -468,6 +468,21 @@ func DeleteBranch(ctx context.Context, doer *user_model.User, repo *repo_model.R
 		return ErrBranchIsDefault
 	}
 
+	// In a cluster, the branch's SQL row is written by the cluster's
+	// consumer after a push was acknowledged, on any node. The deletion
+	// marks the row deleted only when it exists: a branch whose push was
+	// not derived yet had none, and was deleted in git only. The push's
+	// work, derived after on the leader's git, then wrote the row live,
+	// and the deletion, a write without pusher, gives the consumer no work
+	// that would mark it deleted again: the branch came back in the branch
+	// list of the whole cluster for good, and could not be deleted, git no
+	// longer holding it (#267). It waits for the consumer to derive every
+	// write the cluster confirms, as RenameBranch and CreateNewBranch do
+	// (#225, #226), and is refused while it has not, nothing written.
+	if err := clusterhook.RequireDerived(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
+		return err
+	}
+
 	isProtected, err := git_model.IsBranchProtected(ctx, repo.ID, branchName)
 	if err != nil {
 		return err
@@ -541,6 +556,14 @@ func DeleteBranchAfterMerge(ctx context.Context, doer *user_model.User, pr *issu
 	}
 	if !perm.CanWrite(unit.TypeCode) {
 		return util.NewPermissionDeniedErrorf("Must have write permission to the head repository")
+	}
+
+	// The pull requests based on the branch are retargeted before it is
+	// deleted. In a cluster, DeleteBranch refuses while the consumer has
+	// not derived the head repository's last writes (#267): the refusal
+	// comes before the retargeting, so that nothing is written.
+	if err := clusterhook.RequireDerived(ctx, clusterhook.RepoKey(pr.HeadRepo.OwnerName, pr.HeadRepo.Name, false)); err != nil {
+		return err
 	}
 
 	if err := pull_service.RetargetChildrenOnMerge(ctx, doer, pr); err != nil {
