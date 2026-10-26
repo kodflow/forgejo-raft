@@ -611,6 +611,14 @@ func CreatePullReview(ctx *context.APIContext) {
 		return
 	}
 
+	// An approval or a rejection judges the pull request's head, read from
+	// this node's git, the default commit_id below included: in a cluster,
+	// behind a push another node acknowledged, that head is the one before
+	// it (#264). It is refused before its comments are written.
+	if (reviewType == issues_model.ReviewTypeApprove || reviewType == issues_model.ReviewTypeReject) && headBehind(ctx, pr) {
+		return
+	}
+
 	// if CommitID is empty, set it as lastCommitID
 	if opts.CommitID == "" {
 		gitRepo, closer, err := gitrepo.RepositoryFromContextOrOpen(ctx, pr.Issue.Repo)
@@ -668,7 +676,9 @@ func CreatePullReview(ctx *context.APIContext) {
 	// create review and associate all pending review comments
 	review, _, err := pull_service.SubmitReview(ctx, ctx.Doer(), ctx.Repo().GitRepo, pr.Issue, reviewType, opts.Body, opts.CommitID, nil)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "SubmitReview", err)
+		if !clusterBehind(ctx, err) {
+			ctx.Error(http.StatusInternalServerError, "SubmitReview", err)
+		}
 		return
 	}
 
@@ -747,6 +757,10 @@ func SubmitPullReview(ctx *context.APIContext) {
 		return
 	}
 
+	// The review judges the head this node's git shows (#264).
+	if (reviewType == issues_model.ReviewTypeApprove || reviewType == issues_model.ReviewTypeReject) && headBehind(ctx, pr) {
+		return
+	}
 	headCommitID, err := ctx.Repo().GitRepo.GetRefCommitID(pr.GetGitRefName())
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "GitRepo: GetRefCommitID", err)
@@ -756,7 +770,9 @@ func SubmitPullReview(ctx *context.APIContext) {
 	// create review and associate all pending review comments
 	review, _, err = pull_service.SubmitReview(ctx, ctx.Doer(), ctx.Repo().GitRepo, pr.Issue, reviewType, opts.Body, headCommitID, nil)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "SubmitReview", err)
+		if !clusterBehind(ctx, err) {
+			ctx.Error(http.StatusInternalServerError, "SubmitReview", err)
+		}
 		return
 	}
 

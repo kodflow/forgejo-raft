@@ -13,6 +13,7 @@ import (
 	pull_model "forgejo.org/models/pull"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/modules/base"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/json"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/setting"
@@ -424,6 +425,10 @@ func SubmitReview(ctx *context.Context) {
 		if issues_model.IsContentEmptyErr(err) {
 			ctx.Flash.Error(ctx.Tr("repo.issues.review.content.empty"))
 			ctx.JSONRedirect(fmt.Sprintf("%s/pulls/%d/files", ctx.Repo.RepoLink, issue.Index))
+		} else if errors.Is(err, clusterhook.ErrBehind) {
+			// A node of the cluster behind on the pull request's head:
+			// nothing was recorded, the user retries (#264).
+			ctx.Error(http.StatusServiceUnavailable, err.Error())
 		} else {
 			ctx.ServerError("SubmitReview", err)
 		}
