@@ -925,8 +925,22 @@ func syncRestoredBranches(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
+// revokedTables are the tables step 6 empties, a table holding a foreign
+// key to another one before it (TestRecoverRevokesReferencingTablesFirst):
+// the access tokens and the repositories some are restricted to, the
+// OAuth2 grants and codes, the sessions of the database provider, the
+// runners' registration tokens, forgejo_auth_token, every purpose of it
+// (#256): the long-term authentication cookies ("remember me", with a
+// password or through an SSO source) and the codes mailed to reset a
+// password or to activate an account or an address, and the invitations
+// to a team mailed with a link, which any account holding it accepts.
+var revokedTables = []string{"access_token_resource_repo", "access_token", "oauth2_grant", "oauth2_authorization_code", "session", "action_runner_token", "forgejo_auth_token", "team_invite"}
+
 // verifyRecovered checks what the recovery restored, then revokes every
-// token: a recovered forge trusts none it held.
+// token the old forge handed out to sign in or to be let in: a recovered
+// forge trusts none it held. The credentials configured elsewhere, a
+// registered runner's or an OAuth2 application's secret, are kept
+// (observer.md, step 6).
 func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Write([]byte) (int, error) }, acceptOrphans bool) error {
 	e := db.GetEngine(ctx)
 	if err := verifyBranches(ctx, m, w, acceptOrphans); err != nil {
@@ -978,7 +992,7 @@ func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Wri
 	}
 	fmt.Fprintf(w, "verified: %d 2FA secrets open\n", len(tfs))
 
-	for _, table := range []string{"access_token", "oauth2_grant", "oauth2_authorization_code", "session", "action_runner_token"} {
+	for _, table := range revokedTables {
 		if ok, err := e.IsTableExist(table); err != nil || !ok {
 			continue
 		}

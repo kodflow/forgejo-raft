@@ -370,8 +370,20 @@ the stored files already copied with the same bytes are kept:
    at this step. The error offers it only when the orphans are all that
    differs: the branch rows of a repository the checkpoint does not hold
    are refused, with the flag or without it.
-   Then every access token, OAuth2 grant, session and runner token is
-   revoked.
+   Then every token the old forge handed out to sign in or to be let in is
+   revoked: access tokens and the repositories some are restricted to,
+   OAuth2 grants and codes, sessions, runners' registration tokens,
+   `forgejo_auth_token` for every purpose (the "remember me" cookies, with
+   a password or through an SSO source, and the codes mailed to reset a
+   password or to activate an account or an address), and the invitations
+   to a team. Users sign in again, ask again for a reset or an activation
+   mail, and are invited again. Sessions are revoked when they are in the
+   database (`[session] PROVIDER = db`): otherwise give the recovered node
+   a session store of its own. The credentials configured elsewhere are
+   kept: a registered runner's, an OAuth2 application's client secret, and
+   the forge's own toward other services. When the compromise may have
+   reached them, delete the runners and register them again, and
+   regenerate the applications' secrets.
 7. The schema is migrated to this binary's first, so the sequences of the
    tables a migration creates are moved too. Then the identifiers move past
    the checkpoint, once: every sequence of the
