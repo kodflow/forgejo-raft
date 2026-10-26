@@ -9,10 +9,15 @@ import (
 	"forgejo.org/models/db"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/webhook"
+	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 )
 
-// GenerateGitHooks generates git hooks from a template repository
+// GenerateGitHooks generates git hooks from a template repository. The
+// template's hooks are read from its directory on this node between the
+// two checks of readTemplateDirectory, and written into the new repository
+// only once the second one passed: in a cluster, a refused read writes
+// nothing of what it read (#261).
 func GenerateGitHooks(ctx context.Context, templateRepo, generateRepo *repo_model.Repository) error {
 	generateGitRepo, err := gitrepo.OpenRepository(ctx, generateRepo)
 	if err != nil {
@@ -20,14 +25,16 @@ func GenerateGitHooks(ctx context.Context, templateRepo, generateRepo *repo_mode
 	}
 	defer generateGitRepo.Close()
 
-	templateGitRepo, err := gitrepo.OpenRepository(ctx, templateRepo)
-	if err != nil {
+	var templateHooks []*git.Hook
+	if err := readTemplateDirectory(ctx, templateRepo, func() error {
+		templateGitRepo, err := gitrepo.OpenRepository(ctx, templateRepo)
+		if err != nil {
+			return err
+		}
+		defer templateGitRepo.Close()
+		templateHooks, err = templateGitRepo.Hooks()
 		return err
-	}
-	defer templateGitRepo.Close()
-
-	templateHooks, err := templateGitRepo.Hooks()
-	if err != nil {
+	}); err != nil {
 		return err
 	}
 

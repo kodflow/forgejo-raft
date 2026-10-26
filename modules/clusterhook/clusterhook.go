@@ -777,6 +777,54 @@ func ReadRefusal(key string, repoID int64) error {
 	return f(key, repoID)
 }
 
+var watchRewrite func(key string) func() bool
+
+// SetRewriteWatch registers the replicator's watch of a key: whether a
+// rename, a transfer, an owner's rename or a deletion that took the key or
+// freed it, and that this node had not projected at the call, was applied
+// on it, before the call or since.
+func SetRewriteWatch(f func(key string) func() bool) {
+	lifecycleMu.Lock()
+	watchRewrite = f
+	lifecycleMu.Unlock()
+}
+
+// CheckRead is ReadRefusal around a read of the repository's directory on
+// this node that must read the repository repoID and nothing else: err
+// refuses the read now, as ReadRefusal does. Once the directory was read,
+// still says whether it may have held another repository meanwhile, nil
+// when it did not. Nothing keeps the projector's moves out of the directory
+// while it is read: the repository renamed away and another one renamed or
+// created under its name, both projected right after the check, put that
+// one's directory under the name before git opened it (#261). still refuses
+// when the directory holds another repository now (ReadRefusal), and when a
+// rename, a transfer or a deletion that took the key or freed it was not
+// projected on this node at the call, even one undone since. Without a
+// cluster both are nil.
+func CheckRead(key string, repoID int64) (still func() error, err error) {
+	lifecycleMu.RLock()
+	watch := watchRewrite
+	lifecycleMu.RUnlock()
+	// The watch starts before the check: a rename the check did not see
+	// is one the watch does.
+	rewritten := func() bool { return false }
+	if watch != nil {
+		rewritten = watch(key)
+	}
+	if err := ReadRefusal(key, repoID); err != nil {
+		return nil, err
+	}
+	return func() error {
+		if err := ReadRefusal(key, repoID); err != nil {
+			return err
+		}
+		if rewritten() {
+			return fmt.Errorf("a rename or a deletion of %s may have moved its directory on this node of the cluster while it was read; retry shortly", key)
+		}
+		return nil
+	}, nil
+}
+
 // SetFreshWaiter registers the replicator's wait for a repository to be
 // served at the cluster's current commit index.
 func SetFreshWaiter(f func(ctx context.Context, key string) bool) {

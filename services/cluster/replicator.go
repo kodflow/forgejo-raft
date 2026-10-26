@@ -365,6 +365,7 @@ func Init(ctx context.Context) error {
 	clusterhook.SetFreshWaiter(r.WaitFresh)
 	clusterhook.SetDerivedWaiter(r.WaitDerived)
 	clusterhook.SetReadGuard(r.ReadRefusal)
+	clusterhook.SetRewriteWatch(r.watchRewrite)
 	clusterhook.SetRefLookup(r.refLive)
 
 	go r.projector.run(r.ctx)
@@ -775,6 +776,31 @@ func (r *Replicator) ReadRefusal(repo string, repoID int64) error {
 		return fmt.Errorf("this node of the cluster still holds another repository under %s than repository %d; retry shortly or through another node", repo, repoID)
 	}
 	return nil
+}
+
+// watchRewrite is clusterhook.CheckRead's watch of repo: whether a
+// rename, a transfer, an owner's rename or a deletion that took repo or
+// freed it lies above the index this node had projected repo at when the
+// call was made (reftable.Table.RewrittenSince). Only such an entry moves
+// another repository's directory under the key, or the key's own away,
+// and it does so when the projector reaches it, not when the table
+// applies it: a read that began after the call, which the projection of
+// one of them may have crossed, is refused (#261). One applied before the
+// call and not projected yet counts too: a deletion of the key and its
+// creation anew leave the stamp ReadRefusal judges in place until the
+// projection sets the directory aside, and the new one has none until it
+// is certified. A ref transaction is no rewrite: a push not projected yet
+// refuses nothing. Indexes compare in one lineage only: a table that moved
+// to another one meanwhile counts as rewritten.
+func (r *Replicator) watchRewrite(repo string) func() bool {
+	_, id := r.table.Applied()
+	from := r.projector.Projected(repo)
+	return func() bool {
+		if _, now := r.table.Applied(); now != id {
+			return true
+		}
+		return r.table.RewrittenSince(repo, from)
+	}
 }
 
 // refLive reports whether the table this node applied holds ref of repo

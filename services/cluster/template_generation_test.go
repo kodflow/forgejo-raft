@@ -60,13 +60,17 @@ func tplGenPushVia(t *testing.T, n *testNode, work, repo, ref, old, sha string, 
 }
 
 // tplGenServe makes node n serve Forgejo's requests: its git, its
-// freshness checks and its read guard.
+// freshness checks, its read guard and its watch of renames.
 func tplGenServe(t *testing.T, n *testNode) {
 	t.Helper()
 	withGitThroughReplicator(t, n)
 	freshFrom(t, n)
 	clusterhook.SetReadGuard(n.r.ReadRefusal)
-	t.Cleanup(func() { clusterhook.SetReadGuard(nil) })
+	clusterhook.SetRewriteWatch(n.r.watchRewrite)
+	t.Cleanup(func() {
+		clusterhook.SetReadGuard(nil)
+		clusterhook.SetRewriteWatch(nil)
+	})
 }
 
 // tplGenerate generates user2/<name> from the template as the web form
@@ -223,6 +227,167 @@ func TestLaggingTemplateGenerationNeverCopiesAnotherRepository(t *testing.T) {
 	for _, n := range tc.nodes {
 		assert.Equal(t, p1, gitRef(t, n, "user27/payroll.git", "refs/heads/master"), "%s: the private repository is kept under its new name", n.slot)
 	}
+
+	// moves renames each pair in turn through node-b, then waits until
+	// node-a projected them all: its git serves sha as key's master,
+	// certified.
+	moves := func(t *testing.T, key, sha string, pairs ...[2]string) {
+		t.Helper()
+		for _, p := range pairs {
+			renameOn(t, b, p[0], p[1])
+		}
+		waitApplied(t, b, a)
+		require.Eventually(t, func() bool { return gitRef(t, a, key, "refs/heads/master") == sha }, 15*time.Second, 20*time.Millisecond, "node-a projects the renames")
+		settle(t, a)
+	}
+	// around counts node-a's checks of the template's directory, and runs
+	// for the n-th one the function given in before right before it, and
+	// the one given in after once it passed: renames projected between a
+	// check and what precedes or follows it.
+	around := func(t *testing.T, before, after map[int32]func()) *atomic.Int32 {
+		t.Helper()
+		var checks atomic.Int32
+		clusterhook.SetReadGuard(func(key string, repoID int64) error {
+			if key != tplGenTemplate {
+				return a.r.ReadRefusal(key, repoID)
+			}
+			n := checks.Add(1)
+			if f := before[n]; f != nil {
+				f()
+			}
+			err := a.r.ReadRefusal(key, repoID)
+			if f := after[n]; f != nil && err == nil {
+				f()
+			}
+			return err
+		})
+		t.Cleanup(func() { clusterhook.SetReadGuard(a.r.ReadRefusal) })
+		return &checks
+	}
+	const tmp, moved = "user27/template-tmp.git", "user27/template-moved.git"
+
+	// The template is renamed away and the private repository takes its
+	// name, both projected on node-a right after the check that precedes
+	// git's read, and both undone, the template back under its name,
+	// right before the check that follows it: git read the private
+	// repository's directory, while the directory and the database show
+	// the template before the read and after it. The renames of the key
+	// node-a applied meanwhile tell: the generation is refused, and the
+	// repository is removed from every member (#261).
+	t.Run("node-a refuses a read the template's renames went through", func(t *testing.T) {
+		checks := around(t, map[int32]func(){
+			3: func() {
+				moves(t, tplGenTemplate, t1, [2]string{tplGenTemplate, "user27/payroll.git"}, [2]string{tmp, tplGenTemplate})
+			},
+		}, map[int32]func(){
+			2: func() {
+				moves(t, tplGenTemplate, p1, [2]string{tplGenTemplate, tmp}, [2]string{"user27/payroll.git", tplGenTemplate})
+			},
+		})
+		gen, err := tplGenerate(t, "tpl-gen-swapped", repo_service.GenerateRepoOptions{GitContent: true})
+		tplGenServed(t, tc, gen)
+		require.ErrorIs(t, err, clusterhook.ErrBehind)
+		assert.EqualValues(t, 3, checks.Load(), "checked before anything is written, right before the clone, then right after it")
+		unittest.AssertNotExistsBean(t, &repo_model.Repository{OwnerID: 2, LowerName: "tpl-gen-swapped"})
+		requireGoneEverywhere(t, tc, clusterhook.RepoKey("user2", "tpl-gen-swapped", false))
+		require.Equal(t, t1, gitRef(t, a, tplGenTemplate, "refs/heads/master"), "the template is back under its name")
+	})
+
+	// The same swap, for the template's git hooks: git read the private
+	// repository's, and nothing of them is written into the new repository
+	// before the check that follows the read, which refuses it.
+	t.Run("node-a writes no hook of a read the template's renames went through", func(t *testing.T) {
+		private := filepath.Join(a.r.root, "user27", "payroll.git", "hooks", "pre-receive.d", "pre-receive")
+		require.NoError(t, os.MkdirAll(filepath.Dir(private), 0o755))
+		require.NoError(t, os.WriteFile(private, []byte("#!/bin/sh\n# PRIVATE: the payroll's deploy key\n"), 0o644))
+		generated := filepath.Join(a.r.root, "user2", "tpl-gen-hooks-swapped.git", "hooks", "pre-receive.d", "pre-receive")
+		checks := around(t, map[int32]func(){
+			3: func() {
+				assert.NoFileExists(t, generated, "a hook git read through the swap was written before the check that follows the read")
+				moves(t, tplGenTemplate, t1, [2]string{tplGenTemplate, "user27/payroll.git"}, [2]string{tmp, tplGenTemplate})
+			},
+		}, map[int32]func(){
+			2: func() {
+				moves(t, tplGenTemplate, p1, [2]string{tplGenTemplate, tmp}, [2]string{"user27/payroll.git", tplGenTemplate})
+			},
+		})
+		_, err := tplGenerate(t, "tpl-gen-hooks-swapped", repo_service.GenerateRepoOptions{GitHooks: true})
+		require.ErrorIs(t, err, clusterhook.ErrBehind)
+		assert.EqualValues(t, 3, checks.Load(), "checked before anything is written, right before the hooks are read, then right after")
+		unittest.AssertNotExistsBean(t, &repo_model.Repository{OwnerID: 2, LowerName: "tpl-gen-hooks-swapped"})
+		requireGoneEverywhere(t, tc, clusterhook.RepoKey("user2", "tpl-gen-hooks-swapped", false))
+		require.Equal(t, t1, gitRef(t, a, tplGenTemplate, "refs/heads/master"), "the template is back under its name")
+		require.NoError(t, os.Remove(private), "the private repository's directory is back under its name")
+	})
+
+	// The same renames, not undone: the template's directory on node-a
+	// holds the private repository when git reads it, and still does
+	// after.
+	t.Run("node-a refuses a read of the repository that took the template's name", func(t *testing.T) {
+		checks := around(t, nil, map[int32]func(){
+			2: func() {
+				moves(t, tplGenTemplate, p1, [2]string{tplGenTemplate, moved}, [2]string{"user27/payroll.git", tplGenTemplate})
+			},
+		})
+		gen, err := tplGenerate(t, "tpl-gen-taken", repo_service.GenerateRepoOptions{GitContent: true})
+		tplGenServed(t, tc, gen)
+		require.ErrorIs(t, err, clusterhook.ErrBehind)
+		assert.EqualValues(t, 3, checks.Load(), "checked before anything is written, right before the clone, then right after it")
+		unittest.AssertNotExistsBean(t, &repo_model.Repository{OwnerID: 2, LowerName: "tpl-gen-taken"})
+		requireGoneEverywhere(t, tc, clusterhook.RepoKey("user2", "tpl-gen-taken", false))
+	})
+}
+
+// A key deleted and created anew, both applied on node-a and not projected
+// there yet when a read of the key's directory begins: the read's first
+// check passes, the directory still holding the deleted repository under
+// its stamp. The projection then sets that directory aside and makes the
+// new repository's, which carries no stamp until it is certified, while
+// git reads it. The read's watch counts from the index node-a had
+// projected the key at, not from the one it had applied: it tells, as it
+// tells a rename applied during the read. A push node-a had not projected
+// yet is no rewrite: it refuses no read (#261).
+func TestLaggingReadWatchSeesRewritesNotProjectedYet(t *testing.T) {
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	a, b := tc.nodes[0], tc.nodes[1]
+	const key = "s/w.git"
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	c1 := commit(t, work, "one")
+	c2 := commit(t, work, "two")
+	run(t, work, "checkout", "-q", "--orphan", "fresh")
+	c3 := commit(t, work, "three")
+	zero := strings.Repeat("0", 40)
+	require.True(t, tc.pushVia(b, work, key, "refs/heads/main", zero, c1).OK)
+	waitAll(t, tc, func(n *testNode) bool { return gitRef(t, n, key, "refs/heads/main") == c1 })
+	settle(t, a)
+	projects := func(sha string) {
+		t.Helper()
+		require.Eventually(t, func() bool { return gitRef(t, a, key, "refs/heads/main") == sha }, 15*time.Second, 20*time.Millisecond, "node-a projects %s", sha)
+		settle(t, a)
+	}
+
+	release := holdOn(t, a, key)
+	require.True(t, tc.pushVia(b, work, key, "refs/heads/main", c1, c2).OK)
+	waitApplied(t, b, a)
+	rewritten := a.r.watchRewrite(key)
+	release()
+	projects(c2)
+	assert.False(t, rewritten(), "a push is no rewrite")
+
+	release = holdOn(t, a, key)
+	require.NoError(t, os.RemoveAll(filepath.Join(b.r.root, "s", "w.git")))
+	require.NoError(t, b.r.proposeRepoDelete(t.Context(), key, 1))
+	tc.createVia(b, key)
+	require.True(t, tc.pushVia(b, work, key, "refs/heads/main", zero, c3).OK)
+	waitApplied(t, b, a)
+	require.Equal(t, c2, gitRef(t, a, key, "refs/heads/main"), "node-a has not projected the deletion")
+	require.NoError(t, a.r.ReadRefusal(key, 0), "the read's first check passes")
+	rewritten = a.r.watchRewrite(key)
+	release()
+	projects(c3)
+	assert.True(t, rewritten(), "the deletion and the creation anew were not projected when the read began")
+	assert.False(t, a.r.watchRewrite(key)(), "a read that begins once they are projected")
 }
 
 // The template's master moves from t1 to t2 through node-b, acknowledged.
