@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 
+	issues_model "forgejo.org/models/issues"
 	"forgejo.org/modules/clusterhook"
 	cluster_service "forgejo.org/services/cluster"
 	"forgejo.org/services/context"
@@ -45,6 +46,23 @@ func refWritesRefused(ctx *context.APIContext) bool {
 // another.
 func clusterBehind(ctx *context.APIContext, err error) bool {
 	if errors.Is(err, clusterhook.ErrBehind) {
+		ctx.Error(http.StatusServiceUnavailable, "", err.Error())
+		return true
+	}
+	return false
+}
+
+// headBehind answers 503 when this node of the cluster may be behind the
+// cluster's last writes to the base repository of pr, which holds its head
+// refs/pull/N/head, and reports whether it did: a review that judges the
+// head read from this node's git would judge the head before a push
+// another node acknowledged (#264).
+func headBehind(ctx *context.APIContext, pr *issues_model.PullRequest) bool {
+	if err := pr.LoadBaseRepo(ctx); err != nil {
+		ctx.Error(http.StatusInternalServerError, "LoadBaseRepo", err)
+		return true
+	}
+	if err := clusterFresh(ctx, clusterhook.RepoKey(pr.BaseRepo.OwnerName, pr.BaseRepo.Name, false)); err != nil {
 		ctx.Error(http.StatusServiceUnavailable, "", err.Error())
 		return true
 	}

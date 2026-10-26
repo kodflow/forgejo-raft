@@ -14,6 +14,7 @@ import (
 	issues_model "forgejo.org/models/issues"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/log"
@@ -403,6 +404,20 @@ func SubmitReview(ctx context.Context, doer *user_model.User, gitRepo *git.Repos
 	if reviewType != issues_model.ReviewTypeApprove && reviewType != issues_model.ReviewTypeReject {
 		stale = false
 	} else {
+		// An approval or a rejection is stale when the head it judged is
+		// no longer the pull request's, read from this node's git. In a
+		// cluster, a node behind a push another node acknowledged shows
+		// the head before it: an approval of that head was recorded not
+		// stale, and counted for a head no one approved (#264). The head
+		// is read once this node serves the base repository, which holds
+		// refs/pull/N/head, at the cluster's commit index; while it does
+		// not, the review is refused and nothing is recorded.
+		if err := pr.LoadBaseRepo(ctx); err != nil {
+			return nil, nil, err
+		}
+		if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(pr.BaseRepo.OwnerName, pr.BaseRepo.Name, false)); err != nil {
+			return nil, nil, err
+		}
 		headCommitID, err := gitRepo.GetRefCommitID(pr.GetGitRefName())
 		if err != nil {
 			return nil, nil, err
