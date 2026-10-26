@@ -29,7 +29,8 @@ type projector struct {
 	table    *reftable.Table
 	registry *registry
 	// holds keeps the projection, its fetches and the object channel out
-	// of the directories of the owners Forgejo moves on this node (#257).
+	// of the directories Forgejo moves on this node: an owner's (#257), a
+	// repository's and its wiki's (#274).
 	holds *dirHolds
 	// fetch brings missing objects from the other members.
 	fetch func(ctx context.Context, repo, dir string, shas []string) error
@@ -375,8 +376,9 @@ func (p *projector) pass(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		// A key under an owner whose directory Forgejo moves on this node
-		// stays dirty until the hold's release, which wakes a pass (#257).
+		// A key whose directory Forgejo moves on this node, alone or with
+		// its owner's, stays dirty until the hold's release, which wakes a
+		// pass (#257, #274).
 		leave, ok := p.holds.enter(repo)
 		if !ok {
 			continue
@@ -455,9 +457,9 @@ func (p *projector) startFetch(base context.Context, repo, dir string, missing [
 		return
 	}
 	// The fetch writes under repo's directory after the pass moved on: it
-	// is a writer of its owner's directory until it ends, entered under
-	// p.mu, so a hold of that owner finds it in p.fetching and cancels it
-	// (holdOwners, #257).
+	// is a writer of that directory until it ends, entered under p.mu, so
+	// a hold of repo or of its owner finds it in p.fetching and cancels it
+	// (holdDirs, #257, #274).
 	leave, ok := p.holds.enter(repo)
 	if !ok {
 		p.mu.Unlock()
@@ -493,21 +495,18 @@ func (p *projector) startFetch(base context.Context, repo, dir string, missing [
 	}()
 }
 
-// holdOwners keeps the projection, its fetches and the object channel out
-// of the owners' directories until release, and returns once nothing of
-// the cluster writes there any more: a projection under way there ends,
-// and a fetch in flight there is cancelled, retried as a failed one once
-// released. On ctx's error nothing stays held (#257).
-func (p *projector) holdOwners(ctx context.Context, owners []string) (func(), error) {
-	in := make(map[string]bool, len(owners))
-	for _, o := range owners {
-		in[o] = true
-	}
-	release, err := p.holds.hold(ctx, owners, func() {
+// holdDirs keeps the projection, its fetches and the object channel out
+// of the directories names covers, owners' (#257) or repositories' by
+// their keys (#274), until release, and returns once nothing of the
+// cluster writes there any more: a projection under way there ends, and a
+// fetch in flight there is cancelled, retried as a failed one once
+// released. On ctx's error nothing stays held.
+func (p *projector) holdDirs(ctx context.Context, names []string) (func(), error) {
+	release, err := p.holds.hold(ctx, names, func(covers func(string) bool) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		for repo, cancel := range p.fetching {
-			if in[keyOwner(repo)] {
+			if covers(repo) {
 				cancel()
 			}
 		}
@@ -617,8 +616,9 @@ func (p *projector) project(base, ctx context.Context, repo string) error {
 				// fetch. The move waits for the next pass.
 				return nil
 			}
-			// Nor while Forgejo moves the old key's owner on this node: its
-			// directory may go, or come back, under that owner (#257).
+			// Nor while Forgejo moves the old key's directory on this node,
+			// alone or with its owner's: it may go, or come back (#257,
+			// #274).
 			leaveFrom, ok := p.holds.enter(from)
 			if !ok {
 				return nil

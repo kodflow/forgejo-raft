@@ -1195,25 +1195,29 @@ func (r *Replicator) ownerRenameRefusal(ctx context.Context, oldOwner, newOwner 
 	return nil
 }
 
-// ownerHoldWait bounds how long an owner's rename waits for what the
-// cluster writes under the two owners' directories on this node to end.
-var ownerHoldWait = clusterhook.DefaultTimeout
+// dirHoldWait bounds how long a rename waits for what the cluster writes
+// under the directories it moves on this node to end.
+var dirHoldWait = clusterhook.DefaultTimeout
 
-// holdOwnerDirectories is clusterhook.HoldOwnerDirectories: until release,
-// neither the projector, nor its fetches, nor the object channel writes
-// under the owners' directories on this node, while Forgejo moves them
-// before the rename is proposed, and back when the cluster refuses it. The
-// table names the repositories under the old owner until the rename is
-// applied: a projection meanwhile created their directories again there,
-// which refused the next rename to that name (#257). A projection or a
-// shipment under way there is waited for, within ownerHoldWait; past it,
-// nothing is held and the rename is refused before anything is written.
-func (r *Replicator) holdOwnerDirectories(ctx context.Context, owners []string) (func(), error) {
-	hctx, cancel := context.WithTimeout(ctx, ownerHoldWait)
+// holdOwnerDirectories is clusterhook.HoldOwnerDirectories and
+// clusterhook.HoldRepoDirectories: until release, neither the projector,
+// nor its fetches, nor the object channel writes under the directories
+// names covers on this node, owners' or repositories' by their keys, while
+// Forgejo moves them before the rename is proposed, and back when the
+// cluster refuses it. The table names the repositories under their old
+// keys until the rename is applied: a projection meanwhile created their
+// directories again there, which refused the next rename to that name
+// (#257), and, under a repository's old key, fetched the moved
+// repository's objects into it, which a repository created later under
+// the freed name adopted (#274). A projection or a shipment under way
+// there is waited for, within dirHoldWait; past it, nothing is held and
+// the rename is refused before anything is written.
+func (r *Replicator) holdOwnerDirectories(ctx context.Context, names []string) (func(), error) {
+	hctx, cancel := context.WithTimeout(ctx, dirHoldWait)
 	defer cancel()
-	release, err := r.projector.holdOwners(hctx, owners)
+	release, err := r.projector.holdDirs(hctx, names)
 	if err != nil {
-		return nil, fmt.Errorf("the cluster still writes under the directory of %s on this node: %w; retry", strings.Join(owners, " or "), err)
+		return nil, fmt.Errorf("the cluster still writes under the directory of %s on this node: %w; retry", strings.Join(names, " or "), err)
 	}
 	return release, nil
 }

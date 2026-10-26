@@ -94,7 +94,7 @@ func TestAnOwnerDirectoryHoldEndsTheFetchesUnderIt(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	release, err := b.p.holdOwners(ctx, []string{"alice", "heir"})
+	release, err := b.p.holdDirs(ctx, []string{"alice", "heir"})
 	require.NoError(t, err, "the fetch was cancelled, not waited for")
 	assert.False(t, b.p.isFetching("alice/r.git"))
 	b.mu.Lock()
@@ -119,5 +119,93 @@ func TestAnOwnerDirectoryHoldEndsTheFetchesUnderIt(t *testing.T) {
 	require.Eventually(t, func() bool {
 		b.p.pass(t.Context())
 		return b.p.Projected("alice/r.git") > 0
+	}, 10*time.Second, 10*time.Millisecond, "projected again once released")
+}
+
+// A hold of repository keys, a repository's rename or transfer, refuses
+// the writers of those keys from the moment it is taken, and not the other
+// keys of their owners; it returns once the writers of its keys already in
+// left, whatever the other keys' writers do, and nests with a hold of the
+// owner (#274).
+func TestARepositoryKeyHoldWaitsForTheWritersOfItsKeys(t *testing.T) {
+	t.Parallel()
+	h := newDirHolds()
+	admitted := func(key string) bool {
+		leave, ok := h.enter(key)
+		if ok {
+			leave()
+		}
+		return ok
+	}
+	leave, ok := h.enter("alice/r.git")
+	require.True(t, ok)
+	sibling, ok := h.enter("alice/q.git")
+	require.True(t, ok)
+	type held struct {
+		release func()
+		err     error
+	}
+	got := make(chan held, 1)
+	go func() {
+		release, err := h.hold(context.Background(), []string{"alice/r.git", "alice/s.git"}, nil)
+		got <- held{release, err}
+	}()
+	require.Eventually(t, func() bool { return !admitted("alice/s.git") }, 5*time.Second, time.Millisecond, "refused once held")
+	assert.False(t, admitted("alice/r.git"))
+	assert.True(t, admitted("alice/q.git"), "another key of the owner is not held")
+	assert.True(t, admitted("alice/r.wiki.git"), "a key the hold does not name is not held")
+	sibling()
+	select {
+	case <-got:
+		t.Fatal("the hold returned while a writer of its key was still in")
+	case <-time.After(100 * time.Millisecond):
+	}
+	leave()
+	var first held
+	select {
+	case first = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the hold did not return once the writer left")
+	}
+	require.NoError(t, first.err)
+
+	owner, err := h.hold(t.Context(), []string{"alice"}, nil)
+	require.NoError(t, err, "nothing is in")
+	first.release()
+	assert.False(t, admitted("alice/r.git"), "the owner's hold still holds the key")
+	owner()
+	assert.True(t, admitted("alice/r.git"))
+	assert.True(t, admitted("alice/s.git"))
+}
+
+// A hold of a repository's key cancels the fetch in flight under that key
+// and waits for its end, while the fetch of another key of the same owner
+// goes on (#274).
+func TestARepositoryKeyHoldEndsTheFetchOfItsKeyAlone(t *testing.T) {
+	t.Parallel()
+	b := newFetchBench(t, "alice/r.git", "alice/q.git")
+	gateR := b.hold("alice/r.git")
+	gateQ := b.hold("alice/q.git")
+	b.p.unfence()
+	b.p.pass(t.Context())
+	require.Eventually(t, func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return b.inFlight["alice/r.git"] == 1 && b.inFlight["alice/q.git"] == 1
+	}, 10*time.Second, time.Millisecond, "both fetches run")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	release, err := b.p.holdDirs(ctx, []string{"alice/r.git", "alice/s.git"})
+	require.NoError(t, err, "the fetch was cancelled, not waited for")
+	assert.False(t, b.p.isFetching("alice/r.git"))
+	assert.True(t, b.p.isFetching("alice/q.git"), "the fetch of another key of the owner goes on")
+
+	close(gateQ)
+	close(gateR)
+	release()
+	require.Eventually(t, func() bool {
+		b.p.pass(t.Context())
+		return b.p.Projected("alice/r.git") > 0 && b.p.Projected("alice/q.git") > 0
 	}, 10*time.Second, 10*time.Millisecond, "projected again once released")
 }

@@ -208,11 +208,11 @@ func (oc *objectChannel) handlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Taken now, they would create the repository's directory again under
-	// an owner whose directory Forgejo moved, or land in the one it moves:
-	// the sender counts another member (#257).
+	// a name whose directory Forgejo moved, its owner's or its own, or land
+	// in the one it moves: the sender counts another member (#257, #274).
 	leave, ok := oc.holds.enter(repo)
 	if !ok {
-		http.Error(w, fmt.Sprintf("the directory of %s moves with its owner's rename on this node", repo), http.StatusServiceUnavailable)
+		http.Error(w, fmt.Sprintf("the directory of %s moves with a rename on this node", repo), http.StatusServiceUnavailable)
 		return
 	}
 	defer leave()
