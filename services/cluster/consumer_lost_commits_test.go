@@ -231,12 +231,11 @@ func TestACommitAMemberThatDoesNotAnswerMayHoldIsNotLost(t *testing.T) {
 	require.True(t, ok)
 	assert.True(t, s.nowhere.IsZero(), "not every member answered that it does not hold n1")
 
-	// node-b's object channel is back on its address.
+	// node-b's object channel is back on its address, the bench's again:
+	// its close waits for the requests it serves.
 	ln, err := net.Listen("tcp", f.b.addr)
 	require.NoError(t, err)
-	srv := &http.Server{Handler: f.b.r.objects.handler(), TLSConfig: f.b.srv.TLSConfig, ReadHeaderTimeout: 5 * time.Second}
-	go func() { _ = srv.ServeTLS(ln, "", "") }()
-	t.Cleanup(func() { _ = srv.Close() })
+	f.tc.serve(f.b, ln)
 
 	require.NoError(t, dispatchOne(t, c, f.e1), "n1 fetched from node-b, the event derived as pushed")
 	assert.True(t, holds(f.dirC, f.n1))

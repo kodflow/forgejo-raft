@@ -54,7 +54,7 @@ func TestALearnerPromotedDuringAWriteIsNotRefused(t *testing.T) {
 		byAddr: map[string]*autoNode{},
 	}
 	newTestClusterWith(t, consensus.ClusterID(b.cluster), func(tc *testCluster, _ map[string][32]byte) {
-		b.ctx = tc.ctx
+		b.tc, b.ctx = tc, tc.ctx
 		peers := map[string]string{}
 		for _, n := range tc.nodes {
 			peers[n.slot] = n.slot + ".forgejo.test:7480"

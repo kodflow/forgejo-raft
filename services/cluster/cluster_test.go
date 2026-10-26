@@ -200,8 +200,18 @@ type testCluster struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	// loops counts the background goroutines, which close waits for so
-	// none writes into a directory being removed.
+	// none writes into a directory being removed: a goroutine of the
+	// bench runs as loops.Go.
 	loops sync.WaitGroup
+	// serving counts the requests the nodes' object channels serve
+	// (serve), whose handlers write under their node's root: net/http's
+	// Close waits for none of them, and close waits for them (#271).
+	// servingMu guards it with closing, set once close began, and
+	// servers, the servers close closes.
+	servingMu sync.Mutex
+	closing   bool
+	servers   []*http.Server
+	serving   sync.WaitGroup
 	// repoIDs gives each key its own repository id, in the order of its
 	// first push, from 1: the consumer tells repositories by id (#133).
 	repoIDsMu sync.Mutex
@@ -281,9 +291,8 @@ func newTestClusterWith(t *testing.T, clusterID consensus.ClusterID, start func(
 			holds:        r.projector.holds,
 		}
 		r.projector.fetch = r.objects.fetchMissing
-		srv := &http.Server{Handler: r.objects.handler(), TLSConfig: id.serverConfig(), ReadHeaderTimeout: 5 * time.Second}
-		go func() { _ = srv.ServeTLS(ln, "", "") }()
-		n := &testNode{slot: slot, r: r, addr: addrs[slot], srv: srv, work: &recordingWork{}}
+		n := &testNode{slot: slot, r: r, addr: addrs[slot], work: &recordingWork{}}
+		tc.serve(n, ln)
 		tc.nodes = append(tc.nodes, n)
 		// The consumer is wired before start, as Init wires it before the
 		// engine opens: the autopilots start launches read it from their
@@ -303,10 +312,9 @@ func newTestClusterWith(t *testing.T, clusterID consensus.ClusterID, start func(
 
 	for _, n := range tc.nodes {
 		r := n.r
-		tc.loops.Add(3)
-		go func() { defer tc.loops.Done(); r.projector.run(ctx) }()
-		go func() { defer tc.loops.Done(); r.startupBarrier(ctx) }()
-		go func() { defer tc.loops.Done(); r.consumer.run(ctx) }()
+		tc.loops.Go(func() { r.projector.run(ctx) })
+		tc.loops.Go(func() { r.startupBarrier(ctx) })
+		tc.loops.Go(func() { r.consumer.run(ctx) })
 	}
 	for _, n := range tc.nodes {
 		require.Eventually(t, n.r.projector.Ready, 15*time.Second, 10*time.Millisecond, "projector of %s ready", n.slot)
@@ -314,12 +322,78 @@ func newTestClusterWith(t *testing.T, clusterID consensus.ClusterID, start func(
 	return tc
 }
 
+// serve serves node n's object channel on ln, as n.srv, until close: a
+// request that comes once close began is refused, and close waits for the
+// others, whose handlers write under n's root (#271).
+func (tc *testCluster) serve(n *testNode, ln net.Listener) {
+	inner := n.r.objects.handler()
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !tc.enterServing() {
+				http.Error(w, "the bench is closing", http.StatusServiceUnavailable)
+				return
+			}
+			defer tc.serving.Done()
+			inner.ServeHTTP(w, r)
+		}),
+		TLSConfig: n.r.objects.id.serverConfig(), ReadHeaderTimeout: 5 * time.Second,
+	}
+	tc.servingMu.Lock()
+	defer tc.servingMu.Unlock()
+	n.srv = srv
+	if tc.closing {
+		_ = ln.Close()
+		return
+	}
+	tc.servers = append(tc.servers, srv)
+	tc.loops.Go(func() { _ = srv.ServeTLS(ln, "", "") })
+}
+
+// enterServing counts a request in serving, unless close began.
+func (tc *testCluster) enterServing() bool {
+	tc.servingMu.Lock()
+	defer tc.servingMu.Unlock()
+	if tc.closing {
+		return false
+	}
+	tc.serving.Add(1)
+	return true
+}
+
+// close stops the bench, and returns once nothing of it runs any more: its
+// loops, the requests its object channels serve, the fetches its
+// projectors started, and the shipments of its pushes, the stragglers'
+// included, which run on detached from their request. Each of them writes
+// under a node's root, or ships to a node, and t.TempDir's RemoveAll
+// failed under them, "directory not empty" (#271). They keep their own
+// bounds: one that still runs a minute after fails the test.
 func (tc *testCluster) close() {
 	tc.cancel()
-	for _, n := range tc.nodes {
-		_ = n.srv.Close()
+	tc.servingMu.Lock()
+	tc.closing = true
+	servers := tc.servers
+	tc.servingMu.Unlock()
+	for _, srv := range servers {
+		_ = srv.Close()
 	}
-	tc.loops.Wait()
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		tc.loops.Wait()
+		// No pass runs any more, which starts the fetches. A shipment
+		// starts with a push the test makes: none starts any more, but
+		// from a goroutine of the test, which the test waits for (#200).
+		for _, n := range tc.nodes {
+			n.r.projector.fetches.Wait()
+			n.r.objects.shipments.Wait()
+		}
+		tc.serving.Wait()
+	}()
+	select {
+	case <-ended:
+	case <-time.After(time.Minute):
+		tc.t.Errorf("the bench still runs a minute after its close:\n%s", strings.Join(benchWriters(), "\n"))
+	}
 }
 
 func run(t *testing.T, dir string, args ...string) string {

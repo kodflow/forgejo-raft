@@ -80,6 +80,12 @@ type objectChannel struct {
 
 	mu      sync.Mutex
 	clients map[string]*http.Client
+
+	// shipments counts the shipments of shipToMajority until their last
+	// send ended and their packs are removed, the stragglers' included,
+	// which run on detached from their request: a test's bench waits for
+	// them before it removes the members' directories (#271).
+	shipments sync.WaitGroup
 }
 
 // ---- admission ----
@@ -680,6 +686,7 @@ func (oc *objectChannel) shipToMajority(ctx context.Context, repo, dir, format s
 	}
 	sendCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
 	acks := make(chan error, len(peers))
+	oc.shipments.Add(1)
 	var wg sync.WaitGroup
 	for _, m := range peers {
 		wg.Add(1)
@@ -713,6 +720,7 @@ func (oc *objectChannel) shipToMajority(ctx context.Context, repo, dir, format s
 		}(m)
 	}
 	go func() {
+		defer oc.shipments.Done()
 		wg.Wait()
 		cancel()
 		if thin != "" {
