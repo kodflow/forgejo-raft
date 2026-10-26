@@ -5,9 +5,11 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -194,6 +196,27 @@ func TestLaggingTemplateGenerationNeverCopiesAnotherRepository(t *testing.T) {
 
 	release()
 	require.Eventually(t, func() bool { return gitRef(t, a, tplGenTemplate, "refs/heads/master") == t1 }, 15*time.Second, 20*time.Millisecond, "node-a catches up")
+
+	// A rename of the template projected after the first check, while
+	// `git init` of the new repository went through the cluster: the
+	// directory is checked again right before git reads it, and the
+	// repository is removed from every member as for a failed generation.
+	t.Run("node-a checks the directory again right before reading it", func(t *testing.T) {
+		var checks atomic.Int32
+		clusterhook.SetReadGuard(func(key string, repoID int64) error {
+			if key == tplGenTemplate && checks.Add(1) > 1 {
+				return errors.New("this node of the cluster has not projected the last rename of " + key + " yet")
+			}
+			return a.r.ReadRefusal(key, repoID)
+		})
+		defer clusterhook.SetReadGuard(a.r.ReadRefusal)
+		_, err := tplGenerate(t, "tpl-gen-late", repo_service.GenerateRepoOptions{GitContent: true})
+		require.ErrorIs(t, err, clusterhook.ErrBehind)
+		assert.EqualValues(t, 2, checks.Load(), "checked before anything is written, then right before the clone")
+		unittest.AssertNotExistsBean(t, &repo_model.Repository{OwnerID: 2, LowerName: "tpl-gen-late"})
+		requireGoneEverywhere(t, tc, clusterhook.RepoKey("user2", "tpl-gen-late", false))
+	})
+
 	gen, err := tplGenerate(t, "tpl-gen-private", repo_service.GenerateRepoOptions{GitContent: true})
 	require.NoError(t, err)
 	tplGenGenerated(t, tc, gen, "template content")
