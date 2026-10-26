@@ -18,6 +18,7 @@ import (
 
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/consensus/kitsunium"
+	"forgejo.org/services/cluster/consensus/memraft"
 
 	sdk "github.com/kitsunium/sdk/pkg/v1/app/consensus"
 	"github.com/stretchr/testify/assert"
@@ -114,6 +115,30 @@ func newAutoClusterWith(t *testing.T, expected int, hooks map[string]WriterHook,
 		b.formAll(tc.nodes)
 	}, slots...)
 	return tc, b
+}
+
+// The bench's start opens the engines and, for an autonomous bench, starts
+// the autopilots, whose first pass reads the consumer (yieldIfStuck, the
+// checkpoints' holder): the bench wired it only after start returned, a
+// write the race detector caught against those reads, which failed a
+// shard at random (#260). Every node's consumer is wired, as the bench
+// keeps it, before start, as Init wires it before the engine opens.
+func TestTheBenchWiresTheConsumerBeforeItsStartRuns(t *testing.T) {
+	seen := map[string]*consumer{}
+	tc := newTestClusterWith(t, memraft.New().ID(), func(tc *testCluster, pins map[string][32]byte) {
+		for _, n := range tc.nodes {
+			seen[n.slot] = n.r.consumer
+			n.node = tc.mem.Add(n.slot, pins[n.slot], n.r.table)
+			n.r.setEngine(n.node)
+		}
+	}, "node-a", "node-b", "node-c")
+	for _, n := range tc.nodes {
+		require.NotNil(t, seen[n.slot], "%s: the consumer is wired before start", n.slot)
+		assert.Same(t, n.r.consumer, seen[n.slot], "%s: and is not replaced after", n.slot)
+		_, why := seen[n.slot].durable(t.Context())
+		assert.Equal(t, "test", why, "%s: with the bench's database", n.slot)
+		assert.NotNil(t, seen[n.slot].cursor, n.slot)
+	}
 }
 
 // probe answers as the node at addr would on its object channel.
