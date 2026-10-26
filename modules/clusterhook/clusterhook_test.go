@@ -181,3 +181,44 @@ func TestRequireDerived(t *testing.T) {
 	assert.True(t, WaitDerived(context.Background(), "alice/demo.git"))
 	assert.Len(t, asked, 6)
 }
+
+// CheckRead refuses as ReadRefusal before the read, and after it also once
+// the watch saw a rename or a deletion of the key the node had not
+// projected at the call: the watch starts before the first check, so a
+// rename that check did not see is one the watch does (#261).
+func TestCheckRead(t *testing.T) {
+	still, err := CheckRead("o/r.git", 7)
+	require.NoError(t, err)
+	require.NoError(t, still(), "without a cluster")
+
+	var order []string
+	var refuse, moved bool
+	SetReadGuard(func(key string, repoID int64) error {
+		order = append(order, "check")
+		if refuse {
+			return fmt.Errorf("%s holds another repository than %d", key, repoID)
+		}
+		return nil
+	})
+	SetRewriteWatch(func(key string) func() bool {
+		order = append(order, "watch "+key)
+		return func() bool { return moved }
+	})
+	defer func() {
+		SetReadGuard(nil)
+		SetRewriteWatch(nil)
+	}()
+
+	still, err = CheckRead("o/r.git", 7)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"watch o/r.git", "check"}, order)
+	require.NoError(t, still(), "nothing moved")
+
+	moved = true
+	require.ErrorContains(t, still(), "a rename or a deletion of o/r.git may have moved its directory")
+
+	moved, refuse = false, true
+	require.ErrorContains(t, still(), "o/r.git holds another repository than 7", "the directory checked again after the read")
+	_, err = CheckRead("o/r.git", 7)
+	require.ErrorContains(t, err, "o/r.git holds another repository than 7")
+}
