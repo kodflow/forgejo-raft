@@ -102,6 +102,13 @@ func DeleteBranchPost(ctx *context.Context) {
 		case errors.Is(err, git_model.ErrBranchIsProtected):
 			log.Debug("DeleteBranch: Can't delete protected branch '%s'", branchName)
 			ctx.Flash.Error(ctx.Tr("repo.branch.protected_deletion_failed", branchName))
+		case errors.Is(err, clusterhook.ErrBehind):
+			// A node of the cluster whose branch rows are not derived yet
+			// from the last writes to the repository: nothing was deleted,
+			// the user retries (#267). The page reads the answer only to
+			// follow its redirect, so the refusal is said there.
+			log.Warn("DeleteBranch: %v", err)
+			ctx.Flash.Error(ctx.Tr("repo.branch.deletion_behind", branchName))
 		default:
 			log.Error("DeleteBranch: %v", err)
 			ctx.Flash.Error(ctx.Tr("repo.branch.deletion_failed", branchName))

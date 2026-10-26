@@ -1606,6 +1606,11 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		// its notifications, as it does without the cluster; post-receive
 		// work here would repeat them, and fails on the missing user.
 		// dispatch groups events by pusher, so the whole group is such.
+		// A request that writes rows this work derives for pushes waits
+		// first for the repository's earlier writes to be derived
+		// (clusterhook.RequireDerived: RenameBranch #225, CreateNewBranch
+		// #226, DeleteBranch #267): the work of a push derived after it
+		// would overwrite them, and nothing here would write them again.
 		return nil
 	}
 	repo, err := lookupRepo(ctx, first)

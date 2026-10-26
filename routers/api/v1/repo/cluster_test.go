@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"testing"
 
+	"forgejo.org/models/db"
+	git_model "forgejo.org/models/git"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unittest"
 	"forgejo.org/modules/clusterhook"
@@ -259,4 +261,66 @@ func TestApplyDiffPatchOutsideACluster(t *testing.T) {
 	master, err := gitRepo.GetBranchCommitID("master")
 	require.NoError(t, err)
 	assert.Equal(t, master, parent)
+}
+
+// A branch deleted through the API on a node of the cluster whose branch
+// rows are not derived yet from the cluster's last writes is refused with
+// 503 and the reason: deleted then, a branch whose push the consumer
+// derived after would come back live in SQL for good. Nothing is deleted,
+// in git or in SQL (#267).
+func TestDeleteBranchRefusedWhileItsRowLags(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	defer test.MockVariableValue(&clusterWriteRefusal, func(context.Context) error { return nil })()
+	defer test.MockVariableValue(&clusterFresh, func(context.Context, string) error { return nil })()
+	clusterhook.SetDerivedWaiter(func(context.Context, string) error { return clusterhook.ErrBehind })
+	t.Cleanup(func() { clusterhook.SetDerivedWaiter(nil) })
+
+	ctx, resp := contexttest.MockAPIContext(t, "DELETE /api/v1/repos/user2/repo1/branches/branch2")
+	ctx.SetParams("*", "branch2")
+	contexttest.LoadRepo(t, ctx, 1)
+	contexttest.LoadUser(t, ctx, 2)
+	contexttest.LoadGitRepo(t, ctx)
+	defer ctx.Repo().GitRepo.Close()
+
+	func() {
+		// A deletion hands its notifications to the push queue, which
+		// this test binary does not start: it panics after the deletion.
+		defer func() { _ = recover() }()
+		DeleteBranch(ctx)
+	}()
+
+	assert.Equal(t, http.StatusServiceUnavailable, ctx.Resp.Status())
+	assert.Contains(t, resp.Body.String(), "may be behind")
+	assert.True(t, ctx.Repo().GitRepo.IsBranchExist("branch2"))
+	row := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: 1, Name: "branch2"})
+	assert.False(t, row.IsDeleted)
+}
+
+// The branch rows the API synchronises from this node's git when the
+// repository has none are written once the node serves the repository at
+// the cluster's commit index: a node behind is refused before (#267).
+func TestDeleteBranchRefusedOnANodeBehindBeforeTheBranchSync(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	defer test.MockVariableValue(&clusterWriteRefusal, func(context.Context) error { return nil })()
+	defer test.MockVariableValue(&clusterFresh, behind)()
+	// A repository whose branch rows were never written.
+	_, err := db.GetEngine(db.DefaultContext).Where("repo_id = ?", 1).Delete(&git_model.Branch{})
+	require.NoError(t, err)
+
+	ctx, resp := contexttest.MockAPIContext(t, "DELETE /api/v1/repos/user2/repo1/branches/branch2")
+	ctx.SetParams("*", "branch2")
+	contexttest.LoadRepo(t, ctx, 1)
+	contexttest.LoadUser(t, ctx, 2)
+	contexttest.LoadGitRepo(t, ctx)
+	defer ctx.Repo().GitRepo.Close()
+
+	func() {
+		defer func() { _ = recover() }()
+		DeleteBranch(ctx)
+	}()
+
+	assert.Equal(t, http.StatusServiceUnavailable, ctx.Resp.Status())
+	assert.Contains(t, resp.Body.String(), "may be behind")
+	assert.True(t, ctx.Repo().GitRepo.IsBranchExist("branch2"))
+	unittest.AssertCount(t, &git_model.Branch{RepoID: 1}, 0)
 }

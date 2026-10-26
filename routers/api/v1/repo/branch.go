@@ -132,6 +132,13 @@ func DeleteBranch(ctx *context.APIContext) {
 
 	branchName := ctx.Params("*")
 
+	// Before the branch rows are synchronised from this node's git: a node
+	// of the cluster behind on the repository would write them from the
+	// refs it has, not the cluster's.
+	if refWritesRefused(ctx) {
+		return
+	}
+
 	// check whether branches of this repository has been synced
 	totalNumOfBranches, err := db.Count[git_model.Branch](ctx, git_model.FindBranchOptions{
 		RepoID:          ctx.Repo().Repository.ID,
@@ -149,10 +156,12 @@ func DeleteBranch(ctx *context.APIContext) {
 		}
 	}
 
-	if refWritesRefused(ctx) {
-		return
-	}
 	if err := repo_service.DeleteBranch(ctx, ctx.Doer(), ctx.Repo().Repository, ctx.Repo().GitRepo, branchName); err != nil {
+		if clusterBehind(ctx, err) {
+			// The branch rows are not derived yet from the cluster's last
+			// writes to the repository: nothing was deleted (#267).
+			return
+		}
 		switch {
 		case git.IsErrBranchNotExist(err):
 			ctx.NotFound(err)

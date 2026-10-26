@@ -6,6 +6,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"forgejo.org/models/unittest"
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/clusterhook"
+	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/test"
@@ -44,16 +46,7 @@ type derivation struct {
 
 func holdDerivation(t *testing.T, tc *testCluster, ref, sha string, after func(ctx context.Context, ev reftable.Event)) *derivation {
 	t.Helper()
-	var leader *testNode
-	require.Eventually(t, func() bool {
-		for _, n := range tc.nodes {
-			if n.r.Engine().Status().Role == consensus.RoleLeader {
-				leader = n
-				return true
-			}
-		}
-		return false
-	}, 5*time.Second, 10*time.Millisecond, "a leader")
+	leader := clusterLeader(t, tc)
 	d := &derivation{open: make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{})}
 	var opened, stopped, finished sync.Once
 	d.release = func() { opened.Do(func() { close(d.open) }) }
@@ -87,6 +80,23 @@ func holdDerivation(t *testing.T, tc *testCluster, ref, sha string, after func(c
 		d.end()
 	})
 	return d
+}
+
+// clusterLeader is the node that leads now, the one whose consumer derives
+// SQL.
+func clusterLeader(t *testing.T, tc *testCluster) *testNode {
+	t.Helper()
+	var leader *testNode
+	require.Eventually(t, func() bool {
+		for _, n := range tc.nodes {
+			if n.r.Engine().Status().Role == consensus.RoleLeader {
+				leader = n
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 10*time.Millisecond, "a leader")
+	return leader
 }
 
 // derived opens the derivation and waits until its work ran.
@@ -282,4 +292,125 @@ func TestReconcileRebuildsABranchRowAtAnotherCommit(t *testing.T) {
 	require.NoError(t, err)
 	_, ok = lagFrom(ms)
 	assert.False(t, ok, "nothing is left to rebuild")
+}
+
+// deleteBranchOn is repo_service.DeleteBranch, as DELETE
+// /repos/{owner}/{repo}/branches/{branch} and the web's branch list call
+// it. Its last step hands the notifications to the node-local push queue,
+// which this test binary does not start: that call panics after the
+// deletion was written, and the panic is recovered.
+func deleteBranchOn(ctx context.Context, doer *user_model.User, repo *repo_model.Repository, gitRepo *git.Repository, branch string) (err error) {
+	defer func() { _ = recover() }()
+	return repo_service.DeleteBranch(ctx, doer, repo, gitRepo, branch)
+}
+
+// lag-del is pushed (no branch to c1) through node-b and acknowledged.
+// Before the leader's consumer derives the push, lag-del is deleted
+// through node-b, fresh, as DELETE /repos/{owner}/{repo}/branches/lag-del
+// and the web do (DeleteBranch). It found no SQL row, which only the
+// consumer writes, so it marked nothing deleted and only deleted the ref,
+// a write without pusher that leaves the consumer no work. The consumer
+// then derived the push on the leader's git, which had not projected the
+// deletion yet, and wrote the row live: the branch came back in the
+// branch list of the whole cluster for good, and its deletion failed on
+// the missing git branch (#267). Now the deletion waits for the consumer
+// to derive every write the cluster confirmed, and is refused while it
+// has not; once derived, it marks the row deleted.
+func TestABranchDeletedRightAfterItsPushStaysDeletedInSQL(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	tc := newTestCluster(t, "node-a", "node-b", "node-c")
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	c1 := commit(t, work, "one")
+	c2 := commit(t, work, "two")
+	zero := strings.Repeat("0", 40)
+	const name = "lag-del"
+	ref := "refs/heads/" + name
+	require.Equal(t, int64(1), tc.repoID(laggingRepo))
+
+	leader := clusterLeader(t, tc)
+	var follower *testNode
+	for _, n := range tc.nodes {
+		if n != leader {
+			follower = n
+			break
+		}
+	}
+	require.True(t, tc.pushVia(follower, work, laggingRepo, "refs/heads/main", zero, c2).OK)
+	push := holdDerivation(t, tc, ref, c1, nil)
+	resp := tc.pushVia(follower, work, laggingRepo, ref, zero, c1)
+	require.True(t, resp.OK, resp.Message)
+	for _, m := range tc.nodes {
+		require.Eventually(t, func() bool { return gitRef(t, m, laggingRepo, ref) == c1 }, 15*time.Second, 20*time.Millisecond, "%s projects the push", m.slot)
+	}
+	ctx := db.DefaultContext
+	unittest.AssertNotExistsBean(t, &git_model.Branch{RepoID: 1, Name: name})
+
+	// The leader's projector is a moment behind its table on this
+	// repository (a pass on another one, a fetch): held here.
+	hold := clusterhook.NewNonce()
+	require.NoError(t, leader.r.registry.register(hold, laggingRepo, nil, os.Getpid(), false))
+	held := true
+	t.Cleanup(func() {
+		if held {
+			leader.r.registry.release(hold)
+		}
+	})
+
+	withGitThroughReplicator(t, follower)
+	freshFrom(t, follower)
+	sqlRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	gitRepo, err := gitrepo.OpenRepository(ctx, sqlRepo)
+	require.NoError(t, err)
+	defer gitRepo.Close()
+
+	// node-b serves the push, the consumer has not derived it.
+	err = deleteBranchOn(ctx, doer, sqlRepo, gitRepo, name)
+	require.ErrorIs(t, err, clusterhook.ErrBehind, "the deletion did not wait for the consumer to derive the push")
+	tableAt(t, tc, ref, c1, "nothing was deleted")
+	assert.Equal(t, c1, gitRef(t, follower, laggingRepo, ref), "nothing was deleted")
+	unittest.AssertNotExistsBean(t, &git_model.Branch{RepoID: 1, Name: name})
+
+	// The leader's consumer derives the push, on the leader's git.
+	restore := test.MockVariableValue(&setting.RepoRootPath, leader.r.root)
+	push.derived(t)
+	restore()
+	row := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: 1, Name: name})
+	require.False(t, row.IsDeleted)
+	require.Equal(t, c1, row.CommitID)
+
+	require.NoError(t, deleteBranchOn(ctx, doer, sqlRepo, gitRepo, name))
+	for _, m := range tc.nodes {
+		require.Eventually(t, func() bool {
+			v, ok := m.r.table.Get(laggingRepo, ref)
+			return ok && !v.Live()
+		}, 10*time.Second, 20*time.Millisecond, "%s applied the deletion", m.slot)
+	}
+	row = unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: 1, Name: name})
+	assert.True(t, row.IsDeleted, "the deletion marks the derived row deleted")
+	assert.Equal(t, doer.ID, row.DeletedByID)
+
+	// The leader's projection catches up, and the consumer derives the
+	// deletion's event: no pusher, no work, the row stays deleted.
+	leader.r.registry.release(hold)
+	held = false
+	for _, m := range tc.nodes {
+		require.Eventually(t, func() bool { return gitRef(t, m, laggingRepo, ref) == "" }, 15*time.Second, 20*time.Millisecond, "%s projects the deletion", m.slot)
+	}
+	var del *reftable.Event
+	for _, ev := range leader.r.table.Events() {
+		if ev.Repo == laggingRepo && ev.Ref == ref && ev.New == "" {
+			e := ev
+			del = &e
+		}
+	}
+	require.NotNil(t, del, "the deletion's event")
+	assert.Zero(t, del.PusherID)
+	wctx, _ := clusterhook.WithAfterCommit(ctx)
+	require.NoError(t, pushWorkWith(wctx, []reftable.Event{*del}, leader.r.table))
+	row = unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: 1, Name: name})
+	t.Logf("SQL %s is_deleted=%v commit=%.10s; refs: deleted on every node", name, row.IsDeleted, row.CommitID)
+	assert.True(t, row.IsDeleted, "SQL holds the branch deleted through the API live")
+	assert.Equal(t, consensus.RoleLeader, leader.r.Engine().Status().Role, "the leader did not change during the test")
 }
