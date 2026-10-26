@@ -352,8 +352,26 @@ the stored files already copied with the same bytes are kept:
    `fetch.fsckObjects`), and the stored files by digest.
 5. A fresh archive configuration for the recovered primary.
 6. Verification: the refs against the SQL branch rows, every LFS object
-   present, every 2FA secret opening with the restored `SECRET_KEY`; then
-   every access token, OAuth2 grant, session and runner token is revoked.
+   present, every 2FA secret opening with the restored `SECRET_KEY`.
+   A repository the checkpoint holds and SQL has no row for is an orphan of
+   the old cluster: its table held it alive and SQL did not know it (a
+   deletion or a creation the cluster did not record, a loss on the SQL
+   side; see "Recovery" in [README.md](README.md)). Every checkpoint taken
+   while it lasts holds it, and it may be the repository's only copy: it is
+   restored as the old cluster held it, left out of the comparison, and
+   named in a `WARNING`. Once the new cluster runs, `forgejo cluster
+   reconcile` names it too: adopt it (its owner recreated first if SQL lost
+   it too), or delete it with `forgejo cluster reconcile --delete-orphan`.
+   One half of a rename or a transfer cut in two looks the same, its other
+   half a repository SQL holds and the checkpoint does not: while SQL holds
+   such a repository, an orphan with a branch is refused, and the error
+   names both. If they are orphans (`reconcile` named them on the old
+   cluster), run the same command again with `--accept-orphans`: it resumes
+   at this step. The error offers it only when the orphans are all that
+   differs: the branch rows of a repository the checkpoint does not hold
+   are refused, with the flag or without it.
+   Then every access token, OAuth2 grant, session and runner token is
+   revoked.
 7. The schema is migrated to this binary's first, so the sequences of the
    tables a migration creates are moved too. Then the identifiers move past
    the checkpoint, once: every sequence of the
@@ -371,9 +389,10 @@ the stored files already copied with the same bytes are kept:
    history before it.
 
 Then start Forgejo, run `forgejo cluster import` to put the restored refs in
-the new table, `forgejo doctor check --all --fix` and `forgejo cluster
-reconcile --apply`, add the other members, and give the observers their new
-key and the new lineage (`observe accept`).
+the new table, the orphans' included, `forgejo doctor check --all --fix` and
+`forgejo cluster reconcile --apply`, which names the orphans step 6
+restored, to adopt or to delete; add the other members, and give the
+observers their new key and the new lineage (`observe accept`).
 
 ## Limits of this version
 

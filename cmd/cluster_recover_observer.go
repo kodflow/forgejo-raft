@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,6 +56,7 @@ func recoverFromObserverFlags() []cli.Flag {
 		&cli.StringFlag{Name: "pg-hba-file", Usage: "the recovered PostgreSQL's pg_hba.conf, the operator's (default: local peer only)"},
 		&cli.StringFlag{Name: "pg-ctl", Usage: "pg_ctl, run as PostgreSQL's owner; without it, the recovery stops for the operator to start PostgreSQL"},
 		&cli.StringFlag{Name: "wal-archive-dir", Usage: "the recovered primary's fresh WAL archive (default: [cluster] WAL_ARCHIVE_DIR)"},
+		&cli.BoolFlag{Name: "accept-orphans", Usage: "step 6 restores as orphans the repositories the checkpoint holds and SQL has no row for, also when SQL holds repositories the checkpoint does not, as one half of a rename or a transfer cut in two would; the operator's decision, see observer.md"},
 	}
 }
 
@@ -333,7 +335,7 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		if err := git.InitSimple(ctx); err != nil {
 			return err
 		}
-		if err := verifyRecovered(ctx, m, w); err != nil {
+		if err := verifyRecovered(ctx, m, w, c.Bool("accept-orphans")); err != nil {
 			return err
 		}
 		if err := save(stepVerify); err != nil {
@@ -384,7 +386,7 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 	}
 
 	// 8. The loss, stated.
-	fmt.Fprintf(w, "\n%s\n\nNext: start Forgejo on this node with the rotated secrets; run `forgejo cluster import` to put the restored refs in the new table, `forgejo doctor check --all --fix` and `forgejo cluster reconcile --apply` (pull request heads, branches); then add the other members, and re-key the observers with their new key.\n", m.Loss)
+	fmt.Fprintf(w, "\n%s\n\nNext: start Forgejo on this node with the rotated secrets; run `forgejo cluster import` to put the restored refs in the new table, `forgejo doctor check --all --fix` and `forgejo cluster reconcile --apply` (pull request heads, branches; it names the orphans step 6 restored, to adopt or to delete); then add the other members, and re-key the observers with their new key.\n", m.Loss)
 	return nil
 }
 
@@ -621,18 +623,18 @@ func verifyRestoredRepos(ctx context.Context, m *observer.Manifest, root string,
 	if err != nil {
 		return err
 	}
-	var orphans []string
+	var rowsOnly []string
 	for _, r := range rows {
 		repo := strings.ToLower(string(r["owner"])) + "/" + string(r["repo"]) + ".git"
 		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(repo), "HEAD")); err != nil {
-			orphans = append(orphans, repo)
+			rowsOnly = append(rowsOnly, repo)
 		}
 	}
-	sort.Strings(orphans)
-	for _, repo := range orphans {
+	sort.Strings(rowsOnly)
+	for _, repo := range rowsOnly {
 		fmt.Fprintf(w, "WARNING: %s has a repository row and no directory: the checkpoint does not hold it\n", repo)
 	}
-	fmt.Fprintf(w, "verified: %d repositories restored, empty ones included\n", len(rows)-len(orphans))
+	fmt.Fprintf(w, "verified: %d repositories restored, empty ones included\n", len(rows)-len(rowsOnly))
 	return nil
 }
 
@@ -748,6 +750,61 @@ func branchMismatch(ctx context.Context, m *observer.Manifest) (mismatch []strin
 	return mismatch, repos, refs, nil
 }
 
+// checkpointOrphans compares the repositories the checkpoint restores
+// with SQL's. orphans are those SQL has no repository row for, wikis
+// included (a wiki is its repository's): what the table of the old cluster
+// held alive and SQL did not know, as `forgejo cluster reconcile` names it,
+// left by a deletion or a creation the cluster did not record, or by a loss
+// on the SQL side (contrib/cluster/README.md, "Recovery"). branched are the
+// orphans holding a branch, which the comparison of the branch rows would
+// refuse. unheld are the repositories SQL holds and the checkpoint does not
+// restore.
+func checkpointOrphans(ctx context.Context, m *observer.Manifest) (orphans, branched, unheld []string, err error) {
+	rows, err := db.GetEngine(ctx).Query(`SELECT owner_name AS owner, lower_name AS repo FROM repository`)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	inSQL := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		inSQL[strings.ToLower(string(r["owner"]))+"/"+string(r["repo"])+".git"] = true
+	}
+	held := map[string]bool{}
+	for repo, rm := range m.Repos {
+		if len(rm.Refs) == 0 && len(rm.Symbolic) == 0 {
+			// Nothing of it is restored (verifyRestoredRepos).
+			continue
+		}
+		base, wiki := strings.CutSuffix(repo, ".wiki.git")
+		if wiki {
+			base += ".git"
+		} else {
+			held[repo] = true
+		}
+		if inSQL[base] {
+			continue
+		}
+		orphans = append(orphans, repo)
+		if wiki {
+			continue
+		}
+		for ref := range rm.Refs {
+			if strings.HasPrefix(ref, "refs/heads/") {
+				branched = append(branched, repo)
+				break
+			}
+		}
+	}
+	for repo := range inSQL {
+		if !held[repo] {
+			unheld = append(unheld, repo)
+		}
+	}
+	sort.Strings(orphans)
+	sort.Strings(branched)
+	sort.Strings(unheld)
+	return orphans, branched, unheld, nil
+}
+
 // verifyBranches checks that the branch rows of SQL at L are the refs at
 // B. Some rows are written long after the refs they describe, by no
 // operation that holds the cut: a mirror's synchronisation writes them
@@ -756,12 +813,46 @@ func branchMismatch(ctx context.Context, m *observer.Manifest) (mismatch []strin
 // rows derive from the refs: the branches of a repository SQL holds and
 // the checkpoint restored are synchronised with its restored refs, as the
 // mirror or the migration would have done, and the comparison runs again.
-// What does not derive from the refs is still refused: refs of a
-// repository SQL does not hold, rows of a repository the checkpoint does
-// not hold, which a deletion, a rename, a transfer or a creation cut in
-// two leaves (#88).
-func verifyBranches(ctx context.Context, m *observer.Manifest, w interface{ Write([]byte) (int, error) }) error {
-	mismatch, repos, refs, err := branchMismatch(ctx, m)
+//
+// An orphan of the old cluster, a repository its table held alive and SQL
+// did not know, is in every checkpoint taken while it lasts, and the
+// observer protects them (#255): it is restored as the old cluster held
+// it, its refs left out of the comparison, and named, to be adopted or
+// deleted once the new cluster runs. It is told apart from one half of a
+// rename or a transfer cut in two only when SQL holds no repository the
+// checkpoint does not, as the other half would be: otherwise the step
+// refuses, naming both, and only acceptOrphans, the operator's decision,
+// restores them as orphans. The refusal offers it only when the orphans
+// are all that differs.
+//
+// What does not derive from the refs is still refused: rows of a
+// repository the checkpoint does not hold, which a deletion, a rename, a
+// transfer or a creation cut in two leaves (#88), and the refs of a
+// repository SQL does not hold while they cannot be told from the other
+// half of such a cut. A deletion or a creation cut in two that leaves the
+// refs alone leaves what a deletion or a creation the cluster did not
+// record leaves, an orphan, and is restored as one.
+func verifyBranches(ctx context.Context, m *observer.Manifest, w interface{ Write([]byte) (int, error) }, acceptOrphans bool) error {
+	orphans, branched, unheld, err := checkpointOrphans(ctx, m)
+	if err != nil {
+		return err
+	}
+	accepted := len(branched) == 0 || len(unheld) == 0 || acceptOrphans
+	withoutOrphans := &observer.Manifest{Repos: maps.Clone(m.Repos)}
+	for _, repo := range orphans {
+		delete(withoutOrphans.Repos, repo)
+	}
+	compared := m
+	if accepted {
+		compared = withoutOrphans
+		for _, repo := range orphans {
+			fmt.Fprintf(w, "WARNING: %s is an orphan: the checkpoint holds it and SQL has no repository row for it, as the old cluster held it (a deletion or a creation it did not record, a loss on the SQL side). It is restored; once the new cluster runs, `forgejo cluster reconcile` names it: adopt it (its owner recreated first if SQL lost it too), or delete it with `forgejo cluster reconcile --delete-orphan`\n", repo)
+		}
+		if len(branched) > 0 && len(unheld) > 0 {
+			fmt.Fprintf(w, "WARNING: orphans accepted with --accept-orphans, SQL holding repositories the checkpoint does not: %s\n", strings.Join(unheld, ", "))
+		}
+	}
+	mismatch, repos, refs, err := branchMismatch(ctx, compared)
 	if err != nil {
 		return err
 	}
@@ -780,12 +871,26 @@ func verifyBranches(ctx context.Context, m *observer.Manifest, w interface{ Writ
 				fmt.Fprintf(w, "reconciled: %s, its branch rows derived from its restored refs\n", key)
 			}
 		}
-		if mismatch, _, refs, err = branchMismatch(ctx, m); err != nil {
+		if mismatch, _, refs, err = branchMismatch(ctx, compared); err != nil {
 			return err
 		}
 	}
 	if len(mismatch) > 0 {
-		return fmt.Errorf("the refs and the SQL rows differ at the checkpoint:\n  %s", strings.Join(mismatch, "\n  "))
+		msg := "the refs and the SQL rows differ at the checkpoint:\n  " + strings.Join(mismatch, "\n  ")
+		if !accepted {
+			// --accept-orphans is offered only when the orphans are all
+			// that differs: it never passes the rows of a repository the
+			// checkpoint does not hold.
+			rest, _, _, err := branchMismatch(ctx, withoutOrphans)
+			if err != nil {
+				return err
+			}
+			if len(rest) > 0 {
+				return errors.New(msg)
+			}
+			msg += fmt.Sprintf("\n%s has no repository row in SQL: an orphan of the old cluster (a deletion or a creation it did not record, a loss on the SQL side), or one half of a rename or a transfer cut in two, since SQL holds repositories the checkpoint does not: %s. If they are orphans, as `forgejo cluster reconcile` named them on the old cluster, run the same command again with --accept-orphans", strings.Join(branched, ", "), strings.Join(unheld, ", "))
+		}
+		return errors.New(msg)
 	}
 	fmt.Fprintf(w, "verified: %d branches, refs and SQL rows match\n", refs)
 	return nil
@@ -822,9 +927,9 @@ func syncRestoredBranches(ctx context.Context, key string) (bool, error) {
 
 // verifyRecovered checks what the recovery restored, then revokes every
 // token: a recovered forge trusts none it held.
-func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Write([]byte) (int, error) }) error {
+func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Write([]byte) (int, error) }, acceptOrphans bool) error {
 	e := db.GetEngine(ctx)
-	if err := verifyBranches(ctx, m, w); err != nil {
+	if err := verifyBranches(ctx, m, w, acceptOrphans); err != nil {
 		return err
 	}
 	if err := verifyRestoredRepos(ctx, m, setting.RepoRootPath, w); err != nil {

@@ -5,7 +5,11 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"maps"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -13,9 +17,11 @@ import (
 	git_model "forgejo.org/models/git"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unittest"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/gitrepo"
 	repo_module "forgejo.org/modules/repository"
 	"forgejo.org/services/cluster/observer"
+	repo_service "forgejo.org/services/repository"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -79,7 +85,7 @@ func TestRecoverDerivesTheBranchRowsBehindTheRefs(t *testing.T) {
 		require.NoError(t, err)
 
 		var out bytes.Buffer
-		require.NoError(t, verifyBranches(ctx, m, &out))
+		require.NoError(t, verifyBranches(ctx, m, &out, false))
 		assert.Contains(t, out.String(), "reconciled: user2/repo1.git, its branch rows derived from its restored refs")
 		assert.Contains(t, out.String(), "refs and SQL rows match")
 		mismatch, _, _, err := branchMismatch(ctx, m)
@@ -96,7 +102,7 @@ func TestRecoverDerivesTheBranchRowsBehindTheRefs(t *testing.T) {
 		require.NoError(t, os.Rename(repo.RepoPath(), repo_model.RepoPath("user2", "renamed")))
 
 		var out bytes.Buffer
-		err := verifyBranches(ctx, m, &out)
+		err := verifyBranches(ctx, m, &out, false)
 		require.ErrorContains(t, err, "user2/renamed.git refs/heads/master: refs ")
 		require.ErrorContains(t, err, "user2/repo1.git refs/heads/master: in SQL, not in the refs")
 		assert.NotContains(t, out.String(), "reconciled")
@@ -157,7 +163,7 @@ func TestRecoverDerivesABranchRecreatedAtItsCommit(t *testing.T) {
 		m := checkpointOfSQL(t)
 		require.Equal(t, commit, m.Repos["user2/repo1.git"].Refs["refs/heads/branch2"])
 		var out bytes.Buffer
-		require.NoError(t, verifyBranches(ctx, m, &out), out.String())
+		require.NoError(t, verifyBranches(ctx, m, &out, false), out.String())
 		assert.NotContains(t, out.String(), "reconciled")
 		assert.Contains(t, out.String(), "refs and SQL rows match")
 	})
@@ -167,7 +173,7 @@ func TestRecoverDerivesABranchRecreatedAtItsCommit(t *testing.T) {
 		m := checkpointOfSQL(t)
 		require.Equal(t, commit, m.Repos["user2/repo1.git"].Refs["refs/heads/branch2"])
 		var out bytes.Buffer
-		require.NoError(t, verifyBranches(ctx, m, &out), out.String())
+		require.NoError(t, verifyBranches(ctx, m, &out, false), out.String())
 		assert.Contains(t, out.String(), "reconciled: user2/repo1.git, its branch rows derived from its restored refs")
 		assert.Contains(t, out.String(), "refs and SQL rows match")
 		b, err := git_model.GetBranch(ctx, repo.ID, "branch2")
@@ -176,5 +182,167 @@ func TestRecoverDerivesABranchRecreatedAtItsCommit(t *testing.T) {
 		mismatch, _, _, err := branchMismatch(ctx, m)
 		require.NoError(t, err)
 		assert.Empty(t, mismatch)
+	})
+}
+
+// checkpointOfEveryRepository is checkpointOfSQL holding every repository
+// SQL holds, as a checkpoint does: those without a branch row as empty
+// repositories, their HEAD alone.
+func checkpointOfEveryRepository(t *testing.T) *observer.Manifest {
+	t.Helper()
+	m := checkpointOfSQL(t)
+	rows, err := db.GetEngine(db.DefaultContext).Query(`SELECT owner_name AS owner, lower_name AS repo, default_branch AS head FROM repository`)
+	require.NoError(t, err)
+	for _, r := range rows {
+		key := strings.ToLower(string(r["owner"])) + "/" + string(r["repo"]) + ".git"
+		if _, ok := m.Repos[key]; !ok {
+			m.Repos[key] = observer.RepoManifest{Format: "sha1", Symbolic: map[string]string{"HEAD": "refs/heads/" + string(r["head"])}}
+		}
+	}
+	return m
+}
+
+// emptyRepositoryOfSQL is a repository SQL holds without a live branch row.
+func emptyRepositoryOfSQL(t *testing.T) string {
+	t.Helper()
+	rows, err := db.GetEngine(db.DefaultContext).Query(`SELECT owner_name AS owner, lower_name AS repo FROM repository
+		WHERE id NOT IN (SELECT repo_id FROM branch WHERE is_deleted = ?) ORDER BY id`, false)
+	require.NoError(t, err)
+	require.NotEmpty(t, rows)
+	return strings.ToLower(string(rows[0]["owner"])) + "/" + string(rows[0]["repo"]) + ".git"
+}
+
+// withoutRepo is m without repo, as a copy.
+func withoutRepo(m *observer.Manifest, repo string) *observer.Manifest {
+	c := *m
+	c.Repos = maps.Clone(m.Repos)
+	delete(c.Repos, repo)
+	return &c
+}
+
+// An orphan, as contrib/cluster/README.md "Recovery" describes it and
+// services/cluster TestRepositoryDeletionTheClusterDoesNotRecord makes it:
+// a repository deleted while the cluster has no quorum. Its rows are gone
+// (DeleteRepositoryDirectly commits them first), the cluster did not record
+// the deletion, and every member keeps its files and its live key, refs
+// included, until `forgejo cluster reconcile --delete-orphan`. Every
+// checkpoint taken meanwhile holds the orphan's branches at B and no row
+// at L, and the observer protects it: step 6 restores the orphan as the
+// old cluster held it and names it, instead of refusing the checkpoint
+// after the old cluster was fenced (#255). When SQL also holds a
+// repository the checkpoint does not, a rename or a transfer cut in two
+// leaves the same, and only the operator tells them apart. Only SQL rows
+// change here; the repository's files are kept, as the cluster keeps them.
+func TestRecoverRestoresAnOrphanOfTheTable(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	unittest.PrepareTestEnv(t)
+	t.Cleanup(func() { unittest.PrepareTestEnv(t) })
+	ctx := db.DefaultContext
+
+	// The checkpoint before the deletion: every repository SQL holds, and
+	// user2/repo1's refs those of its directory, the table's.
+	m := checkpointOfEveryRepository(t)
+	var out bytes.Buffer
+	require.NoError(t, verifyBranches(ctx, m, &out, false), out.String())
+	assert.NotContains(t, out.String(), "orphan")
+
+	// The deletion, the cluster not recording it (no quorum).
+	clusterhook.SetRepoLifecycle(func(context.Context, string, int64) error {
+		return errors.New("no quorum: the leader did not answer")
+	}, nil)
+	t.Cleanup(func() { clusterhook.SetRepoLifecycle(nil, nil) })
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	err := repo_service.DeleteRepositoryDirectly(ctx, repo.ID, repo_service.DeleteRepositoryOpts{})
+	require.ErrorContains(t, err, "--delete-orphan")
+	unittest.AssertNotExistsBean(t, &repo_model.Repository{ID: 1})
+	_, err = os.Stat(filepath.Join(repo.RepoPath(), "HEAD"))
+	require.NoError(t, err, "the cluster keeps the orphan's files")
+	// Its wiki, which the table keeps alive with it.
+	m.Repos["user2/repo1.wiki.git"] = observer.RepoManifest{Format: "sha1", Refs: map[string]string{"refs/heads/master": strings.Repeat("1", 40)}}
+
+	t.Run("SQL holds no repository the checkpoint does not", func(t *testing.T) {
+		out.Reset()
+		require.NoError(t, verifyBranches(ctx, m, &out, false), out.String())
+		t.Logf("step 6:\n%s", out.String())
+		assert.Contains(t, out.String(), "WARNING: user2/repo1.git is an orphan")
+		assert.Contains(t, out.String(), "WARNING: user2/repo1.wiki.git is an orphan")
+		assert.Contains(t, out.String(), "reconcile --delete-orphan")
+		assert.Contains(t, out.String(), "refs and SQL rows match")
+		assert.NotContains(t, out.String(), "reconciled")
+	})
+
+	t.Run("SQL also holds a repository the checkpoint does not", func(t *testing.T) {
+		unheld := emptyRepositoryOfSQL(t)
+		cut := withoutRepo(m, unheld)
+		out.Reset()
+		err := verifyBranches(ctx, cut, &out, false)
+		t.Logf("step 6 refuses: %v", err)
+		require.ErrorContains(t, err, "user2/repo1.git refs/heads/master: refs ")
+		require.ErrorContains(t, err, "user2/repo1.git has no repository row in SQL")
+		require.ErrorContains(t, err, unheld)
+		require.ErrorContains(t, err, "--accept-orphans")
+
+		// The operator's decision, the same command run again.
+		out.Reset()
+		require.NoError(t, verifyBranches(ctx, cut, &out, true), out.String())
+		assert.Contains(t, out.String(), "WARNING: user2/repo1.git is an orphan")
+		assert.Contains(t, out.String(), "--accept-orphans")
+		assert.Contains(t, out.String(), "refs and SQL rows match")
+	})
+}
+
+// What a rename or a transfer cut in two leaves is still refused once
+// orphans are restored (#255): the refs under one name and the rows under
+// the other, --accept-orphans offered only when it would pass, also when
+// the rows' side has no branch row left, and with --accept-orphans when
+// SQL's rows are not the checkpoint's refs.
+func TestRecoverStillRefusesARenameCutInTwo(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	unittest.PrepareTestEnv(t)
+	t.Cleanup(func() { unittest.PrepareTestEnv(t) })
+	ctx := db.DefaultContext
+	e := db.GetEngine(ctx)
+
+	// The refs at B under the new name, restored there, and the rows at L
+	// under the old.
+	renamed := func(t *testing.T, m *observer.Manifest) *observer.Manifest {
+		t.Helper()
+		m.Repos["user2/renamed.git"] = m.Repos["user2/repo1.git"]
+		delete(m.Repos, "user2/repo1.git")
+		repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+		require.NoError(t, os.Rename(repo.RepoPath(), repo_model.RepoPath("user2", "renamed")))
+		t.Cleanup(func() { require.NoError(t, os.Rename(repo_model.RepoPath("user2", "renamed"), repo.RepoPath())) })
+		return m
+	}
+
+	t.Run("both halves hold branches", func(t *testing.T) {
+		m := renamed(t, checkpointOfEveryRepository(t))
+		var out bytes.Buffer
+		err := verifyBranches(ctx, m, &out, false)
+		require.ErrorContains(t, err, "user2/renamed.git refs/heads/master: refs ")
+		require.ErrorContains(t, err, "user2/repo1.git refs/heads/master: in SQL, not in the refs")
+		// It would not pass the rows under the old name: not offered.
+		assert.NotContains(t, err.Error(), "--accept-orphans")
+		assert.NotContains(t, out.String(), "is an orphan")
+	})
+
+	t.Run("the operator accepts orphans", func(t *testing.T) {
+		m := renamed(t, checkpointOfEveryRepository(t))
+		var out bytes.Buffer
+		err := verifyBranches(ctx, m, &out, true)
+		require.ErrorContains(t, err, "user2/repo1.git refs/heads/master: in SQL, not in the refs")
+		assert.NotContains(t, out.String(), "reconciled")
+	})
+
+	t.Run("the rows' side without a branch row", func(t *testing.T) {
+		m := renamed(t, checkpointOfEveryRepository(t))
+		_, err := e.Exec("DELETE FROM branch WHERE repo_id = 1")
+		require.NoError(t, err)
+		var out bytes.Buffer
+		err = verifyBranches(ctx, m, &out, false)
+		require.ErrorContains(t, err, "user2/renamed.git refs/heads/master: refs ")
+		require.ErrorContains(t, err, "user2/renamed.git has no repository row in SQL")
+		require.ErrorContains(t, err, "user2/repo1.git")
+		assert.NotContains(t, out.String(), "is an orphan")
 	})
 }

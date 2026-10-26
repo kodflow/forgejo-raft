@@ -579,7 +579,9 @@ These commands run with the server stopped, on the data directory.
   unchanged. `reconcile`, `--apply` included, never deletes it. After a loss
   on the SQL side (an asynchronous PostgreSQL failover, a point-in-time
   recovery, `pg_rewind`, a backup restore) the table and the files every
-  member kept are the repository's ONLY copy: restore it. Recreate its owner
+  member kept are the repository's ONLY copy: restore it. An observer's
+  checkpoint holds it too, and `recover --from-observer` restores it as an
+  orphan ([observer.md](observer.md), step 6). Recreate its owner
   if SQL lost it too, then adopt the repository (Site administration >
   Repositories > Unadopted, or `POST /api/v1/admin/unadopted/{owner}/{repo}`).
   The adoption writes the repository's HEAD, and its wiki's, again under the
