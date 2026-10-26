@@ -78,7 +78,7 @@ func cmdCluster() *cli.Command {
 					&cli.StringFlag{Name: "members", Usage: "required unless --from-observer"},
 					&cli.StringSliceFlag{Name: "fenced", Usage: "old voter fence: id:method:receipt-file[+receipt-file], one per old voter; required unless --from-observer"},
 					&cli.StringSliceFlag{Name: "witness-key", Usage: "hex Ed25519 public key of a witness"},
-					&cli.StringSliceFlag{Name: "joining", Usage: "member lines of nodes stamped joining under the new cluster id"},
+					&cli.StringSliceFlag{Name: "joining", Usage: "member lines `forgejo cluster init --cluster <new id>` printed, each under a new node ID"},
 					&cli.StringSliceFlag{Name: "old-peer", Usage: "slot=host:port of an old member's consensus address, probed with PEERS before recovering"},
 					&cli.BoolFlag{Name: "force-old-members-answer", Usage: "recover although an old member answers the probe; logged and kept in the output"},
 				}, recoverFromObserverFlags()...),
@@ -460,11 +460,13 @@ func verifyWitnessFence(c *cli.Command, old, cid consensus.ClusterID, fenced []c
 // another voter than this node: another survivor listed as a voter would
 // either never vote (a majority nobody reaches) or run its own Recover into
 // the same cluster id, two histories under one id. The others enter as
-// learners, with --joining.
+// learners, with --joining, under the new node ID a wipe-and-rejoin then
+// an init under the new cluster id gives them: the SDK refuses a member
+// under an old member's ID (kitsunium/sdk#691).
 func checkRecoverVoters(members []consensus.Member, rep consensus.Report) error {
 	for _, m := range members {
 		if m.ID != rep.Node || m.Slot != rep.Slot {
-			return fmt.Errorf("RECOVER_REFUSED: --members names %s (slot %s): only this node (%s, slot %s) is a voter after a Recover; the others join with --joining", m.ID, m.Slot, rep.Node, rep.Slot)
+			return fmt.Errorf("RECOVER_REFUSED: --members names %s (slot %s): only this node (%s, slot %s) is a voter after a Recover; the other survivors run wipe-and-rejoin, then `forgejo cluster init --cluster <new id>`, and join with --joining under the new node ID it prints", m.ID, m.Slot, rep.Node, rep.Slot)
 		}
 	}
 	return nil

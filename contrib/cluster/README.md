@@ -538,10 +538,15 @@ These commands run with the server stopped, on the data directory.
 - `forgejo cluster quarantine clear --exit wipe-and-rejoin` or
   `--exit truncate-and-stay-silent` leaves a quarantine after a corrupt log.
 - `forgejo cluster recover --new-cluster <id> --members ... --fenced id:method:receipt`
-  forces a new configuration after the majority is lost. Every old voter left
-  out must be fenced, and every fence carries a receipt signed by each
+  forces a new configuration after the majority is lost. Every old voter but
+  this node must be fenced, and every fence carries a receipt signed by each
   witness. `--members` names this node alone: it is the only voter of the
-  new cluster, the other survivors enter as learners (`--joining`). Before
+  new cluster. The other survivors do not keep their old node ID: each
+  leaves the old cluster first (`forgejo cluster quarantine clear --exit
+  wipe-and-rejoin`, or an empty data directory), runs `forgejo cluster init
+  --cluster <new id>`, and the member line it prints goes into `--joining`:
+  they enter as learners, under a new node ID. A member under the ID of an
+  old or retired member, or two members under one ID, is refused. Before
   anything, the command probes each old member at its consensus address
   (`PEERS`, and `--old-peer slot=host:port`) and refuses while one answers:
   the witnesses fence the old cluster at its next boot, they do not stop a
