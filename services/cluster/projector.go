@@ -28,6 +28,9 @@ type projector struct {
 	root     string
 	table    *reftable.Table
 	registry *registry
+	// holds keeps the projection, its fetches and the object channel out
+	// of the directories of the owners Forgejo moves on this node (#257).
+	holds *dirHolds
 	// fetch brings missing objects from the other members.
 	fetch func(ctx context.Context, repo, dir string, shas []string) error
 
@@ -79,7 +82,7 @@ type projector struct {
 
 func newProjector(root string, table *reftable.Table, reg *registry) *projector {
 	p := &projector{
-		root: root, table: table, registry: reg,
+		root: root, table: table, registry: reg, holds: newDirHolds(),
 		dirty: map[string]uint64{}, watermark: map[string]uint64{},
 		fenced: true, pendingFirst: map[string]bool{}, failures: map[string]string{}, deletedAt: map[string]uint64{},
 		fetching: map[string]context.CancelFunc{}, retrying: map[string]bool{}, queued: map[string]bool{},
@@ -372,12 +375,19 @@ func (p *projector) pass(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		// A key under an owner whose directory Forgejo moves on this node
+		// stays dirty until the hold's release, which wakes a pass (#257).
+		leave, ok := p.holds.enter(repo)
+		if !ok {
+			continue
+		}
 		p.mu.Lock()
 		p.current = repo
 		p.mu.Unlock()
 		pctx, cancel := context.WithTimeout(ctx, projectBudget)
 		err := p.project(ctx, pctx, repo)
 		cancel()
+		leave()
 		p.mu.Lock()
 		p.current = ""
 		if err != nil {
@@ -444,6 +454,15 @@ func (p *projector) startFetch(base context.Context, repo, dir string, missing [
 		p.mu.Unlock()
 		return
 	}
+	// The fetch writes under repo's directory after the pass moved on: it
+	// is a writer of its owner's directory until it ends, entered under
+	// p.mu, so a hold of that owner finds it in p.fetching and cancels it
+	// (holdOwners, #257).
+	leave, ok := p.holds.enter(repo)
+	if !ok {
+		p.mu.Unlock()
+		return
+	}
 	delete(p.queued, repo)
 	ctx, cancel := context.WithTimeout(base, projectBudget)
 	p.fetching[repo] = cancel
@@ -454,6 +473,7 @@ func (p *projector) startFetch(base context.Context, repo, dir string, missing [
 	p.mu.Unlock()
 	go func() {
 		defer p.fetches.Done()
+		defer leave()
 		err := p.fetch(ctx, repo, dir, missing)
 		cancel()
 		p.mu.Lock()
@@ -471,6 +491,35 @@ func (p *projector) startFetch(base context.Context, repo, dir string, missing [
 		}
 		p.signal()
 	}()
+}
+
+// holdOwners keeps the projection, its fetches and the object channel out
+// of the owners' directories until release, and returns once nothing of
+// the cluster writes there any more: a projection under way there ends,
+// and a fetch in flight there is cancelled, retried as a failed one once
+// released. On ctx's error nothing stays held (#257).
+func (p *projector) holdOwners(ctx context.Context, owners []string) (func(), error) {
+	in := make(map[string]bool, len(owners))
+	for _, o := range owners {
+		in[o] = true
+	}
+	release, err := p.holds.hold(ctx, owners, func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		for repo, cancel := range p.fetching {
+			if in[keyOwner(repo)] {
+				cancel()
+			}
+		}
+	})
+	if err != nil {
+		p.signal()
+		return nil, err
+	}
+	return func() {
+		release()
+		p.signal()
+	}, nil
 }
 
 // WaitsBehind reports whether a repository's projection waits behind
@@ -568,6 +617,13 @@ func (p *projector) project(base, ctx context.Context, repo string) error {
 				// fetch. The move waits for the next pass.
 				return nil
 			}
+			// Nor while Forgejo moves the old key's owner on this node: its
+			// directory may go, or come back, under that owner (#257).
+			leaveFrom, ok := p.holds.enter(from)
+			if !ok {
+				return nil
+			}
+			defer leaveFrom()
 			if p.holdsRenamed(src, from, to, renIdx) {
 				if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 					return err

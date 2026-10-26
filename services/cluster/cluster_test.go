@@ -278,6 +278,7 @@ func newTestClusterWith(t *testing.T, clusterID consensus.ClusterID, start func(
 			leavesKey:    r.projector.leavesKey,
 			awaitsRename: r.projector.awaitsRename,
 			projected:    r.projector.Projected,
+			holds:        r.projector.holds,
 		}
 		r.projector.fetch = r.objects.fetchMissing
 		srv := &http.Server{Handler: r.objects.handler(), TLSConfig: id.serverConfig(), ReadHeaderTimeout: 5 * time.Second}

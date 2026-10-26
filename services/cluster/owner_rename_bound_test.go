@@ -139,10 +139,19 @@ func TestAnOwnerRenameTooLargeForOneEntryIsRefusedBeforeItIsProposed(t *testing.
 		}
 	}
 
+	// As Forgejo renames an owner: checked, its two directories held while
+	// the old one moves and the rename is proposed (#257).
+	renameOwner := func(from, to string) {
+		t.Helper()
+		require.NoError(t, origin.r.ownerRenameRefusal(t.Context(), from, to))
+		release, err := origin.r.holdOwnerDirectories(t.Context(), []string{from, to})
+		require.NoError(t, err)
+		defer release()
+		require.NoError(t, os.Rename(filepath.Join(origin.r.root, from), filepath.Join(origin.r.root, to)))
+		require.NoError(t, origin.r.proposeOwnerRename(context.Background(), from, to))
+	}
 	origin.r.maxEntry = len(data) + 64
-	require.NoError(t, origin.r.ownerRenameRefusal(t.Context(), "big", "huge"))
-	require.NoError(t, os.Rename(filepath.Join(origin.r.root, "big"), filepath.Join(origin.r.root, "huge")))
-	require.NoError(t, origin.r.proposeOwnerRename(context.Background(), "big", "huge"))
+	renameOwner("big", "huge")
 	waitAll(t, tc, func(n *testNode) bool { return gitRef(t, n, "huge/c.git", "refs/heads/main") == c1 })
 
 	// Every member applies OwnerRenameVersion: the owner goes back past the
@@ -150,9 +159,7 @@ func TestAnOwnerRenameTooLargeForOneEntryIsRefusedBeforeItIsProposed(t *testing.
 	raisePayload(t, tc)
 	origin.r.maxEntry = len(data) - 1
 	settle(t, origin)
-	require.NoError(t, origin.r.ownerRenameRefusal(t.Context(), "huge", "big"))
-	require.NoError(t, os.Rename(filepath.Join(origin.r.root, "huge"), filepath.Join(origin.r.root, "big")))
-	require.NoError(t, origin.r.proposeOwnerRename(context.Background(), "huge", "big"))
+	renameOwner("huge", "big")
 	assert.Equal(t, byte(reftable.KindOwnerRename), lastEntry(t, origin.node).Data[1])
 	waitAll(t, tc, func(n *testNode) bool { return gitRef(t, n, "big/c.git", "refs/heads/main") == c1 })
 }

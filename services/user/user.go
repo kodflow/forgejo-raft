@@ -122,6 +122,16 @@ func renameUser(ctx context.Context, u *user_model.User, newUserName string, doe
 		return fmt.Errorf("rename user in the cluster: %w", err)
 	}
 
+	// In a cluster, nothing of the cluster writes under the two owners'
+	// directories on this node while they move, back too when the cluster
+	// refuses the rename: until the rename is applied, the replicated table
+	// names the repositories under the old owner (#257).
+	releaseDirs, err := clusterhook.HoldOwnerDirectories(ctx, oldUserName, newUserName)
+	if err != nil {
+		return fmt.Errorf("rename user in the cluster: %w", err)
+	}
+	defer releaseDirs()
+
 	// In a cluster, the moves recorded in the replicated table and the SQL
 	// committed below fall on the same side of a checkpoint (#88).
 	releaseCut, err := clusterhook.HoldCut(ctx)
