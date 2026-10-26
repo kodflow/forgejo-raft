@@ -209,3 +209,37 @@ func TestARepositoryKeyHoldEndsTheFetchOfItsKeyAlone(t *testing.T) {
 		return b.p.Projected("alice/r.git") > 0 && b.p.Projected("alice/q.git") > 0
 	}, 10*time.Second, 10*time.Millisecond, "projected again once released")
 }
+
+// A writer entered with a context, the consumer's fetch, is cancelled by a
+// hold of its key or of its owner before the hold waits for it, while a
+// writer elsewhere keeps its context; it is refused while held, and its
+// leave cancels its context (#275).
+func TestADirectoryHoldCancelsTheWritersEnteredWithAContext(t *testing.T) {
+	t.Parallel()
+	h := newDirHolds()
+	for _, names := range [][]string{{"alice", "heir"}, {"alice/r.git", "alice/s.git"}} {
+		wctx, leave, ok := h.enterCtx(t.Context(), "alice/r.git")
+		require.True(t, ok)
+		octx, oleave, ok := h.enterCtx(t.Context(), "bob/s.git")
+		require.True(t, ok)
+		go func() {
+			<-wctx.Done()
+			leave()
+		}()
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		release, err := h.hold(ctx, names, nil)
+		cancel()
+		require.NoError(t, err, "%v: the writer was cancelled and left", names)
+		require.ErrorIs(t, wctx.Err(), context.Canceled)
+		require.NoError(t, octx.Err(), "%v: a writer elsewhere keeps its context", names)
+		_, _, ok = h.enterCtx(t.Context(), "alice/r.git")
+		assert.False(t, ok, "%v: refused while held", names)
+		release()
+		oleave()
+		require.ErrorIs(t, octx.Err(), context.Canceled, "leave cancels the writer's context")
+	}
+	wctx, leave, ok := h.enterCtx(t.Context(), "alice/r.git")
+	require.True(t, ok, "admitted once released")
+	leave()
+	require.ErrorIs(t, wctx.Err(), context.Canceled)
+}

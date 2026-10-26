@@ -16,30 +16,40 @@ import (
 // Forgejo moves them before the entry is proposed, and back when the
 // cluster refuses it; until the entry is applied, the table still names
 // the repositories under their old keys. A projection, a fetch of missing
-// objects or a shipment of a push's objects that wrote there meanwhile
-// created a repository's directory again under the old name: left there
-// once the rename was applied, it refused the next rename to that name,
-// and the move back of a refused rename (#257); under a repository's old
-// key, it held the moved repository's objects, which a repository created
-// later under the freed name adopted and served under its own rights
-// (#274).
+// objects, a shipment of a push's objects or a fetch of the consumer that
+// wrote there meanwhile created a repository's directory again under the
+// old name: left there once the rename was applied, it refused the next
+// rename to that name, and the move back of a refused rename (#257); under
+// a repository's old key, it held the moved repository's objects, which a
+// repository created later under the freed name adopted and served under
+// its own rights (#274).
 //
 // A hold names owners, or repository keys: an owner's covers every key
 // under it. A writer enters the keys it writes under, and is refused while
-// one of them, or its owner, is held; a hold waits for the writers
-// already in there to leave. Holds nest.
+// one of them, or its owner, is held; a hold cancels the writers entered
+// with a context (enterCtx) under what it covers, and waits for the
+// writers already in there to leave. Holds nest.
 type dirHolds struct {
 	mu sync.Mutex
 	// held counts the holds of each owner and of each key.
 	held map[string]int
 	// writing counts the writers under each key.
 	writing map[string]int
+	// cancellable are the writers entered with a context, which a hold of
+	// one of their keys cancels.
+	cancellable map[*dirWriter]struct{}
 	// left is closed, and replaced, whenever a writer leaves.
 	left chan struct{}
 }
 
+// dirWriter is a writer entered with a context.
+type dirWriter struct {
+	keys   []string
+	cancel context.CancelFunc
+}
+
 func newDirHolds() *dirHolds {
-	return &dirHolds{held: map[string]int{}, writing: map[string]int{}, left: make(chan struct{})}
+	return &dirHolds{held: map[string]int{}, writing: map[string]int{}, cancellable: map[*dirWriter]struct{}{}, left: make(chan struct{})}
 }
 
 // keyOwner is the owner whose directory holds the key's.
@@ -71,7 +81,33 @@ func (h *dirHolds) enter(keys ...string) (leave func(), ok bool) {
 		return nil, false
 	}
 	var once sync.Once
-	return func() { once.Do(func() { h.leave(keys) }) }, true
+	return func() { once.Do(func() { h.leave(keys, nil) }) }, true
+}
+
+// enterCtx is enter for a writer a hold may end: its context, derived from
+// ctx, is cancelled by a hold of one of keys, or of its owner, before the
+// hold waits for it to leave. leave ends it and cancels its context.
+func (h *dirHolds) enterCtx(ctx context.Context, keys ...string) (wctx context.Context, leave func(), ok bool) {
+	if h == nil {
+		return ctx, func() {}, true
+	}
+	wctx, cancel := context.WithCancel(ctx)
+	h.mu.Lock()
+	if !h.admitLocked(keys) {
+		h.mu.Unlock()
+		cancel()
+		return nil, nil, false
+	}
+	w := &dirWriter{keys: keys, cancel: cancel}
+	h.cancellable[w] = struct{}{}
+	h.mu.Unlock()
+	var once sync.Once
+	return wctx, func() {
+		once.Do(func() {
+			h.leave(keys, w)
+			cancel()
+		})
+	}, true
 }
 
 // admitLocked counts a writer under keys, unless one of them is held.
@@ -86,8 +122,9 @@ func (h *dirHolds) admitLocked(keys []string) bool {
 	return true
 }
 
-// leave uncounts a writer under keys, and wakes the holds waiting for it.
-func (h *dirHolds) leave(keys []string) {
+// leave uncounts a writer under keys, w when it entered with a context, and
+// wakes the holds waiting for it.
+func (h *dirHolds) leave(keys []string, w *dirWriter) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, k := range keys {
@@ -95,15 +132,19 @@ func (h *dirHolds) leave(keys []string) {
 			delete(h.writing, k)
 		}
 	}
+	if w != nil {
+		delete(h.cancellable, w)
+	}
 	close(h.left)
 	h.left = make(chan struct{})
 }
 
 // hold refuses every new writer under the directories names covers, owners
 // or repository keys, and returns once none is left in them, or ctx's
-// error, the hold then undone. stop is called once they are held, before
-// the wait, with what the hold covers: it ends what would keep writing
-// there for long.
+// error, the hold then undone. Once they are held, before the wait, the
+// writers entered with a context there are cancelled, and stop is called
+// with what the hold covers: it ends what else would keep writing there
+// for long.
 func (h *dirHolds) hold(ctx context.Context, names []string, stop func(covers func(key string) bool)) (release func(), err error) {
 	in := make(map[string]bool, len(names))
 	for _, n := range names {
@@ -113,6 +154,11 @@ func (h *dirHolds) hold(ctx context.Context, names []string, stop func(covers fu
 	h.mu.Lock()
 	for _, n := range names {
 		h.held[n]++
+	}
+	for w := range h.cancellable {
+		if slices.ContainsFunc(w.keys, covers) {
+			w.cancel()
+		}
 	}
 	h.mu.Unlock()
 	var once sync.Once

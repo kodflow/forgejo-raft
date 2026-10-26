@@ -69,7 +69,7 @@ func (r *Replicator) VerifyObjects(ctx context.Context, backfill bool) (ObjectsR
 			continue
 		}
 		if backfill {
-			if err := r.objects.fetchMissing(ctx, key, dir, missing); err != nil {
+			if err := r.backfill(ctx, key, dir, missing); err != nil {
 				rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v", key, err))
 			} else {
 				rep.Fetched += len(missing)
@@ -79,6 +79,26 @@ func (r *Replicator) VerifyObjects(ctx context.Context, backfill bool) (ObjectsR
 		rep.Missing[key] = len(missing)
 	}
 	return rep, nil
+}
+
+// backfill fetches the objects missing from key's directory for
+// VerifyObjects. The fetch writes under that directory, as the consumer's
+// does: while Forgejo moves it on this node, the repository's or its
+// owner's rename, it is refused, and the hold such a move takes cancels a
+// fetch in flight there and waits for its end; outside the hold, a
+// member's answer arriving after the move created the directory again
+// under the old name (#275).
+func (r *Replicator) backfill(ctx context.Context, key, dir string, missing []string) error {
+	var holds *dirHolds
+	if r.projector != nil {
+		holds = r.projector.holds
+	}
+	fctx, leave, ok := holds.enterCtx(ctx, key)
+	if !ok {
+		return errors.New("its directory moves with a rename on this node; retry")
+	}
+	defer leave()
+	return r.objects.fetchMissing(fctx, key, dir, missing)
 }
 
 // Mismatch is one difference between the table and SQL.
