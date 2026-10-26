@@ -297,6 +297,47 @@ func (t *Table) DeletedSince(repo string, index uint64) bool {
 	return ok && at > index
 }
 
+// RewrittenSince reports whether a command other than a ref transaction
+// wrote repo's refs after index: a deletion of repo, or a rename, a
+// transfer or an owner's rename from or into it. Each writes a ref it
+// touches at its revision plus one, the revision a ref transaction that
+// read it before expects plus one: a rename's or a deletion's tombstone is
+// a deletion's value, a rename's HEAD in its target a creation's. A
+// proposer whose outcome was unknown cannot tell its own transaction by
+// the values then (#252). It reads the histories kept at every version,
+// and the departures GenerationVersion entries record; a key renamed away
+// below GenerationVersion is no longer seen once keptPerKey renames into
+// its target followed.
+func (t *Table) RewrittenSince(repo string, index uint64) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if at, ok := t.deleted[repo]; ok && at > index {
+		return true
+	}
+	if d := t.deletions[repo]; len(d) > 0 && d[len(d)-1] > index {
+		return true
+	}
+	if t.departedAt[repo] > index {
+		return true
+	}
+	if m, ok := t.renamed[repo]; ok && m.Index > index {
+		return true
+	}
+	for _, m := range t.renamed {
+		if m.From == repo && m.Index > index {
+			return true
+		}
+	}
+	for _, h := range t.renames {
+		for _, m := range h {
+			if m.From == repo && m.Index > index {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // WriteVersion is the payload version a proposer writes: BaseVersion until
 // an Audit entry raised it, once every member could read the new one.
 func (t *Table) WriteVersion() uint8 {
