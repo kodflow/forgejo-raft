@@ -61,6 +61,9 @@ type autoBench struct {
 	expected int
 	timing   sdk.TimingContractSpec
 	clock    *fakeClock
+	// tc is the bench the nodes run on, whose context is ctx: its close
+	// waits for the goroutines the bench starts (tc.loops).
+	tc *testCluster
 	// hooks are the writer hooks by slot, set before the autopilot starts.
 	hooks map[string]WriterHook
 
@@ -111,7 +114,7 @@ func newAutoClusterWith(t *testing.T, expected int, hooks map[string]WriterHook,
 		hooks: hooks, byAddr: map[string]*autoNode{},
 	}
 	tc := newTestClusterWith(t, consensus.ClusterID(b.cluster), func(tc *testCluster, _ map[string][32]byte) {
-		b.ctx = tc.ctx
+		b.tc, b.ctx = tc, tc.ctx
 		b.formAll(tc.nodes)
 	}, slots...)
 	return tc, b
@@ -218,14 +221,15 @@ func (b *autoBench) form(an *autoNode) {
 	require.NoError(t, b.open(an))
 }
 
-// startAutopilot runs the node's autopilot until kill stops it.
+// startAutopilot runs the node's autopilot until kill stops it, or the
+// bench closes.
 func (b *autoBench) startAutopilot(an *autoNode) {
 	ctx, cancel := context.WithCancel(b.ctx)
 	done := make(chan struct{})
-	go func() {
+	b.tc.loops.Go(func() {
 		defer close(done)
 		an.r().autopilot(ctx)
-	}()
+	})
 	b.mu.Lock()
 	an.stop = func() { cancel(); <-done }
 	b.mu.Unlock()
@@ -254,7 +258,7 @@ func (b *autoBench) open(an *autoNode) error {
 	if stamp.State != sdk.StampJoining {
 		return nil
 	}
-	go func() {
+	b.tc.loops.Go(func() {
 		for b.ctx.Err() == nil {
 			b.mu.Lock()
 			gone := an.down || an.tr != tr
@@ -273,7 +277,7 @@ func (b *autoBench) open(an *autoNode) error {
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-	}()
+	})
 	return nil
 }
 
@@ -306,7 +310,7 @@ func (b *autoBench) rejoin(an *autoNode) error {
 	if err := b.open(an); err != nil {
 		return err
 	}
-	go an.r().startupBarrier(b.ctx)
+	b.tc.loops.Go(func() { an.r().startupBarrier(b.ctx) })
 	return nil
 }
 

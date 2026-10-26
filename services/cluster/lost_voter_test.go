@@ -44,7 +44,7 @@ func (b *autoBench) lose(an *autoNode) consensus.NodeID {
 	require.NoError(t, an.r().auto.formLoop(b.ctx, func(context.Context) error { founded = true; return nil }))
 	require.False(t, founded, "a node that finds a member never founds")
 	require.NoError(t, b.open(an))
-	go an.r().startupBarrier(b.ctx)
+	b.tc.loops.Go(func() { an.r().startupBarrier(b.ctx) })
 	b.startAutopilot(an)
 	return consensus.NodeID(id)
 }
