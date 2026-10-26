@@ -510,13 +510,28 @@ func PushToBaseRepo(ctx context.Context, pr *issues_model.PullRequest) (err erro
 
 // UpdateRef update refs/pull/id/head directly for agit flow pull request
 func UpdateRef(ctx context.Context, pr *issues_model.PullRequest) (err error) {
+	return UpdateRefFrom(ctx, pr, "")
+}
+
+// UpdateRefFrom is UpdateRef for an update decided against the head the
+// caller read, expected: update-ref writes the new head only while the
+// ref is still at expected, which git checks on this node and, in a
+// cluster, Apply against the head the cluster holds (the transaction's
+// old value). An AGit push decided against a head another node replaced
+// meanwhile would otherwise overwrite that head for the whole cluster
+// (#263). An empty expected checks nothing, as UpdateRef.
+func UpdateRefFrom(ctx context.Context, pr *issues_model.PullRequest, expected string) (err error) {
 	log.Trace("UpdateRef[%d]: upgate pull request ref in base repo '%s'", pr.ID, pr.GetGitRefName())
 	if err := pr.LoadBaseRepo(ctx); err != nil {
 		log.Error("Unable to load base repository for PR[%d] Error: %v", pr.ID, err)
 		return err
 	}
 
-	_, _, err = git.NewCommand(ctx, "update-ref").AddDynamicArguments(pr.GetGitRefName(), pr.HeadCommitID).RunStdString(&git.RunOpts{Dir: pr.BaseRepo.RepoPath()})
+	cmd := git.NewCommand(ctx, "update-ref").AddDynamicArguments(pr.GetGitRefName(), pr.HeadCommitID)
+	if expected != "" {
+		cmd.AddDynamicArguments(expected)
+	}
+	_, _, err = cmd.RunStdString(&git.RunOpts{Dir: pr.BaseRepo.RepoPath()})
 	if err != nil {
 		log.Error("Unable to update ref in base repository for PR[%d] Error: %v", pr.ID, err)
 	}

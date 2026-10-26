@@ -32,11 +32,15 @@ func generateRepoCommit(ctx context.Context, repo, templateRepo, generateRepo *r
 		"GIT_COMMITTER_DATE="+commitTimeStr,
 	)
 
-	// Clone to temporary path and do the init commit.
+	// Clone to temporary path and do the init commit. In a cluster, the
+	// directory cloned is checked around the clone, before anything read
+	// leaves this temporary path (#261).
 	templateRepoPath := templateRepo.RepoPath()
-	if err := git.Clone(ctx, templateRepoPath, tmpDir, git.CloneRepoOptions{
-		Depth:  1,
-		Branch: templateRepo.DefaultBranch,
+	if err := readTemplateDirectory(ctx, templateRepo, func() error {
+		return git.Clone(ctx, templateRepoPath, tmpDir, git.CloneRepoOptions{
+			Depth:  1,
+			Branch: templateRepo.DefaultBranch,
+		})
 	}); err != nil {
 		return fmt.Errorf("git clone: %w", err)
 	}

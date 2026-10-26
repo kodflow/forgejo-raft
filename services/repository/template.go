@@ -64,6 +64,116 @@ func GenerateProtectedBranch(ctx context.Context, templateRepo, generateRepo *re
 	return db.Insert(ctx, newBranches)
 }
 
+// clusterTemplateRefusal refuses, in a cluster, a generation that reads the
+// template's directory on this node, for its git content or its git hooks,
+// while this node may not serve the template as the cluster holds it. The
+// template is loaded by its ID, by the web form outside RepoAssignment and
+// its guard (#82): the directory under its name may still hold another
+// repository, a private one renamed away whose rename this node has not
+// projected yet, whose tree the generation committed into a new repository
+// of the requester, replicated to every member. Or it may show the
+// template's branches from before a push another node acknowledged, on
+// which the new repository was built for good (#261). The generation first
+// waits for this node to serve the template at the commit index the cluster
+// confirms at the call, as the services that write from this node's git do
+// (#189, #226, #239), then checks that the directory holds the template, as
+// git's reads do (templateReadRefusal). Either refusal wraps
+// clusterhook.ErrBehind and comes before anything is written: the caller
+// retries. A generation that reads only SQL is not refused. Without a
+// cluster it returns nil.
+func clusterTemplateRefusal(ctx context.Context, templateRepo *repo_model.Repository, opts GenerateRepoOptions) error {
+	readsDirectory := (opts.GitContent && !templateRepo.IsEmpty) || opts.GitHooks
+	if !readsDirectory {
+		return nil
+	}
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(templateRepo.OwnerName, templateRepo.Name, false)); err != nil {
+		return err
+	}
+	return templateReadRefusal(templateRepo)
+}
+
+// templateReadRefusal refuses, wrapping clusterhook.ErrBehind, a read of the
+// template's directory on this node while it holds another repository than
+// the template (#82, #261). The generation asks it before anything is
+// written; the read itself is checked again around git's
+// (readTemplateDirectory). Without a cluster it returns nil.
+func templateReadRefusal(templateRepo *repo_model.Repository) error {
+	if err := clusterhook.ReadRefusal(clusterhook.RepoKey(templateRepo.OwnerName, templateRepo.Name, false), templateRepo.ID); err != nil {
+		return templateRefused(err)
+	}
+	return nil
+}
+
+// templateRefused is a refusal of the generation, wrapping
+// clusterhook.ErrBehind: the caller retries.
+func templateRefused(err error) error {
+	return fmt.Errorf("%w: %w; no repository was generated", clusterhook.ErrBehind, err)
+}
+
+// readTemplateDirectory runs read, which reads the template's directory on
+// this node, git's clone of its content or its git hooks, between two
+// checks that it holds the template, and nothing else (#261). The checks
+// made before anything was written leave the time `git init` of the new
+// repository takes through the cluster, and nothing keeps the projector's
+// moves out of the directory while git reads it: the template renamed away
+// and another repository, a private one, renamed or created under its
+// name, both projected right after the last check, and git read that one's
+// directory, whose tree the generation committed into the new repository,
+// replicated to every member.
+//
+// Right before the read, the template's row must still give the directory's
+// name, and the directory must hold the template (clusterhook.CheckRead).
+// Once git is done, before anything read leaves the generation, the
+// directory must still hold it, no rename, transfer or deletion that took
+// the template's key or freed it may lie above the index this node had
+// projected the key at when the read began, even one undone since, and
+// the row must still give the name. Any of them refuses the generation,
+// wrapping clusterhook.ErrBehind, and the new repository is removed as for
+// any failed generation (#102). Without a cluster it only runs read.
+func readTemplateDirectory(ctx context.Context, templateRepo *repo_model.Repository, read func() error) error {
+	if !clusterhook.Enabled() {
+		return read()
+	}
+	key := clusterhook.RepoKey(templateRepo.OwnerName, templateRepo.Name, false)
+	if err := templateStillNamed(ctx, templateRepo, key); err != nil {
+		return err
+	}
+	still, err := clusterhook.CheckRead(key, templateRepo.ID)
+	if err != nil {
+		return templateRefused(err)
+	}
+	if err := read(); err != nil {
+		// A directory the projector moved while git read it fails the
+		// read: the move is the reason, and the caller retries.
+		if serr := still(); serr != nil {
+			return templateRefused(fmt.Errorf("%w (and the read failed: %v)", serr, err))
+		}
+		return err
+	}
+	if err := still(); err != nil {
+		return templateRefused(err)
+	}
+	return templateStillNamed(ctx, templateRepo, key)
+}
+
+// templateStillNamed refuses, wrapping clusterhook.ErrBehind, a generation
+// from a template whose row no longer gives key: renamed, transferred or
+// deleted, it or its owner, since it was loaded. Another repository may take
+// the name meanwhile, and then its directory on this node (#261).
+func templateStillNamed(ctx context.Context, templateRepo *repo_model.Repository, key string) error {
+	current, err := repo_model.GetRepositoryByID(ctx, templateRepo.ID)
+	if repo_model.IsErrRepoNotExist(err) {
+		return templateRefused(fmt.Errorf("the template %s was deleted", key))
+	}
+	if err != nil {
+		return err
+	}
+	if now := clusterhook.RepoKey(current.OwnerName, current.Name, false); now != key {
+		return templateRefused(fmt.Errorf("the template %s is %s now", key, now))
+	}
+	return nil
+}
+
 // GenerateRepository generates a repository from a template
 func GenerateRepository(ctx context.Context, doer, owner *user_model.User, templateRepo *repo_model.Repository, opts GenerateRepoOptions) (_ *repo_model.Repository, err error) {
 	if !doer.IsAdmin && !owner.CanCreateRepo() {
@@ -75,6 +185,11 @@ func GenerateRepository(ctx context.Context, doer, owner *user_model.User, templ
 	// In a cluster, a name whose key the cluster holds is refused before
 	// anything is written, as a creation's (#245).
 	if err := clusterCreateRefusal(ctx, owner, opts.Name); err != nil {
+		return nil, err
+	}
+	// And so is a generation that would read the template's directory on
+	// a node that does not serve the template yet (#261).
+	if err := clusterTemplateRefusal(ctx, templateRepo, opts); err != nil {
 		return nil, err
 	}
 
@@ -100,7 +215,8 @@ func GenerateRepository(ctx context.Context, doer, owner *user_model.User, templ
 			return err
 		}
 
-		// Git Content
+		// Git Content, read from the template's directory between two
+		// checks (readTemplateDirectory, #261).
 		if opts.GitContent && !templateRepo.IsEmpty {
 			if err = GenerateGitContent(ctx, templateRepo, generateRepo); err != nil {
 				return err
@@ -114,7 +230,8 @@ func GenerateRepository(ctx context.Context, doer, owner *user_model.User, templ
 			}
 		}
 
-		// Git Hooks
+		// Git Hooks, read from the template's directory between two
+		// checks, and written once the second one passed (#261).
 		if opts.GitHooks {
 			if err = GenerateGitHooks(ctx, templateRepo, generateRepo); err != nil {
 				return err

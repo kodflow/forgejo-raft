@@ -457,6 +457,11 @@ func Generate(ctx *context.APIContext) {
 
 	repo, err := repo_service.GenerateRepository(ctx, ctx.Doer(), targetOwner, ctx.Repo().Repository, opts)
 	if err != nil {
+		// A node of the cluster that does not serve the template yet
+		// answers 503: nothing was written, the client retries (#261).
+		if clusterBehind(ctx, err) {
+			return
+		}
 		if repo_model.IsErrRepoAlreadyExist(err) {
 			ctx.Error(http.StatusConflict, "", "The repository with the same name already exists.")
 		} else if db.IsErrNameReserved(err) ||
