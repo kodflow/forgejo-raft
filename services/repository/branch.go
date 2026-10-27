@@ -455,10 +455,24 @@ func RenameBranch(ctx context.Context, repo *repo_model.Repository, doer *user_m
 // enmuerates all branch related errors
 var (
 	ErrBranchIsDefault = errors.New("branch is default")
+	// ErrBranchHasNewCommits refuses to delete a merged pull request's head
+	// branch that no longer is at the head the merge took: the commits
+	// pushed to it since would be lost with it.
+	ErrBranchHasNewCommits = errors.New("branch has commits the merge did not take")
 )
 
 // DeleteBranch delete branch
 func DeleteBranch(ctx context.Context, doer *user_model.User, repo *repo_model.Repository, gitRepo *git.Repository, branchName string) error {
+	return deleteBranch(ctx, doer, repo, gitRepo, branchName, "")
+}
+
+// deleteBranch is DeleteBranch, from the commit expected when it is not
+// empty: the branch is deleted only while it still points at it, which git
+// checks on this node and, in a cluster, Apply against the head the
+// cluster holds (the transaction's old value), as UpdateRefFrom does
+// (#263). A push acknowledged after the caller read the branch is then
+// never deleted with it; the deletion is refused, nothing written.
+func deleteBranch(ctx context.Context, doer *user_model.User, repo *repo_model.Repository, gitRepo *git.Repository, branchName, expected string) error {
 	err := repo.MustNotBeArchived()
 	if err != nil {
 		return err
@@ -503,6 +517,9 @@ func DeleteBranch(ctx context.Context, doer *user_model.User, repo *repo_model.R
 	if err != nil {
 		return err
 	}
+	if expected != "" && commit.ID.String() != expected {
+		return fmt.Errorf("%w: %s is at %s, not at %s", ErrBranchHasNewCommits, branchName, commit.ID, expected)
+	}
 
 	if err := db.WithTx(ctx, func(ctx context.Context) error {
 		if !notExist {
@@ -511,6 +528,10 @@ func DeleteBranch(ctx context.Context, doer *user_model.User, repo *repo_model.R
 			}
 		}
 
+		if expected != "" {
+			_, _, err := git.NewCommand(ctx, "update-ref", "--no-deref", "-d").AddDynamicArguments(git.BranchPrefix+branchName, expected).RunStdString(&git.RunOpts{Dir: gitRepo.Path})
+			return err
+		}
 		return gitRepo.DeleteBranch(branchName, git.DeleteBranchOptions{
 			Force: true,
 		})
@@ -539,7 +560,13 @@ func DeleteBranch(ctx context.Context, doer *user_model.User, repo *repo_model.R
 }
 
 // DeleteBranchAfterMerge deletes the head branch after a PR was merged associated with the head branch.
-func DeleteBranchAfterMerge(ctx context.Context, doer *user_model.User, pr *issues_model.PullRequest, headRepo *git.Repository) error {
+// mergedHead, when not empty, is the head the merge took: the branch is
+// deleted only while it is still there, and kept with
+// ErrBranchHasNewCommits once a push moved it, whose commits would be lost
+// with it. A scheduled merge passes it: a node of a cluster whose consumer
+// lags deletes the branch later (#279), a push may land meanwhile. The web
+// and the API pass none, as before.
+func DeleteBranchAfterMerge(ctx context.Context, doer *user_model.User, pr *issues_model.PullRequest, headRepo *git.Repository, mergedHead string) error {
 	// Don't cleanup when there are other PR's that use this branch as head branch.
 	exist, err := issues_model.HasUnmergedPullRequestsByHeadInfo(ctx, pr.HeadRepoID, pr.HeadBranch)
 	if err != nil {
@@ -566,10 +593,23 @@ func DeleteBranchAfterMerge(ctx context.Context, doer *user_model.User, pr *issu
 		return err
 	}
 
+	// The branch is read once this node serves the head repository at the
+	// cluster's commit index: a branch that moved past the merged head is
+	// kept, nothing retargeted. The deletion itself is from mergedHead.
+	if mergedHead != "" {
+		tip, err := headRepo.GetBranchCommitID(pr.HeadBranch)
+		if err != nil {
+			return err
+		}
+		if tip != mergedHead {
+			return fmt.Errorf("%w: %s:%s is at %s, the merge took %s", ErrBranchHasNewCommits, pr.HeadRepo.FullName(), pr.HeadBranch, tip, mergedHead)
+		}
+	}
+
 	if err := pull_service.RetargetChildrenOnMerge(ctx, doer, pr); err != nil {
 		return err
 	}
-	if err := DeleteBranch(ctx, doer, pr.HeadRepo, headRepo, pr.HeadBranch); err != nil {
+	if err := deleteBranch(ctx, doer, pr.HeadRepo, headRepo, pr.HeadBranch, mergedHead); err != nil {
 		return err
 	}
 

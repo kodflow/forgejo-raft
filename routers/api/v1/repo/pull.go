@@ -1092,7 +1092,7 @@ func MergePullRequest(ctx *context.APIContext) {
 			defer headRepo.Close()
 		}
 
-		if err := repo_service.DeleteBranchAfterMerge(ctx, ctx.Doer(), pr, headRepo); err != nil {
+		if err := repo_service.DeleteBranchAfterMerge(ctx, ctx.Doer(), pr, headRepo, ""); err != nil {
 			switch {
 			case errors.Is(err, clusterhook.ErrBehind):
 				// A node of the cluster whose branch rows are not derived
