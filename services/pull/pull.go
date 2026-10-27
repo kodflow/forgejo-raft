@@ -197,6 +197,18 @@ func ChangeTargetBranch(ctx context.Context, pr *issues_model.PullRequest, doer 
 		}
 	}
 
+	// In a cluster, the checks and the patch test below read the head and
+	// the base from this node's git: behind a push another node
+	// acknowledged, the head is the commit before it, and the status, merge
+	// base, changed protected files and divergence written from it are
+	// those the merge checks trust, until the next push to the head or the
+	// base (#300). The change waits for this node to serve the head and the
+	// base repositories, and is refused with clusterhook.ErrBehind while it
+	// does not: nothing is written, the caller retries.
+	if err := RequireFreshHeadAndBase(ctx, pr); err != nil {
+		return err
+	}
+
 	// Check if branches are equal
 	branchesEqual, err := IsHeadEqualWithBranch(ctx, pr, targetBranch)
 	if err != nil {

@@ -661,6 +661,21 @@ func EditPullRequest(ctx *context.APIContext) {
 		return
 	}
 
+	// In a cluster, a change of the base reads the new base's existence and
+	// tests the patch on this node's git: behind a push another node
+	// acknowledged, the head is the commit before it, and the columns the
+	// change writes are those the merge checks trust (#300). The edit waits
+	// for this node to serve the head and the base repositories before it
+	// writes anything, and is refused with 503 while it does not.
+	if !pr.HasMerged && len(form.Base) != 0 && form.Base != pr.BaseBranch {
+		if err := pull_service.RequireFreshHeadAndBase(ctx, pr); err != nil {
+			if !clusterBehind(ctx, err) {
+				ctx.Error(http.StatusInternalServerError, "RequireFreshHeadAndBase", err)
+			}
+			return
+		}
+	}
+
 	if len(form.Title) > 0 {
 		err = issue_service.ChangeTitle(ctx, issue, ctx.Doer(), form.Title)
 		if err != nil {
@@ -783,6 +798,8 @@ func EditPullRequest(ctx *context.APIContext) {
 				return
 			} else if models.IsErrPullRequestHasMerged(err) {
 				ctx.Error(http.StatusConflict, "IsErrPullRequestHasMerged", err)
+				return
+			} else if clusterBehind(ctx, err) {
 				return
 			}
 			ctx.InternalServerError(err)

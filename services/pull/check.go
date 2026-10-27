@@ -18,6 +18,7 @@ import (
 	access_model "forgejo.org/models/perm/access"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/graceful"
@@ -281,31 +282,44 @@ func InitializePullRequests(ctx context.Context) {
 	}
 }
 
-// handle passed PR IDs and test the PRs
+// handle passed PR IDs and test the PRs. The items it returns are pushed
+// back to the queue, after a few seconds when none was handled: a test a
+// node of a cluster defers until it serves the pull request's repositories
+// (#300).
 func handler(items ...string) []string {
+	var deferred []string
 	for _, s := range items {
 		id, _ := strconv.ParseInt(s, 10, 64)
-		testPR(id)
+		if testPR(id) {
+			deferred = append(deferred, s)
+		}
 	}
-	return nil
+	return deferred
 }
 
-func testPR(id int64) {
+// testPR tests the pull request id, and reports whether the test is
+// deferred, to be handed back to the queue.
+func testPR(id int64) bool {
 	ctx, _, finished := process.GetManager().AddContext(graceful.GetManager().HammerContext(), fmt.Sprintf("Test PR[%d] from patch checking queue", id))
 	defer finished()
 
-	if pr, updated := testPRProtected(ctx, id); pr != nil && updated {
+	pr, updated, deferred := testPRProtected(ctx, id)
+	if pr != nil && updated {
 		shared_automerge.AddToQueueIfMergeable(ctx, pr)
 	}
+	return deferred
 }
 
-func testPRProtected(ctx context.Context, id int64) (*issues_model.PullRequest, bool) {
+// testPRProtected tests the pull request id, and returns it with whether
+// its status was updated, and whether the test is deferred: nothing is
+// written then.
+func testPRProtected(ctx context.Context, id int64) (*issues_model.PullRequest, bool, bool) {
 	defer pullWorkingPool.Lock(fmt.Sprint(id))()
 
 	pr, err := issues_model.GetPullRequestByID(ctx, id)
 	if err != nil {
 		log.Error("Unable to GetPullRequestByID[%d] for testPR: %v", id, err)
-		return nil, false
+		return nil, false, false
 	}
 
 	log.Trace("Testing %-v", pr)
@@ -315,24 +329,51 @@ func testPRProtected(ctx context.Context, id int64) (*issues_model.PullRequest, 
 
 	if pr.HasMerged {
 		log.Trace("%-v is already merged (status: %s, merge commit: %s)", pr, pr.Status, pr.MergedCommitID)
-		return nil, false
+		return nil, false, false
+	}
+
+	// In a cluster, the detection of a manual merge and the patch test read
+	// the head and the base from the git of the node whose queue holds the
+	// test: a reopened pull request, one whose base's protection changed,
+	// every checking one at the node's start. Behind a push another node
+	// acknowledged, the head is the commit before it: the status, merge
+	// base and changed protected files written from it are those the merge
+	// checks trust, and a head the base already holds marks the pull
+	// request merged, until the next push to the head or the base (#300).
+	// The test waits for this node to serve the head and the base
+	// repositories, and is deferred while it does not: nothing is written,
+	// the pull request stays checking, which no merge passes, and the
+	// queue retries it.
+	if err := RequireFreshHeadAndBase(ctx, pr); err != nil {
+		if errors.Is(err, clusterhook.ErrBehind) {
+			log.Warn("Test of %-v deferred: %v", pr, err)
+			return nil, false, true
+		}
+		log.Error("RequireFreshHeadAndBase[%-v]: %v", pr, err)
+		markTestFailed(ctx, pr)
+		return nil, false, false
 	}
 
 	if manuallyMerged(ctx, pr) {
 		log.Trace("%-v is manually merged (status: %s, merge commit: %s)", pr, pr.Status, pr.MergedCommitID)
-		return nil, false
+		return nil, false, false
 	}
 
 	if err := TestPatch(pr); err != nil {
 		log.Error("testPatch[%-v]: %v", pr, err)
-		pr.Status = issues_model.PullRequestStatusError
-		if err := pr.UpdateCols(ctx, "status"); err != nil {
-			log.Error("update pr [%-v] status to PullRequestStatusError failed: %v", pr, err)
-		}
-		return nil, false
+		markTestFailed(ctx, pr)
+		return nil, false, false
 	}
 
-	return pr, checkAndUpdateStatus(ctx, pr)
+	return pr, checkAndUpdateStatus(ctx, pr), false
+}
+
+// markTestFailed records that the test of pr failed.
+func markTestFailed(ctx context.Context, pr *issues_model.PullRequest) {
+	pr.Status = issues_model.PullRequestStatusError
+	if err := pr.UpdateCols(ctx, "status"); err != nil {
+		log.Error("update pr [%-v] status to PullRequestStatusError failed: %v", pr, err)
+	}
 }
 
 // CheckPRsForBaseBranch check all pulls with baseBrannch

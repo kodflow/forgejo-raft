@@ -2030,6 +2030,13 @@ func UpdatePullRequestTarget(ctx *context.Context) {
 				"error":      err.Error(),
 				"user_error": errorMessage,
 			})
+		} else if errors.Is(err, clusterhook.ErrBehind) {
+			// A node of the cluster behind on the pull request's
+			// repositories: nothing was changed, the user retries (#300).
+			ctx.JSON(http.StatusServiceUnavailable, map[string]any{
+				"error":      err.Error(),
+				"user_error": err.Error(),
+			})
 		} else {
 			ctx.ServerError("UpdatePullRequestTarget", err)
 		}
