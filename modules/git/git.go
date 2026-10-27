@@ -231,6 +231,7 @@ func syncGitConfig() (err error) {
 	if err = os.MkdirAll(HomeDir(), os.ModePerm); err != nil {
 		return fmt.Errorf("unable to prepare git home directory %s, err: %w", HomeDir(), err)
 	}
+	removeStaleConfigLock(HomeDir(), time.Now())
 
 	// first, write user's git config options to git config file
 	// user config options could be overwritten by builtin values later, because if a value is builtin, it must have some special purposes

@@ -225,7 +225,11 @@ jobs:
           docker compose --profile observer build observer
           docker compose up -d --no-build --wait --wait-timeout 300 \
             consul-1 consul-2 consul-3 pg-1 pg-2 pg-3 haproxy
-          docker compose up -d --no-build forgejo-1 forgejo-2 forgejo-3
+          # The PKI only: the nodes start once founded, at the end of
+          # bootstrap.sh. Started before it, they were stopped a second into
+          # their first start, a `git config --global` killed with them, and
+          # the lock it left kept a node from ever starting again (#308).
+          docker compose run --rm --no-deps -T pki
           scripts/bootstrap.sh
 
       - name: Suite observer
