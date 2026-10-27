@@ -303,6 +303,12 @@ func DeleteTag(ctx *context.APIContext) {
 	//     "$ref": "#/responses/repoArchivedError"
 	tagName := ctx.Params("*")
 
+	// Before the tag's row is read: a tag whose push is not derived yet has
+	// no row, or the row of its value before the push, which that
+	// derivation would write again after the deletion (#298).
+	if releaseRowsBehind(ctx) {
+		return
+	}
 	tag, err := repo_model.GetRelease(ctx, ctx.Repo().Repository.ID, tagName)
 	if err != nil {
 		if repo_model.IsErrReleaseNotExist(err) {

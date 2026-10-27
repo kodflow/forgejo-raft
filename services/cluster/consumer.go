@@ -1919,8 +1919,9 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		// A request that writes rows this work derives for pushes waits
 		// first for the repository's earlier writes to be derived
 		// (clusterhook.RequireDerived: RenameBranch #225, CreateNewBranch
-		// #226, DeleteBranch #267): the work of a push derived after it
-		// would overwrite them, and nothing here would write them again.
+		// #226, DeleteBranch #267, the release service's tags and releases
+		// #298): the work of a push derived after it would overwrite them,
+		// and nothing here would write them again.
 		return nil
 	}
 	repo, err := lookupRepo(ctx, first)
@@ -1999,14 +2000,16 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 			continue
 		}
 		if ref.IsTag() {
-			gone, err := tagGone(ctx, repo, opt, openGit)
+			gone, err := tagGone(ctx, repo, ev, opt, tbl, openGit)
 			if err != nil {
 				return err
 			}
 			if gone {
 				// Created then deleted before this work ran: there is no
 				// tag to describe, or no release row to remove, and the
-				// work would fail at every retry, parked for good (#44).
+				// work would fail at every retry, parked for good (#44);
+				// or written again, its row with it, by a deletion that
+				// has no work of its own (#298).
 				log.Info("cluster consumer: the tag %s of %s at %d is gone; its post-receive work is dropped", ref.TagName(), first.Repo, ev.Token.Index)
 				continue
 			}
@@ -2045,8 +2048,9 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 }
 
 // tagGone reports whether a tag update has nothing left to land on: a new
-// tag git no longer holds, or a deleted tag without a release row.
-func tagGone(ctx context.Context, repo *repo_model.Repository, opt *repo_module.PushUpdateOptions, openGit func() (*git.Repository, error)) (bool, error) {
+// tag the cluster deleted since, or git no longer holds, or a deleted tag
+// without a release row.
+func tagGone(ctx context.Context, repo *repo_model.Repository, ev reftable.Event, opt *repo_module.PushUpdateOptions, tbl lifecycleTable, openGit func() (*git.Repository, error)) (bool, error) {
 	name := opt.RefFullName.TagName()
 	if opt.IsDelRef() {
 		_, err := repo_model.GetRelease(ctx, repo.ID, name)
@@ -2055,11 +2059,45 @@ func tagGone(ctx context.Context, repo *repo_model.Repository, opt *repo_module.
 		}
 		return false, err
 	}
+	if tagDeletedSince(tbl, repo, ev) {
+		return true, nil
+	}
 	gitRepo, err := openGit()
 	if err != nil {
 		return false, err
 	}
 	return !gitRepo.IsTagExist(name), nil
+}
+
+// refHistory is what tagDeletedSince reads of the table the consumer
+// applies: a ref's value now, and whether a command other than a ref
+// transaction rewrote the repository's refs since an index.
+type refHistory interface {
+	Get(repo, ref string) (reftable.RefValue, bool)
+	RewrittenSince(repo string, index uint64) bool
+}
+
+var _ refHistory = (*reftable.Table)(nil)
+
+// tagDeletedSince reports whether the table holds the tag ev created or
+// moved deleted since, by a later ref transaction: a push, or a deletion
+// through the API or the web. The leader's git, which the rest of the work
+// reads, may not show that deletion yet: the work would write the tag's
+// row again from it, and a deletion without pusher, which wrote its rows
+// itself, has no work that would remove it again. The tag came back in the
+// tag list, no member holding it (#298). The table decides only when it
+// can: under the event's key, which neither a rename nor a deletion of the
+// repository rewrote since, and which still is the repository's name.
+// Otherwise git decides, as before.
+func tagDeletedSince(tbl lifecycleTable, repo *repo_model.Repository, ev reftable.Event) bool {
+	h, ok := tbl.(refHistory)
+	if !ok || clusterhook.RepoKey(repo.OwnerName, repo.Name, false) != ev.Repo {
+		return false
+	}
+	if v, ok := h.Get(ev.Repo, ev.Ref); !ok || !v.Tombstone || v.Rev <= ev.Rev {
+		return false
+	}
+	return !h.RewrittenSince(ev.Repo, ev.Token.Index)
 }
 
 // getPusher looks up the account holding a pusher's ID; tests replace it.

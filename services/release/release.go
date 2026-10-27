@@ -151,8 +151,32 @@ func createTag(ctx context.Context, gitRepo *git.Repository, rel *repo_model.Rel
 	return created, nil
 }
 
+// requireDerived waits, in a cluster, until this node serves repo and the
+// cluster's log consumer derived the SQL of every write to it the cluster
+// confirms at the call, and refuses with clusterhook.ErrBehind while it
+// has not, or while an event of the repository is parked. The consumer
+// writes a tag's release row after the push was acknowledged: a push that
+// deletes a tag turns its release into a draft, sha1 cleared, and removes
+// a tag-only row; a push that creates or moves one writes its row from the
+// leader's git, and publishes a draft release of that tag. A release or a
+// tag written by a request before that derivation is overwritten by it, and
+// nothing writes it again, the request's own tag write having no pusher,
+// hence no post-receive work (#298), as for the branches (#225, #226,
+// #267). Without a cluster it returns nil at once.
+func requireDerived(ctx context.Context, repo *repo_model.Repository) error {
+	return clusterhook.RequireDerived(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false))
+}
+
 // CreateRelease creates a new release of repository.
 func CreateRelease(gitRepo *git.Repository, rel *repo_model.Release, msg string, attachmentChanges []*AttachmentChange) error {
+	if err := rel.LoadRepo(gitRepo.Ctx); err != nil {
+		return err
+	}
+	// Before the release is looked up and its tag created: nothing is
+	// written while it refuses.
+	if err := requireDerived(gitRepo.Ctx, rel.Repo); err != nil {
+		return err
+	}
 	has, err := repo_model.IsReleaseExist(gitRepo.Ctx, rel.RepoID, rel.TagName)
 	if err != nil {
 		return err
@@ -220,6 +244,11 @@ func CreateRelease(gitRepo *git.Repository, rel *repo_model.Release, msg string,
 
 // CreateNewTag creates a new repository tag
 func CreateNewTag(ctx context.Context, doer *user_model.User, repo *repo_model.Repository, commit, tagName, msg string) error {
+	// A tag whose deletion by a push is not derived yet would have its new
+	// row removed by that derivation (#298).
+	if err := requireDerived(ctx, repo); err != nil {
+		return err
+	}
 	has, err := repo_model.IsReleaseExist(ctx, repo.ID, tagName)
 	if err != nil {
 		return err
@@ -262,6 +291,27 @@ func UpdateRelease(ctx context.Context, doer *user_model.User, gitRepo *git.Repo
 ) error {
 	if rel.ID == 0 {
 		return errors.New("UpdateRelease only accepts an exist release")
+	}
+	if err := rel.LoadRepo(ctx); err != nil {
+		return err
+	}
+	if err := requireDerived(ctx, rel.Repo); err != nil {
+		return err
+	}
+	if clusterhook.Enabled() {
+		// rel was read by the caller, possibly before the wait above,
+		// while the consumer derived a push meanwhile: a tag-only row it
+		// removed (its tag deleted by the push) would be updated in no
+		// row, after its tag was created again, and the client told the
+		// release exists (#298). The routes wait before they read; this
+		// covers a write acknowledged between the two waits.
+		exists, err := db.GetEngine(ctx).ID(rel.ID).Exist(new(repo_model.Release))
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("%w to %s: the release %q was removed while its rows were derived; nothing was written, retry", clusterhook.ErrBehind, clusterhook.RepoKey(rel.Repo.OwnerName, rel.Repo.Name, false), rel.TagName)
+		}
 	}
 	isCreated, err := createTag(gitRepo.Ctx, gitRepo, rel, "")
 	if err != nil {
@@ -395,6 +445,15 @@ func UpdateRelease(ctx context.Context, doer *user_model.User, gitRepo *git.Repo
 // DeleteReleaseByID deletes a release and corresponding Git tag by given ID.
 func DeleteReleaseByID(ctx context.Context, repo *repo_model.Repository, rel *repo_model.Release, doer *user_model.User, delTag bool) error {
 	if delTag {
+		// A tag whose creation or move by a push is not derived yet would
+		// have its row written again by that derivation, from the leader's
+		// git before it shows the deletion: the tag deleted here would come
+		// back in the tag list, no member holding it (#298). Kept as a tag
+		// (delTag false), the release's row converges: the derivation of a
+		// deletion removes a tag-only row, that of a creation updates it.
+		if err := requireDerived(ctx, repo); err != nil {
+			return err
+		}
 		protectedTags, err := git_model.GetProtectedTags(ctx, rel.RepoID)
 		if err != nil {
 			return fmt.Errorf("GetProtectedTags: %w", err)
