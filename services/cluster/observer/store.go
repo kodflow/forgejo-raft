@@ -414,6 +414,14 @@ func writeStream(path string, r io.Reader, limit int64, gz bool) (int64, string,
 	return n, hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// isTempName reports whether name is one os.CreateTemp makes of the
+// pattern "."+base+".*", as writeAtomic and writeStream name the file they
+// write before its rename or link: the random part is decimal digits.
+func isTempName(name, base string) bool {
+	random, ok := strings.CutPrefix(name, "."+base+".")
+	return ok && random != "" && strings.Trim(random, "0123456789") == ""
+}
+
 // ---- WAL ----
 
 // The archive keeps each PostgreSQL system's files apart, under

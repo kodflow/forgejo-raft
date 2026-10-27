@@ -368,3 +368,199 @@ func TestRestoreReposRefusesAnEscapingKey(t *testing.T) {
 	require.Error(t, err)
 	assert.NoDirExists(t, filepath.Join(base, "escape.git"))
 }
+
+// A rerun of step 4 removes the temporary files a killed copy left beside
+// the stored files it restores, ".<name>.<digits>" as writeStream names
+// them, whether the copy was killed before its link (the file absent) or
+// after it (the file whole): the restored cluster's leader would list them,
+// and its observers refuse an LFS path that is not a digest (#290). It
+// removes nothing else: not a file the checkpoint itself holds, not a name
+// writeStream does not make, not a directory.
+func TestRestoreFilesRerunRemovesOnlyTheTemporaryFilesItLeft(t *testing.T) {
+	ctx := t.Context()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	seed(t, c, o)
+	// An attachment whose own name has the shape of a temporary file of
+	// another one beside it: the checkpoint holds both.
+	c.storeAttachment("a1/b2/9f0c2d4e-attachment", "an attachment")
+	c.storeAttachment("a1/b2/.9f0c2d4e-attachment.12", "another attachment")
+	cp := c.checkpoint()
+	require.NoError(t, o.Step(ctx))
+	a, err := OpenArchive(o.cfg.Dir, "")
+	require.NoError(t, err)
+	m, err := a.Manifest(cp.Name())
+	require.NoError(t, err)
+	var obj string
+	for _, f := range m.Files {
+		if f.Storage == "lfs" {
+			obj = f.Path
+		}
+	}
+	require.NotEmpty(t, obj)
+
+	roots := map[string]string{"lfs": filepath.Join(t.TempDir(), "lfs"), "attachments": filepath.Join(t.TempDir(), "attachments")}
+	n, err := a.RestoreFiles(cp.Name(), roots)
+	require.NoError(t, err)
+	require.Equal(t, len(m.Files), n)
+
+	dst := filepath.Join(roots["lfs"], filepath.FromSlash(obj))
+	dir, base := filepath.Dir(dst), filepath.Base(dst)
+	write := func(name, body string) {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600))
+	}
+	// Killed after the link: the temporary file is the object's second name.
+	require.NoError(t, os.Link(dst, filepath.Join(dir, "."+base+".1260260618")))
+	// Killed during an earlier copy: a partial one.
+	write("."+base+".984472376", "an lf")
+	// Names writeStream does not make, and a directory.
+	keep := []string{"." + base + ".tmp", "." + base + ".", base + ".123", ".other.456"}
+	for _, k := range keep {
+		write(k, "not the restore's")
+	}
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "."+base+".789"), 0o700))
+	keep = append(keep, "."+base+".789")
+
+	synced := map[string]bool{}
+	prev := syncPath
+	defer func() { syncPath = prev }()
+	syncPath = func(p string) error {
+		synced[p] = true
+		return prev(p)
+	}
+	n, err = a.RestoreFiles(cp.Name(), roots)
+	require.NoError(t, err)
+	require.Equal(t, len(m.Files), n)
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	assert.ElementsMatch(t, append([]string{base}, keep...), names, "the temporary files are gone, and nothing else")
+	assert.True(t, synced[dir], "the removal is durable before the step is recorded")
+	for _, f := range m.Files {
+		b, err := os.ReadFile(filepath.Join(roots[f.Storage], filepath.FromSlash(f.Path)))
+		require.NoError(t, err, "%s/%s", f.Storage, f.Path)
+		assert.Equal(t, c.files[f.Storage+"/"+f.Path], b)
+	}
+
+	// Killed before the link: the object is absent, its partial copy left.
+	require.NoError(t, os.Remove(dst))
+	write("."+base+".42", "an l")
+	_, err = a.RestoreFiles(cp.Name(), roots)
+	require.NoError(t, err)
+	assert.NoFileExists(t, filepath.Join(dir, "."+base+".42"))
+	b, err := os.ReadFile(dst)
+	require.NoError(t, err)
+	assert.Equal(t, c.files["lfs/"+obj], b)
+}
+
+// A crash while Materialize wrote the mark under a temporary name, before
+// its rename, left the target holding that file alone: no mark, no
+// repository, refused as "not empty" by every rerun of step 4 (#291). The
+// rerun takes such a target as its own and writes it again; a target that
+// holds anything else is still refused, and nothing in it is removed.
+func TestRestoreReposTakesUpATargetLeftBeforeItsMark(t *testing.T) {
+	ctx := t.Context()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	cp := seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	a, err := OpenArchive(o.cfg.Dir, "")
+	require.NoError(t, err)
+	m, err := a.Manifest(cp.Name())
+	require.NoError(t, err)
+
+	// The state that crash leaves, made by hand: the window is too short
+	// to kill a process into.
+	leave := func(t *testing.T, root string) (string, string) {
+		target := filepath.Join(root, "alice", "demo.git")
+		require.NoError(t, os.MkdirAll(target, 0o755))
+		tmp, err := os.CreateTemp(target, "."+IncompleteMark+".*")
+		require.NoError(t, err)
+		require.NoError(t, tmp.Close())
+		return target, tmp.Name()
+	}
+
+	root := t.TempDir()
+	target, tmp := leave(t, root)
+	n, err := a.RestoreRepos(ctx, cp.Name(), root)
+	require.NoError(t, err, "the rerun of step 4 takes the target up")
+	assert.Equal(t, 1, n)
+	assert.True(t, o.store.git.restoredRefs(ctx, target, m.Repos["alice/demo.git"].Refs))
+	assert.NoFileExists(t, tmp)
+	assert.NoFileExists(t, filepath.Join(target, IncompleteMark))
+
+	for what, add := range map[string]func(target string) error{
+		"a file of its own": func(target string) error {
+			return os.WriteFile(filepath.Join(target, "precious"), []byte("x"), 0o600)
+		},
+		"a file named otherwise": func(target string) error {
+			return os.WriteFile(filepath.Join(target, "."+IncompleteMark+".tmp"), nil, 0o600)
+		},
+		"a directory named as the temporary file": func(target string) error {
+			return os.Mkdir(filepath.Join(target, "."+IncompleteMark+".1"), 0o700)
+		},
+	} {
+		t.Run("beside "+what, func(t *testing.T) {
+			other := t.TempDir()
+			target, tmp := leave(t, other)
+			require.NoError(t, add(target))
+			names := func() []string {
+				entries, err := os.ReadDir(target)
+				require.NoError(t, err)
+				var out []string
+				for _, e := range entries {
+					out = append(out, e.Name())
+				}
+				return out
+			}
+			before := names()
+			_, err := a.RestoreRepos(ctx, cp.Name(), other)
+			require.ErrorContains(t, err, "is not empty")
+			assert.Equal(t, before, names(), "nothing is removed")
+			assert.FileExists(t, tmp)
+		})
+	}
+}
+
+// Materialize creates the mark under its own name, and syncs it and the
+// target before git writes anything there: no crash leaves the target
+// holding a temporary name instead of the mark (#291).
+func TestMaterializeWritesTheMarkUnderItsOwnName(t *testing.T) {
+	ctx := t.Context()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	cp := seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	a, err := OpenArchive(o.cfg.Dir, "")
+	require.NoError(t, err)
+
+	root := t.TempDir()
+	target := filepath.Join(root, "alice", "demo.git")
+	mark := filepath.Join(target, IncompleteMark)
+	// What the target holds each time the mark or the target is synced
+	// while git has not written there yet.
+	seen := map[string][]string{}
+	prev := syncPath
+	defer func() { syncPath = prev }()
+	syncPath = func(p string) error {
+		if p == mark || p == target {
+			if _, err := os.Stat(filepath.Join(target, "HEAD")); os.IsNotExist(err) {
+				entries, err := os.ReadDir(target)
+				require.NoError(t, err)
+				var names []string
+				for _, e := range entries {
+					names = append(names, e.Name())
+				}
+				seen[p] = names
+			}
+		}
+		return prev(p)
+	}
+	_, err = a.RestoreRepos(ctx, cp.Name(), root)
+	require.NoError(t, err)
+	assert.Equal(t, []string{IncompleteMark}, seen[mark], "the mark is synced before git init")
+	assert.Equal(t, []string{IncompleteMark}, seen[target], "and its name in the target")
+}
