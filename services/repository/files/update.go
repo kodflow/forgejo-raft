@@ -446,11 +446,14 @@ func CreateOrUpdateFile(ctx context.Context, t *TemporaryUploadRepository, file 
 	}
 
 	if lfsMetaObject != nil {
-		// We have an LFS object - create it
-		lfsMetaObject, err = git_model.NewLFSMetaObject(ctx, lfsMetaObject.RepositoryID, lfsMetaObject.Pointer)
-		if err != nil {
-			return err
-		}
+		// We have an LFS object: its file is written, its content checked,
+		// before its row is committed, as the LFS server's upload does. A
+		// row committed first named a file the storage did not hold yet:
+		// a cluster checkpoint taken meanwhile, or after the node died
+		// there, was refused by recover --from-observer (#289). A file
+		// whose row never comes is an orphan, which `forgejo doctor`
+		// (storages) finds; it is not removed here: the content addresses
+		// it, and another repository may name it.
 		exist, err := contentStore.Exists(lfsMetaObject.Pointer)
 		if err != nil {
 			return err
@@ -461,11 +464,11 @@ func CreateOrUpdateFile(ctx context.Context, t *TemporaryUploadRepository, file 
 				return err
 			}
 			if err := contentStore.Put(lfsMetaObject.Pointer, file.ContentReader); err != nil {
-				if _, err2 := git_model.RemoveLFSMetaObjectByOid(ctx, repoID, lfsMetaObject.Oid); err2 != nil {
-					return fmt.Errorf("unable to remove failed inserted LFS object %s: %v (Prev Error: %w)", lfsMetaObject.Oid, err2, err)
-				}
 				return err
 			}
+		}
+		if _, err := git_model.NewLFSMetaObject(ctx, lfsMetaObject.RepositoryID, lfsMetaObject.Pointer); err != nil {
+			return err
 		}
 	}
 
