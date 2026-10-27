@@ -23,6 +23,11 @@ func getSyncForkInfo(ctx *context.APIContext, branch string) {
 			ctx.NotFound(err, branch)
 			return
 		}
+		// A node of the cluster whose directory of the base may hold
+		// another repository answers 503: the client retries (#283).
+		if clusterBehind(ctx, err) {
+			return
+		}
 
 		ctx.Error(http.StatusInternalServerError, "GetSyncForkInfo", err)
 		return
@@ -104,6 +109,11 @@ func syncForkBranch(ctx *context.APIContext, branch string) {
 			ctx.NotFound(err, branch)
 			return
 		}
+		// A node of the cluster whose directory of the base may hold
+		// another repository answers 503: the client retries (#283).
+		if clusterBehind(ctx, err) {
+			return
+		}
 
 		ctx.Error(http.StatusInternalServerError, "GetSyncForkInfo", err)
 		return
@@ -116,6 +126,11 @@ func syncForkBranch(ctx *context.APIContext, branch string) {
 
 	err = repo_service.SyncFork(ctx, ctx.Doer(), ctx.Repo().Repository, branch)
 	if err != nil {
+		// A node of the cluster that does not serve the base yet answers
+		// 503: nothing was pushed, the client retries (#283).
+		if clusterBehind(ctx, err) {
+			return
+		}
 		ctx.Error(http.StatusInternalServerError, "SyncFork", err)
 		return
 	}

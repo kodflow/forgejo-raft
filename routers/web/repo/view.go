@@ -37,6 +37,7 @@ import (
 	"forgejo.org/modules/actions"
 	"forgejo.org/modules/base"
 	"forgejo.org/modules/charset"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/highlight"
@@ -1252,12 +1253,14 @@ PostRecentBranchCheck:
 
 	if ctx.Repo.Repository.IsFork && ctx.Repo.IsViewBranch && len(ctx.Repo.TreePath) == 0 && ctx.Repo.CanWriteToBranch(ctx, ctx.Doer, ctx.Repo.BranchName) {
 		syncForkInfo, err := repo_service.GetSyncForkInfo(ctx, ctx.Repo.Repository, ctx.Repo.BranchName)
-		if err != nil {
+		// A node of the cluster whose directory of the base may hold
+		// another repository offers no sync, and serves the page (#283).
+		if err != nil && !errors.Is(err, clusterhook.ErrBehind) {
 			ctx.ServerError("CanSync", err)
 			return
 		}
 
-		if syncForkInfo.Allowed {
+		if err == nil && syncForkInfo.Allowed {
 			ctx.Data["CanSyncFork"] = true
 			ctx.Data["ForkCommitsBehind"] = syncForkInfo.CommitsBehind
 			ctx.Data["BaseBranchLink"] = fmt.Sprintf("%s/src/branch/%s", ctx.Repo.Repository.BaseRepo.HTMLURL(), util.PathEscapeSegments(ctx.Repo.BranchName))
