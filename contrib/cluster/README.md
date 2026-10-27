@@ -23,6 +23,19 @@ derive in it is written by a single consumer, on the leader.
   `serverAuth` and `clientAuth` usages. The key stays on the node.
 - `[security] DISABLE_GIT_HOOKS = true`. Start-up fails without it, since a
   user hook would run inside the replication path.
+- The same secrets on every node: `[security] SECRET_KEY`, and the
+  token-signing secrets `[oauth2] JWT_SECRET` and `[server] LFS_JWT_SECRET`
+  (32 random bytes in unpadded base64url, `forgejo generate secret
+  JWT_SECRET`). A token one node signs comes back to whichever node the
+  load balancer picks: the container registry's and the Actions' tokens are
+  signed with `JWT_SECRET`, those `git lfs` receives over SSH with
+  `LFS_JWT_SECRET`. A node that is not given them draws its own at its
+  first start, into its own `app.ini`, and refuses the tokens of the
+  others. The deployment examples share them as they share `SECRET_KEY`.
+  The leader compares the members' `JWT_SECRET` and LFS key with its own,
+  every five minutes, and logs an error naming the members whose keys
+  differ; a member on an older binary is not compared. OAuth2's access
+  tokens are a known limit (see "Known limits").
 - git 2.48 or later. Start-up fails with an older git: the cluster learns
   HEAD only from the reference-transaction hook, which git before 2.46
   bypasses for `git init` and `git symbolic-ref`, and git up to 2.47 reports
@@ -387,8 +400,8 @@ at the JOIN.
 ## Founding the cluster
 
 This is the manual mode, without `EXPECTED_NODES`. The three servers are
-stopped and share one configuration, apart from `SLOT`, `LISTEN_ADDR` and
-the TLS files.
+stopped and share one configuration, its secrets included (see
+"Requirements"), apart from `SLOT`, `LISTEN_ADDR` and the TLS files.
 
 1. On each node, `forgejo cluster init`. It prepares the data directory and
    prints the member line `id:incarnation:slot:spki:host:port`.
@@ -827,3 +840,11 @@ Watch, Custom, Releases on GitHub, or the tags of
   drained or purged remains the responsibility of the operator who grants the
   join.
 - Forgejo has no tracing: the engine's spans are not exported.
+- OAuth2's access tokens are signed, under the default `[oauth2]
+  JWT_SIGNING_ALGORITHM` (RS256), with a key each node draws into its own
+  `APP_DATA_PATH` (`jwt/private.pem`): a token is verified only by the node
+  that issued it, and refused when the load balancer sends its request to
+  another. Sharing that key (`JWT_SIGNING_PRIVATE_KEY_FILE`) would need a
+  recovery from an observer to rotate it as it rotates `JWT_SECRET`, which
+  it does not do yet; an HS* algorithm signs them with the shared
+  `JWT_SECRET`, but changes what OpenID Connect clients verify.

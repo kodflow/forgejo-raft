@@ -113,7 +113,12 @@ object store, and the node refuses to start the coordinator otherwise.
 
 `OBSERVER_RECIPIENTS` are the observers' X25519 public keys. The export
 seals the database's `SECRET_KEY` to the observer its SSH key belongs to;
-every other secret is rotated by a recovery, never restored.
+the token-signing secrets (`[oauth2] JWT_SECRET`, `[server] LFS_JWT_SECRET`)
+and the observers' keys are rotated by a recovery, never restored. A
+signing key kept in a file of `APP_DATA_PATH`, as OAuth2's under its default
+RS256 (`jwt/private.pem`), is the node's own and no step rotates it: a new
+node draws a new one at its first start, never copy the old cluster's onto
+it.
 
 ### SSH
 
@@ -336,8 +341,18 @@ the stored files already copied with the same bytes are kept:
    taken before the voters were recorded names none: at least one
    `--fenced` is then required, and the operator answers for the others.
 2. Rotation first: `<out>/rotated.ini` holds the checkpoint's `SECRET_KEY`
-   (the database's encrypted columns need it), new JWT secrets and the
-   observers' new key. The command stops until `app.ini` carries them.
+   (the database's encrypted columns need it), new JWT secrets (`[oauth2]
+   JWT_SECRET`, `[server] LFS_JWT_SECRET`) and the observers' new key. The
+   command stops until `app.ini` carries every one of them, and names those
+   it does not carry yet: a node that kept the old cluster's `JWT_SECRET` or
+   `LFS_JWT_SECRET`, compromised with its members, would honour the tokens
+   it signs, an LFS one for any user and any repository. `LFS_JWT_SECRET`
+   is required with the LFS server off too, since the server signs with
+   whatever the configuration carries once turned on, and an asymmetric
+   `LFS_JWT_SIGNING_ALGORITHM` is refused: its key is a file the recovery
+   does not rotate. Recover with HS256, the default; the other members get
+   the same rotated secrets when they join (see "Requirements" in
+   [README.md](README.md)).
 3. PostgreSQL: the base is extracted without the source's configuration
    (`postgresql.conf`, `postgresql.auto.conf`, includes, `conf.d`, signals,
    `tablespace_map`), and replayed with the observer's own:

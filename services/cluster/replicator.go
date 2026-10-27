@@ -106,6 +106,12 @@ type Replicator struct {
 	// the autopilot's goroutine touches them.
 	projectionProbe time.Time
 	projectionNoted string
+	// signingProbe is when the leader next compares the members'
+	// token-signing keys with its own, and signingNoted what it last
+	// logged of them (signing.go, #285). Only the autopilot's goroutine,
+	// or the manual mode's pilot, touches them.
+	signingProbe time.Time
+	signingNoted string
 	// sqlYield is when, in Unix seconds, this node last gave the leadership
 	// away because it could not derive the SQL; its hello says it, so the
 	// leadership is not handed back to it for its checkpoints

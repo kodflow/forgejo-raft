@@ -50,6 +50,11 @@ x-node: &node
     FORGEJO__database__SSL_MODE: disable
     FORGEJO__security__INSTALL_LOCK: "true"
     FORGEJO__security__SECRET_KEY: ${FORGEJO_SECRET_KEY:?}
+    # The token-signing secrets, the same for every node: a token one node
+    # hands out (the container registry's, the Actions', LFS's) is verified
+    # by the node the next request reaches. A node given none draws its own.
+    FORGEJO__oauth2__JWT_SECRET: ${FORGEJO_JWT_SECRET:?}
+    FORGEJO__server__LFS_JWT_SECRET: ${FORGEJO_LFS_JWT_SECRET:?}
     # Required by [cluster]: a user git hook would run inside the
     # replication path, so the node refuses to start without it.
     FORGEJO__security__DISABLE_GIT_HOOKS: "true"

@@ -15,7 +15,8 @@
 #      a gap in the archive
 #   5. every member and every PostgreSQL is lost
 #   6. a new node recovers the CLEAN checkpoint from its snapshot, mounted
-#      read-only: rotation first, PostgreSQL replayed to the position with
+#      read-only: rotation first (a node that keeps the old cluster's
+#      LFS_JWT_SECRET stops there), PostgreSQL replayed to the position with
 #      the observer's configuration (recovery_target_inclusive = off, and the
 #      same replay with on compared), refs, objects and files, verification,
 #      then the new cluster with this node its only voter
@@ -265,6 +266,23 @@ ok "$CLEAN listed and restorable from its snapshot"
 if rexec "${RECOVER[@]}" >"$WORK/run1.txt" 2>&1; then fail "the recovery did not stop for the rotation"; fi
 grep -q "rotated secrets are in" "$WORK/run1.txt" || fail "run 1: $(cat "$WORK/run1.txt")"
 dco exec -T forgejo-r test ! -e /data/pg/PG_VERSION || fail "PostgreSQL was restored before the rotation"
+# Every rotated secret but LFS_JWT_SECRET, which stays the old cluster's,
+# the members' (.env): the node would honour the LFS tokens it signs, and
+# whoever holds it mints one for any user and any repository. The command
+# stops again, naming it alone (#284).
+dco exec -T -u 0 forgejo-r python3 -c '
+import configparser, sys
+c = configparser.ConfigParser(); c.read("/data/recover/rotated.ini")
+c["server"]["lfs_jwt_secret"] = sys.argv[1]
+with open("/data/recover/rotated.env", "w") as f:
+    for s in c.sections():
+        for k, v in c.items(s):
+            f.write("FORGEJO__%s__%s=%s\n" % (s, k.upper(), v))' "$LFS_JWT_SECRET"
+if rexec "${RECOVER[@]}" >"$WORK/run1-lfs.txt" 2>&1; then fail "the recovery went on with the old cluster's LFS_JWT_SECRET"; fi
+grep -q "^  \[server\] LFS_JWT_SECRET\$" "$WORK/run1-lfs.txt" || fail "run 1, the old LFS_JWT_SECRET: $(cat "$WORK/run1-lfs.txt")"
+if grep -Eq "^  \[(security|oauth2|cluster)\] " "$WORK/run1-lfs.txt"; then fail "run 1, the old LFS_JWT_SECRET: another secret named: $(cat "$WORK/run1-lfs.txt")"; fi
+dco exec -T forgejo-r test ! -e /data/pg/PG_VERSION || fail "PostgreSQL was restored with the old cluster's LFS_JWT_SECRET"
+ok "a node that keeps the old cluster's LFS_JWT_SECRET stops at the rotation"
 dco exec -T -u 0 forgejo-r python3 -c '
 import configparser
 c = configparser.ConfigParser(); c.read("/data/recover/rotated.ini")

@@ -84,6 +84,11 @@ x-forgejo: &forgejo
     FORGEJO__database__CONN_MAX_LIFETIME: 30s
     FORGEJO__security__INSTALL_LOCK: "true"
     FORGEJO__security__SECRET_KEY: ${FORGEJO_SECRET_KEY:?}
+    # The token-signing secrets, shared as SECRET_KEY is: a token one node
+    # hands out (the container registry's, the Actions', LFS's) is verified
+    # by the node the next request reaches.
+    FORGEJO__oauth2__JWT_SECRET: ${FORGEJO_JWT_SECRET:?}
+    FORGEJO__server__LFS_JWT_SECRET: ${LFS_JWT_SECRET:?}
     # Required by [cluster]: a user hook would run inside the replication path.
     FORGEJO__security__DISABLE_GIT_HOOKS: "true"
     FORGEJO__service__DISABLE_REGISTRATION: "true"

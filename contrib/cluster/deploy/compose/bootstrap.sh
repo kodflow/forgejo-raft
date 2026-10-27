@@ -22,6 +22,10 @@ touch .env
 add() { grep -q "^$1=" .env || echo "$1=$2" >>.env; }
 add POSTGRES_PASSWORD "$(openssl rand -hex 24)"
 add FORGEJO_SECRET_KEY "$(openssl rand -hex 32)"
+# [oauth2] JWT_SECRET and [server] LFS_JWT_SECRET, shared by the nodes: 32
+# bytes in unpadded base64url.
+add FORGEJO_JWT_SECRET "$(openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
+add FORGEJO_LFS_JWT_SECRET "$(openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
 add CLUSTER_ID "$(openssl rand -hex 16)"
 
 # The image's own setup renders app.ini from FORGEJO__* as the server
