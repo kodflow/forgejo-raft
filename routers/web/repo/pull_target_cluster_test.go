@@ -6,14 +6,22 @@ package repo
 import (
 	gocontext "context"
 	"net/http"
+	"sync/atomic"
 	"testing"
 
+	"forgejo.org/models/db"
+	git_model "forgejo.org/models/git"
 	issues_model "forgejo.org/models/issues"
+	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unittest"
 	"forgejo.org/modules/clusterhook"
+	"forgejo.org/modules/git"
+	"forgejo.org/modules/setting"
+	"forgejo.org/modules/test"
 	"forgejo.org/services/contexttest"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // updateTarget posts, as the pull request page does, a new target branch
@@ -59,4 +67,50 @@ func TestUpdatePullRequestTargetOnAFreshNode(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, code, body)
 	assert.Equal(t, "develop", unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: 2}).BaseBranch)
+}
+
+// The "Delete branch" button of a merged pull request retargets the pull
+// requests based on its head branch before it deletes the branch. Since
+// #300, a node of the cluster behind on a child's repositories refuses
+// the child's retarget: the branch is kept, the child keeps its target,
+// and the page says that the node lags, for the user to retry, where it
+// said that the deletion failed.
+func TestCleanUpPullRequestKeepsTheBranchWhileAChildRetargetLags(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	defer test.MockVariableValue(&setting.Repository.PullRequest.RetargetChildrenOnMerge, true)()
+	dir := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1}).RepoPath()
+	head, err := git.GetFullCommitID(t.Context(), dir, "branch2")
+	require.NoError(t, err)
+	// Pull request 2, index 3 of repo1, merged branch2 at its head; pull
+	// request 5 (pr-to-update into branch2) is its child.
+	_, _, err = git.NewCommand(t.Context(), "update-ref", "refs/pull/3/head").AddDynamicArguments(head).RunStdString(&git.RunOpts{Dir: dir})
+	require.NoError(t, err)
+	_, err = db.GetEngine(db.DefaultContext).ID(2).Cols("has_merged").Update(&issues_model.PullRequest{HasMerged: true})
+	require.NoError(t, err)
+	var asked atomic.Int32
+	clusterhook.SetFreshWaiter(func(gocontext.Context, string) bool { asked.Add(1); return false })
+	t.Cleanup(func() { clusterhook.SetFreshWaiter(nil) })
+
+	ctx, _ := contexttest.MockContext(t, "user2/repo1/pulls/3/cleanup")
+	contexttest.LoadUser(t, ctx, 2)
+	contexttest.LoadRepo(t, ctx, 1)
+	contexttest.LoadGitRepo(t, ctx)
+	defer ctx.Repo.GitRepo.Close()
+	ctx.SetParams(":index", "3")
+
+	func() {
+		// A deletion hands its notifications to the push queue, which
+		// this test binary does not start: it panics after the deletion.
+		defer func() { _ = recover() }()
+		CleanUpPullRequest(ctx)
+	}()
+
+	assert.Positive(t, asked.Load(), "the child's retarget waited for the node")
+	assert.EqualValues(t, ctx.Tr("repo.branch.deletion_behind", "user2/repo1:branch2"), ctx.Flash.ErrorMsg)
+	assert.Empty(t, ctx.Flash.SuccessMsg)
+	got, err := git.GetFullCommitID(t.Context(), dir, "refs/heads/branch2")
+	require.NoError(t, err, "branch2 is kept")
+	assert.Equal(t, head, got)
+	assert.False(t, unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: 1, Name: "branch2"}).IsDeleted)
+	assert.Equal(t, "branch2", unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: 5}).BaseBranch, "the child keeps its target")
 }

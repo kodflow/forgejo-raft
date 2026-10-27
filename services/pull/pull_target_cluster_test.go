@@ -5,6 +5,8 @@ package pull
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -192,4 +194,88 @@ func TestPatchCheckDeferredOnANodeBehind(t *testing.T) {
 	mergeBase, _, err := git.NewCommand(ctx, "merge-base", "refs/heads/master", "refs/heads/branch2").RunStdString(&git.RunOpts{Dir: dir})
 	require.NoError(t, err)
 	assert.Equal(t, strings.TrimSpace(mergeBase), pr.MergeBase, "the test wrote its merge base")
+}
+
+// secondChild opens, in repository 1, a pull request of
+// home-md-img-check into branch2: with pull request 5 (pr-to-update into
+// branch2), the second child of pull request 2 (branch2 into master).
+func secondChild(t *testing.T) *issues_model.PullRequest {
+	t.Helper()
+	ctx := db.DefaultContext
+	issue := &issues_model.Issue{RepoID: 1, Index: 1000, PosterID: 2, IsPull: true, Title: "second child of branch2"}
+	require.NoError(t, db.Insert(ctx, issue))
+	pr := &issues_model.PullRequest{
+		IssueID: issue.ID, Index: issue.Index, HeadRepoID: 1, BaseRepoID: 1,
+		HeadBranch: "home-md-img-check", BaseBranch: "branch2",
+		Type: issues_model.PullRequestGitea, Status: issues_model.PullRequestStatusMergeable,
+	}
+	require.NoError(t, db.Insert(ctx, pr))
+	return pr
+}
+
+// The pull requests based on a merged pull request's head branch are
+// retargeted before the branch is deleted (RetargetChildrenOnMerge), and
+// any child's error keeps the branch. Since #300 a child's retarget on a
+// node of a cluster behind on its repositories is refused with ErrBehind,
+// and the errors of the children hid it from errors.Is: the deletion of
+// the branch after an auto-merge took it for a failure and dropped it for
+// good (#279), the web for a failed deletion. The refusal now stays an
+// ErrBehind, and the first one stops the loop: each child would wait for
+// the node again, in the request that merged the parent. Nothing is
+// retargeted; once the node serves the repositories, every child is.
+func TestRetargetChildrenOnMergeRefusedOnANodeBehind(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	defer test.MockVariableValue(&setting.Repository.PullRequest.RetargetChildrenOnMerge, true)()
+	ctx := db.DefaultContext
+	var fresh atomic.Bool
+	asked := freshWaiter(t, func(context.Context, string) bool { return fresh.Load() })
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	// Pull request 2 (branch2 into master) is the parent of pull request 5
+	// (pr-to-update into branch2) and of second.
+	parent := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: 2})
+	second := secondChild(t)
+	children := []int64{5, second.ID}
+	retargets := func() int64 {
+		n, err := db.GetEngine(ctx).Where("type = ?", issues_model.CommentTypeChangeTargetBranch).In("issue_id", []int64{11, second.IssueID}).Count(new(issues_model.Comment))
+		require.NoError(t, err)
+		return n
+	}
+
+	err := RetargetChildrenOnMerge(ctx, doer, parent)
+	require.ErrorIs(t, err, clusterhook.ErrBehind, "the refusal of a child is a refusal to retry: %v", err)
+	assert.Len(t, asked(), 1, "the first refusal stops the loop: %v", asked())
+	for _, id := range children {
+		assert.Equal(t, "branch2", unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: id}).BaseBranch, "child %d keeps its target", id)
+	}
+	assert.Zero(t, retargets(), "no retarget comment")
+
+	fresh.Store(true)
+	require.NoError(t, RetargetChildrenOnMerge(ctx, doer, parent))
+	for _, id := range children {
+		assert.Equal(t, "master", unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: id}).BaseBranch, "child %d is retargeted", id)
+	}
+	assert.EqualValues(t, 2, retargets())
+}
+
+// The other errors of a child's retarget keep their behaviour: returned,
+// so that the branch is kept, and not taken for a node behind, which the
+// callers would retry. A new target the repository does not hold is one.
+func TestRetargetBranchPullsKeepsTheOtherRefusals(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	ctx := db.DefaultContext
+	freshWaiter(t, func(context.Context, string) bool { return true })
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+
+	err := RetargetBranchPulls(ctx, doer, 1, "branch2", "no-such-branch")
+	require.Error(t, err)
+	require.NotErrorIs(t, err, clusterhook.ErrBehind, "%v", err)
+	assert.Equal(t, "branch2", unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: 5}).BaseBranch)
+
+	// The errors of the children read as before, and a refusal among
+	// them is found.
+	other := errors.New("other child")
+	behind := fmt.Errorf("a child: %w", clusterhook.ErrBehind)
+	assert.Equal(t, "other child, "+behind.Error(), errlist{other, behind}.Error())
+	require.ErrorIs(t, errlist{other, behind}, clusterhook.ErrBehind)
+	assert.NotErrorIs(t, errlist{other}, clusterhook.ErrBehind)
 }
