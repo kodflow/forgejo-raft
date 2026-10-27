@@ -91,6 +91,21 @@ func loadSecret(sec ConfigSection, uriKey, verbatimKey string) string {
 	return ""
 }
 
+// ConfiguredSecret is the secret sec carries, from uriKey or verbatimKey as
+// loadSecret reads them, "" when it carries none. It reports as an error
+// what stops loadSecret, and loads, creates and writes nothing: it reads a
+// configuration the server will load, not the one it runs with.
+func ConfiguredSecret(sec ConfigSection, uriKey, verbatimKey string) (string, error) {
+	uri, verbatim := sec.Key(uriKey).String(), sec.Key(verbatimKey).String()
+	if uri == "" {
+		return verbatim, nil
+	}
+	if verbatim != "" {
+		return "", fmt.Errorf("cannot specify both %s and %s", uriKey, verbatimKey)
+	}
+	return loadSecretFromURI(uri)
+}
+
 func loadSecretFromURI(uri string) (string, error) {
 	tempURI, err := url.Parse(uri)
 	if err != nil {

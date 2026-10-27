@@ -128,6 +128,12 @@ spec:
 # LFS_JWT_SECRET, 32 random bytes in unpadded base64url, shared by every
 # pod as secret-key is. A Secret made before them lacks them, and the pods
 # do not start until they are added to it.
+#
+# The image's setup writes the three into app.ini at every start: after a
+# `forgejo cluster recover --from-observer`, put rotated.ini's SECRET_KEY,
+# JWT_SECRET and LFS_JWT_SECRET into secret-key, jwt-secret and
+# lfs-jwt-secret before a pod starts, or the old cluster's come back
+# (contrib/cluster/observer.md, "Recovering from an observer").
 apiVersion: v1
 kind: ConfigMap
 metadata:

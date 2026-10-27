@@ -182,3 +182,113 @@ func TestRecoverRotationRefusesTheOldLFSSecret(t *testing.T) {
 		require.ErrorContains(t, err, "LFS_JWT_SECRET", "a rotated.ini without it stops the recovery")
 	})
 }
+
+// The shipped deployments set [oauth2] JWT_SECRET and [server]
+// LFS_JWT_SECRET from their shared store (#297), and SECRET_KEY: FORGEJO__*
+// variables that the image's setup writes into app.ini at every start
+// (environment-to-ini). Step 2 read app.ini alone: run in the deployment's
+// container, with app.ini carrying the rotated secrets, it passed, and the
+// node's first start put the store's values back, the old cluster's,
+// compromised with its members (#305). The gate now names what this
+// process's environment sets to another value than rotated.ini's.
+func TestRecoverRotationRefusesWhatTheEnvironmentSetsBack(t *testing.T) {
+	dir := t.TempDir()
+	recipientKey := strings.Repeat("ab", 32)
+	recipient := "nas=" + recipientKey
+	rot, err := rotatedSecrets(filepath.Join(dir, rotatedFile), setting.SecretKey, recipient)
+	require.NoError(t, err)
+	// The node carries the rotated JWT_SECRET: the one this process signs
+	// with stands for it, as no test reloads [oauth2].
+	rot["JWT_SECRET"] = base64.RawURLEncoding.EncodeToString(setting.GetGeneralTokenSigningSecret())
+	rotatedLFS, err := generate.DecodeJwtSecret(rot["LFS_JWT_SECRET"])
+	require.NoError(t, err)
+	defer test.MockVariableValue(&setting.Cluster.ObserverRecipients, map[string]string{"nas": recipientKey})()
+	// app.ini as the operator left it: every rotated secret.
+	cfg, err := setting.NewConfigProviderFromData("[server]\nLFS_JWT_SECRET = " + rot["LFS_JWT_SECRET"] + "\n")
+	require.NoError(t, err)
+	defer test.MockVariableValue(&setting.CfgProvider, cfg)()
+	defer test.MockVariableValue(&setting.LFS.StartServer, true)()
+	key, err := jwtx.CreateSigningKey("HS256", rotatedLFS)
+	require.NoError(t, err)
+	defer test.MockVariableValue(&setting.LFS.SigningKey, key)()
+	pending, err := rotationPending(rot, recipient)
+	require.NoError(t, err)
+	require.Empty(t, pending, "app.ini alone carries the rotated secrets")
+
+	// The old cluster's values, as the deployment's store keeps them:
+	// drawn here, never written in the test.
+	_, oldLFS := generate.NewJwtSecret()
+	_, oldJWT := generate.NewJwtSecret()
+	_, oldKey := generate.NewJwtSecret()
+	file := func(name, content string) string {
+		f := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(f, []byte(content+"\n"), 0o600))
+		return f
+	}
+	for _, c := range []struct {
+		name string
+		env  map[string]string
+		want []string
+	}{
+		{"LFS secret", map[string]string{"FORGEJO__server__LFS_JWT_SECRET": oldLFS}, []string{"[server] LFS_JWT_SECRET"}},
+		{"LFS secret from a file", map[string]string{"FORGEJO__server__LFS_JWT_SECRET__FILE": file("lfs", oldLFS)}, []string{"[server] LFS_JWT_SECRET"}},
+		{"LFS secret from its URI", map[string]string{"FORGEJO__server__LFS_JWT_SECRET_URI": "file:" + file("lfs-uri", oldLFS)}, []string{"[server] LFS_JWT_SECRET"}},
+		{"LFS algorithm", map[string]string{"FORGEJO__server__LFS_JWT_SIGNING_ALGORITHM": "EdDSA"}, []string{"[server] LFS_JWT_SECRET (LFS_JWT_SIGNING_ALGORITHM EdDSA signs with a key file the recovery does not rotate: recover with HS256, the default)"}},
+		{"JWT secret, GITEA__", map[string]string{"GITEA__oauth2__JWT_SECRET": oldJWT}, []string{"[oauth2] JWT_SECRET"}},
+		{"JWT secret from a file", map[string]string{"FORGEJO__oauth2__JWT_SECRET__FILE": file("jwt", oldJWT)}, []string{"[oauth2] JWT_SECRET"}},
+		{"JWT secret from its URI", map[string]string{"FORGEJO__oauth2__JWT_SECRET_URI": "file:" + file("jwt-uri", oldJWT)}, []string{"[oauth2] JWT_SECRET"}},
+		{"SECRET_KEY", map[string]string{"FORGEJO__security__SECRET_KEY": oldKey}, []string{"[security] SECRET_KEY"}},
+		{"recipients", map[string]string{"FORGEJO__cluster__OBSERVER_RECIPIENTS": "old=" + strings.Repeat("cd", 32)}, []string{"[cluster] OBSERVER_RECIPIENTS"}},
+		{"all of them", map[string]string{
+			"FORGEJO__security__SECRET_KEY": oldKey, "FORGEJO__oauth2__JWT_SECRET": oldJWT, "FORGEJO__server__LFS_JWT_SECRET": oldLFS,
+		}, []string{"[security] SECRET_KEY", "[oauth2] JWT_SECRET", "[server] LFS_JWT_SECRET"}},
+		{"the rotated values", map[string]string{
+			"FORGEJO__security__SECRET_KEY": rot["SECRET_KEY"], "FORGEJO__oauth2__JWT_SECRET": rot["JWT_SECRET"],
+			"FORGEJO__server__LFS_JWT_SECRET": rot["LFS_JWT_SECRET"], "FORGEJO__cluster__OBSERVER_RECIPIENTS": "nas=" + strings.ToUpper(recipientKey),
+		}, nil},
+		{"other settings", map[string]string{"FORGEJO__server__ROOT_URL": "https://example.org/", "FORGEJO__server__LFS_START_SERVER": "true"}, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			for k, v := range c.env {
+				t.Setenv(k, v)
+			}
+			pending, err := rotationPending(rot, recipient)
+			require.NoError(t, err)
+			assert.Equal(t, c.want, pending)
+		})
+	}
+
+	t.Run("the variables named", func(t *testing.T) {
+		pending, vars, err := rotationGate(rot, recipient, []string{
+			"FORGEJO__server__LFS_JWT_SECRET=" + oldLFS, "FORGEJO__server__ROOT_URL=https://example.org/",
+			"GITEA__oauth2__JWT_SECRET__FILE=" + file("jwt-vars", oldJWT), "FORGEJO__oauth2__JWT_SECRET=" + oldJWT,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"[oauth2] JWT_SECRET", "[server] LFS_JWT_SECRET"}, pending)
+		assert.Equal(t, []string{"GITEA__oauth2__JWT_SECRET__FILE", "FORGEJO__oauth2__JWT_SECRET", "FORGEJO__server__LFS_JWT_SECRET"}, vars)
+	})
+	t.Run("named once", func(t *testing.T) {
+		// app.ini carries the old LFS secret too, as the setup rendered it.
+		old, err := generate.DecodeJwtSecret(oldLFS)
+		require.NoError(t, err)
+		cfg, err := setting.NewConfigProviderFromData("[server]\nLFS_JWT_SECRET = " + oldLFS + "\n")
+		require.NoError(t, err)
+		defer test.MockVariableValue(&setting.CfgProvider, cfg)()
+		k, err := jwtx.CreateSigningKey("HS256", old)
+		require.NoError(t, err)
+		defer test.MockVariableValue(&setting.LFS.SigningKey, k)()
+		pending, vars, err := rotationGate(rot, recipient, []string{"FORGEJO__server__LFS_JWT_SECRET=" + oldLFS})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"[server] LFS_JWT_SECRET"}, pending)
+		assert.Equal(t, []string{"FORGEJO__server__LFS_JWT_SECRET"}, vars)
+	})
+	t.Run("cleared after the start", func(t *testing.T) {
+		// An installed instance clears its FORGEJO__* variables while it
+		// reads its configuration: the gate reads them as the process
+		// started.
+		defer test.MockVariableValue(&startEnviron, []string{"FORGEJO__server__LFS_JWT_SECRET=" + oldLFS})()
+		pending, err := rotationPending(rot, recipient)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"[server] LFS_JWT_SECRET"}, pending)
+	})
+}

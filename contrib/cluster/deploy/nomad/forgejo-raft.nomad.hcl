@@ -45,7 +45,12 @@
 #     balancer sends the next request to: a node given none draws its own,
 #     and refuses the others' tokens. Each is 32 random bytes in unpadded
 #     base64url, `openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n'`.
-#     `nomad var put` replaces every item of the variable: give it the four;
+#     `nomad var put` replaces every item of the variable: give it the four.
+#     The image's setup writes them into app.ini at every start: after a
+#     `forgejo cluster recover --from-observer`, put rotated.ini's
+#     SECRET_KEY, JWT_SECRET and LFS_JWT_SECRET into secret_key, jwt_secret
+#     and lfs_jwt_secret before a node starts, or the old cluster's come
+#     back (contrib/cluster/observer.md, "Recovering from an observer");
 #   - a PostgreSQL that every node reaches, highly available (Patroni or a
 #     managed service): the cluster replicates git refs, not SQL.
 

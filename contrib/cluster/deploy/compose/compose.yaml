@@ -53,6 +53,12 @@ x-node: &node
     # The token-signing secrets, the same for every node: a token one node
     # hands out (the container registry's, the Actions', LFS's) is verified
     # by the node the next request reaches. A node given none draws its own.
+    # The setup writes them into app.ini at every start: after a `forgejo
+    # cluster recover --from-observer`, put rotated.ini's SECRET_KEY,
+    # JWT_SECRET and LFS_JWT_SECRET into .env before a node starts
+    # (bootstrap.sh never replaces a value .env holds), or the old
+    # cluster's come back (contrib/cluster/observer.md, "Recovering from
+    # an observer").
     FORGEJO__oauth2__JWT_SECRET: ${FORGEJO_JWT_SECRET:?}
     FORGEJO__server__LFS_JWT_SECRET: ${FORGEJO_LFS_JWT_SECRET:?}
     # Required by [cluster]: a user git hook would run inside the

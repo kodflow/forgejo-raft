@@ -194,12 +194,15 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		pending, err := rotationPending(rot, c.String("new-observer-recipient"))
+		pending, vars, err := rotationGate(rot, c.String("new-observer-recipient"), deploymentEnviron())
 		if err != nil {
 			return err
 		}
 		if len(pending) > 0 {
 			fmt.Fprintf(w, "The rotated secrets are in %s. Put them in this node's app.ini, then run the same command again. Not carried yet:\n  %s\n", filepath.Join(out, rotatedFile), strings.Join(pending, "\n  "))
+			if len(vars) > 0 {
+				fmt.Fprintf(w, "This process's environment sets some of them, as the deployment does at every start of Forgejo (the image's setup writes each FORGEJO__* and GITEA__* variable into app.ini): give %s rotated.ini's values where the deployment keeps them (its .env, Kubernetes Secret or Nomad variable), not in app.ini alone (contrib/cluster/observer.md).\n", strings.Join(vars, ", "))
+			}
 			return errRecoverStopped
 		}
 		if err := save(stepRotate); err != nil {
@@ -510,11 +513,51 @@ func parseRotated(b []byte) map[string]string {
 	return out
 }
 
+// startEnviron is this process's environment as it started: an installed
+// instance clears its FORGEJO__* and GITEA__* variables while it reads its
+// configuration (setting.ClearEnvConfigKeys), before step 2 runs.
+var startEnviron = os.Environ()
+
+// deploymentEnviron is the environment step 2 takes for the one Forgejo
+// starts with on this node: this process's, as it started then as it is.
+func deploymentEnviron() []string {
+	return append(slices.Clone(startEnviron), os.Environ()...)
+}
+
 // rotationPending names what of rotated.ini this node's configuration does
-// not carry yet, as the server loads it: step 2 stops until it carries
-// every secret, the old cluster's being the compromised ones (#284).
-// recipient is --new-observer-recipient.
+// not carry yet, as the server loads it, or the deployment's environment
+// sets back: step 2 stops until it carries every secret, the old cluster's
+// being the compromised ones (#284, #305). recipient is
+// --new-observer-recipient.
 func rotationPending(rot map[string]string, recipient string) ([]string, error) {
+	pending, _, err := rotationGate(rot, recipient, deploymentEnviron())
+	return pending, err
+}
+
+// rotationGate is step 2's gate: what this node's configuration does not
+// carry yet, then what environ sets to another value, and the variables
+// that do. A key the configuration lacks is named once.
+func rotationGate(rot map[string]string, recipient string, environ []string) (pending, vars []string, err error) {
+	pending, err = configPending(rot, recipient)
+	if err != nil {
+		return nil, nil, err
+	}
+	fromEnv, vars, err := environmentPending(rot, recipient, environ)
+	if err != nil {
+		return nil, nil, err
+	}
+	key := func(p string) string { k, _, _ := strings.Cut(p, " ("); return k }
+	for _, p := range fromEnv {
+		if !slices.ContainsFunc(pending, func(q string) bool { return key(q) == key(p) }) {
+			pending = append(pending, p)
+		}
+	}
+	return pending, vars, nil
+}
+
+// configPending names what of rotated.ini this node's configuration does
+// not carry yet, as the server loads it.
+func configPending(rot map[string]string, recipient string) ([]string, error) {
 	var pending []string
 	if setting.SecretKey != rot["SECRET_KEY"] {
 		pending = append(pending, "[security] SECRET_KEY")
@@ -539,10 +582,107 @@ func rotationPending(rot map[string]string, recipient string) ([]string, error) 
 	if why != "" {
 		pending = append(pending, why)
 	}
-	if !recipientSet(recipient) {
+	if !recipientIn(setting.Cluster.ObserverRecipients, recipient) {
 		pending = append(pending, "[cluster] OBSERVER_RECIPIENTS")
 	}
 	return pending, nil
+}
+
+// environmentPending names the settings of rotated.ini that environ sets
+// to other values than rotated.ini's, and the variables that set them. The
+// image's setup writes every FORGEJO__* and GITEA__* variable into app.ini
+// at each start (environment-to-ini), as setting.EnvironmentToConfig reads
+// them, __FILE and _URI included. The shipped deployments set SECRET_KEY,
+// JWT_SECRET and LFS_JWT_SECRET so, from their store: app.ini carrying the
+// rotated secrets holds until Forgejo starts, which puts the store's back,
+// the old cluster's (#305). Only what this process's environment says is
+// seen: run outside the deployment's, the command cannot see its store.
+func environmentPending(rot map[string]string, recipient string, environ []string) (pending, vars []string, err error) {
+	cfg, err := setting.NewConfigProviderFromData("")
+	if err != nil {
+		return nil, nil, err
+	}
+	setting.EnvironmentToConfig(cfg, environ)
+	// The variables that set each section's keys, in environ's order.
+	setBy := map[string][]string{}
+	for _, kv := range environ {
+		one, err := setting.NewConfigProviderFromData("")
+		if err != nil {
+			return nil, nil, err
+		}
+		if !setting.EnvironmentToConfig(one, []string{kv}) {
+			continue
+		}
+		name, _, _ := strings.Cut(kv, "=")
+		for _, sec := range one.Sections() {
+			for _, k := range sec.Keys() {
+				id := sec.Name() + "\x00" + k.Name()
+				if !slices.Contains(setBy[id], name) {
+					setBy[id] = append(setBy[id], name)
+				}
+			}
+		}
+	}
+	sets := func(section string, keys ...string) []string {
+		var out []string
+		for _, k := range keys {
+			out = append(out, setBy[section+"\x00"+k]...)
+		}
+		return out
+	}
+	name := func(p string, by []string) {
+		pending = append(pending, p)
+		for _, v := range by {
+			if !slices.Contains(vars, v) {
+				vars = append(vars, v)
+			}
+		}
+	}
+	// differs says whether a symmetric secret the environment configures,
+	// in unpadded base64url, is not rotated.ini's; one the server could not
+	// read is not either: it would draw another, or stop.
+	differs := func(v string, err error, rotated []byte) bool {
+		if err != nil {
+			return true
+		}
+		b, err := generate.DecodeJwtSecret(v)
+		return err != nil || !bytes.Equal(b, rotated)
+	}
+	jwt, err := generate.DecodeJwtSecret(rot["JWT_SECRET"])
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: JWT_SECRET: %w", rotatedFile, err)
+	}
+	lfs, err := generate.DecodeJwtSecret(rot["LFS_JWT_SECRET"])
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: LFS_JWT_SECRET: %w", rotatedFile, err)
+	}
+
+	if by := sets("security", "SECRET_KEY", "SECRET_KEY_URI"); len(by) > 0 {
+		if v, err := setting.ConfiguredSecret(cfg.Section("security"), "SECRET_KEY_URI", "SECRET_KEY"); err != nil || v != rot["SECRET_KEY"] {
+			name("[security] SECRET_KEY", by)
+		}
+	}
+	if by := sets("oauth2", "JWT_SECRET", "JWT_SECRET_URI"); len(by) > 0 {
+		if v, err := setting.ConfiguredSecret(cfg.Section("oauth2"), "JWT_SECRET_URI", "JWT_SECRET"); differs(v, err, jwt) {
+			name("[oauth2] JWT_SECRET", by)
+		}
+	}
+	if by := sets("server", "LFS_JWT_SECRET", "LFS_JWT_SECRET_URI"); len(by) > 0 {
+		if v, err := setting.LFSJWTSecretConfigured(cfg); differs(v, err, lfs) {
+			name("[server] LFS_JWT_SECRET", by)
+		}
+	}
+	if by := sets("server", "LFS_JWT_SIGNING_ALGORITHM"); len(by) > 0 {
+		if alg := cfg.Section("server").Key("LFS_JWT_SIGNING_ALGORITHM").String(); jwtx.IsValidAsymmetricAlgorithm(alg) {
+			name(lfsAsymmetric(alg), by)
+		}
+	}
+	if by := sets("cluster", "OBSERVER_RECIPIENTS"); len(by) > 0 {
+		if !recipientIn(parseRecipients(cfg.Section("cluster").Key("OBSERVER_RECIPIENTS").Strings(",")), recipient) {
+			name("[cluster] OBSERVER_RECIPIENTS", by)
+		}
+	}
+	return pending, vars, nil
 }
 
 // lfsSecretPending says why this node's LFS signing key is not rotated's,
@@ -562,13 +702,10 @@ func lfsSecretPending(rotated []byte) (string, error) {
 	if b, err := generate.DecodeJwtSecret(configured); err != nil || !bytes.Equal(b, rotated) {
 		return name, nil
 	}
-	asymmetric := func(alg string) string {
-		return fmt.Sprintf("%s (LFS_JWT_SIGNING_ALGORITHM %s signs with a key file the recovery does not rotate: recover with HS256, the default)", name, alg)
-	}
 	// As the server reads it (loadSigningKeyCfg), with the server off too;
 	// unset is HS256.
 	if alg := setting.CfgProvider.Section("server").Key("LFS_JWT_SIGNING_ALGORITHM").String(); jwtx.IsValidAsymmetricAlgorithm(alg) {
-		return asymmetric(alg), nil
+		return lfsAsymmetric(alg), nil
 	}
 	if !setting.LFS.StartServer {
 		return "", nil
@@ -578,7 +715,7 @@ func lfsSecretPending(rotated []byte) (string, error) {
 		return name + " (the LFS server's key is not loaded)", nil
 	}
 	if !k.IsSymmetric() {
-		return asymmetric(k.SigningMethod().Alg()), nil
+		return lfsAsymmetric(k.SigningMethod().Alg()), nil
 	}
 	if b, ok := k.VerifyKey().([]byte); !ok || !bytes.Equal(b, rotated) {
 		return name, nil
@@ -586,9 +723,26 @@ func lfsSecretPending(rotated []byte) (string, error) {
 	return "", nil
 }
 
-func recipientSet(nameKey string) bool {
+// lfsAsymmetric names an asymmetric LFS_JWT_SIGNING_ALGORITHM as pending.
+func lfsAsymmetric(alg string) string {
+	return fmt.Sprintf("[server] LFS_JWT_SECRET (LFS_JWT_SIGNING_ALGORITHM %s signs with a key file the recovery does not rotate: recover with HS256, the default)", alg)
+}
+
+// parseRecipients reads OBSERVER_RECIPIENTS as the settings do.
+func parseRecipients(entries []string) map[string]string {
+	out := map[string]string{}
+	for _, p := range entries {
+		name, key, _ := strings.Cut(strings.TrimSpace(p), "=")
+		out[strings.TrimSpace(name)] = strings.ToLower(strings.TrimSpace(key))
+	}
+	return out
+}
+
+// recipientIn says whether recipients hold nameKey, name=hex.
+func recipientIn(recipients map[string]string, nameKey string) bool {
 	name, key, _ := strings.Cut(nameKey, "=")
-	return setting.Cluster.ObserverRecipients[name] == strings.ToLower(key)
+	got, ok := recipients[name]
+	return ok && got == strings.ToLower(key)
 }
 
 // replayWait bounds the wait for PostgreSQL's replay, as pg_ctl's -t does.
