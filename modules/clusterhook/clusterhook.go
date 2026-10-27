@@ -580,13 +580,14 @@ func OwnerRenameRefusal(ctx context.Context, oldOwner, newOwner string) error {
 	return f(ctx, strings.ToLower(oldOwner), strings.ToLower(newOwner))
 }
 
-var holdOwnerDirs func(ctx context.Context, owners []string) (func(), error)
+var holdDirs func(ctx context.Context, names []string) (func(), error)
 
-// SetOwnerDirectoryHold registers the replicator's hold of owners'
-// directories on this node.
-func SetOwnerDirectoryHold(f func(ctx context.Context, owners []string) (func(), error)) {
+// SetOwnerDirectoryHold registers the replicator's hold of directories on
+// this node: names are owners, whose hold covers every repository under
+// them, or repository keys (RepoKey).
+func SetOwnerDirectoryHold(f func(ctx context.Context, names []string) (func(), error)) {
 	lifecycleMu.Lock()
-	holdOwnerDirs = f
+	holdDirs = f
 	lifecycleMu.Unlock()
 }
 
@@ -601,17 +602,41 @@ func SetOwnerDirectoryHold(f func(ctx context.Context, owners []string) (func(),
 // or an error, nothing held, when that did not end within ctx. Without a
 // cluster it does nothing.
 func HoldOwnerDirectories(ctx context.Context, owners ...string) (func(), error) {
-	lifecycleMu.RLock()
-	f := holdOwnerDirs
-	lifecycleMu.RUnlock()
-	if f == nil {
-		return func() {}, nil
-	}
 	lower := make([]string, len(owners))
 	for i, o := range owners {
 		lower[i] = strings.ToLower(o)
 	}
-	release, err := f(ctx, lower)
+	return holdDirectories(ctx, lower)
+}
+
+// HoldRepoDirectories is HoldOwnerDirectories for a repository's rename or
+// transfer: the keys of the repository and of its wiki, under their old
+// and their new names. Forgejo moves their directories before RepoRenamed
+// proposes the move, and back when the cluster refuses it, while the
+// replicated table still names the repository under its old key: the
+// cluster fetched the whole repository again into a directory it created
+// there meanwhile, which stayed under the freed name, and a repository
+// created later under that name adopted it and served the moved
+// repository's objects under its own rights (#274). Forgejo holds them
+// from before the move until the rename or the transfer ends, its move
+// back included.
+func HoldRepoDirectories(ctx context.Context, oldOwner, oldName, newOwner, newName string) (func(), error) {
+	return holdDirectories(ctx, []string{
+		RepoKey(oldOwner, oldName, false), RepoKey(oldOwner, oldName, true),
+		RepoKey(newOwner, newName, false), RepoKey(newOwner, newName, true),
+	})
+}
+
+// holdDirectories takes the registered hold of names, and returns its
+// release, safe to call more than once.
+func holdDirectories(ctx context.Context, names []string) (func(), error) {
+	lifecycleMu.RLock()
+	f := holdDirs
+	lifecycleMu.RUnlock()
+	if f == nil {
+		return func() {}, nil
+	}
+	release, err := f(ctx, names)
 	if err != nil {
 		return nil, err
 	}

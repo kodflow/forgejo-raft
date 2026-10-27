@@ -151,6 +151,11 @@ type consumer struct {
 	lacking  map[lackKey]*lackState
 	fetching map[string]bool
 	fetches  sync.WaitGroup
+	// holds are the projector's: a fetch of such commits writes under the
+	// repository's directory, and a rename on this node that moves it,
+	// the repository's or its owner's, cancels it and waits for its end
+	// (#275). nil in unit tests.
+	holds *dirHolds
 }
 
 // lackKey is a commit a repository's directory lacks.
@@ -234,6 +239,9 @@ func newConsumer(r *Replicator) *consumer {
 	}
 	if r.objects != nil {
 		c.fetch = r.objects.fetchMissing
+	}
+	if r.projector != nil {
+		c.holds = r.projector.holds
 	}
 	c.ack = func(ctx context.Context, lineage string, index uint64) error {
 		data, err := reftable.Encode(reftable.KindAck, &reftable.Ack{Identity: lineage, Index: index})
@@ -1306,11 +1314,27 @@ func (c *consumer) obtain(ctx context.Context, evs []reftable.Event) map[string]
 
 // startFetch fetches the commits ids into dir from the members, in the
 // background, and notes what they answered; it returns a channel closed
-// when that fetch ended, or nil when a fetch for dir runs already. The
-// fetch is bounded by the object channel's own bounds and by ctx.
+// when that fetch ended, or nil when a fetch for dir runs already, or
+// when Forgejo moves dir on this node. The fetch is bounded by the object
+// channel's own bounds and by ctx.
+//
+// The fetch writes under dir, its quarantine created there (receivePack):
+// it is a writer of key's directory until it ends. A rename on this node
+// that moves that directory, the repository's or its owner's, holds it
+// (dirHolds): the hold cancels the fetch and waits for its end, and no
+// fetch starts there until it is released. Outside the hold, a fetch
+// whose member answered after Forgejo moved the directory created it
+// again under the old name, which refused the move back of a refused
+// rename and every later rename to that name (#275). A fetch ended so is
+// tried again by a later dispatch, as a failed one.
 func (c *consumer) startFetch(ctx context.Context, key, dir string, ids []string) <-chan struct{} {
 	c.mu.Lock()
 	if c.fetching[dir] {
+		c.mu.Unlock()
+		return nil
+	}
+	fctx, leave, ok := c.holds.enterCtx(ctx, key)
+	if !ok {
 		c.mu.Unlock()
 		return nil
 	}
@@ -1323,14 +1347,18 @@ func (c *consumer) startFetch(ctx context.Context, key, dir string, ids []string
 	done := make(chan struct{})
 	go func() {
 		defer c.fetches.Done()
+		defer leave()
 		fetched := false
 		for _, id := range ids {
+			if fctx.Err() != nil {
+				break // ended by a hold, or by ctx
+			}
 			// One commit at a time: a member holding one of them only
 			// answers that it does not hold them all.
-			if m, err := missingObjects(ctx, dir, []string{id}); err == nil && len(m) == 0 {
+			if m, err := missingObjects(fctx, dir, []string{id}); err == nil && len(m) == 0 {
 				continue
 			}
-			err := c.fetch(ctx, key, dir, []string{id})
+			err := c.fetch(fctx, key, dir, []string{id})
 			c.noteFetch(dir, id, err)
 			switch {
 			case err == nil:

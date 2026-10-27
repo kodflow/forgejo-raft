@@ -77,9 +77,22 @@ func transferOwnership(ctx context.Context, doer *user_model.User, newOwnerName 
 		return fmt.Errorf("transfer repository in the cluster: %w", err)
 	}
 
+	// In a cluster, nothing of the cluster writes under the directories of
+	// the repository and its wiki, under both owners, on this node while
+	// they move, back too after a failure: until the transfer is applied,
+	// the replicated table names the repository under its old owner, and
+	// a directory the cluster created there meanwhile kept the repository's
+	// objects under the freed name, for a repository created there later
+	// to serve (#274). It is released last, after any undo.
+	releaseDirs, err := clusterhook.HoldRepoDirectories(ctx, repo.Owner.Name, repo.Name, newOwnerName, repo.Name)
+	if err != nil {
+		return fmt.Errorf("transfer repository in the cluster: %w", err)
+	}
+	defer releaseDirs()
+
 	// In a cluster, the move recorded in the replicated table and the SQL
 	// committed below fall on the same side of a checkpoint (#88). It is
-	// released last, after any undo.
+	// released after any undo.
 	releaseCut, err := clusterhook.HoldCut(ctx)
 	if err != nil {
 		return err
@@ -355,6 +368,19 @@ func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newR
 	if err := clusterhook.RepoRenameRefusal(ctx, repo.Owner.Name, oldRepoName); err != nil {
 		return fmt.Errorf("rename repository in the cluster: %w", err)
 	}
+
+	// In a cluster, nothing of the cluster writes under the directories of
+	// the repository and its wiki, old and new names, on this node while
+	// they move, back too when the cluster refuses the rename: until the
+	// rename is applied, the replicated table names the repository under
+	// its old key, and a directory the cluster created there meanwhile kept
+	// the repository's objects under the freed name, for a repository
+	// created there later to serve (#274).
+	releaseDirs, err := clusterhook.HoldRepoDirectories(ctx, repo.Owner.Name, oldRepoName, repo.Owner.Name, newRepoName)
+	if err != nil {
+		return fmt.Errorf("rename repository in the cluster: %w", err)
+	}
+	defer releaseDirs()
 
 	// In a cluster, the move recorded in the replicated table and the SQL
 	// committed below fall on the same side of a checkpoint (#88).

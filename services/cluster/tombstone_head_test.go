@@ -106,11 +106,20 @@ func TestKeysAllTombstonesCertifyAfterRenamesOnALaggingNode(t *testing.T) {
 	}
 }
 
-// renameOn renames a repository on node n as Forgejo does: the directory
-// first, then the entry.
+// renameOn renames a repository on node n as Forgejo does: the keys of
+// the repository and of its wiki, under both names, held on n
+// (clusterhook.HoldRepoDirectories), then the directory, then the entry,
+// and the hold released once the entry returned. Without the hold, a fetch
+// of n's projector into the old key that fell between the move and the
+// entry created its directory again, and the next rename to that name met
+// it, "file exists" (#274).
 func renameOn(t *testing.T, n *testNode, from, to string) {
 	t.Helper()
 	root := n.r.root
+	wiki := func(key string) string { return strings.TrimSuffix(key, ".git") + ".wiki.git" }
+	release, err := n.r.holdOwnerDirectories(t.Context(), []string{from, wiki(from), to, wiki(to)})
+	require.NoError(t, err)
+	defer release()
 	require.NoError(t, os.Rename(filepath.Join(root, filepath.FromSlash(from)), filepath.Join(root, filepath.FromSlash(to))))
 	require.NoError(t, n.r.proposeRepoRename(t.Context(), from, to))
 }
