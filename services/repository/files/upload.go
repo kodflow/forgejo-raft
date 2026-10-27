@@ -39,8 +39,10 @@ type uploadInfo struct {
 	lfsMetaObject *git_model.LFSMetaObject
 }
 
-func cleanUpAfterFailure(ctx context.Context, infos *[]uploadInfo, t *TemporaryUploadRepository, original error) error {
-	for _, info := range *infos {
+// cleanUpAfterFailure removes the rows of infos that did not exist before
+// this upload committed them.
+func cleanUpAfterFailure(ctx context.Context, infos []uploadInfo, t *TemporaryUploadRepository, original error) error {
+	for _, info := range infos {
 		if info.lfsMetaObject == nil {
 			continue
 		}
@@ -169,27 +171,31 @@ func UploadRepoFiles(ctx context.Context, repo *repo_model.Repository, doer *use
 		return err
 	}
 
-	// Now deal with LFS objects
+	// Now deal with LFS objects. Every file is written, its content
+	// checked, before any row is committed, as the LFS server's upload
+	// does. A row committed first named a file the storage did not hold
+	// yet: a cluster checkpoint taken meanwhile, or after the node died
+	// there, was refused by recover --from-observer (#289). There's no way
+	// to clean up the store once a file is in there: the content addresses
+	// it, another repository may name it, and one whose row never comes is
+	// an orphan, which `forgejo doctor` (storages) finds.
+	contentStore := lfs.NewContentStore()
+	for _, info := range infos {
+		if err := uploadToLFSContentStore(info, contentStore); err != nil {
+			// No row is committed yet.
+			return err
+		}
+	}
 	for i := range infos {
 		if infos[i].lfsMetaObject == nil {
 			continue
 		}
-		infos[i].lfsMetaObject, err = git_model.NewLFSMetaObject(ctx, infos[i].lfsMetaObject.RepositoryID, infos[i].lfsMetaObject.Pointer)
+		meta, err := git_model.NewLFSMetaObject(ctx, infos[i].lfsMetaObject.RepositoryID, infos[i].lfsMetaObject.Pointer)
 		if err != nil {
-			// OK Now we need to cleanup
-			return cleanUpAfterFailure(ctx, &infos, t, err)
+			// Only the rows committed before this one are ours to remove.
+			return cleanUpAfterFailure(ctx, infos[:i], t, err)
 		}
-		// Don't move the files yet - we need to ensure that
-		// everything can be inserted first
-	}
-
-	// OK now we can insert the data into the store - there's no way to clean up the store
-	// once it's in there, it's in there.
-	contentStore := lfs.NewContentStore()
-	for _, info := range infos {
-		if err := uploadToLFSContentStore(info, contentStore); err != nil {
-			return cleanUpAfterFailure(ctx, &infos, t, err)
-		}
+		infos[i].lfsMetaObject = meta
 	}
 
 	// Then push this tree to NewBranch

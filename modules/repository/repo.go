@@ -216,17 +216,23 @@ func StoreMissingLfsObjectsInRepository(ctx context.Context, repo *repo_model.Re
 
 			defer content.Close()
 
-			_, err := git_model.NewLFSMetaObject(ctx, repo.ID, p)
-			if err != nil {
-				log.Error("Repo[%-v]: Error creating LFS meta object %-v: %v", repo, p, err)
+			// The object is written, its content checked, before its row
+			// is committed, as the LFS server's upload does. A row
+			// committed first named, for the whole download, a file the
+			// storage did not hold: a cluster checkpoint taken meanwhile
+			// was refused by recover --from-observer, and a node that died
+			// then left the row for good, every later synchronisation
+			// skipping an object whose row exists (#289). A file whose row
+			// never comes is an orphan, which `forgejo doctor` (storages)
+			// finds; it is not removed here: the content addresses it, and
+			// another repository may name it.
+			if err := contentStore.Put(p, content); err != nil {
+				log.Error("Repo[%-v]: Error storing content for LFS meta object %-v: %v", repo, p, err)
 				return err
 			}
 
-			if err := contentStore.Put(p, content); err != nil {
-				log.Error("Repo[%-v]: Error storing content for LFS meta object %-v: %v", repo, p, err)
-				if _, err2 := git_model.RemoveLFSMetaObjectByOid(ctx, repo.ID, p.Oid); err2 != nil {
-					log.Error("Repo[%-v]: Error removing LFS meta object %-v: %v", repo, p, err2)
-				}
+			if _, err := git_model.NewLFSMetaObject(ctx, repo.ID, p); err != nil {
+				log.Error("Repo[%-v]: Error creating LFS meta object %-v: %v", repo, p, err)
 				return err
 			}
 			return nil
