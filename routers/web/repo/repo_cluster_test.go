@@ -37,3 +37,23 @@ func TestGenerateFromATemplateRefusedOnANodeBehind(t *testing.T) {
 	assert.Contains(t, resp.Body.String(), "may be behind")
 	unittest.AssertNotExistsBean(t, &repo_model.Repository{OwnerID: 2, LowerName: "generated-behind"})
 }
+
+// A fork through the web form on a node of the cluster that does not serve
+// its base yet is refused with 503 and the reason, before anything is
+// written (#283).
+func TestForkRefusedOnANodeBehind(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	clusterhook.SetFreshWaiter(func(context.Context, string) bool { return false })
+	t.Cleanup(func() { clusterhook.SetFreshWaiter(nil) })
+
+	ctx, resp := contexttest.MockContext(t, "user2/repo1/fork")
+	contexttest.LoadUser(t, ctx, 4)
+	contexttest.LoadRepo(t, ctx, 1)
+	web.SetForm(ctx, &forms.CreateRepoForm{UID: 4, RepoName: "forked-behind"})
+
+	ForkPost(ctx)
+
+	assert.Equal(t, http.StatusServiceUnavailable, resp.Result().StatusCode)
+	assert.Contains(t, resp.Body.String(), "may be behind")
+	unittest.AssertNotExistsBean(t, &repo_model.Repository{OwnerID: 4, LowerName: "forked-behind"})
+}

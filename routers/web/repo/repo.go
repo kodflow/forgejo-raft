@@ -822,6 +822,12 @@ func SyncFork(ctx *context.Context) {
 
 	syncForkInfo, err := repo_service.GetSyncForkInfo(ctx, ctx.Repo.Repository, branch)
 	if err != nil {
+		if errors.Is(err, clusterhook.ErrBehind) {
+			// A node of the cluster that does not serve the base yet:
+			// nothing was pushed, the user retries (#283).
+			ctx.Error(http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		ctx.ServerError("GetSyncForkInfo", err)
 		return
 	}
@@ -833,6 +839,10 @@ func SyncFork(ctx *context.Context) {
 
 	err = repo_service.SyncFork(ctx, ctx.Doer, ctx.Repo.Repository, branch)
 	if err != nil {
+		if errors.Is(err, clusterhook.ErrBehind) {
+			ctx.Error(http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		ctx.ServerError("SyncFork", err)
 		return
 	}

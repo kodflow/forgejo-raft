@@ -151,6 +151,11 @@ func CreateFork(ctx *context.APIContext) {
 		Description: repo.Description,
 	})
 	if err != nil {
+		// A node of the cluster that does not serve the base yet answers
+		// 503: nothing was written, the client retries (#283).
+		if clusterBehind(ctx, err) {
+			return
+		}
 		if errors.Is(err, util.ErrAlreadyExist) || repo_model.IsErrReachLimitOfRepo(err) {
 			ctx.Error(http.StatusConflict, "ForkRepositoryAndUpdates", err)
 		} else {
