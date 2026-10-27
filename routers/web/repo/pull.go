@@ -328,6 +328,10 @@ func ForkPost(ctx *context.Context) {
 			ctx.RenderWithErr(ctx.Tr("repo.form.name_reserved", err.(db.ErrNameReserved).Name), tplFork, &form)
 		case db.IsErrNamePatternNotAllowed(err):
 			ctx.RenderWithErr(ctx.Tr("repo.form.name_pattern_not_allowed", err.(db.ErrNamePatternNotAllowed).Pattern), tplFork, &form)
+		case errors.Is(err, clusterhook.ErrBehind):
+			// A node of the cluster that does not serve the base yet:
+			// nothing was written, the user retries (#283).
+			ctx.Error(http.StatusServiceUnavailable, err.Error())
 		default:
 			ctx.ServerError("ForkPost", err)
 		}

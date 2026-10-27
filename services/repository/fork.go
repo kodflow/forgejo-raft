@@ -78,6 +78,15 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 	if err := clusterCreateRefusal(ctx, owner, opts.Name); err != nil {
 		return nil, err
 	}
+	// And the base's directory on this node is read before anything is
+	// written too: once this node serves the base at the cluster's commit
+	// index, between two checks that it holds the base, into a staging
+	// copy the fork's refs then come from (#283).
+	staging, removeStaging, err := stageForkBase(ctx, opts.BaseRepo)
+	if err != nil {
+		return nil, err
+	}
+	defer removeStaging()
 
 	defaultBranch := opts.BaseRepo.DefaultBranch
 	if opts.SingleBranch != "" {
@@ -157,7 +166,7 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 
 		repoPath := repo_model.RepoPath(owner.Name, repo.Name)
 		if clusterhook.Enabled() {
-			if err := copyForkInCluster(txCtx, opts, oldRepoPath, repoPath, defaultBranch, repo.ObjectFormatName); err != nil {
+			if err := copyForkInCluster(txCtx, opts, staging, repoPath, defaultBranch, repo.ObjectFormatName); err != nil {
 				log.Error("Fork Repository (git init and fetch) Failed for %v (from %v): %v", repo, opts.BaseRepo, err)
 				return err
 			}
@@ -220,7 +229,11 @@ func ForkRepositoryIfNotExists(ctx context.Context, doer, owner *user_model.User
 // the fork's row is not committed yet, and they refuse them. `git init`
 // writes HEAD alone first, which ships no object and makes the key known
 // to the table; the refs then follow with `git fetch`, by batches that
-// stay within the cluster's bound of refs per transaction (#80).
+// stay within the cluster's bound of refs per transaction (#80). from is
+// the staging copy of the base stageForkBase read and checked, never the
+// base's directory: each batch sends its refs to the other members as it
+// lands, and the projector may move another repository under the base's
+// name between two of them (#283).
 func copyForkInCluster(ctx context.Context, opts ForkRepoOptions, from, to, defaultBranch, objectFormat string) error {
 	if strings.ContainsAny(opts.SingleBranch, "*:") {
 		return fmt.Errorf("invalid branch name %q", opts.SingleBranch)
@@ -245,6 +258,70 @@ func copyForkInCluster(ctx context.Context, opts ForkRepoOptions, from, to, defa
 		return err
 	}
 	return fetchRefsInBatches(ctx, from, to, append(refs, tags...), 10*time.Minute)
+}
+
+// stageForkBase reads, in a cluster, the base's directory on this node
+// into a staging copy, outside the repository root and so not replicated,
+// and returns its path and its removal. The fork's refs come from that
+// copy (copyForkInCluster), never from the base's directory itself.
+//
+// The fork read the base's directory by the name the request loaded at its
+// start, past the one guard RepoAssignment made, and fetched from it right
+// into the fork, whose refs, and the objects they carry, each fetch sends
+// to the other members. On a node behind the cluster, the directory showed
+// the base from before a push another node acknowledged: the fork started
+// from the commit before it, on every member and for good. Or it held
+// another repository, a private one, renamed under the base's name and
+// projected on this node meanwhile: its history went into the fork, public
+// as its base, on every member (#283, as #261 for a generation).
+//
+// The fork now first waits for this node to serve the base at the commit
+// index the cluster confirms at the call (clusterhook.RequireFresh), as a
+// generation from a template does. The base's directory is then read once,
+// by `git clone --bare` into the staging copy, between two checks that it
+// holds the base, and nothing else (readSourceDirectory). Every refusal
+// wraps clusterhook.ErrBehind and comes before anything of the fork is
+// written, its row, its key or any ref: what the fork takes from this
+// copy, batch by batch, was read and checked whole before. The copy takes
+// what `git clone --bare` would, the base's branches and tags.
+//
+// Without a cluster it does not read the base: the fork clones the base's
+// directory itself, as before, and the path is empty.
+func stageForkBase(ctx context.Context, base *repo_model.Repository) (string, func(), error) {
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(base.OwnerName, base.Name, false)); err != nil {
+		return "", nil, err
+	}
+	if !clusterhook.Enabled() {
+		return "", func() {}, nil
+	}
+	staging, err := repo_module.CreateTemporaryPath("fork")
+	if err != nil {
+		return "", nil, err
+	}
+	remove := func() {
+		if err := repo_module.RemoveTemporaryPath(staging); err != nil {
+			log.Error("Failed to remove the staging copy of the fork's base %s: %v", base.FullName(), err)
+		}
+	}
+	from := base.RepoPath()
+	if err := readSourceDirectory(ctx, base, "base repository", forkRefused, func() error {
+		if stdout, _, err := git.NewCommand(ctx, "clone", "--bare", "--quiet").AddDynamicArguments(from, staging).
+			SetDescription(fmt.Sprintf("stageForkBase(git clone): %s", base.FullName())).
+			RunStdString(&git.RunOpts{Timeout: 10 * time.Minute}); err != nil {
+			return fmt.Errorf("git clone: %w: %s", err, stdout)
+		}
+		return nil
+	}); err != nil {
+		remove()
+		return "", nil, err
+	}
+	return staging, remove, nil
+}
+
+// forkRefused is a refusal of the fork, wrapping clusterhook.ErrBehind: the
+// caller retries.
+func forkRefused(err error) error {
+	return fmt.Errorf("%w: %w; no fork was created", clusterhook.ErrBehind, err)
 }
 
 // ForkRepositoryAndUpdates forks a repository. On success it updates metadata (size, stats, etc.) and send a notification.
