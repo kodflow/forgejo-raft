@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -230,10 +231,16 @@ func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, err
 
 // RestoreFiles copies a checkpoint's stored files under their storages'
 // roots, checked by digest; a file already there with other bytes stops it.
+// Run again after a crash, it removes the temporary files the killed copies
+// left beside the files it restores.
 func (a *Archive) RestoreFiles(name string, roots map[string]string) (int, error) {
 	m, err := a.store.ReadManifest(name)
 	if err != nil {
 		return 0, err
+	}
+	left := copyLeftovers{held: make(map[string]bool, len(m.Files)), dirs: map[string][]string{}}
+	for _, f := range m.Files {
+		left.held[f.Storage+"/"+f.Path] = true
 	}
 	ready := map[string]bool{}
 	for i, f := range m.Files {
@@ -254,10 +261,16 @@ func (a *Archive) RestoreFiles(name string, roots map[string]string) (int, error
 			return i, fmt.Errorf("unsafe stored path %q", f.Path)
 		}
 		dst := filepath.Join(root, filepath.FromSlash(clean))
-		if sum, err := fileSHA256(dst); err == nil {
-			if sum != f.SHA256 {
-				return i, fmt.Errorf("%s exists with other bytes", dst)
-			}
+		have, herr := fileSHA256(dst)
+		if herr == nil && have != f.SHA256 {
+			return i, fmt.Errorf("%s exists with other bytes", dst)
+		}
+		// Absent, or whole from an earlier run: a copy killed before its
+		// link, or after it, left its temporary file beside it.
+		if err := left.drop(dst, f.Storage, clean); err != nil {
+			return i, err
+		}
+		if herr == nil {
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
@@ -283,6 +296,57 @@ func (a *Archive) RestoreFiles(name string, roots map[string]string) (int, error
 		}
 	}
 	return len(m.Files), nil
+}
+
+// copyLeftovers finds the temporary files a killed RestoreFiles left: the
+// name writeStream copies a file under, ".<name>.<digits>" beside it, which
+// its deferred removal never takes away from a process killed, out of
+// memory or powered off. The restored cluster's leader would list one as a
+// stored file at every checkpoint, and its observers refuse an LFS path
+// that is not a digest: none of its checkpoints would ever be ingested
+// (#290). Nothing else writes such a name in a storage root, whose uploads
+// go through its temporary directory; a name the checkpoint holds itself
+// is kept all the same.
+type copyLeftovers struct {
+	// held are the files the checkpoint holds, by storage and path.
+	held map[string]bool
+	// dirs are the regular files named ".*" of each directory, read once:
+	// a storage directory may hold many files.
+	dirs map[string][]string
+}
+
+// drop removes the temporary files of the copies into dst, the file of
+// storage at path p, and makes their removal durable before the step is
+// recorded.
+func (l *copyLeftovers) drop(dst, storage, p string) error {
+	dir := filepath.Dir(dst)
+	names, ok := l.dirs[dir]
+	if !ok {
+		entries, err := os.ReadDir(dir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		for _, e := range entries {
+			if e.Type().IsRegular() && strings.HasPrefix(e.Name(), ".") {
+				names = append(names, e.Name())
+			}
+		}
+		l.dirs[dir] = names
+	}
+	removed := false
+	for _, name := range names {
+		if !isTempName(name, filepath.Base(dst)) || l.held[storage+"/"+path.Join(path.Dir(p), name)] {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		removed = true
+	}
+	if !removed {
+		return nil
+	}
+	return syncDir(dir)
 }
 
 // ---- PostgreSQL ----

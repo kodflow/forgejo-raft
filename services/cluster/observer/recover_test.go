@@ -368,3 +368,90 @@ func TestRestoreReposRefusesAnEscapingKey(t *testing.T) {
 	require.Error(t, err)
 	assert.NoDirExists(t, filepath.Join(base, "escape.git"))
 }
+
+// A rerun of step 4 removes the temporary files a killed copy left beside
+// the stored files it restores, ".<name>.<digits>" as writeStream names
+// them, whether the copy was killed before its link (the file absent) or
+// after it (the file whole): the restored cluster's leader would list them,
+// and its observers refuse an LFS path that is not a digest (#290). It
+// removes nothing else: not a file the checkpoint itself holds, not a name
+// writeStream does not make, not a directory.
+func TestRestoreFilesRerunRemovesOnlyTheTemporaryFilesItLeft(t *testing.T) {
+	ctx := t.Context()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	seed(t, c, o)
+	// An attachment whose own name has the shape of a temporary file of
+	// another one beside it: the checkpoint holds both.
+	c.storeAttachment("a1/b2/9f0c2d4e-attachment", "an attachment")
+	c.storeAttachment("a1/b2/.9f0c2d4e-attachment.12", "another attachment")
+	cp := c.checkpoint()
+	require.NoError(t, o.Step(ctx))
+	a, err := OpenArchive(o.cfg.Dir, "")
+	require.NoError(t, err)
+	m, err := a.Manifest(cp.Name())
+	require.NoError(t, err)
+	var obj string
+	for _, f := range m.Files {
+		if f.Storage == "lfs" {
+			obj = f.Path
+		}
+	}
+	require.NotEmpty(t, obj)
+
+	roots := map[string]string{"lfs": filepath.Join(t.TempDir(), "lfs"), "attachments": filepath.Join(t.TempDir(), "attachments")}
+	n, err := a.RestoreFiles(cp.Name(), roots)
+	require.NoError(t, err)
+	require.Equal(t, len(m.Files), n)
+
+	dst := filepath.Join(roots["lfs"], filepath.FromSlash(obj))
+	dir, base := filepath.Dir(dst), filepath.Base(dst)
+	write := func(name, body string) {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600))
+	}
+	// Killed after the link: the temporary file is the object's second name.
+	require.NoError(t, os.Link(dst, filepath.Join(dir, "."+base+".1260260618")))
+	// Killed during an earlier copy: a partial one.
+	write("."+base+".984472376", "an lf")
+	// Names writeStream does not make, and a directory.
+	keep := []string{"." + base + ".tmp", "." + base + ".", base + ".123", ".other.456"}
+	for _, k := range keep {
+		write(k, "not the restore's")
+	}
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "."+base+".789"), 0o700))
+	keep = append(keep, "."+base+".789")
+
+	synced := map[string]bool{}
+	prev := syncPath
+	defer func() { syncPath = prev }()
+	syncPath = func(p string) error {
+		synced[p] = true
+		return prev(p)
+	}
+	n, err = a.RestoreFiles(cp.Name(), roots)
+	require.NoError(t, err)
+	require.Equal(t, len(m.Files), n)
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	assert.ElementsMatch(t, append([]string{base}, keep...), names, "the temporary files are gone, and nothing else")
+	assert.True(t, synced[dir], "the removal is durable before the step is recorded")
+	for _, f := range m.Files {
+		b, err := os.ReadFile(filepath.Join(roots[f.Storage], filepath.FromSlash(f.Path)))
+		require.NoError(t, err, "%s/%s", f.Storage, f.Path)
+		assert.Equal(t, c.files[f.Storage+"/"+f.Path], b)
+	}
+
+	// Killed before the link: the object is absent, its partial copy left.
+	require.NoError(t, os.Remove(dst))
+	write("."+base+".42", "an l")
+	_, err = a.RestoreFiles(cp.Name(), roots)
+	require.NoError(t, err)
+	assert.NoFileExists(t, filepath.Join(dir, "."+base+".42"))
+	b, err := os.ReadFile(dst)
+	require.NoError(t, err)
+	assert.Equal(t, c.files["lfs/"+obj], b)
+}
