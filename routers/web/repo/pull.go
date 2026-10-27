@@ -1908,6 +1908,15 @@ func deleteBranch(ctx *context.Context, pr *issues_model.PullRequest, gitRepo *g
 	fullBranchName := pr.HeadRepo.FullName() + ":" + pr.HeadBranch
 
 	if err := pull_service.RetargetChildrenOnMerge(ctx, ctx.Doer, pr); err != nil {
+		if errors.Is(err, clusterhook.ErrBehind) {
+			// A node of the cluster behind on a child pull request's
+			// repositories refused its retarget: the children left keep
+			// their target, the branch is not deleted, and the user
+			// retries once the node caught up (#300).
+			log.Warn("RetargetChildrenOnMerge: %v", err)
+			ctx.Flash.Error(ctx.Tr("repo.branch.deletion_behind", fullBranchName))
+			return
+		}
 		ctx.Flash.Error(ctx.Tr("repo.branch.deletion_failed", fullBranchName))
 		return
 	}
@@ -2029,6 +2038,13 @@ func UpdatePullRequestTarget(ctx *context.Context) {
 			ctx.JSON(http.StatusBadRequest, map[string]any{
 				"error":      err.Error(),
 				"user_error": errorMessage,
+			})
+		} else if errors.Is(err, clusterhook.ErrBehind) {
+			// A node of the cluster behind on the pull request's
+			// repositories: nothing was changed, the user retries (#300).
+			ctx.JSON(http.StatusServiceUnavailable, map[string]any{
+				"error":      err.Error(),
+				"user_error": err.Error(),
 			})
 		} else {
 			ctx.ServerError("UpdatePullRequestTarget", err)

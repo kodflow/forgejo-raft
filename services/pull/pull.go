@@ -5,6 +5,7 @@ package pull
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -195,6 +196,18 @@ func ChangeTargetBranch(ctx context.Context, pr *issues_model.PullRequest, doer 
 			HeadBranch: pr.HeadBranch,
 			BaseBranch: pr.BaseBranch,
 		}
+	}
+
+	// In a cluster, the checks and the patch test below read the head and
+	// the base from this node's git: behind a push another node
+	// acknowledged, the head is the commit before it, and the status, merge
+	// base, changed protected files and divergence written from it are
+	// those the merge checks trust, until the next push to the head or the
+	// base (#300). The change waits for this node to serve the head and the
+	// base repositories, and is refused with clusterhook.ErrBehind while it
+	// does not: nothing is written, the caller retries.
+	if err := RequireFreshHeadAndBase(ctx, pr); err != nil {
+		return err
 	}
 
 	// Check if branches are equal
@@ -555,6 +568,16 @@ func (errs errlist) Error() string {
 	return ""
 }
 
+// Unwrap exposes the collected errors to errors.Is and errors.As. The
+// retarget of a child pull request that a node of a cluster refuses while
+// it is behind (clusterhook.ErrBehind) must stay a refusal to retry for
+// the callers of RetargetChildrenOnMerge: the API answers 503, the web
+// says the node lags, and an auto-merge defers the deletion of the merged
+// head branch instead of dropping it for good (#279, #300).
+func (errs errlist) Unwrap() []error {
+	return errs
+}
+
 // RetargetChildrenOnMerge retarget children pull requests on merge if possible
 func RetargetChildrenOnMerge(ctx context.Context, doer *user_model.User, pr *issues_model.PullRequest) error {
 	if setting.Repository.PullRequest.RetargetChildrenOnMerge && pr.BaseRepoID == pr.HeadRepoID {
@@ -583,6 +606,14 @@ func RetargetBranchPulls(ctx context.Context, doer *user_model.User, repoID int6
 			!issues_model.IsErrIssueIsClosed(err) && !models.IsErrPullRequestHasMerged(err) &&
 			!issues_model.IsErrPullRequestAlreadyExists(err) {
 			errs = append(errs, err)
+			// A node of a cluster behind: the next children's retargets
+			// would each wait READ_AFTER_WRITE_TIMEOUT again, in the request
+			// that merged the parent. The refusal already keeps the branch,
+			// and the retry takes the children left, which nothing changed
+			// (#300).
+			if errors.Is(err, clusterhook.ErrBehind) {
+				break
+			}
 		}
 	}
 
