@@ -283,16 +283,16 @@ replace git.sr.ht/~mariusor/go-xsd-duration => code.forgejo.org/forgejo/go-xsd-d
 // (kitsunium/sdk#689), of #683 (kitsunium/sdk#692), of #690 and #691
 // (kitsunium/sdk#693), of #694 (kitsunium/sdk#697), of #696
 // (kitsunium/sdk#699), of #701 (kitsunium/sdk#710), of #700
-// (kitsunium/sdk#709), of #707 (kitsunium/sdk#711) and of #695
-// (kitsunium/sdk#712) (main at 4a8de8a3):
-// to be replaced by the first SDK tag that contains 4a8de8a3.
+// (kitsunium/sdk#709), of #707 (kitsunium/sdk#711), of #695
+// (kitsunium/sdk#712) and of #718 (kitsunium/sdk#721) (main at 6559f54e):
+// to be replaced by the first SDK tag that contains 6559f54e.
 // That commit's go.mod files require their sibling modules at the zero
 // version their own replaces resolve, which a consumer ignores: the zero
 // versions are mapped to the tags the build selects, so the whole module graph loads.
 replace (
-	github.com/kitsunium/sdk/internal => github.com/kitsunium/sdk/internal v0.0.0-20261027073346-4a8de8a3133e
+	github.com/kitsunium/sdk/internal => github.com/kitsunium/sdk/internal v0.0.0-20261027111135-6559f54e66f3
 	github.com/kitsunium/sdk/internal v0.0.0-00010101000000-000000000000 => github.com/kitsunium/sdk/internal v0.25.1
-	github.com/kitsunium/sdk/pkg/v1/app => github.com/kitsunium/sdk/pkg/v1/app v0.0.0-20261027073346-4a8de8a3133e
+	github.com/kitsunium/sdk/pkg/v1/app => github.com/kitsunium/sdk/pkg/v1/app v0.0.0-20261027111135-6559f54e66f3
 	github.com/kitsunium/sdk/pkg/v1/clock v0.0.0-00010101000000-000000000000 => github.com/kitsunium/sdk/pkg/v1/clock v0.1.2
 	github.com/kitsunium/sdk/pkg/v1/crypto v0.0.0-00010101000000-000000000000 => github.com/kitsunium/sdk/pkg/v1/crypto v0.3.3
 	github.com/kitsunium/sdk/pkg/v1/data v0.0.0-00010101000000-000000000000 => github.com/kitsunium/sdk/pkg/v1/data v0.11.0
