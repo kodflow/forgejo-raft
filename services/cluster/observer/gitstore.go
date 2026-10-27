@@ -287,6 +287,38 @@ func (g gitStore) dropRefs(ctx context.Context, dir, checkpoint string) error {
 // whole and durable.
 const IncompleteMark = "forgejo-restore-incomplete"
 
+// writeMark creates the IncompleteMark in target under its own name, then
+// syncs it and target, before git writes anything there. Written under a
+// temporary name and renamed, a crash before the rename left target with
+// that name alone, neither empty nor marked (#291).
+func writeMark(target string) error {
+	mark := filepath.Join(target, IncompleteMark)
+	f, err := os.OpenFile(mark, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := syncPath(mark); err != nil {
+		return err
+	}
+	return syncDir(target)
+}
+
+// markLeftovers reports whether entries, a target's, are only the
+// temporary files under which an older restore wrote the IncompleteMark:
+// one killed before the rename left target holding them alone, a target
+// of this restore's (#291).
+func markLeftovers(entries []os.DirEntry) bool {
+	for _, e := range entries {
+		if !e.Type().IsRegular() || !isTempName(e.Name(), IncompleteMark) {
+			return false
+		}
+	}
+	return len(entries) > 0
+}
+
 // restoredRefs reports whether target already holds exactly refs: a
 // repository an earlier run of the same restore wrote whole.
 func (g gitStore) restoredRefs(ctx context.Context, target string, refs map[string]string) bool {
@@ -322,7 +354,7 @@ func (g gitStore) Materialize(ctx context.Context, repo, checkpoint, target, for
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		return err
 	}
-	if err := writeAtomic(filepath.Join(target, IncompleteMark), nil, true); err != nil {
+	if err := writeMark(target); err != nil {
 		return err
 	}
 	if _, err := g.run(ctx, filepath.Dir(target), nil, "init", "-q", "--bare", "--object-format="+format, target); err != nil {

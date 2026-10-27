@@ -455,3 +455,112 @@ func TestRestoreFilesRerunRemovesOnlyTheTemporaryFilesItLeft(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, c.files["lfs/"+obj], b)
 }
+
+// A crash while Materialize wrote the mark under a temporary name, before
+// its rename, left the target holding that file alone: no mark, no
+// repository, refused as "not empty" by every rerun of step 4 (#291). The
+// rerun takes such a target as its own and writes it again; a target that
+// holds anything else is still refused, and nothing in it is removed.
+func TestRestoreReposTakesUpATargetLeftBeforeItsMark(t *testing.T) {
+	ctx := t.Context()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	cp := seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	a, err := OpenArchive(o.cfg.Dir, "")
+	require.NoError(t, err)
+	m, err := a.Manifest(cp.Name())
+	require.NoError(t, err)
+
+	// The state that crash leaves, made by hand: the window is too short
+	// to kill a process into.
+	leave := func(t *testing.T, root string) (string, string) {
+		target := filepath.Join(root, "alice", "demo.git")
+		require.NoError(t, os.MkdirAll(target, 0o755))
+		tmp, err := os.CreateTemp(target, "."+IncompleteMark+".*")
+		require.NoError(t, err)
+		require.NoError(t, tmp.Close())
+		return target, tmp.Name()
+	}
+
+	root := t.TempDir()
+	target, tmp := leave(t, root)
+	n, err := a.RestoreRepos(ctx, cp.Name(), root)
+	require.NoError(t, err, "the rerun of step 4 takes the target up")
+	assert.Equal(t, 1, n)
+	assert.True(t, o.store.git.restoredRefs(ctx, target, m.Repos["alice/demo.git"].Refs))
+	assert.NoFileExists(t, tmp)
+	assert.NoFileExists(t, filepath.Join(target, IncompleteMark))
+
+	for what, add := range map[string]func(target string) error{
+		"a file of its own": func(target string) error {
+			return os.WriteFile(filepath.Join(target, "precious"), []byte("x"), 0o600)
+		},
+		"a file named otherwise": func(target string) error {
+			return os.WriteFile(filepath.Join(target, "."+IncompleteMark+".tmp"), nil, 0o600)
+		},
+		"a directory named as the temporary file": func(target string) error {
+			return os.Mkdir(filepath.Join(target, "."+IncompleteMark+".1"), 0o700)
+		},
+	} {
+		t.Run("beside "+what, func(t *testing.T) {
+			other := t.TempDir()
+			target, tmp := leave(t, other)
+			require.NoError(t, add(target))
+			names := func() []string {
+				entries, err := os.ReadDir(target)
+				require.NoError(t, err)
+				var out []string
+				for _, e := range entries {
+					out = append(out, e.Name())
+				}
+				return out
+			}
+			before := names()
+			_, err := a.RestoreRepos(ctx, cp.Name(), other)
+			require.ErrorContains(t, err, "is not empty")
+			assert.Equal(t, before, names(), "nothing is removed")
+			assert.FileExists(t, tmp)
+		})
+	}
+}
+
+// Materialize creates the mark under its own name, and syncs it and the
+// target before git writes anything there: no crash leaves the target
+// holding a temporary name instead of the mark (#291).
+func TestMaterializeWritesTheMarkUnderItsOwnName(t *testing.T) {
+	ctx := t.Context()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	cp := seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	a, err := OpenArchive(o.cfg.Dir, "")
+	require.NoError(t, err)
+
+	root := t.TempDir()
+	target := filepath.Join(root, "alice", "demo.git")
+	mark := filepath.Join(target, IncompleteMark)
+	// What the target holds each time the mark or the target is synced
+	// while git has not written there yet.
+	seen := map[string][]string{}
+	prev := syncPath
+	defer func() { syncPath = prev }()
+	syncPath = func(p string) error {
+		if p == mark || p == target {
+			if _, err := os.Stat(filepath.Join(target, "HEAD")); os.IsNotExist(err) {
+				entries, err := os.ReadDir(target)
+				require.NoError(t, err)
+				var names []string
+				for _, e := range entries {
+					names = append(names, e.Name())
+				}
+				seen[p] = names
+			}
+		}
+		return prev(p)
+	}
+	_, err = a.RestoreRepos(ctx, cp.Name(), root)
+	require.NoError(t, err)
+	assert.Equal(t, []string{IncompleteMark}, seen[mark], "the mark is synced before git init")
+	assert.Equal(t, []string{IncompleteMark}, seen[target], "and its name in the target")
+}

@@ -172,8 +172,8 @@ func (a *Archive) OpenSecrets(name string, priv *[32]byte) (*Bundle, error) {
 // RestoreRepos writes every repository of a checkpoint under root, which
 // must hold none of them yet. Run again after an interruption, it keeps a
 // repository an earlier run wrote whole (the checkpoint's refs exactly, no
-// mark left), writes again one it left marked incomplete, and refuses any
-// other.
+// mark left), writes again one it left marked incomplete or holding only
+// the mark's temporary files, and refuses any other.
 func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, error) {
 	m, err := a.store.ReadManifest(name)
 	if err != nil {
@@ -202,6 +202,14 @@ func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, err
 			if _, err := os.Stat(filepath.Join(target, IncompleteMark)); err == nil {
 				if err := os.RemoveAll(target); err != nil {
 					return n, fmt.Errorf("%s: %w", repo, err)
+				}
+			} else if markLeftovers(entries) {
+				// Killed while an older restore wrote the mark: the target
+				// holds nothing else, and Materialize finds it empty.
+				for _, e := range entries {
+					if err := os.Remove(filepath.Join(target, e.Name())); err != nil {
+						return n, fmt.Errorf("%s: %w", repo, err)
+					}
 				}
 			} else if a.store.git.restoredRefs(ctx, target, rm.Refs) {
 				n++
