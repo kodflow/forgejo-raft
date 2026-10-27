@@ -22,6 +22,7 @@ import (
 	repo_model "forgejo.org/models/repo"
 	unit_model "forgejo.org/models/unit"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/label"
 	"forgejo.org/modules/log"
@@ -772,6 +773,20 @@ func updateBasicProperties(ctx *context.APIContext, opts api.EditRepoOption) err
 		if visibilityChanged && setting.Repository.ForcePrivate && !*opts.Private && !ctx.IsUserSiteAdmin() {
 			err := errors.New("cannot change private repository to public")
 			ctx.Error(http.StatusUnprocessableEntity, "Force Private enabled", err)
+			return err
+		}
+	}
+
+	// A new default branch is looked up in this node's git. In a cluster, a
+	// node behind on the repository would take for absent a branch another
+	// node pushed, and answer 200 without changing it, or point HEAD to a
+	// branch another node deleted. The request waits until this node serves
+	// the repository at the commit index the cluster confirms now, and is
+	// refused with 503 while it does not, before the rename for the same
+	// reason as the visibility (#299).
+	if opts.DefaultBranch != nil && repo.DefaultBranch != *opts.DefaultBranch {
+		if err := clusterFresh(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
+			ctx.Error(http.StatusServiceUnavailable, "", err.Error())
 			return err
 		}
 	}

@@ -4,9 +4,11 @@
 package setting
 
 import (
+	"errors"
 	"net/http"
 
 	git_model "forgejo.org/models/git"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/setting"
 	"forgejo.org/routers/web/repo"
@@ -38,6 +40,10 @@ func SetDefaultBranchPost(ctx *context.Context) {
 			switch {
 			case git_model.IsErrBranchNotExist(err):
 				ctx.Status(http.StatusNotFound)
+			case errors.Is(err, clusterhook.ErrBehind):
+				// A node of the cluster behind on the repository: nothing
+				// was changed, the user retries (#299).
+				ctx.Error(http.StatusServiceUnavailable, err.Error())
 			default:
 				ctx.ServerError("SetDefaultBranch", err)
 			}
