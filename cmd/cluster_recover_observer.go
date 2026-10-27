@@ -31,6 +31,7 @@ import (
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/json"
+	"forgejo.org/modules/jwtx"
 	repo_module "forgejo.org/modules/repository"
 	"forgejo.org/modules/setting"
 	"forgejo.org/services/cluster"
@@ -547,11 +548,11 @@ func rotationPending(rot map[string]string, recipient string) ([]string, error) 
 // lfsSecretPending says why this node's LFS signing key is not rotated's,
 // "" when it is. A token it signs authenticates its user on its repository,
 // to read and to write the LFS objects. The configuration carries the
-// rotated secret whether the server runs or not: turned on later, the
-// server would sign with whatever it carries. Running, the server signs
-// with that secret only under a symmetric LFS_JWT_SIGNING_ALGORITHM: an
-// asymmetric one signs with a key file of APP_DATA_PATH, which no step
-// rotates.
+// rotated secret, and a symmetric LFS_JWT_SIGNING_ALGORITHM, whether the
+// server runs or not: turned on later, the server would sign with whatever
+// it carries, and an asymmetric algorithm signs with a key file of
+// APP_DATA_PATH, which no step rotates. Running, the server's loaded key
+// must be the rotated secret.
 func lfsSecretPending(rotated []byte) (string, error) {
 	const name = "[server] LFS_JWT_SECRET"
 	configured, err := setting.LFSJWTSecretConfigured(setting.CfgProvider)
@@ -561,6 +562,14 @@ func lfsSecretPending(rotated []byte) (string, error) {
 	if b, err := generate.DecodeJwtSecret(configured); err != nil || !bytes.Equal(b, rotated) {
 		return name, nil
 	}
+	asymmetric := func(alg string) string {
+		return fmt.Sprintf("%s (LFS_JWT_SIGNING_ALGORITHM %s signs with a key file the recovery does not rotate: recover with HS256, the default)", name, alg)
+	}
+	// As the server reads it (loadSigningKeyCfg), with the server off too;
+	// unset is HS256.
+	if alg := setting.CfgProvider.Section("server").Key("LFS_JWT_SIGNING_ALGORITHM").String(); jwtx.IsValidAsymmetricAlgorithm(alg) {
+		return asymmetric(alg), nil
+	}
 	if !setting.LFS.StartServer {
 		return "", nil
 	}
@@ -569,7 +578,7 @@ func lfsSecretPending(rotated []byte) (string, error) {
 		return name + " (the LFS server's key is not loaded)", nil
 	}
 	if !k.IsSymmetric() {
-		return fmt.Sprintf("%s (LFS_JWT_SIGNING_ALGORITHM %s signs with a key file the recovery does not rotate: recover with HS256, the default)", name, k.SigningMethod().Alg()), nil
+		return asymmetric(k.SigningMethod().Alg()), nil
 	}
 	if b, ok := k.VerifyKey().([]byte); !ok || !bytes.Equal(b, rotated) {
 		return name, nil

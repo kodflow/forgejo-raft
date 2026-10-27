@@ -145,6 +145,15 @@ func TestRecoverRotationRefusesTheOldLFSSecret(t *testing.T) {
 		require.Len(t, pending, 1)
 		assert.Contains(t, pending[0], "LFS_JWT_SIGNING_ALGORITHM EdDSA")
 	})
+	t.Run("asymmetric LFS algorithm, server off", func(t *testing.T) {
+		// Turned on later, the server would sign with the key file the
+		// configuration names, which no step rotates.
+		node(t, false, "LFS_JWT_SIGNING_ALGORITHM = EdDSA\nLFS_JWT_SECRET = "+rot["LFS_JWT_SECRET"], nil)
+		pending, err := rotationPending(rot, recipient)
+		require.NoError(t, err)
+		require.Len(t, pending, 1)
+		assert.Contains(t, pending[0], "LFS_JWT_SIGNING_ALGORITHM EdDSA")
+	})
 	t.Run("LFS server off", func(t *testing.T) {
 		// Turned on later, the server would sign with what the
 		// configuration carries.
