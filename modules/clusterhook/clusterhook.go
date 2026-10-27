@@ -990,7 +990,11 @@ type afterCommitKey struct{}
 // replicated command committed, and never on a rolled-back attempt: the log
 // consumer replays a batch until its SQL transaction commits, and a
 // goroutine or a queue started during a failed attempt would act again on
-// the replay (kitsunium ADR 0152 D10, R8-25).
+// the replay (kitsunium ADR 0152 D10, R8-25). An attempt whose COMMIT
+// failed with an unknown outcome keeps them until a read of the database
+// tells whether it committed. Where no read can tell, they run anyway, as
+// the attempt may have committed, and run again at the replay if it had
+// not: they must bear running twice.
 type AfterCommit struct {
 	mu  sync.Mutex
 	fns []func()

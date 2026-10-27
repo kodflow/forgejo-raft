@@ -92,6 +92,10 @@ type consumer struct {
 	durability durabilityState
 	// retryMu lets one retry of the parked events run at a time.
 	retryMu sync.Mutex
+	// unknown holds the batches and the retried parked entries whose
+	// COMMIT failed with an outcome no read settled yet, with their
+	// effects, until a read does (#268); guarded by mu.
+	unknown []unknownCommit
 
 	mu       sync.Mutex
 	lastAck  map[string]uint64
@@ -507,6 +511,7 @@ func (c *consumer) run(ctx context.Context) {
 	// A fetch of a work's commits writes into a repository's directory: it
 	// ends, cancelled with ctx, before the consumer does.
 	defer c.fetches.Wait()
+	defer c.settleAtStop(ctx)
 	checked := false
 	for {
 		select {
@@ -563,7 +568,7 @@ func (c *consumer) step(ctx context.Context) error {
 		// Only the leader's own retries say what waits for its projection.
 		c.unprojected = nil
 		c.mu.Unlock()
-		return nil
+		return c.settleUnknown(ctx)
 	}
 	if term := eng.Status().Term; term != 0 {
 		c.mu.Lock()
@@ -623,6 +628,9 @@ func (c *consumer) readCursor(ctx context.Context, lineage string) (*cluster_mod
 
 // pass is one pass of the dispatcher, the leader's.
 func (c *consumer) pass(ctx context.Context) error {
+	if err := c.settleUnknown(ctx); err != nil {
+		return err
+	}
 	events := c.events()
 	cursors := map[string]*cluster_model.Cursor{}
 	var pending []reftable.Event
@@ -820,15 +828,33 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 		if errors.Is(err, cluster_model.ErrCursorMoved) {
 			return nil // another dispatcher moved it; its work stands, ours rolled back
 		}
-		if !ran || !c.committedAnyway(ctx, lineage, next, err) {
+		outcome := outcomeRolledBack
+		if ran {
+			outcome = c.committedAnyway(ctx, lineage, next, err)
+		}
+		switch outcome {
+		case outcomeRolledBack:
 			dispatchFailuresTotal.Inc()
 			return err
+		case outcomeUnknown:
+			// Its effects wait for a read that settles it, and nothing is
+			// dispatched before (settleBatches, #268).
+			c.holdUnknown(unknownCommit{lineage: lineage, cause: err, effects: effects, batch: batch, parked: parked, next: next})
+			dispatchFailuresTotal.Inc()
+			return fmt.Errorf("the batch up to %d of %s has an unknown outcome, its effects wait for a read that settles it: %w", next.Position, lineage, err)
 		}
 	}
+	c.batchCommitted(lineage, batch, parked, next, effects)
+	cur.Lineage, cur.Position = next.Lineage, next.Position
+	return nil
+}
+
+// batchCommitted is what follows the COMMIT of a batch: its effects, the
+// counters, and the failures of its events forgotten.
+func (c *consumer) batchCommitted(lineage string, batch []reftable.Event, parked int, next cluster_model.Cursor, effects *clusterhook.AfterCommit) {
 	effects.Run()
 	dispatchedTotal.Add(float64(len(batch) - parked))
 	parkedTotal.Add(float64(parked))
-	cur.Lineage, cur.Position = next.Lineage, next.Position
 	c.mu.Lock()
 	for _, ev := range batch {
 		delete(c.failures, ev.Token.Index)
@@ -838,45 +864,284 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 		c.seen[lineage] = next.Position
 	}
 	c.mu.Unlock()
-	return nil
 }
 
 // committedAnyway tells a batch whose COMMIT failed with an unknown
 // outcome (the connection cut after the database committed it, a
 // synchronous standby's wait ended by a failover) from one that rolled
-// back: the cursor is read again on a new connection, and a cursor at
+// back: the cursor is read again on a new connection. A cursor at or past
 // next means the work committed, so its effects run once, here, since no
-// replay will collect them again (#103).
-func (c *consumer) committedAnyway(ctx context.Context, lineage string, next cluster_model.Cursor, cause error) bool {
+// replay will collect them again (#103); a cursor behind it means it
+// rolled back, and is replayed. A read that fails says neither: the
+// failover that cut the COMMIT usually leaves no primary for a while, and
+// the outcome stays unknown until a read settles it (#268).
+func (c *consumer) committedAnyway(ctx context.Context, lineage string, next cluster_model.Cursor, cause error) commitOutcome {
 	if c.cursor == nil {
-		return false
+		return outcomeRolledBack
 	}
-	cur, err := c.cursor(ctx, cursorName(lineage))
-	if err != nil || cur.Lineage != next.Lineage || cur.Position != next.Position {
-		return false
+	landed, at, err := c.batchLanded(ctx, lineage, next)
+	switch {
+	case err != nil:
+		log.Error("cluster consumer: the commit of the batch up to %d of %s returned %v, and the read of its cursor failed (%v): its outcome is unknown, its effects wait for a read that settles it, and nothing is dispatched before", next.Position, lineage, cause, err)
+		return outcomeUnknown
+	case landed:
+		log.Warn("cluster consumer: the commit of the batch up to %d of %s returned %v, but the cursor reads %d: it committed, its effects run", next.Position, lineage, cause, at)
+		return outcomeCommitted
 	}
-	log.Warn("cluster consumer: the commit of the batch up to %d of %s returned %v, but the cursor reads %d: it committed, its effects run", next.Position, lineage, cause, next.Position)
-	return true
+	return outcomeRolledBack
+}
+
+// batchLanded reads the cursor of lineage, within commitOutcomeReadMax,
+// and reports whether it is at or past next, where the COMMIT of a batch
+// moves it. Past it, another dispatcher, the next leader's, went on from
+// where this COMMIT left it; or it dispatched the same events again after
+// they rolled back here, which no read of the cursor tells apart: the
+// effects then run twice rather than never (unknownCommit).
+func (c *consumer) batchLanded(ctx context.Context, lineage string, next cluster_model.Cursor) (bool, int64, error) {
+	rctx, cancel := context.WithTimeout(ctx, commitOutcomeReadMax)
+	defer cancel()
+	cur, err := c.cursor(rctx, cursorName(lineage))
+	if err != nil {
+		return false, 0, err
+	}
+	return cur.Lineage == next.Lineage && cur.Position >= next.Position, cur.Position, nil
 }
 
 // parkedGone tells a retried parked entry whose COMMIT failed with an
 // unknown outcome from one that rolled back: its rows are gone only if the
-// transaction that removed them, with the work, committed (#103).
-func (c *consumer) parkedGone(ctx context.Context, lineage string, index int64, cause error) bool {
+// transaction that removed them, with the work, committed (#103). A read
+// of them that fails leaves the outcome unknown, as in committedAnyway
+// (#268).
+func (c *consumer) parkedGone(ctx context.Context, lineage string, index int64, cause error) commitOutcome {
 	if c.listParked == nil {
-		return false
+		return outcomeRolledBack
 	}
-	rows, err := c.listParked(ctx)
-	if err != nil {
-		return false
-	}
-	for _, row := range rows {
-		if row.Lineage == lineage && row.LogIndex == index {
-			return false
-		}
+	rows, err := c.readParked(ctx)
+	switch {
+	case err != nil:
+		log.Error("cluster consumer: the commit of the parked entry %d of %s returned %v, and the read of the parked rows failed (%v): its outcome is unknown, its effects wait for a read that settles it, and it is not retried before", index, lineage, cause, err)
+		return outcomeUnknown
+	case holdsEntry(rows, lineage, index):
+		return outcomeRolledBack
 	}
 	log.Warn("cluster consumer: the commit of the parked entry %d of %s returned %v, but its rows are gone: it committed, its effects run", index, lineage, cause)
-	return true
+	return outcomeCommitted
+}
+
+// readParked lists the parked rows, within commitOutcomeReadMax.
+func (c *consumer) readParked(ctx context.Context) ([]*cluster_model.ParkedEvent, error) {
+	rctx, cancel := context.WithTimeout(ctx, commitOutcomeReadMax)
+	defer cancel()
+	return c.listParked(rctx)
+}
+
+// holdsEntry reports whether rows hold the parked entry index of lineage.
+func holdsEntry(rows []*cluster_model.ParkedEvent, lineage string, index int64) bool {
+	return slices.ContainsFunc(rows, func(row *cluster_model.ParkedEvent) bool {
+		return row.Lineage == lineage && row.LogIndex == index
+	})
+}
+
+// commitOutcome is what a read after a COMMIT that failed tells of it.
+type commitOutcome int
+
+const (
+	// outcomeRolledBack: a read that succeeded found the transaction's
+	// writes missing.
+	outcomeRolledBack commitOutcome = iota
+	// outcomeCommitted: a read that succeeded found them.
+	outcomeCommitted
+	// outcomeUnknown: the read failed.
+	outcomeUnknown
+)
+
+// commitOutcomeReadMax bounds one read that settles a COMMIT with an
+// unknown outcome: a connection that hangs on a primary going down holds
+// the dispatcher, or a retry, no longer. Tests lower it.
+var commitOutcomeReadMax = 5 * time.Second
+
+// unknownCommit is a batch, or a retried parked entry, whose COMMIT failed
+// and whose outcome the read made right after could not settle. The
+// database may hold its work, and then no replay collects its effects
+// again; or not, and then its replay runs them. Its effects wait, held by
+// the consumer, for a read that tells (#268): one that finds the work runs
+// them, one that does not drops them for the replay to collect again, and
+// they run once either way.
+//
+// Run at once instead, they would run during the outage that failed the
+// read, where they fail on their own SQL: the synchronisation of a pushed
+// branch's pull requests starts by looking them up, and is lost all the
+// same; a webhook's delivery starts by reading its task, and waits for the
+// next start. And they would run again at the replay of a batch that
+// rolled back. Two doubts remain, where the effects run, a duplicate
+// costing less than a loss: a read that cannot tell this attempt from
+// another dispatcher's replay of the same events (batchLanded), and a
+// consumer that stops before any read settled it (settleAtStop). Run
+// twice, the effects of a push synchronise its pull requests again: a
+// second "pushed commits" comment, with its notifications, and a second
+// synchronize webhook and workflow run; their head, stale reviews and
+// approvals end as after one run. The webhook task an effect queues is
+// delivered once: queued twice, its id is skipped once delivered, and
+// skipped when its row never committed. Never run, the effects leave the
+// pull requests' head behind their branch, their stale approvals
+// standing, and their workflows not run, until the next push.
+type unknownCommit struct {
+	lineage string
+	cause   error
+	effects *clusterhook.AfterCommit
+	// A batch: its events, how many of them it parked, and the cursor its
+	// COMMIT moves to.
+	batch  []reftable.Event
+	parked int
+	next   cluster_model.Cursor
+	// A parked entry, when entry is set: its index, its repository and
+	// how many rows it has.
+	entry bool
+	index int64
+	repo  string
+	rows  int
+}
+
+func (u *unknownCommit) what() string {
+	if u.entry {
+		return fmt.Sprintf("the parked entry %d of %s", u.index, u.lineage)
+	}
+	return fmt.Sprintf("the batch up to %d of %s", u.next.Position, u.lineage)
+}
+
+// holdUnknown keeps u until a read settles it.
+func (c *consumer) holdUnknown(u unknownCommit) {
+	c.mu.Lock()
+	c.unknown = append(c.unknown, u)
+	c.mu.Unlock()
+}
+
+// takeUnknown removes and returns the batches held, or the parked entries
+// when entries is set.
+func (c *consumer) takeUnknown(entries bool) []unknownCommit {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out, keep []unknownCommit
+	for _, u := range c.unknown {
+		if u.entry == entries {
+			out = append(out, u)
+		} else {
+			keep = append(keep, u)
+		}
+	}
+	c.unknown = keep
+	return out
+}
+
+// hasUnknown reports whether a batch, or a parked entry when entries is
+// set, waits for a read that settles it.
+func (c *consumer) hasUnknown(entries bool) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.ContainsFunc(c.unknown, func(u unknownCommit) bool { return u.entry == entries })
+}
+
+// settleUnknown settles what the consumer holds with an unknown outcome,
+// before its pass dispatches or retries anything; on a node that no longer
+// leads too, whose batch or entry that committed the next leader neither
+// replays nor retries, and whose effects only this node holds. The error
+// says that something stays unknown, and waits for the next call.
+func (c *consumer) settleUnknown(ctx context.Context) error {
+	if err := c.settleBatches(ctx); err != nil {
+		return err
+	}
+	if !c.hasUnknown(true) {
+		return nil
+	}
+	c.retryMu.Lock()
+	defer c.retryMu.Unlock()
+	rows, err := c.readParked(ctx)
+	if err != nil {
+		return fmt.Errorf("a retried parked entry has an unknown outcome, nothing is dispatched before a read settles it: %w", err)
+	}
+	c.settleParked(rows)
+	return nil
+}
+
+// settleBatches reads the cursor of each batch held with an unknown
+// outcome: one that committed runs its effects, one that rolled back drops
+// them, its replay collecting them again. The dispatch waits for it: a
+// replay that committed first would make the read find the cursor past
+// the batch, and the effects run twice. A batch whose read fails stays
+// held; the error is the first such read's.
+func (c *consumer) settleBatches(ctx context.Context) error {
+	var first error
+	var keep []unknownCommit
+	for _, u := range c.takeUnknown(false) {
+		landed, at, err := c.batchLanded(ctx, u.lineage, u.next)
+		switch {
+		case err != nil:
+			keep = append(keep, u)
+			if first == nil {
+				first = fmt.Errorf("%s, whose commit returned %v, has an unknown outcome, nothing is dispatched before a read settles it: %w", u.what(), u.cause, err)
+			}
+		case landed:
+			log.Warn("cluster consumer: %s, whose commit returned %v, committed (its cursor reads %d): its effects run", u.what(), u.cause, at)
+			c.batchCommitted(u.lineage, u.batch, u.parked, u.next, u.effects)
+		default:
+			log.Warn("cluster consumer: %s, whose commit returned %v, rolled back (its cursor reads %d): it is replayed", u.what(), u.cause, at)
+		}
+	}
+	for _, u := range keep {
+		c.holdUnknown(u)
+	}
+	return first
+}
+
+// settleParked settles, from rows a read of the parked events just
+// returned, each parked entry held with an unknown outcome: its rows gone,
+// its retry committed and its effects run; its rows there, it rolled back
+// and its effects are dropped, for a retry to run it again. The caller
+// holds retryMu: a retry of the entry that committed before the read would
+// make its rows read as gone, and the effects run twice. It returns how
+// many parked events it found applied.
+func (c *consumer) settleParked(rows []*cluster_model.ParkedEvent) int {
+	applied := 0
+	for _, u := range c.takeUnknown(true) {
+		if holdsEntry(rows, u.lineage, u.index) {
+			log.Warn("cluster consumer: %s, whose commit returned %v, rolled back (its rows are there): it is retried", u.what(), u.cause)
+			continue
+		}
+		log.Warn("cluster consumer: %s, whose commit returned %v, committed (its rows are gone): its effects run", u.what(), u.cause)
+		applied += c.entryApplied(u.lineage, u.index, u.repo, u.rows, u.effects)
+	}
+	return applied
+}
+
+// settleAtStop reads once more, past the consumer's end, what it holds
+// with an unknown outcome; what stays unknown runs its effects: no later
+// read on this node settles it, and effects run twice cost less than
+// effects lost (unknownCommit). A retry of the parked events running at
+// that moment is not waited for.
+func (c *consumer) settleAtStop(ctx context.Context) {
+	c.mu.Lock()
+	n := len(c.unknown)
+	c.mu.Unlock()
+	if n == 0 {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	_ = c.settleBatches(ctx)
+	if c.hasUnknown(true) && c.retryMu.TryLock() {
+		if rows, err := c.readParked(ctx); err == nil {
+			c.settleParked(rows)
+		}
+		c.retryMu.Unlock()
+	}
+	c.mu.Lock()
+	left := c.unknown
+	c.unknown = nil
+	c.mu.Unlock()
+	for i := range left {
+		u := &left[i]
+		log.Error("cluster consumer: the consumer stops while %s, whose commit returned %v, has an unknown outcome: its effects run, and run again at its replay if it rolled back", u.what(), u.cause)
+		u.effects.Run()
+	}
 }
 
 // parkGroup writes the parked rows of a group, in the dispatch's
@@ -1171,11 +1436,13 @@ func (c *consumer) retryParkedNoting(ctx context.Context, waits *[]parkedWait) (
 	if err != nil {
 		return 0, err
 	}
+	// An entry whose last retry had an unknown outcome is settled from
+	// this read, before any entry is retried (settleParked, #268).
+	applied := c.settleParked(rows)
 	// A repository whose entry stays parked blocks its later entries: by
 	// id when known, so a rename does not let them pass and a new
 	// repository under the old name is not held (#133).
 	blocked := map[parkedRepo]bool{}
-	applied := 0
 	now := ""
 	if c.lineageNow != nil {
 		now = c.lineageNow()
@@ -1261,8 +1528,16 @@ func (c *consumer) retryParkedNoting(ctx context.Context, waits *[]parkedWait) (
 		// Only an error after the callback's end may hide a COMMIT that
 		// landed: one of the work rolled back, even when another retrier
 		// removed the rows meanwhile.
-		if err != nil && ran && c.parkedGone(ctx, lineage, index, err) {
-			err = nil
+		if err != nil && ran {
+			switch c.parkedGone(ctx, lineage, index, err) {
+			case outcomeCommitted:
+				err = nil
+			case outcomeUnknown:
+				// Its effects wait for a read that settles it, and the
+				// entry is not retried before (settleParked, #268).
+				c.holdUnknown(unknownCommit{lineage: lineage, cause: err, effects: effects, entry: true, index: index, repo: repo, rows: len(entry)})
+				err = fmt.Errorf("its commit has an unknown outcome, its effects wait for a read that settles it: %w", err)
+			}
 		}
 		if err != nil {
 			blocked[key] = true
@@ -1275,13 +1550,20 @@ func (c *consumer) retryParkedNoting(ctx context.Context, waits *[]parkedWait) (
 			}
 			continue
 		}
-		effects.Run()
-		applied += len(entry)
-		unparkedTotal.Add(float64(len(entry)))
-		c.dropUnprojected(lineage, index)
-		log.Info("cluster consumer: applied the parked event of %s at %d", repo, index)
+		applied += c.entryApplied(lineage, index, repo, len(entry), effects)
 	}
 	return applied, nil
+}
+
+// entryApplied is what follows the COMMIT of a parked entry's retry: its
+// effects, the counters, and the entry forgotten as waiting for its
+// projection. It returns the entry's rows.
+func (c *consumer) entryApplied(lineage string, index int64, repo string, rows int, effects *clusterhook.AfterCommit) int {
+	effects.Run()
+	unparkedTotal.Add(float64(rows))
+	c.dropUnprojected(lineage, index)
+	log.Info("cluster consumer: applied the parked event of %s at %d", repo, index)
+	return rows
 }
 
 // parkedWait is a parked entry of the table's lineage whose retry waits
