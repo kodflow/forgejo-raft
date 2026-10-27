@@ -193,12 +193,12 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		if err != nil {
 			return err
 		}
-		jwt, err := generate.DecodeJwtSecret(rot["JWT_SECRET"])
+		pending, err := rotationPending(rot, c.String("new-observer-recipient"))
 		if err != nil {
-			return fmt.Errorf("%s: %w", rotatedFile, err)
+			return err
 		}
-		if setting.SecretKey != rot["SECRET_KEY"] || !bytes.Equal(setting.GetGeneralTokenSigningSecret(), jwt) || !recipientSet(c.String("new-observer-recipient")) {
-			fmt.Fprintf(w, "The rotated secrets are in %s. Put them in this node's app.ini, then run the same command again.\n", filepath.Join(out, rotatedFile))
+		if len(pending) > 0 {
+			fmt.Fprintf(w, "The rotated secrets are in %s. Put them in this node's app.ini, then run the same command again. Not carried yet:\n  %s\n", filepath.Join(out, rotatedFile), strings.Join(pending, "\n  "))
 			return errRecoverStopped
 		}
 		if err := save(stepRotate); err != nil {
@@ -469,17 +469,11 @@ func recoveryMarker(checkpoint, newCluster string) string {
 }
 
 // rotatedSecrets writes, once, the secrets the recovered node runs with,
-// and reads them back on a later run.
+// and reads them back on a later run. The first run returns what a later
+// one reads: every key the file holds, the gate of step 2 checks each.
 func rotatedSecrets(path, secretKey, recipient string) (map[string]string, error) {
 	if b, err := os.ReadFile(path); err == nil {
-		out := map[string]string{}
-		for line := range strings.SplitSeq(string(b), "\n") {
-			k, v, ok := strings.Cut(line, " = ")
-			if ok {
-				out[strings.TrimSpace(k)] = strings.TrimSpace(v)
-			}
-		}
-		return out, nil
+		return parseRotated(b), nil
 	}
 	_, lfs := generate.NewJwtSecret()
 	_, oauth := generate.NewJwtSecret()
@@ -499,7 +493,88 @@ OBSERVER_RECIPIENTS = %s
 	if err := observer.WriteFileDurable(path, []byte(body)); err != nil {
 		return nil, err
 	}
-	return map[string]string{"SECRET_KEY": secretKey, "JWT_SECRET": oauth}, nil
+	return parseRotated([]byte(body)), nil
+}
+
+// parseRotated reads rotated.ini's keys, whatever their section: no two
+// sections share one.
+func parseRotated(b []byte) map[string]string {
+	out := map[string]string{}
+	for line := range strings.SplitSeq(string(b), "\n") {
+		k, v, ok := strings.Cut(line, " = ")
+		if ok {
+			out[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
+	}
+	return out
+}
+
+// rotationPending names what of rotated.ini this node's configuration does
+// not carry yet, as the server loads it: step 2 stops until it carries
+// every secret, the old cluster's being the compromised ones (#284).
+// recipient is --new-observer-recipient.
+func rotationPending(rot map[string]string, recipient string) ([]string, error) {
+	var pending []string
+	if setting.SecretKey != rot["SECRET_KEY"] {
+		pending = append(pending, "[security] SECRET_KEY")
+	}
+	jwt, err := generate.DecodeJwtSecret(rot["JWT_SECRET"])
+	if err != nil {
+		return nil, fmt.Errorf("%s: JWT_SECRET: %w", rotatedFile, err)
+	}
+	// The general signing secret: the registry's, the Actions' and, with
+	// an HS* algorithm, OAuth2's tokens.
+	if !bytes.Equal(setting.GetGeneralTokenSigningSecret(), jwt) {
+		pending = append(pending, "[oauth2] JWT_SECRET")
+	}
+	lfs, err := generate.DecodeJwtSecret(rot["LFS_JWT_SECRET"])
+	if err != nil {
+		return nil, fmt.Errorf("%s: LFS_JWT_SECRET: %w", rotatedFile, err)
+	}
+	why, err := lfsSecretPending(lfs)
+	if err != nil {
+		return nil, err
+	}
+	if why != "" {
+		pending = append(pending, why)
+	}
+	if !recipientSet(recipient) {
+		pending = append(pending, "[cluster] OBSERVER_RECIPIENTS")
+	}
+	return pending, nil
+}
+
+// lfsSecretPending says why this node's LFS signing key is not rotated's,
+// "" when it is. A token it signs authenticates its user on its repository,
+// to read and to write the LFS objects. The configuration carries the
+// rotated secret whether the server runs or not: turned on later, the
+// server would sign with whatever it carries. Running, the server signs
+// with that secret only under a symmetric LFS_JWT_SIGNING_ALGORITHM: an
+// asymmetric one signs with a key file of APP_DATA_PATH, which no step
+// rotates.
+func lfsSecretPending(rotated []byte) (string, error) {
+	const name = "[server] LFS_JWT_SECRET"
+	configured, err := setting.LFSJWTSecretConfigured(setting.CfgProvider)
+	if err != nil {
+		return "", fmt.Errorf("[server] %w", err)
+	}
+	if b, err := generate.DecodeJwtSecret(configured); err != nil || !bytes.Equal(b, rotated) {
+		return name, nil
+	}
+	if !setting.LFS.StartServer {
+		return "", nil
+	}
+	k := setting.LFS.SigningKey
+	if k == nil {
+		return name + " (the LFS server's key is not loaded)", nil
+	}
+	if !k.IsSymmetric() {
+		return fmt.Sprintf("%s (LFS_JWT_SIGNING_ALGORITHM %s signs with a key file the recovery does not rotate: recover with HS256, the default)", name, k.SigningMethod().Alg()), nil
+	}
+	if b, ok := k.VerifyKey().([]byte); !ok || !bytes.Equal(b, rotated) {
+		return name, nil
+	}
+	return "", nil
 }
 
 func recipientSet(nameKey string) bool {

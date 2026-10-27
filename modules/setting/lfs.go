@@ -4,6 +4,7 @@
 package setting
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -30,6 +31,22 @@ var LFSClient = struct {
 	BatchSize                 int `ini:"BATCH_SIZE"`
 	BatchOperationConcurrency int `ini:"BATCH_OPERATION_CONCURRENCY"`
 }{}
+
+// LFSJWTSecretConfigured is the [server] LFS_JWT_SECRET rootCfg carries,
+// from LFS_JWT_SECRET_URI or LFS_JWT_SECRET, "" when it carries none,
+// whether the LFS server is on or not. Unlike loading the LFS settings, it
+// creates none.
+func LFSJWTSecretConfigured(rootCfg ConfigProvider) (string, error) {
+	sec := rootCfg.Section("server")
+	uri, verbatim := sec.Key("LFS_JWT_SECRET_URI").String(), sec.Key("LFS_JWT_SECRET").String()
+	if uri == "" {
+		return verbatim, nil
+	}
+	if verbatim != "" {
+		return "", errors.New("cannot specify both LFS_JWT_SECRET_URI and LFS_JWT_SECRET")
+	}
+	return loadSecretFromURI(uri)
+}
 
 func loadLFSFrom(rootCfg ConfigProvider) error {
 	mustMapSetting(rootCfg, "lfs_client", &LFSClient)
