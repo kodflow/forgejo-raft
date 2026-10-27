@@ -19,7 +19,6 @@ import (
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	giturl "forgejo.org/modules/git/url"
-	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/lfs"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/process"
@@ -282,6 +281,15 @@ func preparePush(ctx context.Context, m *repo_model.PushMirror, repo *repo_model
 		log.Error("SyncPushMirror [repo: %-v]: recreating the remote of the push mirror: %v", m.Repo, err)
 		return nil, err
 	}
+	return preparePushFrom(ctx, m, path, isWiki, "")
+}
+
+// preparePushFrom does what comes before the push from the repository at
+// path, the directory of the repository or of its wiki, or in a cluster
+// its staging copy (stagePush), to the push mirror m: everything but the
+// git push itself, the LFS objects included, which are path's. credURL, if
+// set, authenticates the push instead of the credentials SQL keeps.
+func preparePushFrom(ctx context.Context, m *repo_model.PushMirror, path string, isWiki bool, credURL string) (*preparedPush, error) {
 	// We used to erronously configure repos with `--mirror`, which would set both push and fetch refspecs into the
 	// git config.  We need to remove any `fetch` configurations that were leftover from that error, as they caused
 	// source repository references to rollback: https://codeberg.org/forgejo/forgejo/issues/14273 Exit code 5 is
@@ -307,10 +315,12 @@ func preparePush(ctx context.Context, m *repo_model.PushMirror, repo *repo_model
 		return nil, util.SanitizeErrorCredentialURLs(err)
 	}
 
-	credURL, err := pushCredentialURL(ctx, m, remoteURL, isWiki)
-	if err != nil {
-		log.Error("SyncPushMirror [repo: %-v]: the push mirror's credentials: %v", m.Repo, err)
-		return nil, errors.New("Unexpected error")
+	if credURL == "" {
+		credURL, err = pushCredentialURL(ctx, m, remoteURL, isWiki)
+		if err != nil {
+			log.Error("SyncPushMirror [repo: %-v]: the push mirror's credentials: %v", m.Repo, err)
+			return nil, errors.New("Unexpected error")
+		}
 	}
 	lfsURL := remoteURL.String()
 	if credURL != "" {
@@ -320,12 +330,7 @@ func preparePush(ctx context.Context, m *repo_model.PushMirror, repo *repo_model
 	if setting.LFS.StartServer && !useSSHAuthentication {
 		log.Trace("SyncMirrors [repo: %-v]: syncing LFS objects...", m.Repo)
 
-		var gitRepo *git.Repository
-		if isWiki {
-			gitRepo, err = gitrepo.OpenWikiRepository(ctx, repo)
-		} else {
-			gitRepo, err = gitrepo.OpenRepository(ctx, repo)
-		}
+		gitRepo, err := git.OpenRepository(ctx, path)
 		if err != nil {
 			log.Error("OpenRepository: %v", err)
 			return nil, errors.New("Unexpected error")

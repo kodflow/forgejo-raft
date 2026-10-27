@@ -815,10 +815,12 @@ Watch, Custom, Releases on GitHub, or the tags of
   it, at its first sync there; until then it pushes from that node only.
   `forgejo doctor` never removes a push mirror in a cluster because one
   node lacks its remote.
-- A push mirror's sync pushes `--mirror --force` from the node's disk. A
-  node pushes only once it serves the repository, and its wiki, at the
-  commit index the cluster confirms, from a directory that holds the
-  repository the database names; otherwise the sync fails, is not
+- A push mirror's sync pushes `--mirror --force` from a copy of the
+  node's directory. A node pushes only once it serves the repository, and
+  its wiki, at the commit index the cluster confirms, from a copy read
+  between two checks that the directory holds the repository the database
+  names under the name the sync loaded: a rename of the repository during
+  the sync refuses it too. Otherwise the sync fails, is not
   recorded as done, and the next `update_mirrors` round retries it. A
   node holds the sync in the database while it runs: `push_mirror`'s
   `last_update` is then the hold's expiry, some minutes ahead, which the

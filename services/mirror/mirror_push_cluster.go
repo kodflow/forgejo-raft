@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"time"
 
 	repo_model "forgejo.org/models/repo"
@@ -15,6 +16,7 @@ import (
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/optional"
 	"forgejo.org/modules/process"
+	repo_module "forgejo.org/modules/repository"
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/timeutil"
 	"forgejo.org/modules/util"
@@ -33,10 +35,12 @@ import (
 // it reads the repository: last_update holds the hold's expiry, ahead of
 // every clock, until the sync writes its outcome there. Under the hold,
 // each push starts once the node serves its repository at least at the
-// commit index the cluster confirms then (WaitFresh), from a directory
-// that holds the repository the database describes (ReadRefusal): it
-// carries every write acknowledged before the hold, and so every write the
-// previous hold's pushes carried. The hold, not the leadership, keeps the
+// commit index the cluster confirms then (WaitFresh), from a copy of its
+// directory read between two checks that the directory holds the
+// repository the database describes, under the name the sync loaded
+// (stagePush, #294): it carries every write acknowledged before the hold,
+// and so every write the previous hold's pushes carried, and nothing of
+// another repository. The hold, not the leadership, keeps the
 // pushes apart: a node that led when its push started may still be
 // pushing when the next leader does, and nothing fences a push at the
 // remote; the hold needs SQL only, and works on whichever node runs the
@@ -60,7 +64,8 @@ var errPushHoldLost = errors.New("another node of the cluster took over the sync
 var errPushCarried = errors.New("carried by a sync of this push mirror started since")
 
 // pushRefused is a push this node refused to make: it may be behind the
-// cluster, or its directory holds another repository. The sync is not
+// cluster, its directory holds another repository, or the repository was
+// renamed since the sync loaded it. The sync is not
 // written as done, and the next round of update_mirrors, on any node,
 // retries it.
 type pushRefused struct{ error }
@@ -80,9 +85,10 @@ func pushTimeoutInCluster() time.Duration {
 }
 
 // pushHoldSpan is how long a hold lasts. What follows its last renewal is
-// bounded: for the repository and its wiki, a fresh wait and a push, which
-// git kills past timeout, its process group past the process manager's
-// grace; the clock skew counts on both sides.
+// bounded: for the repository and its wiki, a fresh wait, then the copy
+// brought up to the directory and the push, which git runs within timeout
+// together (pushFresh), its process group killed past the process
+// manager's grace; the clock skew counts on both sides.
 func pushHoldSpan(timeout time.Duration) time.Duration {
 	return 2*(setting.Cluster.ReadAfterWriteTimeout+timeout+process.TerminateGraceTimeout) + 2*pushHoldSkew
 }
@@ -235,75 +241,289 @@ func syncPushMirrorInCluster(ctx context.Context, m *repo_model.PushMirror) bool
 	return err == nil
 }
 
-// runPushSyncHeld is runPushSync under the hold. Both pushes come last,
-// after one renewal of the hold, so that every write of the hold, taken
-// or renewed, is followed by the fresh waits of both before they push. A
-// wiki that fails keeps the repository's push, which runPushSync makes
-// first. The wiki is waited for before the node looks for it: one created
-// lately may not be projected here yet, and would be skipped.
+// runPushSyncHeld is runPushSync under the hold. Each push, of the
+// repository and of its wiki, comes from a staging copy of its directory
+// on this node, read between two checks that it holds the repository the
+// sync loaded (stagePush). Both pushes come last, after one renewal of the
+// hold, so that every write of the hold, taken or renewed, is followed by
+// the fresh waits of both, and their copies brought up to the directory,
+// before they push. A wiki that fails keeps the repository's push, which
+// runPushSync makes first. The wiki is waited for before the node looks
+// for it: one created lately may not be projected here yet, and would be
+// skipped.
 func runPushSyncHeld(ctx context.Context, m *repo_model.PushMirror, hold *pushHold, timeout time.Duration) error {
 	if err := mayPushFrom(ctx, m, false); err != nil {
 		return err
 	}
-	repoPush, err := preparePush(ctx, m, m.Repo, false)
+	repoStage, err := stagePush(ctx, m, false, timeout)
 	if err != nil {
 		return err
 	}
+	defer repoStage.remove()
+	repoPush, err := repoStage.prepare(ctx, m)
+	if err != nil {
+		return err
+	}
+	var wikiStage *pushStage
 	var wikiPush *preparedPush
 	wikiErr := mayPushFrom(ctx, m, true)
 	if wikiErr == nil && m.Repo.HasWiki() {
-		var has bool
-		if has, wikiErr = wikiPushRemote(ctx, m); has {
-			wikiPush, wikiErr = preparePush(ctx, m, m.Repo, true)
+		wikiStage, wikiErr = stagePush(ctx, m, true, timeout)
+		switch {
+		case errors.Is(wikiErr, errNoPushRemote):
+			log.Trace("Skipping wiki: No remote configured")
+			wikiErr = nil
+		case wikiErr == nil:
+			defer wikiStage.remove()
+			wikiPush, wikiErr = wikiStage.prepare(ctx, m)
 		}
 	}
 	if err := hold.renew(ctx); err != nil {
 		return err
 	}
-	if err := mayPushFrom(ctx, m, false); err != nil {
-		return err
-	}
-	if err := repoPush.push(ctx, m, timeout); err != nil {
+	if err := repoStage.pushFresh(ctx, m, repoPush, timeout); err != nil {
 		return err
 	}
 	if wikiErr != nil || wikiPush == nil {
 		return wikiErr
 	}
-	if err := mayPushFrom(ctx, m, true); err != nil {
-		return err
-	}
-	return wikiPush.push(ctx, m, timeout)
-}
-
-// wikiPushRemote recreates the remote of the wiki's push mirror when this
-// node lacks it, and reports whether the wiki has one to push to, as
-// runPushSync does.
-func wikiPushRemote(ctx context.Context, m *repo_model.PushMirror) (bool, error) {
-	if err := ensurePushMirrorRemote(ctx, m, m.Repo.WikiPath(), true); err != nil {
-		log.Error("SyncPushMirror [repo: %-v]: recreating the remote of the wiki's push mirror: %v", m.Repo, err)
-		return false, util.SanitizeErrorCredentialURLs(err)
-	}
-	if _, err := git.GetRemoteAddress(ctx, m.Repo.WikiPath(), m.RemoteName); err != nil {
-		log.Trace("Skipping wiki: No remote configured")
-		return false, nil
-	}
-	return true, nil
+	return wikiStage.pushFresh(ctx, m, wikiPush, timeout)
 }
 
 // mayPushFrom refuses a push from this node, of the repository or of its
 // wiki, unless the node serves it at least at the commit index the
-// cluster confirms now, which a node without a leader cannot tell, and
-// its directory holds the repository the database describes (#82): the
-// checks git's reads make (routers/web/repo/githttp.go), before anything
-// reads or changes the directory. A read past the bound is served as the
-// node has it; a push `--mirror --force` from it is not made.
+// cluster confirms now, which a node without a leader cannot tell: before
+// anything reads the directory, and again right before the push. A read
+// past the bound is served as the node has it; a push `--mirror --force`
+// from it is not made. That the directory holds the repository the
+// database describes (#82, #294) is checked around each read of it
+// (readPushSource).
 func mayPushFrom(ctx context.Context, m *repo_model.PushMirror, isWiki bool) error {
 	key := clusterhook.RepoKey(m.Repo.OwnerName, m.Repo.Name, isWiki)
 	if !clusterhook.WaitFresh(ctx, key) {
 		return pushRefused{fmt.Errorf("this node of the cluster may be behind the cluster's last writes to %s; the push mirror's sync is retried", key)}
 	}
-	if err := clusterhook.ReadRefusal(key, m.Repo.ID); err != nil {
-		return pushRefused{err}
+	return nil
+}
+
+// readPushSource runs read, which reads the directory on this node of the
+// push mirror's repository, or of its wiki, between two checks that it
+// holds that repository and nothing else, as a fork's base and a template
+// are read (#283): the repository's row, read again by its ID, must still
+// give the name the sync loaded, and the directory must hold the
+// repository (clusterhook.ReadBetweenChecks). A refusal is a pushRefused:
+// the sync is not written as done, and the next round of update_mirrors
+// retries it, with the repository loaded again, under its new name if it
+// was renamed.
+func readPushSource(ctx context.Context, m *repo_model.PushMirror, isWiki bool, read func() error) error {
+	key := clusterhook.RepoKey(m.Repo.OwnerName, m.Repo.Name, isWiki)
+	return clusterhook.ReadBetweenChecks(key, m.Repo.ID, func() error {
+		return pushSourceStillNamed(ctx, m.Repo, key, isWiki)
+	}, func(err error) error { return pushRefused{err} }, read)
+}
+
+// pushSourceStillNamed refuses, as a pushRefused, a push of repo whose row
+// no longer gives key: renamed, transferred or deleted, it or its owner,
+// since the sync loaded it. Another repository may take the name
+// meanwhile, and then its directory on this node, whose stamp may carry no
+// repository ID for the read guard to compare (#294).
+func pushSourceStillNamed(ctx context.Context, repo *repo_model.Repository, key string, isWiki bool) error {
+	current, err := repo_model.GetRepositoryByID(ctx, repo.ID)
+	if repo_model.IsErrRepoNotExist(err) {
+		return pushRefused{fmt.Errorf("the repository of %s was deleted; the push mirror's sync is retried", key)}
+	}
+	if err != nil {
+		return err
+	}
+	if now := clusterhook.RepoKey(current.OwnerName, current.Name, isWiki); now != key {
+		return pushRefused{fmt.Errorf("the repository of %s is %s now; the push mirror's sync is retried under its new name", key, now)}
 	}
 	return nil
+}
+
+// errNoPushRemote is a wiki without a remote to push to: its push is
+// skipped, as runPushSync skips it.
+var errNoPushRemote = errors.New("the wiki has no remote to push to")
+
+// pushStage is the staging copy, outside the repository root and so never
+// replicated, that a push mirror's sync pushes from in a cluster: of the
+// directory of the repository, or of its wiki, on this node.
+type pushStage struct {
+	from   string // the directory on this node
+	dir    string // the copy
+	key    string
+	isWiki bool
+	// cred is the address of the directory's remote with its password,
+	// which the copy's remote does not hold: the push passes it through a
+	// credential helper.
+	cred string
+}
+
+// stagePush reads, in a cluster, the directory on this node of the push
+// mirror's repository, or of its wiki, into a staging copy, and returns it
+// with the push mirror's remote configured in the copy. A wiki without a
+// remote to push to gives none, and errNoPushRemote.
+//
+// The sync loaded its repository once, at its start, and read the
+// directory under that name past one check, ReadRefusal, that it held the
+// repository. A directory whose stamp carries no repository ID, that of a
+// repository written only by a fork, a migration or a pull mirror's sync,
+// is judged by the replicated table alone, which rightly holds, under the
+// name, the repository a rename put there: the check passed, the remote
+// was recreated from SQL in that repository's git config (#79), its LFS
+// objects went to the remote and git pushed its history there `--mirror
+// --force` (#294, after #172). The window ran from the start of the sync,
+// the wait for another node's hold included, to the push.
+//
+// The directory is now read once, by `git clone --mirror`, between two
+// checks that it holds the repository the sync loaded, and nothing else
+// (readPushSource); its LFS objects and the push come from the copy only.
+// The copy's remote is the one the directory's git config holds, read with
+// it, or the one SQL gives (pushRemoteAddress), with the push refspecs of
+// SQL's branch filter, and without a password. Only once the read was
+// checked does the directory's own remote follow SQL, as before (#79,
+// #183): nothing of the sync writes into a directory it did not check.
+func stagePush(ctx context.Context, m *repo_model.PushMirror, isWiki bool, timeout time.Duration) (*pushStage, error) {
+	from := m.Repo.RepoPath()
+	if isWiki {
+		from = m.Repo.WikiPath()
+	}
+	dir, err := repo_module.CreateTemporaryPath("push-mirror")
+	if err != nil {
+		return nil, err
+	}
+	s := &pushStage{from: from, dir: dir, key: clusterhook.RepoKey(m.Repo.OwnerName, m.Repo.Name, isWiki), isWiki: isWiki}
+	if err := s.configure(ctx, m, timeout); err != nil {
+		s.remove()
+		if errors.As(err, new(pushRefused)) || errors.Is(err, errNoPushRemote) {
+			return nil, err
+		}
+		err = util.SanitizeErrorCredentialURLs(err)
+		log.Error("SyncPushMirror [repo: %-v]: staging the push mirror's copy of %s: %v", m.Repo, s.key, err)
+		return nil, err
+	}
+	return s, nil
+}
+
+// configure reads the directory into the copy, between two checks, and
+// sets the push mirror's remote in the copy, then in the directory. A wiki
+// without a remote to push to is errNoPushRemote.
+func (s *pushStage) configure(ctx context.Context, m *repo_model.PushMirror, timeout time.Duration) error {
+	var held string
+	var exists bool
+	if err := readPushSource(ctx, m, s.isWiki, func() error {
+		var err error
+		if held, exists, err = remoteURLIn(ctx, s.from, m.RemoteName); err != nil {
+			return err
+		}
+		if stdout, _, err := git.NewCommand(ctx, "clone", "--mirror", "--quiet").AddDynamicArguments(s.from, s.dir).
+			SetDescription(fmt.Sprintf("stagePush(git clone): %s", s.key)).
+			RunStdString(&git.RunOpts{Timeout: timeout}); err != nil {
+			return fmt.Errorf("git clone: %w: %s", err, stdout)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	// The copy pushes to the push mirror's remote only: the clone's own
+	// remote, the directory, goes, its refs kept.
+	if _, _, err := git.NewCommand(ctx, "config", "--remove-section", "remote.origin").RunStdString(&git.RunOpts{Dir: s.dir}); err != nil {
+		return err
+	}
+
+	addr := held
+	if !exists {
+		var err error
+		if addr, err = pushRemoteAddress(ctx, m, s.isWiki); err != nil {
+			return err
+		}
+	}
+	if addr == "" {
+		if s.isWiki {
+			return errNoPushRemote
+		}
+		// The repository without any remote fails at the push's
+		// preparation, as without a cluster.
+		return nil
+	}
+
+	// The node that created the push mirror holds its remote with the
+	// password: the copy's remote never does, and the push passes it
+	// through a credential helper. A push mirror from before
+	// EncryptedRemoteAddress has it stored from there, as
+	// pushCredentialURL does, for the other nodes.
+	copyAddr := addr
+	if u, err := url.Parse(addr); err == nil && hasPassword(u) {
+		if m.EncryptedRemoteAddress == nil && !s.isWiki {
+			if err := m.SetEncryptedRemoteAddress(ctx, addr); err != nil {
+				return err
+			}
+		}
+		s.cred = addr
+		u.User = url.User(u.User.Username())
+		copyAddr = u.String()
+	}
+	if err := addPushRemoteAndConfig(ctx, m, copyAddr, s.dir); err != nil {
+		return err
+	}
+
+	// The directory's own remote follows SQL, now that the read was
+	// checked, as ensurePushMirrorRemote brings it.
+	if m.RemoteAddress == "" {
+		return nil
+	}
+	if exists {
+		if err := alignPushRefSpecs(ctx, m, s.from); err != nil {
+			return err
+		}
+	} else if err := addPushRemoteAndConfig(ctx, m, addr, s.from); err != nil {
+		return err
+	}
+	// The fetch refspec `git remote add` writes for a branch filter goes,
+	// as preparePushFrom removes it from the copy.
+	if _, _, err := git.NewCommand(ctx, "config", "--unset-all").AddDynamicArguments("remote." + m.RemoteName + ".fetch").RunStdString(&git.RunOpts{Dir: s.from}); err != nil && !git.IsErrorExitCode(err, 5) {
+		return err
+	}
+	return nil
+}
+
+// prepare does what comes before the push of the copy: its LFS objects,
+// which are the copy's, the remote's checks and its credentials.
+func (s *pushStage) prepare(ctx context.Context, m *repo_model.PushMirror) (*preparedPush, error) {
+	return preparePushFrom(ctx, m, s.dir, s.isWiki, s.cred)
+}
+
+// pushFresh pushes the copy p was prepared from once this node serves the
+// repository, or its wiki, fresh (mayPushFrom), the copy first brought up
+// to the directory, read again between two checks (readPushSource): the
+// push carries every write this node serves then, and nothing of another
+// repository. Both run within timeout, the bound pushHoldSpan counts for
+// a push.
+func (s *pushStage) pushFresh(ctx context.Context, m *repo_model.PushMirror, p *preparedPush, timeout time.Duration) error {
+	if err := mayPushFrom(ctx, m, s.isWiki); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(timeout)
+	if err := readPushSource(ctx, m, s.isWiki, func() error {
+		if stdout, _, err := git.NewCommand(ctx, "fetch", "--prune", "--quiet").AddDynamicArguments(s.from, "+refs/*:refs/*").
+			SetDescription(fmt.Sprintf("stagePush(git fetch): %s", s.key)).
+			RunStdString(&git.RunOpts{Dir: s.dir, Timeout: timeout}); err != nil {
+			return fmt.Errorf("git fetch: %w: %s", err, stdout)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	left := time.Until(deadline)
+	if left <= 0 {
+		return fmt.Errorf("bringing the copy of %s up to date took the push's whole timeout", s.key)
+	}
+	return p.push(ctx, m, left)
+}
+
+// remove removes the copy.
+func (s *pushStage) remove() {
+	if err := repo_module.RemoveTemporaryPath(s.dir); err != nil {
+		log.Error("Failed to remove the push mirror's copy of %s: %v", s.key, err)
+	}
 }

@@ -138,31 +138,13 @@ func readTemplateDirectory(ctx context.Context, templateRepo *repo_model.Reposit
 // the read began, even one undone since, and the row must still give the
 // name. Any of them refuses the write with refused, which wraps
 // clusterhook.ErrBehind: the caller retries. noun names source in the
-// refusal. Without a cluster it only runs read.
+// refusal. The checks are clusterhook.ReadBetweenChecks, which a push
+// mirror's sync shares (#294). Without a cluster it only runs read.
 func readSourceDirectory(ctx context.Context, source *repo_model.Repository, noun string, refused func(error) error, read func() error) error {
-	if !clusterhook.Enabled() {
-		return read()
-	}
 	key := clusterhook.RepoKey(source.OwnerName, source.Name, false)
-	if err := sourceStillNamed(ctx, source, key, noun, refused); err != nil {
-		return err
-	}
-	still, err := clusterhook.CheckRead(key, source.ID)
-	if err != nil {
-		return refused(err)
-	}
-	if err := read(); err != nil {
-		// A directory the projector moved while git read it fails the
-		// read: the move is the reason, and the caller retries.
-		if serr := still(); serr != nil {
-			return refused(fmt.Errorf("%w (and the read failed: %v)", serr, err))
-		}
-		return err
-	}
-	if err := still(); err != nil {
-		return refused(err)
-	}
-	return sourceStillNamed(ctx, source, key, noun, refused)
+	return clusterhook.ReadBetweenChecks(key, source.ID, func() error {
+		return sourceStillNamed(ctx, source, key, noun, refused)
+	}, refused, read)
 }
 
 // sourceStillNamed refuses with refused, which wraps clusterhook.ErrBehind,
