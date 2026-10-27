@@ -87,6 +87,10 @@ spec:
             - name: members
               mountPath: /etc/forgejo-raft/members
               readOnly: true
+            # The stored files (LFS, attachments, avatars, packages...), on
+            # the one volume every pod mounts: see common.yaml.
+            - name: stored
+              mountPath: /stored
             # The consensus node's boot-scoped STORAGE_FAILED marker: it
             # outlives a restart of the pod and goes with a reboot of the
             # node (ADR 0152 D4, R9-05). The image's setup, as root, hands
@@ -151,10 +155,18 @@ spec:
           hostPath:
             path: /run/kitsunium-consensus
             type: DirectoryOrCreate
+        # Last, after the volumes the per-slot kustomizations patch by
+        # index: the stored files' claim, the same for every pod.
+        - name: stored
+          persistentVolumeClaim:
+            claimName: forgejo-raft-stored
       securityContext:
         # The image starts as root and drops to the git user (uid 1000);
-        # the volumes are handed to that group.
+        # the volumes are handed to that group. Only when their root is
+        # not yet: a recursive change at every start would rewrite the
+        # modes of the files the other pods are writing on the shared one.
         fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
   volumeClaimTemplates:
     - metadata:
         name: data

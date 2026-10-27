@@ -59,7 +59,7 @@ the *decisions*, not the disk.
 | Acknowledged push is on | one disk | the storage's guarantee | a majority of disks |
 | Repositories live on | local disk | network filesystem | local disk, on every node |
 | Split brain | n/a | the storage's problem | impossible by construction (majority) |
-| Extra infrastructure | none | a storage cluster | none for git, an HA PostgreSQL for SQL |
+| Extra infrastructure | none | a storage cluster | none for git, an HA PostgreSQL for SQL, one shared storage for non-git files |
 
 Each node keeps complete git repositories on its own local disk. What the
 nodes agree on, through Raft, is the **ref table**: for every repository,
@@ -525,10 +525,16 @@ shares one host, so it survives the loss of a process, not of the machine.
   the node's private address explicitly; a wildcard is refused.
 - **PostgreSQL, highly available**, reachable from every node, with backups
   of its own. The cluster does not replicate SQL.
-- **Object storage for non-git files.** The cluster replicates git refs and
-  objects (repositories and wikis). LFS objects, attachments, avatars and
-  packages live in Forgejo's `[storage]`: point it at an S3-compatible store
-  shared by the nodes.
+- **One storage for non-git files, shared by the nodes.** The cluster
+  replicates git refs and objects (repositories and wikis). LFS objects,
+  attachments, avatars, packages, archives and Actions logs live in
+  Forgejo's storages, which every node must see: the node the load balancer
+  picks next reads the file another node wrote. Either a filesystem every
+  node mounts at the same path (NFS, CephFS, a ReadWriteMany volume), the
+  only kind the observers copy, or an S3-compatible store, without
+  observers (`CHECKPOINT_INTERVAL` refuses it). The deployment examples
+  mount one shared volume on `/stored`; see "Requirements" in
+  [contrib/cluster/README.md](../contrib/cluster/README.md).
 - **A CA** for the cluster, ideally Vault's PKI engine for in-process
   renewal, or cert-manager on Kubernetes.
 - **Two witness hosts** for the Recover fence, failing independently of the
@@ -748,8 +754,9 @@ official release would give (clean, carried, or the conflicted files).
 - **The SQL side is eventually consistent** with git by a few moments: the
   branch list or a pull request's state follows the push, computed once on
   the leader.
-- **Non-git data** (LFS, attachments, packages) must be on shared object
-  storage; the cluster does not replicate it.
+- **Non-git data** (LFS, attachments, avatars, packages) must be on one
+  storage every node sees; the cluster does not replicate it. Observers copy
+  a shared filesystem only, never an object store.
 - The Nomad JOIN drain check looks at the joiner's machine only. Checking
   that the old member's machine was emptied stays the job of the operator
   who authorizes the join.

@@ -9,6 +9,10 @@
 #     must survive a node loss on its own. Fill the Secret forgejo-raft-db;
 #   - three schedulable nodes (the pods refuse to share one), with a
 #     StorageClass for persistent, ideally local and encrypted, volumes;
+#   - a StorageClass offering ReadWriteMany (an NFS or CephFS provisioner,
+#     EFS, Azure Files, Filestore...) for the claim forgejo-raft-stored:
+#     the files Forgejo keeps outside git, which every pod reads and writes
+#     (see "Stored files" below);
 #   - optionally, the Recover witnesses, two small services OUTSIDE this
 #     Kubernetes cluster (see WITNESSES below).
 #
@@ -49,6 +53,18 @@
 #   - LISTEN_ADDR is the pod's stable DNS name in the headless Service, which
 #     publishes not-ready pods: the members must reach each other before
 #     any of them is ready.
+#
+# Stored files
+#   The cluster replicates git, not the files Forgejo keeps beside it: LFS
+#   objects, attachments, avatars, packages, archives, Actions logs and
+#   artifacts. A file one pod wrote is read by whichever pod the Service
+#   picks next, so they live on ONE volume every pod mounts on /stored (the
+#   claim forgejo-raft-stored, ReadWriteMany), never on a pod's own: a
+#   local storage, the only kind observers copy (contrib/cluster/observer.md).
+#   An S3-compatible store shared by the pods is the other choice, without
+#   observers: drop the claim and its mount, and set [storage] STORAGE_TYPE =
+#   minio and its MINIO_* settings (see "Requirements" in
+#   contrib/cluster/README.md).
 #
 # Limits of this example
 #   - cert-manager draws each private key and keeps it in that slot's
@@ -125,6 +141,10 @@ data:
     # The image's setup expects unset variables to be empty: no -u before it.
     cd /etc/s6/gitea && source ./setup >/dev/null
     set -u
+    # The shared volume of the stored files: the git user writes there. A
+    # driver that ignores fsGroup leaves it root's; a chown that fails here
+    # (root squashed) names it before Forgejo fails on it.
+    if ! su-exec git test -w /stored; then chown git:git /stored; fi
     fj() { su-exec git /usr/local/bin/gitea cluster "$@"; }
     line_file=/data/gitea/cluster-member-line
     if [ ! -s /data/gitea/cluster/STAMP ]; then
@@ -191,12 +211,33 @@ data:
     node-a=forgejo-raft-a-0.forgejo-raft-consensus:7480,node-b=forgejo-raft-b-0.forgejo-raft-consensus:7480,node-c=forgejo-raft-c-0.forgejo-raft-consensus:7480
   # Seeds the cluster-operator permission while nobody holds it yet.
   FORGEJO__cluster__OPERATORS: site-admin
+  # The stored files on the shared claim (see "Stored files" above): every
+  # storage under /stored/<name>, and the paths the image's app.ini names.
+  FORGEJO__storage__PATH: /stored
+  FORGEJO__lfs__PATH: /stored/lfs
+  FORGEJO__attachment__PATH: /stored/attachments
+  FORGEJO__picture__AVATAR_UPLOAD_PATH: /stored/avatars
+  FORGEJO__picture__REPOSITORY_AVATAR_UPLOAD_PATH: /stored/repo-avatars
   # The Recover witnesses, outside this Kubernetes cluster, on machines that
   # fail independently of its nodes, with their Ed25519 public keys in the
   # same order. Empty: the fence is off, and a Recover cannot keep an old
   # majority from coming back.
   FORGEJO__cluster__WITNESSES: ""
   FORGEJO__cluster__WITNESS_KEYS: ""
+---
+# The stored files, shared by the three pods: ReadWriteMany. Name an RWX
+# StorageClass of your cluster; the default class is usually ReadWriteOnce.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: forgejo-raft-stored
+  namespace: forgejo-raft
+spec:
+  accessModes: [ReadWriteMany]
+  # storageClassName: <an RWX class>
+  resources:
+    requests:
+      storage: 100Gi
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

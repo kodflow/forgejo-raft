@@ -110,6 +110,13 @@ command kinds in the log, which a member of an older version stops on: turn
 it on only once every member runs this version. It needs PostgreSQL, and the
 LFS, attachment and package storages local: an observer cannot copy an
 object store, and the node refuses to start the coordinator otherwise.
+Local means one filesystem every member mounts at the same path, as the
+deployment examples do on `/stored` (see "Requirements" in
+[README.md](README.md)): the leader lists and exports every stored file,
+whichever member took it. A file kept on another member's own disk is in
+no checkpoint: a recovery restores none of them, and its verification
+stops on the first LFS object, attachment or package blob SQL names and
+the checkpoint lacks.
 
 `OBSERVER_RECIPIENTS` are the observers' X25519 public keys. The export
 seals the database's `SECRET_KEY` to the observer its SSH key belongs to;

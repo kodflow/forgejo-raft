@@ -36,6 +36,34 @@ derive in it is written by a single consumer, on the leader.
   every five minutes, and logs an error naming the members whose keys
   differ; a member on an older binary is not compared. OAuth2's access
   tokens are a known limit (see "Known limits").
+- One storage for the files Forgejo keeps outside git, seen by every node:
+  LFS objects, attachments, avatars, packages, archives, Actions logs and
+  artifacts. The cluster replicates git, not them, and behind the load
+  balancer the node that serves a download is rarely the one that took the
+  upload: on each node's own disk, a file is missing on two nodes of three.
+  Two kinds work:
+  - a filesystem every node mounts at the same path (an NFS or CephFS
+    export, a ReadWriteMany volume), Forgejo's local storage. It is the
+    only kind observers copy: `CHECKPOINT_INTERVAL` refuses an LFS,
+    attachment or package storage that is not local (see
+    [observer.md](observer.md)), and the leader lists and exports the
+    files whichever member took them;
+  - an S3-compatible store shared by the nodes (`[storage] STORAGE_TYPE =
+    minio` and its `MINIO_*` keys), without observers.
+
+  The deployment examples mount one shared volume on `/stored` and set
+  `[storage] PATH = /stored`, which puts every storage under
+  `/stored/<name>`, plus the paths the image's `app.ini` names itself:
+  `[lfs] PATH = /stored/lfs`, `[attachment] PATH = /stored/attachments`,
+  `[picture] AVATAR_UPLOAD_PATH = /stored/avatars` and
+  `REPOSITORY_AVATAR_UPLOAD_PATH = /stored/repo-avatars`. A deployment
+  that kept them on each node's volume (`/data/git/lfs` and
+  `/data/gitea/<name>` in the image) holds each file on the node that took
+  it: before pointing the nodes at the shared storage, copy every node's
+  directories into it without replacing anything (`cp -a -n`, or `rsync -a
+  --ignore-existing`). Names do not collide: LFS objects and package blobs
+  are named by their digest, attachments by a random UUID, the others by
+  the row they belong to.
 - git 2.48 or later. Start-up fails with an older git: the cluster learns
   HEAD only from the reference-transaction hook, which git before 2.46
   bypasses for `git init` and `git symbolic-ref`, and git up to 2.47 reports
