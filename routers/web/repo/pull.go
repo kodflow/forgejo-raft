@@ -1599,7 +1599,7 @@ func MergePullRequest(ctx *context.Context) {
 			defer headRepo.Close()
 		}
 
-		if err := repo_service.DeleteBranchAfterMerge(workCtx, ctx.Doer, pr, headRepo); err != nil {
+		if err := repo_service.DeleteBranchAfterMerge(workCtx, ctx.Doer, pr, headRepo, ""); err != nil {
 			switch {
 			case errors.Is(err, repo_service.ErrBranchIsDefault):
 				ctx.Flash.Error(ctx.Tr("repo.pulls.delete_after_merge.head_branch.is_default"))
