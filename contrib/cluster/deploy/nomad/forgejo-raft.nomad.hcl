@@ -14,6 +14,17 @@
 #     encrypted, persistent disk. It holds the node's key and certificate
 #     (tls/), the consensus data directory and the repositories. The key is
 #     born there and never enters Nomad Variables or Vault;
+#   - on each machine, a host volume "forgejo-stored" (client config) on ONE
+#     filesystem every machine mounts, an NFS or CephFS export, writable by
+#     uid 1000. It holds what Forgejo keeps outside git: LFS objects,
+#     attachments, avatars, packages, archives, Actions logs and artifacts.
+#     The cluster replicates git, not these files, and a file one node wrote
+#     is read by whichever node the load balancer picks next: a host volume
+#     on each machine's own disk loses them behind it. A CSI volume in
+#     multi-node-multi-writer mode does as well. A local storage is the only
+#     kind observers copy (contrib/cluster/observer.md); an S3-compatible
+#     store is the other choice, without observers (see "Requirements" in
+#     contrib/cluster/README.md);
 #   - on each machine, a host volume "kitsunium-consensus" (client config)
 #     on /run/kitsunium-consensus, a tmpfs created at boot owned by uid 1000
 #     with mode 0700 (systemd-tmpfiles:
@@ -34,7 +45,12 @@
 #     balancer sends the next request to: a node given none draws its own,
 #     and refuses the others' tokens. Each is 32 random bytes in unpadded
 #     base64url, `openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n'`.
-#     `nomad var put` replaces every item of the variable: give it the four;
+#     `nomad var put` replaces every item of the variable: give it the four.
+#     The image's setup writes them into app.ini at every start: after a
+#     `forgejo cluster recover --from-observer`, put rotated.ini's
+#     SECRET_KEY, JWT_SECRET and LFS_JWT_SECRET into secret_key, jwt_secret
+#     and lfs_jwt_secret before a node starts, or the old cluster's come
+#     back (contrib/cluster/observer.md, "Recovering from an observer");
 #   - a PostgreSQL that every node reaches, highly available (Patroni or a
 #     managed service): the cluster replicates git refs, not SQL.
 
@@ -182,6 +198,12 @@ job "forgejo-raft" {
         source = "kitsunium-consensus"
       }
 
+      # The same shared filesystem on every machine.
+      volume "stored" {
+        type   = "host"
+        source = "forgejo-stored"
+      }
+
       # The Recover fence, before Forgejo. It asks every witness whether the
       # cluster this data directory belongs to was superseded by a Recover.
       # It exits 77 when one says so: the main task then never starts, and
@@ -252,6 +274,11 @@ job "forgejo-raft" {
             destination = "/run/kitsunium-consensus"
           }
 
+          volume_mount {
+            volume      = "stored"
+            destination = "/stored"
+          }
+
           # The default identity: the task API socket (secrets/api.sock) and
           # the Nomad Variables of this job. The JOIN drain check reads the
           # Nomad nodes with it, under forgejo-raft.policy.hcl.
@@ -303,6 +330,14 @@ job "forgejo-raft" {
             FORGEJO__security__INSTALL_LOCK = "true"
             FORGEJO__session__PROVIDER      = "db"
             FORGEJO__metrics__ENABLED       = "true"
+
+            # The stored files on the shared volume: every storage under
+            # /stored/<name>, and the paths the image's app.ini names.
+            FORGEJO__storage__PATH                          = "/stored"
+            FORGEJO__lfs__PATH                              = "/stored/lfs"
+            FORGEJO__attachment__PATH                       = "/stored/attachments"
+            FORGEJO__picture__AVATAR_UPLOAD_PATH            = "/stored/avatars"
+            FORGEJO__picture__REPOSITORY_AVATAR_UPLOAD_PATH = "/stored/repo-avatars"
 
             FORGEJO__cluster__SLOT               = group.key
             FORGEJO__cluster__LISTEN_ADDR        = "${var.addresses[group.key]}:7480"

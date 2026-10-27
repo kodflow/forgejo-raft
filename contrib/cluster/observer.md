@@ -110,6 +110,13 @@ command kinds in the log, which a member of an older version stops on: turn
 it on only once every member runs this version. It needs PostgreSQL, and the
 LFS, attachment and package storages local: an observer cannot copy an
 object store, and the node refuses to start the coordinator otherwise.
+Local means one filesystem every member mounts at the same path, as the
+deployment examples do on `/stored` (see "Requirements" in
+[README.md](README.md)): the leader lists and exports every stored file,
+whichever member took it. A file kept on another member's own disk is in
+no checkpoint: a recovery restores none of them, and its verification
+stops on the first LFS object, attachment or package blob SQL names and
+the checkpoint lacks.
 
 `OBSERVER_RECIPIENTS` are the observers' X25519 public keys. The export
 seals the database's `SECRET_KEY` to the observer its SSH key belongs to;
@@ -343,8 +350,11 @@ the stored files already copied with the same bytes are kept:
 2. Rotation first: `<out>/rotated.ini` holds the checkpoint's `SECRET_KEY`
    (the database's encrypted columns need it), new JWT secrets (`[oauth2]
    JWT_SECRET`, `[server] LFS_JWT_SECRET`) and the observers' new key. The
-   command stops until `app.ini` carries every one of them, and names those
-   it does not carry yet: a node that kept the old cluster's `JWT_SECRET` or
+   command stops until the configuration carries every one of them, and
+   names those it does not carry yet: `app.ini`, and the `FORGEJO__*` and
+   `GITEA__*` variables of the command's environment, which the image's
+   setup writes into `app.ini` at every start of Forgejo (`__FILE` and
+   `_URI` included); a node that kept the old cluster's `JWT_SECRET` or
    `LFS_JWT_SECRET`, compromised with its members, would honour the tokens
    it signs, an LFS one for any user and any repository. `LFS_JWT_SECRET`
    is required with the LFS server off too, since the server signs with
@@ -353,6 +363,23 @@ the stored files already copied with the same bytes are kept:
    does not rotate. Recover with HS256, the default; the other members get
    the same rotated secrets when they join (see "Requirements" in
    [README.md](README.md)).
+   On a deployment that sets the secrets from its store, as the examples of
+   `deploy/` do, put `rotated.ini`'s `SECRET_KEY`, `JWT_SECRET` and
+   `LFS_JWT_SECRET` in that store before Forgejo starts on this node or any
+   member joins: the compose `.env` (`FORGEJO_SECRET_KEY`,
+   `FORGEJO_JWT_SECRET`, `FORGEJO_LFS_JWT_SECRET`), the Kubernetes Secret
+   `forgejo-raft-db` (`secret-key`, `jwt-secret`, `lfs-jwt-secret`), or the
+   Nomad variable `nomad/jobs/forgejo-raft` (`secret_key`, `jwt_secret`,
+   `lfs_jwt_secret`, given with `db_password`: `nomad var put` replaces
+   every item). Otherwise the first start writes the store's values back
+   into `app.ini`, the old cluster's, compromised with its members, and
+   every member that joins carries them too, so the leader's comparison of
+   the keys says nothing. The command sees the store only when it runs with
+   the deployment's environment (a `docker compose run` of the node's
+   service, a pod or a Nomad task made from the node's own template), where
+   it names the variables to change: run outside it (the binary on the
+   host, a bare debug container), nothing checks the store, and replacing
+   its values is the operator's step.
 3. PostgreSQL: the base is extracted without the source's configuration
    (`postgresql.conf`, `postgresql.auto.conf`, includes, `conf.d`, signals,
    `tablespace_map`), and replayed with the observer's own:
@@ -415,7 +442,8 @@ the stored files already copied with the same bytes are kept:
 9. The loss, stated: everything after the checkpoint, and the replicated
    history before it.
 
-Then start Forgejo, run `forgejo cluster import` to put the restored refs in
+Then start Forgejo, the deployment's store carrying the rotated secrets
+(step 2), run `forgejo cluster import` to put the restored refs in
 the new table, the orphans' included, `forgejo doctor check --all --fix` and
 `forgejo cluster reconcile --apply`, which names the orphans step 6
 restored, to adopt or to delete; add the other members, and give the

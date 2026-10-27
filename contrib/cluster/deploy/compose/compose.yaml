@@ -53,11 +53,29 @@ x-node: &node
     # The token-signing secrets, the same for every node: a token one node
     # hands out (the container registry's, the Actions', LFS's) is verified
     # by the node the next request reaches. A node given none draws its own.
+    # The setup writes them into app.ini at every start: after a `forgejo
+    # cluster recover --from-observer`, put rotated.ini's SECRET_KEY,
+    # JWT_SECRET and LFS_JWT_SECRET into .env before a node starts
+    # (bootstrap.sh never replaces a value .env holds), or the old
+    # cluster's come back (contrib/cluster/observer.md, "Recovering from
+    # an observer").
     FORGEJO__oauth2__JWT_SECRET: ${FORGEJO_JWT_SECRET:?}
     FORGEJO__server__LFS_JWT_SECRET: ${FORGEJO_LFS_JWT_SECRET:?}
     # Required by [cluster]: a user git hook would run inside the
     # replication path, so the node refuses to start without it.
     FORGEJO__security__DISABLE_GIT_HOOKS: "true"
+    # Every file Forgejo keeps outside git (LFS objects, attachments,
+    # avatars, packages, archives, Actions logs and artifacts) on ONE volume
+    # the three nodes mount: the cluster replicates git, not these files,
+    # and a file one node wrote is read by whichever node the next request
+    # reaches. A local storage, the only kind an observer copies
+    # (contrib/cluster/observer.md); see "Requirements" in
+    # contrib/cluster/README.md for an object store instead.
+    FORGEJO__storage__PATH: /stored
+    FORGEJO__lfs__PATH: /stored/lfs
+    FORGEJO__attachment__PATH: /stored/attachments
+    FORGEJO__picture__AVATAR_UPLOAD_PATH: /stored/avatars
+    FORGEJO__picture__REPOSITORY_AVATAR_UPLOAD_PATH: /stored/repo-avatars
     # Any node may serve the next request. Sessions live in the shared
     # database. The cache stays in each node's memory, kept short: a value
     # cached on one node can lag a change made through another for up to
@@ -124,6 +142,15 @@ services:
       - node-b:/nodes/node-b
       - node-c:/nodes/node-c
 
+  # One-shot: the shared volume of the stored files, handed to the git user
+  # (uid 1000) of every node.
+  stored-init:
+    image: ${PKI_IMAGE:-alpine:3.22}
+    profiles: [setup]
+    entrypoint: ["/bin/sh", "-c", "chown 1000:1000 /stored && chmod 0750 /stored"]
+    volumes: [stored:/stored]
+    network_mode: none
+
   node-a:
     <<: *node
     hostname: node-a
@@ -134,7 +161,7 @@ services:
       FORGEJO__cluster__LISTEN_ADDR: node-a:7480
       FORGEJO__server__ROOT_URL: http://localhost:${NODE_A_PORT:-3001}/
     ports: ["127.0.0.1:${NODE_A_PORT:-3001}:3000"]
-    volumes: [node-a:/data, /run/kitsunium-consensus:/run/kitsunium-consensus]
+    volumes: [node-a:/data, stored:/stored, /run/kitsunium-consensus:/run/kitsunium-consensus]
 
   node-b:
     <<: *node
@@ -149,7 +176,7 @@ services:
       FORGEJO__cluster__LISTEN_ADDR: node-b:7480
       FORGEJO__server__ROOT_URL: http://localhost:${NODE_B_PORT:-3002}/
     ports: ["127.0.0.1:${NODE_B_PORT:-3002}:3000"]
-    volumes: [node-b:/data, /run/kitsunium-consensus:/run/kitsunium-consensus]
+    volumes: [node-b:/data, stored:/stored, /run/kitsunium-consensus:/run/kitsunium-consensus]
 
   node-c:
     <<: *node
@@ -163,7 +190,7 @@ services:
       FORGEJO__cluster__LISTEN_ADDR: node-c:7480
       FORGEJO__server__ROOT_URL: http://localhost:${NODE_C_PORT:-3003}/
     ports: ["127.0.0.1:${NODE_C_PORT:-3003}:3000"]
-    volumes: [node-c:/data, /run/kitsunium-consensus:/run/kitsunium-consensus]
+    volumes: [node-c:/data, stored:/stored, /run/kitsunium-consensus:/run/kitsunium-consensus]
 
 volumes:
   postgres:
@@ -171,3 +198,5 @@ volumes:
   node-a:
   node-b:
   node-c:
+  # The stored files, shared by the three nodes (see FORGEJO__storage__PATH).
+  stored:

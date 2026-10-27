@@ -36,6 +36,34 @@ derive in it is written by a single consumer, on the leader.
   every five minutes, and logs an error naming the members whose keys
   differ; a member on an older binary is not compared. OAuth2's access
   tokens are a known limit (see "Known limits").
+- One storage for the files Forgejo keeps outside git, seen by every node:
+  LFS objects, attachments, avatars, packages, archives, Actions logs and
+  artifacts. The cluster replicates git, not them, and behind the load
+  balancer the node that serves a download is rarely the one that took the
+  upload: on each node's own disk, a file is missing on two nodes of three.
+  Two kinds work:
+  - a filesystem every node mounts at the same path (an NFS or CephFS
+    export, a ReadWriteMany volume), Forgejo's local storage. It is the
+    only kind observers copy: `CHECKPOINT_INTERVAL` refuses an LFS,
+    attachment or package storage that is not local (see
+    [observer.md](observer.md)), and the leader lists and exports the
+    files whichever member took them;
+  - an S3-compatible store shared by the nodes (`[storage] STORAGE_TYPE =
+    minio` and its `MINIO_*` keys), without observers.
+
+  The deployment examples mount one shared volume on `/stored` and set
+  `[storage] PATH = /stored`, which puts every storage under
+  `/stored/<name>`, plus the paths the image's `app.ini` names itself:
+  `[lfs] PATH = /stored/lfs`, `[attachment] PATH = /stored/attachments`,
+  `[picture] AVATAR_UPLOAD_PATH = /stored/avatars` and
+  `REPOSITORY_AVATAR_UPLOAD_PATH = /stored/repo-avatars`. A deployment
+  that kept them on each node's volume (`/data/git/lfs` and
+  `/data/gitea/<name>` in the image) holds each file on the node that took
+  it: before pointing the nodes at the shared storage, copy every node's
+  directories into it without replacing anything (`cp -a -n`, or `rsync -a
+  --ignore-existing`). Names do not collide: LFS objects and package blobs
+  are named by their digest, attachments by a random UUID, the others by
+  the row they belong to.
 - git 2.48 or later. Start-up fails with an older git: the cluster learns
   HEAD only from the reference-transaction hook, which git before 2.46
   bypasses for `git init` and `git symbolic-ref`, and git up to 2.47 reports
@@ -206,7 +234,7 @@ on at least one voter.
 | `STEP_UP_MAX_AGE` | `5m` | How long a re-authentication allows further operations. |
 | `STEP_UP_OIDC_SOURCE`, `STEP_UP_ACR` | empty | The OpenID Connect source every operator re-authenticates with, and the authentication class required. Without a source, password and TOTP apply. |
 | `STEP_UP_PASSWORD_OPERATORS` | empty | Break-glass logins that keep password and TOTP when `STEP_UP_OIDC_SOURCE` is set. |
-| `READ_AFTER_WRITE_TIMEOUT` | `2s` | How long a request waits for the node to catch up with the caller's last write, and a git request (fetch, clone, push over HTTP or SSH) with the cluster's commit index. Without a known leader a git request does not wait: it is served as the node has it, except a repository whose directory on the node still holds another repository than the one the table holds under its name (a rename or a recreation of the name not projected there yet, or a directory the projector stamped with another repository ID than the database's, which a node cut off from the others also sees): git over HTTP and SSH, the repository's web pages and its API answer 503 until the node projects it. A directory stamped before this check, or a repository no push carrying its ID wrote yet, is judged by the table alone. A repository generated from a template with its git content or its git hooks, through the web form or the API, first waits for the node to serve the template at the cluster's commit index, and answers 503 with nothing created while the node does not, past this bound or without a leader, or while the template's directory still holds another repository. So does a fork, through the web form or the API, for its base: the node copies the base's directory outside the repository root, checked before and after, then takes the fork's refs from that copy, and nothing of the fork is written before. A sync of a fork with its base waits the same way, and pushes the branch from such a copy, with nothing pushed when refused. |
+| `READ_AFTER_WRITE_TIMEOUT` | `2s` | How long a request waits for the node to catch up with the caller's last write, and a git request (fetch, clone, push over HTTP or SSH) with the cluster's commit index. Without a known leader a git request does not wait: it is served as the node has it, except a repository whose directory on the node still holds another repository than the one the table holds under its name (a rename or a recreation of the name not projected there yet, or a directory the projector stamped with another repository ID than the database's, which a node cut off from the others also sees): git over HTTP and SSH, the repository's web pages and its API answer 503 until the node projects it. A directory stamped before this check, or a repository no push carrying its ID wrote yet, is judged by the table alone. A repository generated from a template with its git content or its git hooks, through the web form or the API, first waits for the node to serve the template at the cluster's commit index, and answers 503 with nothing created while the node does not, past this bound or without a leader, or while the template's directory still holds another repository. So does a fork, through the web form or the API, for its base: the node copies the base's directory outside the repository root, checked before and after, then takes the fork's refs from that copy, and nothing of the fork is written before. A sync of a fork with its base waits the same way, and pushes the branch from such a copy, with nothing pushed when refused. Changing a pull request's target branch, through the web form or `PATCH /repos/{owner}/{repo}/pulls/{index}` with `base`, first waits for the node to serve the head and base repositories at the cluster's commit index, and answers 503 with nothing written while it does not, past this bound or without a leader. The `pr_patch_checker` queue waits the same way before it tests a pull request: a node behind defers the test, the pull request stays in its checking state, and the queue runs it again. Deleting the head branch of a merged pull request first retargets the pull requests based on that branch, so it waits too: on a node behind, the branch is kept and nothing is retargeted; the merge API with `delete_branch_after_merge` answers 503, the web UI says the server has not caught up with the repository yet, and an automatic merge deletes the branch later. |
 | `HOOK_TIMEOUT` | `1m`, between `20s` and `1h` | How long one ref transaction may take in the cluster: its objects written on a majority, then its entry committed. A push that needs longer fails with nothing written; its retry ships only the objects the peers still lack. The proxies in front of Forgejo must allow at least as long. |
 | `MAX_LOG_BYTES`, `MAX_SNAPSHOT_BYTES` | 1 GiB | Bounds of the log and of a snapshot. |
 | `ACK_MARGIN` | `1024` | How far the trimming of consumed events lags the cursor. |

@@ -3,7 +3,8 @@
 # a rerun on a founded cluster only starts it.
 #
 #   1. .env: random secrets and a cluster id, written once, never replaced
-#   2. PostgreSQL up, the PKI (one key per node, born in its volume)
+#   2. PostgreSQL up, the PKI (one key per node, born in its volume), the
+#      shared volume of the stored files handed to the git user
 #   3. `forgejo cluster init` on each node, offline, once: prints the node's
 #      member line, id:incarnation:slot:spki:host:port
 #   4. `forgejo cluster bootstrap --members a,b,c` on each node, offline,
@@ -47,9 +48,10 @@ offline() {
     fi' -- "$@"
 }
 
-echo "== PostgreSQL and the PKI"
+echo "== PostgreSQL, the PKI and the stored files' volume"
 dc up -d --wait postgres
 dc run --rm pki
+dc run --rm stored-init
 
 # The offline commands need the data directories: servers stopped.
 dc stop "${NODES[@]}" 2>/dev/null || true
