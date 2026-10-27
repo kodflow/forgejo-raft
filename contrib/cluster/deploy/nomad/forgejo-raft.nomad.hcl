@@ -26,8 +26,15 @@
 #   - the Nomad ACL policy forgejo-raft.policy.hcl attached to this job;
 #   - Vault (vault-setup.sh): the PKI mount pki-consensus with one role per
 #     slot, and the JWT auth mount jwt-consensus with one role per slot;
-#   - the Nomad Variable nomad/jobs/forgejo-raft with db_password and
-#     secret_key (the job reads it with its own workload identity);
+#   - the Nomad Variable nomad/jobs/forgejo-raft with db_password,
+#     secret_key, jwt_secret and lfs_jwt_secret (the job reads it with its
+#     own workload identity). Every node signs and verifies its tokens with
+#     the last two, so that a token one node hands out (the container
+#     registry's, the Actions', LFS's) is honoured by the node the load
+#     balancer sends the next request to: a node given none draws its own,
+#     and refuses the others' tokens. Each is 32 random bytes in unpadded
+#     base64url, `openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n'`.
+#     `nomad var put` replaces every item of the variable: give it the four;
 #   - a PostgreSQL that every node reaches, highly available (Patroni or a
 #     managed service): the cluster replicates git refs, not SQL.
 
@@ -264,15 +271,20 @@ job "forgejo-raft" {
             change_mode = "noop"
           }
 
-          # Secrets from the Nomad Variable nomad/jobs/forgejo-raft.
+          # Secrets from the Nomad Variable nomad/jobs/forgejo-raft. An item
+          # it lacks fails the allocation rather than rendering "<no value>":
+          # a node would then draw its own token-signing secret at each start.
           template {
-            destination = "secrets/forgejo.env"
-            env         = true
-            change_mode = "restart"
-            data        = <<-EOT
+            destination          = "secrets/forgejo.env"
+            env                  = true
+            change_mode          = "restart"
+            error_on_missing_key = true
+            data                 = <<-EOT
               {{ with nomadVar "nomad/jobs/forgejo-raft" -}}
               FORGEJO__database__PASSWD={{ .db_password }}
               FORGEJO__security__SECRET_KEY={{ .secret_key }}
+              FORGEJO__oauth2__JWT_SECRET={{ .jwt_secret }}
+              FORGEJO__server__LFS_JWT_SECRET={{ .lfs_jwt_secret }}
               {{- end }}
             EOT
           }

@@ -96,14 +96,22 @@ spec:
     - name: http
       port: 3000
 ---
-# The Secret forgejo-raft-db (keys: host, password, secret-key) is NOT in
-# this file: no credential belongs in a manifest. Create it from your
-# PostgreSQL operator or secret manager, or by hand:
+# The Secret forgejo-raft-db (keys: host, password, secret-key, jwt-secret,
+# lfs-jwt-secret) is NOT in this file: no credential belongs in a manifest.
+# Create it from your PostgreSQL operator or secret manager, or by hand:
 #
+#   jwt() { openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n'; }
 #   kubectl -n forgejo-raft create secret generic forgejo-raft-db \
 #     --from-literal=host=<postgres-host>:5432 \
 #     --from-file=password=<file holding the database password> \
-#     --from-literal=secret-key="$(openssl rand -hex 32)"
+#     --from-literal=secret-key="$(openssl rand -hex 32)" \
+#     --from-literal=jwt-secret="$(jwt)" \
+#     --from-literal=lfs-jwt-secret="$(jwt)"
+#
+# jwt-secret and lfs-jwt-secret are [oauth2] JWT_SECRET and [server]
+# LFS_JWT_SECRET, 32 random bytes in unpadded base64url, shared by every
+# pod as secret-key is. A Secret made before them lacks them, and the pods
+# do not start until they are added to it.
 apiVersion: v1
 kind: ConfigMap
 metadata:

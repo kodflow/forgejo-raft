@@ -304,4 +304,41 @@ else
   flunk C.same-refs-on-every-node
 fi
 
+# Behind a load balancer the next request of a client may reach another
+# node than the one that handed it its token: every node verifies the
+# tokens any node signs, with the same [oauth2] JWT_SECRET and [server]
+# LFS_JWT_SECRET (#285).
+say "C12. A token one node signs, honoured by the others"
+REGISTRY_TOKEN="$(curl -sf -m 15 -u "$ADMIN:$TOKEN" "$(node_url 1)/v2/token" | jq -r '.token // empty')"
+# What the checks print of a token: never the token.
+said() { if [ -n "$1" ]; then echo "handed out"; else echo "missing${2:+: $2}"; fi; }
+for n in 2 3; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H "Authorization: Bearer $REGISTRY_TOKEN" "$(node_url "$n")/v2/")"
+  if [ -n "$REGISTRY_TOKEN" ] && [ "$code" = 200 ]; then
+    pass "C.registry-token-node-$n" "the container registry's token from node 1, HTTP 200 on node $n"
+  else
+    flunk "C.registry-token-node-$n" "token from node 1 $(said "$REGISTRY_TOKEN"), HTTP $code on node $n"
+  fi
+done
+if [ -n "${LFS_SUM:-}" ] && [ -n "${KEY_ID:-}" ] && [ "$KEY_ID" != null ]; then
+  # git-lfs-authenticate over SSH: the token git lfs sends with its HTTP
+  # requests, signed with the LFS key of the node that answered.
+  LFS_AUTH="$(ssh -i "$WORK/id_e2e" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+    -p 2221 git@127.0.0.1 git-lfs-authenticate "$REPO" download 2>"$WORK/err" | jq -r '.header.Authorization // empty')"
+  batch="$(jq -nc --arg oid "$LFS_SUM" '{operation: "download", transfers: ["basic"], objects: [{oid: $oid, size: 1048576}]}')"
+  for n in 2 3; do
+    code="$(curl -s -o "$WORK/lfs-batch-$n.json" -w '%{http_code}' -m 30 -X POST -H "Authorization: $LFS_AUTH" \
+      -H 'Accept: application/vnd.git-lfs+json' -H 'Content-Type: application/vnd.git-lfs+json' --data "$batch" \
+      "$(node_url "$n")/$REPO.git/info/lfs/objects/batch")"
+    href="$(jq -r '.objects[0].actions.download.href // empty' "$WORK/lfs-batch-$n.json" 2>/dev/null)"
+    if [ -n "$LFS_AUTH" ] && [ "$code" = 200 ] && [ -n "$href" ]; then
+      pass "C.lfs-token-node-$n" "the LFS token node 1 signed over SSH, the object's download on node $n"
+    else
+      flunk "C.lfs-token-node-$n" "token from node 1 $(said "$LFS_AUTH" "$(tail -n 2 "$WORK/err" | tr '\n' ' ')"), HTTP $code on node $n $(jq -r '.message // .objects[0].error.message // empty' "$WORK/lfs-batch-$n.json" 2>/dev/null)"
+    fi
+  done
+else
+  flunk C.lfs-token "no LFS object (C8) or no SSH key (C10) to ask a token for"
+fi
+
 finish

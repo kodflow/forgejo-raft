@@ -20,7 +20,6 @@ x-ci-forgejo-env: &ci-forgejo-env
   FORGEJO__cluster__EXPECTED_NODES: "3"
   FORGEJO__cluster__PEERS: node-a=10.89.1.41:7480,node-b=10.89.1.42:7480,node-c=10.89.1.43:7480
   FORGEJO__server__LFS_START_SERVER: "true"
-  FORGEJO__server__LFS_JWT_SECRET: ${LFS_JWT_SECRET:?}
   FORGEJO__server__DISABLE_SSH: "false"
   FORGEJO__server__START_SSH_SERVER: "true"
   FORGEJO__server__SSH_LISTEN_PORT: "2222"

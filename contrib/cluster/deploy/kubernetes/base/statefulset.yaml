@@ -65,6 +65,16 @@ spec:
             - name: FORGEJO__security__SECRET_KEY
               valueFrom:
                 secretKeyRef: {name: forgejo-raft-db, key: secret-key}
+            # The token-signing secrets, the same for every pod: a token one
+            # pod hands out (the container registry's, the Actions', LFS's)
+            # comes back to whichever pod the Service picks. A pod given
+            # none draws its own, on its own volume.
+            - name: FORGEJO__oauth2__JWT_SECRET
+              valueFrom:
+                secretKeyRef: {name: forgejo-raft-db, key: jwt-secret}
+            - name: FORGEJO__server__LFS_JWT_SECRET
+              valueFrom:
+                secretKeyRef: {name: forgejo-raft-db, key: lfs-jwt-secret}
           volumeMounts: &node-mounts
             - name: data
               mountPath: /data

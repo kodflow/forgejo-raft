@@ -153,6 +153,10 @@ type hello struct {
 	// same slot (#186). Absent from older binaries, whose joiner is never
 	// added so.
 	Incarnation string `json:"incarnation,omitempty"`
+	// Signing tells the answering node's token-signing keys apart from
+	// another's, which the leader compares with its own (signing.go,
+	// #285); absent from older binaries, which are not compared.
+	Signing *signingDigests `json:"signing,omitempty"`
 	// SPKI is the key the handshake proved, never read from the body.
 	SPKI [32]byte `json:"-"`
 }
@@ -226,7 +230,7 @@ func (a *autoMode) noteJoining(id consensus.NodeID, inc consensus.Incarnation) {
 func (r *Replicator) helloOf() hello {
 	h := hello{
 		Slot: r.auto.self, State: helloStarting, Address: r.auto.listen, Expected: r.auto.expected, Payload: reftable.PayloadVersion,
-		Checkpoints: r.checkpointsWord(), SQLYield: r.sqlYield.Load(),
+		Checkpoints: r.checkpointsWord(), SQLYield: r.sqlYield.Load(), Signing: localSigning(),
 	}
 	switch r.auto.disk.Load() {
 	case diskMember:
@@ -287,7 +291,7 @@ func (a *autoMode) joiningStamp(h *hello) {
 // applies, which an operator's raise of the version asks every member for
 // (#50).
 func (r *Replicator) memberHello() hello {
-	h := hello{Slot: setting.Cluster.Slot, State: helloMember, Payload: reftable.PayloadVersion, Checkpoints: r.checkpointsWord(), SQLYield: r.sqlYield.Load()}
+	h := hello{Slot: setting.Cluster.Slot, State: helloMember, Payload: reftable.PayloadVersion, Checkpoints: r.checkpointsWord(), SQLYield: r.sqlYield.Load(), Signing: localSigning()}
 	if eng := r.Engine(); eng != nil {
 		h.Node = eng.Status().ID.String()
 	}

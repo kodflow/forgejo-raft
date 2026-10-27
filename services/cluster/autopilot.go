@@ -125,6 +125,9 @@ func (r *Replicator) autopilotStep(ctx context.Context) {
 	r.maybeRaisePayload(pctx, m)
 	r.maybeRaiseCluster(pctx, eng)
 	_ = r.flushRevocations(pctx) // logged; the next pass retries it
+	// Last: it only logs, and its round of hellos must not eat the time of
+	// the revocations' flush.
+	r.maybeCheckSigning(pctx, eng)
 }
 
 // payloadProbeEvery paces the leader's question "does every member apply

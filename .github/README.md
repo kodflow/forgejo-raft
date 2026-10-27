@@ -540,7 +540,9 @@ shares one host, so it survives the loss of a process, not of the machine.
 ### Founding the cluster
 
 The nodes are stopped and share one configuration except `SLOT`,
-`LISTEN_ADDR` and the TLS files.
+`LISTEN_ADDR` and the TLS files: the same `SECRET_KEY`, `[oauth2]
+JWT_SECRET` and `[server] LFS_JWT_SECRET` on every node, or a token one node
+hands out is refused by the next.
 
 ```sh
 # on each node, offline: prints id:incarnation:slot:spki:host:port
@@ -588,7 +590,8 @@ Generic, commented, validated with their own tools, under
 
 On Nomad, the job relies on: a host volume per machine, each client's meta
 `forgejo_slot`, the ACL policy attached to the job, Vault configured by the
-script, and a Nomad Variable with the database password and secret key.
+script, and a Nomad Variable with the database password, the secret key
+and the two token-signing secrets every node shares.
 Nomad never moves a member (`reschedule { attempts = 0 }`,
 `disconnect { replace = false }`): Raft decides who holds the data, not the
 scheduler. Before admitting a node that joins by itself, Forgejo reads

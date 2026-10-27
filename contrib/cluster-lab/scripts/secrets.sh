@@ -26,6 +26,8 @@ for name in PG_SUPERUSER_PASSWORD PG_REPLICATION_PASSWORD FORGEJO_DB_PASSWORD FO
 done
 # Nomad's ACL bootstrap token must be a UUID.
 add NOMAD_TOKEN "$(openssl rand -hex 16 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')"
-# Forgejo's LFS JWT secret, shared by the nodes (compose.ci.yaml): 32 bytes
-# in unpadded base64url.
+# Forgejo's token-signing secrets, [server] LFS_JWT_SECRET and [oauth2]
+# JWT_SECRET, shared by the nodes (compose.yaml): 32 bytes in unpadded
+# base64url.
 add LFS_JWT_SECRET "$(openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
+add FORGEJO_JWT_SECRET "$(openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n')"

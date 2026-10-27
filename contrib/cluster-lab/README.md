@@ -190,9 +190,11 @@ The outputs of the latest full runs from scratch are in
 - No secret is written in the repository. At the first `make`,
   `scripts/secrets.sh` draws random values (`openssl rand`) into `.env`, which
   git ignores: the PostgreSQL and Forgejo database passwords, `SECRET_KEY`,
-  `lab-admin`'s password, the Vault dev token, the witness override secret and
-  the Nomad token. It never replaces one, and `make reset` keeps them. To read
-  one, for example `lab-admin`'s password (the account `make e2e` creates):
+  the token-signing secrets `JWT_SECRET` and `LFS_JWT_SECRET` (shared by the
+  nodes, as a cluster requires), `lab-admin`'s password, the Vault dev
+  token, the witness override secret and the Nomad token. It never replaces
+  one, and `make reset` keeps them. To read one, for example `lab-admin`'s
+  password (the account `make e2e` creates):
 
   ```sh
   make secret NAME=LAB_ADMIN_PASSWORD
