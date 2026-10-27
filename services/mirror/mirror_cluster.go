@@ -187,34 +187,46 @@ func ensurePushMirrorRemote(ctx context.Context, m *repo_model.PushMirror, path 
 	if exists {
 		return alignPushRefSpecs(ctx, m, path)
 	}
-	addr := m.RemoteAddress
-	if isWiki {
-		// The wiki's address is found by asking the remote: only once the
-		// address passed the allow and block lists again, and with the
-		// mirror's password, which a private wiki requires. The git
-		// config keeps the address without it.
-		u, err := giturl.Parse(addr)
-		if err != nil {
-			return err
-		}
-		if err := recheckPushPermitted(ctx, m, u); err != nil {
-			return err
-		}
-		ask, err := pushCredentialURL(ctx, m, u, true)
-		if err != nil {
-			return err
-		}
-		if ask == "" {
-			ask = addr
-		}
-		found := wikiRemoteURL(ctx, ask)
-		suffix, ok := strings.CutPrefix(found, strings.TrimSuffix(ask, ".git"))
-		if found == "" || !ok {
-			return nil
-		}
-		addr = strings.TrimSuffix(addr, ".git") + suffix
+	addr, err := pushRemoteAddress(ctx, m, isWiki)
+	if err != nil || addr == "" {
+		return err
 	}
 	return addPushRemoteAndConfig(ctx, m, addr, path)
+}
+
+// pushRemoteAddress returns the address a node that lacks the remote of
+// the push mirror m recreates it with: the address SQL holds, without its
+// password, or for the wiki the address the remote gives for its wiki, ""
+// when it serves none.
+func pushRemoteAddress(ctx context.Context, m *repo_model.PushMirror, isWiki bool) (string, error) {
+	addr := m.RemoteAddress
+	if !isWiki || addr == "" {
+		return addr, nil
+	}
+	// The wiki's address is found by asking the remote: only once the
+	// address passed the allow and block lists again, and with the
+	// mirror's password, which a private wiki requires. The git config
+	// keeps the address without it.
+	u, err := giturl.Parse(addr)
+	if err != nil {
+		return "", err
+	}
+	if err := recheckPushPermitted(ctx, m, u); err != nil {
+		return "", err
+	}
+	ask, err := pushCredentialURL(ctx, m, u, true)
+	if err != nil {
+		return "", err
+	}
+	if ask == "" {
+		ask = addr
+	}
+	found := wikiRemoteURL(ctx, ask)
+	suffix, ok := strings.CutPrefix(found, strings.TrimSuffix(ask, ".git"))
+	if found == "" || !ok {
+		return "", nil
+	}
+	return strings.TrimSuffix(addr, ".git") + suffix, nil
 }
 
 // alignPushRefSpecs rewrites the push refspecs of the push mirror's remote
