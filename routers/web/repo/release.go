@@ -19,6 +19,7 @@ import (
 	"forgejo.org/models/unit"
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/base"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/container"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
@@ -486,6 +487,19 @@ func NewRelease(ctx *context.Context) {
 	ctx.HTML(http.StatusOK, tplReleaseNew)
 }
 
+// releaseRowsRefusal is, in a cluster, the refusal of a write of a release
+// or a tag while this node does not serve the repository yet at the
+// cluster's commit index, or the cluster's log consumer has not derived the
+// SQL of its last writes (an event of the repository parked included): a
+// push's derivation rewrites the release rows of its tags, and would
+// overwrite a release or a tag written from a row read before it, or the
+// write would land on a row it removed (#298). It is asked before the row
+// is read; nil without a cluster.
+func releaseRowsRefusal(ctx *context.Context) error {
+	repo := ctx.Repo.Repository
+	return clusterhook.RequireDerived(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false))
+}
+
 // NewReleasePost response for creating a release
 func NewReleasePost(ctx *context.Context) {
 	form := web.GetForm(ctx).(*forms.NewReleaseForm)
@@ -559,6 +573,12 @@ func NewReleasePost(ctx *context.Context) {
 		}
 	}
 
+	// Before the tag's row is read: the release is built on it. Nothing
+	// was written, the user retries.
+	if err := releaseRowsRefusal(ctx); err != nil {
+		ctx.Error(http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	rel, err := repo_model.GetRelease(ctx, ctx.Repo.Repository.ID, form.TagName)
 	if err != nil {
 		if !repo_model.IsErrReleaseNotExist(err) {
@@ -573,6 +593,11 @@ func NewReleasePost(ctx *context.Context) {
 
 		if len(form.TagOnly) > 0 {
 			if err = release_service.CreateNewTag(ctx, ctx.Doer, ctx.Repo.Repository, form.Target, form.TagName, msg); err != nil {
+				if errors.Is(err, clusterhook.ErrBehind) {
+					// Nothing was written, the user retries (#189, #298).
+					ctx.Error(http.StatusServiceUnavailable, err.Error())
+					return
+				}
 				if models.IsErrTagAlreadyExists(err) {
 					e := err.(models.ErrTagAlreadyExists)
 					ctx.Flash.Error(ctx.Tr("repo.branch.tag_collision", e.TagName))
@@ -619,6 +644,9 @@ func NewReleasePost(ctx *context.Context) {
 		if err = release_service.CreateRelease(ctx.Repo.GitRepo, rel, msg, attachmentChanges.Values()); err != nil {
 			ctx.Data["Err_TagName"] = true
 			switch {
+			case errors.Is(err, clusterhook.ErrBehind):
+				// Nothing was written, the user retries (#189, #298).
+				ctx.Error(http.StatusServiceUnavailable, err.Error())
 			case repo_model.IsErrReleaseAlreadyExist(err):
 				ctx.RenderWithErr(ctx.Tr("repo.release.tag_name_already_exist"), tplReleaseNew, &form)
 			case models.IsErrInvalidTagName(err):
@@ -651,6 +679,9 @@ func NewReleasePost(ctx *context.Context) {
 		if err = release_service.UpdateRelease(ctx, ctx.Doer, ctx.Repo.GitRepo, rel, true, attachmentChanges.Values()); err != nil {
 			ctx.Data["Err_TagName"] = true
 			switch {
+			case errors.Is(err, clusterhook.ErrBehind):
+				// Nothing was written, the user retries (#189, #298).
+				ctx.Error(http.StatusServiceUnavailable, err.Error())
 			case repo_model.IsErrInvalidExternalURL(err):
 				ctx.RenderWithErr(ctx.Tr("repo.release.invalid_external_url", err.(repo_model.ErrInvalidExternalURL).ExternalURL), tplReleaseNew, &form)
 			default:
@@ -717,6 +748,12 @@ func EditReleasePost(ctx *context.Context) {
 	ctx.Data["PageIsEditRelease"] = true
 
 	tagName := ctx.Params("*")
+	// Before the release is read: it is written back whole. Nothing was
+	// written, the user retries.
+	if err := releaseRowsRefusal(ctx); err != nil {
+		ctx.Error(http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	rel, err := repo_model.GetRelease(ctx, ctx.Repo.Repository.ID, tagName)
 	if err != nil {
 		if repo_model.IsErrReleaseNotExist(err) {
@@ -825,6 +862,9 @@ func EditReleasePost(ctx *context.Context) {
 	rel.HideArchiveLinks = form.HideArchiveLinks
 	if err = release_service.UpdateRelease(ctx, ctx.Doer, ctx.Repo.GitRepo, rel, false, attachmentChanges.Values()); err != nil {
 		switch {
+		case errors.Is(err, clusterhook.ErrBehind):
+			// Nothing was written, the user retries (#189, #298).
+			ctx.Error(http.StatusServiceUnavailable, err.Error())
 		case repo_model.IsErrInvalidExternalURL(err):
 			ctx.RenderWithErr(ctx.Tr("repo.release.invalid_external_url", err.(repo_model.ErrInvalidExternalURL).ExternalURL), tplReleaseNew, &form)
 		default:
@@ -855,6 +895,17 @@ func deleteReleaseOrTag(ctx *context.Context, isDelTag bool) {
 		ctx.JSONRedirect(ctx.Repo.RepoLink + "/releases")
 	}
 
+	if isDelTag {
+		// Before the tag's row is read: a tag whose push is not derived yet
+		// would have its row written again by that derivation after the
+		// deletion (#298). Nothing was deleted; the page reads the answer
+		// only to follow its redirect, so the refusal is said there.
+		if err := releaseRowsRefusal(ctx); err != nil {
+			ctx.Flash.Error("DeleteReleaseByID: " + err.Error())
+			redirect()
+			return
+		}
+	}
 	rel, err := repo_model.GetReleaseForRepoByID(ctx, ctx.Repo.Repository.ID, ctx.FormInt64("id"))
 	if err != nil {
 		if repo_model.IsErrReleaseNotExist(err) {

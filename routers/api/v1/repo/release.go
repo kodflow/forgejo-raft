@@ -13,6 +13,7 @@ import (
 	"forgejo.org/models/perm"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unit"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	api "forgejo.org/modules/structs"
 	"forgejo.org/modules/web"
@@ -193,6 +194,21 @@ func ListReleases(ctx *context.APIContext) {
 	ctx.JSON(http.StatusOK, rels)
 }
 
+// releaseRowsBehind answers 503 with the reason when, in a cluster, this
+// node does not serve the repository yet at the cluster's commit index, or
+// the cluster's log consumer has not derived the SQL of its last writes
+// (an event of the repository parked included), and reports whether it
+// did. A push's derivation rewrites the release rows of its tags: a
+// release or a tag written from a row read before it, and before the
+// tag's state it derives, would be overwritten by it, or written on a row
+// it removed, and the push's own work would not write it again (#298).
+// It is asked before the row is read, which the write then builds on;
+// nothing is written while it refuses.
+func releaseRowsBehind(ctx *context.APIContext) bool {
+	repo := ctx.Repo().Repository
+	return clusterBehind(ctx, clusterhook.RequireDerived(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)))
+}
+
 // CreateRelease create a release
 func CreateRelease(ctx *context.APIContext) {
 	// swagger:operation POST /repos/{owner}/{repo}/releases repository repoCreateRelease
@@ -228,6 +244,10 @@ func CreateRelease(ctx *context.APIContext) {
 	//     "$ref": "#/responses/validationError"
 
 	form := web.GetForm(ctx).(*api.CreateReleaseOption)
+	// Before the tag's row is read: the release is built on it.
+	if releaseRowsBehind(ctx) {
+		return
+	}
 	if ctx.Repo().Repository.IsEmpty {
 		ctx.Error(http.StatusUnprocessableEntity, "RepoIsEmpty", errors.New("repo is empty"))
 		return
@@ -345,6 +365,10 @@ func EditRelease(ctx *context.APIContext) {
 
 	form := web.GetForm(ctx).(*api.EditReleaseOption)
 	id := ctx.ParamsInt64(":id")
+	// Before the release is read: it is written back whole.
+	if releaseRowsBehind(ctx) {
+		return
+	}
 	rel, err := repo_model.GetReleaseForRepoByID(ctx, ctx.Repo().Repository.ID, id)
 	if err != nil && !repo_model.IsErrReleaseNotExist(err) {
 		ctx.Error(http.StatusInternalServerError, "GetReleaseForRepoByID", err)
