@@ -145,7 +145,7 @@ func TestAPullMirrorMovedToAnAddressWithoutAWikiOutsideACluster(t *testing.T) {
 			{filepath.Join(node, key), base + "/old.git"},
 			{filepath.Join(node, wikiKey), base + "/old.wiki.git"},
 		} {
-			require.NoError(t, addPullRemote(ctx, r.dir, "origin", r.addr))
+			require.NoError(t, addPullRemote(ctx, r.dir, "origin", r.addr, nil))
 		}
 		require.True(t, SyncPullMirror(ctx, repo.ID))
 	})

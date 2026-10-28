@@ -171,12 +171,18 @@ func parseRemoteUpdateOutput(output, remoteName string) []*mirrorSyncResult {
 	return results
 }
 
+// pruneBrokenReferences prunes the references of the mirror's remote in
+// the repository at repoPath. env is the environment of git there, and
+// check, if set, runs right before it, which it refuses with its error
+// (pullGuard).
 func pruneBrokenReferences(ctx context.Context,
 	m *repo_model.Mirror,
 	repoPath string,
 	timeout time.Duration,
 	stdoutBuilder, stderrBuilder *strings.Builder,
 	isWiki bool,
+	env []string,
+	check func() error,
 ) error {
 	wiki := ""
 	if isWiki {
@@ -185,11 +191,15 @@ func pruneBrokenReferences(ctx context.Context,
 
 	stderrBuilder.Reset()
 	stdoutBuilder.Reset()
+	if err := checkDir(check); err != nil {
+		return err
+	}
 	pruneErr := git.NewCommand(ctx, "remote", "prune").AddDynamicArguments(m.GetRemoteName()).
 		SetDescription(fmt.Sprintf("Mirror.runSync %ssPrune references: %s ", wiki, m.Repo.FullName())).
 		Run(&git.RunOpts{
 			Timeout: timeout,
 			Dir:     repoPath,
+			Env:     env,
 			Stdout:  stdoutBuilder,
 			Stderr:  stderrBuilder,
 		})
@@ -273,8 +283,13 @@ func DecryptOrRecoverRemoteAddress(ctx context.Context, m *repo_model.Mirror) (*
 // Ensure that an on-disk pull mirror is in a modern expected configuration state, in case those expectations have
 // changed since the time the mirror was created on-disk.
 func ModernizePullMirrorConfig(ctx context.Context, m *repo_model.Mirror) error {
-	repoPath := m.GetRepository(ctx).RepoPath()
+	return modernizePullMirrorConfig(ctx, m.GetRepository(ctx).RepoPath(), nil)
+}
 
+// modernizePullMirrorConfig is ModernizePullMirrorConfig in the repository
+// at repoPath. check, if set, runs right before git writes its config,
+// which it refuses with its error (pullGuard).
+func modernizePullMirrorConfig(ctx context.Context, repoPath string, check func() error) error {
 	// New pull mirrors are created with http.followRedirects=false to mitigate SSRF risks, as redirection URLs may not
 	// meet Forgejo's configured migration allow/deny host lists. Migrate to that setting if it is not present:
 	followRedirects, _, err := git.
@@ -286,6 +301,9 @@ func ModernizePullMirrorConfig(ctx context.Context, m *repo_model.Mirror) error 
 	}
 	followRedirects = strings.TrimSpace(followRedirects)
 	if followRedirects != "false" {
+		if err := checkDir(check); err != nil {
+			return err
+		}
 		_, _, err = git.
 			NewCommand(ctx, "config", "--replace-all", "http.followRedirects", "false").
 			RunStdString(&git.RunOpts{Dir: repoPath})
@@ -321,24 +339,47 @@ func recheckPullPermitted(ctx context.Context, m *repo_model.Mirror, remoteURL *
 	return migrations_allowlist.IsMigrateURLAllowed(remoteURL.String(), m.Repo.Owner)
 }
 
-// runSync returns true if sync finished without error.
-func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bool) {
+// refusedSync logs a pull mirror's sync that failed with err, a refusal
+// of the cluster (pullRefusal) as such, and reports whether it was one.
+func refusedSync(m *repo_model.Mirror, err error) bool {
+	if !isPullRefusal(err) {
+		return false
+	}
+	log.Warn("SyncMirrors [repo: %-v]: refused by this node of the cluster, the next update retries it: %v", m.Repo, err)
+	return true
+}
+
+// runSync returns true if sync finished without error. In a cluster,
+// guard checks the directories it works in (pullGuard): its checks run
+// right before each git command that writes there, and once the reads
+// that follow the fetches are done.
+func runSync(ctx context.Context, m *repo_model.Mirror, guard *pullGuard) ([]*mirrorSyncResult, bool) {
 	repoPath := m.Repo.RepoPath()
 	wikiPath := m.Repo.WikiPath()
 	timeout := time.Duration(setting.Git.Timeout.Mirror) * time.Second
 
 	log.Trace("SyncMirrors [repo: %-v]: running git remote update...", m.Repo)
 
-	if err := ModernizePullMirrorConfig(ctx, m); err != nil {
-		log.Error("SyncMirrors [repo: %-v]: failed to modernize pull mirror configuration: %v", m.Repo, err)
+	if err := modernizePullMirrorConfig(ctx, repoPath, guard.checker(false)); err != nil {
+		if !refusedSync(m, err) {
+			log.Error("SyncMirrors [repo: %-v]: failed to modernize pull mirror configuration: %v", m.Repo, err)
+		}
 		return nil, false
 	}
 
-	if err := ensurePullMirrorRemote(ctx, m); err != nil {
-		log.Error("SyncMirrors [repo: %-v]: failed to recreate the mirror's remote: %v", m.Repo, err)
+	if err := ensurePullMirrorRemote(ctx, m, guard.checker(false)); err != nil {
+		if !refusedSync(m, err) {
+			log.Error("SyncMirrors [repo: %-v]: failed to recreate the mirror's remote: %v", m.Repo, err)
+		}
 		return nil, false
 	}
 
+	// A mirror from before the address was kept in SQL reads it from the
+	// git config, and writes it there again without its password.
+	if err := guard.check(false); err != nil {
+		refusedSync(m, err)
+		return nil, false
+	}
 	remoteURL, err := DecryptOrRecoverRemoteAddress(ctx, m)
 	if err != nil {
 		log.Error("SyncMirrors [repo: %-v]: failed to get remote address: %v", m.Repo, err)
@@ -359,8 +400,10 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 		log.Error("SyncMirrors [repo: %-v]: SanitizedRemoteAddress: %v", m.Repo, err)
 		return nil, false
 	} else if has, addr := sanitized.Get(); has {
-		if err := ensurePullWikiRemote(ctx, m, remoteURL.URL.String(), addr); err != nil {
-			log.Error("SyncMirrors [repo: %-v]: failed to recreate the wiki mirror's remote: %v", m.Repo, err)
+		if err := ensurePullWikiRemote(ctx, m, remoteURL.URL.String(), addr, guard.checker(true)); err != nil {
+			if !refusedSync(m, err) {
+				log.Error("SyncMirrors [repo: %-v]: failed to recreate the wiki mirror's remote: %v", m.Repo, err)
+			}
 			return nil, false
 		}
 	}
@@ -382,14 +425,23 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 	}
 	cmd.AddArguments("--tags").AddDynamicArguments(m.GetRemoteName())
 
-	envs := proxy.EnvWithProxy(remoteURL.URL)
+	// In a cluster, the fetch's ref transactions carry the repository's
+	// ID: the cluster refuses them in a directory stamped with another.
+	envs := guard.environ(proxy.EnvWithProxy(remoteURL.URL), false)
 
+	if err := guard.check(false); err != nil {
+		refusedSync(m, err)
+		return nil, false
+	}
 	stdoutBuilder := strings.Builder{}
 	stderrBuilder := strings.Builder{}
 	// In a cluster, a sync that updates more refs than one transaction
 	// takes is written by batches (#134).
-	batched, err := syncInBatches(ctx, m, remoteURL.URL.String(), repoPath, m.EnablePrune, true, timeout, envs, &stderrBuilder)
+	batched, err := syncInBatches(ctx, m, remoteURL.URL.String(), repoPath, m.EnablePrune, true, timeout, envs, guard.checker(false), &stderrBuilder)
 	if err != nil {
+		if refusedSync(m, err) {
+			return nil, false
+		}
 		log.Error("SyncMirrors [repo: %-v]: failed to update mirror repository by batches: %v", m.Repo, err)
 		desc := fmt.Sprintf("Failed to update mirror repository '%s' by batches: %s", repoPath, util.SanitizeCredentialURLs(err.Error()))
 		if err = system_model.CreateRepositoryNotice(desc); err != nil {
@@ -399,6 +451,11 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 	}
 	if batched {
 		log.Info("SyncMirrors [repo: %-v]: the sync updated more refs than the cluster takes in one transaction; written by batches", m.Repo)
+	} else if err := guard.check(false); err != nil {
+		// The batches' dry run fetched the objects first, which takes its
+		// time: the fetch comes right after a check of its own.
+		refusedSync(m, err)
+		return nil, false
 	} else if err := cmd.
 		SetDescription(fmt.Sprintf("Mirror.runSync: %s", m.Repo.FullName())).
 		Run(&git.RunOpts{
@@ -421,16 +478,24 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 			err = nil
 
 			// Attempt prune
-			pruneErr := pruneBrokenReferences(ctx, m, repoPath, timeout, &stdoutBuilder, &stderrBuilder, false)
+			pruneErr := pruneBrokenReferences(ctx, m, repoPath, timeout, &stdoutBuilder, &stderrBuilder, false, envs, guard.checker(false))
+			if refusedSync(m, pruneErr) {
+				return nil, false
+			}
 			if pruneErr == nil {
 				// Successful prune - reattempt mirror
 				stderrBuilder.Reset()
 				stdoutBuilder.Reset()
+				if err := guard.check(false); err != nil {
+					refusedSync(m, err)
+					return nil, false
+				}
 				if err = cmd.
 					SetDescription(fmt.Sprintf("Mirror.runSync: %s", m.Repo.FullName())).
 					Run(&git.RunOpts{
 						Timeout: timeout,
 						Dir:     repoPath,
+						Env:     envs,
 						Stdout:  &stdoutBuilder,
 						Stderr:  &stderrBuilder,
 					}); err != nil {
@@ -457,6 +522,12 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 	}
 	output := stderrBuilder.String()
 
+	// What follows reads the directory under the name: it must still hold
+	// the repository the fetch wrote.
+	if err := guard.check(false); err != nil {
+		refusedSync(m, err)
+		return nil, false
+	}
 	if err := git.WriteCommitGraph(ctx, repoPath); err != nil {
 		log.Error("SyncMirrors [repo: %-v]: %v", m.Repo, err)
 	}
@@ -493,9 +564,13 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 	}
 
 	if m.Repo.HasWiki() && wikiHasPullRemote(ctx, m, wikiPath) {
+		wikiEnv := guard.environ(nil, true)
 		// The wiki's remote holds no password, as the repository's: the
 		// same credential helper authenticates its update.
 		updateWiki := func() error {
+			if err := guard.check(true); err != nil {
+				return err
+			}
 			cmd := git.NewCommand(ctx)
 			_, cleanup, err := cmd.AddAuthCredentialHelperForRemote(remoteURL.URL.String())
 			if err != nil {
@@ -507,6 +582,7 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 				Run(&git.RunOpts{
 					Timeout: timeout,
 					Dir:     wikiPath,
+					Env:     wikiEnv,
 					Stdout:  &stdoutBuilder,
 					Stderr:  &stderrBuilder,
 				})
@@ -514,8 +590,15 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 		log.Trace("SyncMirrors [repo: %-v Wiki]: running git remote update...", m.Repo)
 		stderrBuilder.Reset()
 		stdoutBuilder.Reset()
-		batched, err := syncInBatches(ctx, m, remoteURL.URL.String(), wikiPath, true, false, timeout, nil, &stderrBuilder)
+		if err := guard.check(true); err != nil {
+			refusedSync(m, err)
+			return nil, false
+		}
+		batched, err := syncInBatches(ctx, m, remoteURL.URL.String(), wikiPath, true, false, timeout, wikiEnv, guard.checker(true), &stderrBuilder)
 		if err != nil {
+			if refusedSync(m, err) {
+				return nil, false
+			}
 			log.Error("SyncMirrors [repo: %-v Wiki]: failed to update mirror wiki repository by batches: %v", m.Repo, err)
 			desc := fmt.Sprintf("Failed to update mirror repository wiki '%s' by batches: %s", wikiPath, util.SanitizeCredentialURLs(err.Error()))
 			if err = system_model.CreateRepositoryNotice(desc); err != nil {
@@ -526,6 +609,9 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 		if batched {
 			log.Info("SyncMirrors [repo: %-v Wiki]: written by batches", m.Repo)
 		} else if err := updateWiki(); err != nil {
+			if refusedSync(m, err) {
+				return nil, false
+			}
 			stdout := stdoutBuilder.String()
 			stderr := stderrBuilder.String()
 
@@ -538,14 +624,21 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 				log.Warn("SyncMirrors [repo: %-v Wiki]: failed to update mirror wiki repository due to broken references:\nStdout: %s\nStderr: %s\nErr: %v\nAttempting Prune", m.Repo, stdoutMessage, stderrMessage, err)
 				err = nil
 
-				// Attempt prune
-				pruneErr := pruneBrokenReferences(ctx, m, repoPath, timeout, &stdoutBuilder, &stderrBuilder, true)
+				// Attempt prune: of the repository's directory, as it always
+				// was, with its checks and its environment.
+				pruneErr := pruneBrokenReferences(ctx, m, repoPath, timeout, &stdoutBuilder, &stderrBuilder, true, envs, guard.checker(false))
+				if refusedSync(m, pruneErr) {
+					return nil, false
+				}
 				if pruneErr == nil {
 					// Successful prune - reattempt mirror
 					stderrBuilder.Reset()
 					stdoutBuilder.Reset()
 
 					if err = updateWiki(); err != nil {
+						if refusedSync(m, err) {
+							return nil, false
+						}
 						stdout := stdoutBuilder.String()
 						stderr := stderrBuilder.String()
 						stderrMessage = util.SanitizeCredentialURLs(stderr)
@@ -582,6 +675,16 @@ func runSync(ctx context.Context, m *repo_model.Mirror) ([]*mirrorSyncResult, bo
 		cache.Remove(m.Repo.GetCommitsCountCacheKey(branch.Name, true))
 	}
 
+	// The reads since the fetch, the branches and the tags written to
+	// SQL among them, came from the mirror's directories, or the sync is
+	// not done: the next one derives them again.
+	for _, isWiki := range []bool{false, true} {
+		if err := guard.check(isWiki); err != nil {
+			refusedSync(m, err)
+			return nil, false
+		}
+	}
+
 	m.UpdatedUnix = timeutil.TimeStampNow()
 	return parseRemoteUpdateOutput(output, m.GetRemoteName()), true
 }
@@ -609,7 +712,16 @@ func SyncPullMirror(ctx context.Context, repoID int64) bool {
 	defer finished()
 
 	log.Trace("SyncMirrors [repo: %-v]: Running Sync", m.Repo)
-	results, ok := runSync(ctx, m)
+	// In a cluster, before anything touches the directories under the
+	// name loaded above (#322).
+	var results []*mirrorSyncResult
+	guard, err := guardPullSync(ctx, m)
+	ok := err == nil
+	if ok {
+		results, ok = runSync(ctx, m, guard)
+	} else if !refusedSync(m, err) {
+		log.Error("SyncMirrors [repo: %-v]: checking its directories in the cluster: %v", m.Repo, err)
+	}
 	if !ok {
 		if err = repo_model.TouchMirror(ctx, m); err != nil {
 			log.Error("SyncMirrors [repo: %-v]: failed to TouchMirror: %v", m.Repo, err)
@@ -633,6 +745,12 @@ func SyncPullMirror(ctx context.Context, repoID int64) bool {
 
 	log.Trace("SyncMirrors [repo: %-v]: %d branches updated", m.Repo, len(results))
 	if len(results) > 0 {
+		// The default branch of a repository that was empty is written to
+		// its directory's HEAD.
+		if err := guard.check(false); err != nil {
+			refusedSync(m, err)
+			return false
+		}
 		if ok := checkAndUpdateEmptyRepository(ctx, m, results); !ok {
 			log.Error("SyncMirrors [repo: %-v]: checkAndUpdateEmptyRepository: %v", m.Repo, err)
 			return false

@@ -30,23 +30,74 @@ func ReadBetweenChecks(key string, repoID int64, named func() error, refused fun
 	if !Enabled() {
 		return read()
 	}
-	if err := named(); err != nil {
+	g, err := GuardDirectory(key, repoID, named, refused)
+	if err != nil {
 		return err
+	}
+	if err := read(); err != nil {
+		return g.Failed(err)
+	}
+	return g.Check()
+}
+
+// DirectoryGuard is ReadBetweenChecks's checks for a caller that runs
+// several git commands in this node's directory under key, writes among
+// them, and must touch the repository repoID and nothing else: a pull
+// mirror's sync, which loaded its repository once, at its start, and
+// recreated its remote, fetched into the directory and pruned it, under
+// that name, past no check at all (#322). GuardDirectory makes the first
+// check, before anything touches the directory; Check, right before each
+// git command that writes there and once the last read is done, says
+// whether the directory may have held another repository since. A git
+// command that started in the directory the check passed keeps working in
+// it when the projector moves it, as its working directory follows the
+// move: what is left is the time from the check to the command's start.
+type DirectoryGuard struct {
+	named   func() error
+	refused func(error) error
+	still   func() error
+}
+
+// GuardDirectory runs named, then CheckRead, as ReadBetweenChecks does
+// before its read: a failed check refuses with refused, before anything
+// touched the directory. Without a cluster it checks nothing, and returns
+// a guard whose checks pass.
+func GuardDirectory(key string, repoID int64, named func() error, refused func(error) error) (*DirectoryGuard, error) {
+	if !Enabled() {
+		return &DirectoryGuard{}, nil
+	}
+	if err := named(); err != nil {
+		return nil, err
 	}
 	still, err := CheckRead(key, repoID)
 	if err != nil {
-		return refused(err)
+		return nil, refused(err)
 	}
-	if err := read(); err != nil {
-		// A directory the projector moved while git read it fails the
-		// read: the move is the reason, and the caller retries.
-		if serr := still(); serr != nil {
-			return refused(fmt.Errorf("%w (and the read failed: %v)", serr, err))
-		}
+	return &DirectoryGuard{named: named, refused: refused, still: still}, nil
+}
+
+// Check is still() and named again: nil when the directory held the
+// repository, and nothing else, since GuardDirectory, and its row still
+// gives the name.
+func (g *DirectoryGuard) Check() error {
+	if g == nil || g.still == nil {
+		return nil
+	}
+	if err := g.still(); err != nil {
+		return g.refused(err)
+	}
+	return g.named()
+}
+
+// Failed is the reason a git command in the directory failed with err: a
+// directory the projector moved meanwhile fails the command, and the move,
+// a refusal the caller retries, is then its reason.
+func (g *DirectoryGuard) Failed(err error) error {
+	if g == nil || g.still == nil {
 		return err
 	}
-	if err := still(); err != nil {
-		return refused(err)
+	if serr := g.still(); serr != nil {
+		return g.refused(fmt.Errorf("%w (and git failed there: %v)", serr, err))
 	}
-	return named()
+	return err
 }
