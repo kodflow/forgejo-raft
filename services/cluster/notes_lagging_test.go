@@ -110,7 +110,7 @@ func notesOnEveryNode(t *testing.T, tc *testCluster, sha, want, msg string) {
 // note on c2 was gone (#324). The note now carries the value it was built
 // on, which the cluster checks: written on a node behind, as a write that
 // raced the freshness wait would be, it is refused and n1 is kept.
-func TestANoteSetOnALaggingNodeKeepsAnAcknowledgedNote(t *testing.T) {
+func TestALaggingNodesNoteKeepsAnAcknowledgedNote(t *testing.T) {
 	tc, a, c1, c2, n0, n1, hold := laggingNotes(t)
 	withGitThroughReplicator(t, a)
 	ctx := db.DefaultContext
@@ -138,7 +138,7 @@ func TestANoteSetOnALaggingNodeKeepsAnAcknowledgedNote(t *testing.T) {
 // repository, and is refused before anything is written. Once node-a caught
 // up, the same writes are built on the cluster's notes, and keep every other
 // note.
-func TestANoteSetThroughAFreshNodeKeepsTheOtherNotes(t *testing.T) {
+func TestAFreshNodeSetsNotesOnTheAcknowledgedOnes(t *testing.T) {
 	tc, a, c1, c2, n0, n1, hold := laggingNotes(t)
 	withGitThroughReplicator(t, a)
 	ctx := db.DefaultContext
