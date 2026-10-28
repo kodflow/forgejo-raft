@@ -312,3 +312,95 @@ func TestRestoreReposRefusesARepositoryMissingItsObjects(t *testing.T) {
 	require.ErrorContains(t, err, "is not empty", "a repository missing its objects is not kept as restored")
 	assert.Equal(t, before, under(), "nothing is removed")
 }
+
+// A target, or the owner's directory above it, that is a symbolic link is
+// not this restore's: os.ReadDir follows the link, and taking the target up
+// removed what the directory it names holds, wherever that is, mark or
+// mark's temporary files there. The rerun refuses it, naming it, and
+// neither follows nor removes anything. The directory the link names is a
+// witness of the test, in t.TempDir() too.
+func TestRestoreReposRefusesALinkedTarget(t *testing.T) {
+	ctx := t.Context()
+	c := newFakeCluster(t)
+	o := newTestObserver(t, c, &hookLog{})
+	cp := seed(t, c, o)
+	require.NoError(t, o.Step(ctx))
+	a, err := OpenArchive(o.cfg.Dir, "")
+	require.NoError(t, err)
+
+	// What the witness holds, by path relative to it: the bytes of a
+	// regular file, "dir" for a directory.
+	held := func(dir string) map[string]string {
+		out := map[string]string{}
+		require.NoError(t, filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(dir, p)
+			if err != nil {
+				return err
+			}
+			switch {
+			case d.IsDir():
+				out[rel] = "dir"
+			case d.Type().IsRegular():
+				b, err := os.ReadFile(p)
+				if err != nil {
+					return err
+				}
+				out[rel] = string(b)
+			default:
+				out[rel] = d.Type().String()
+			}
+			return nil
+		}))
+		return out
+	}
+	marked := func(dir string) error {
+		if err := os.MkdirAll(filepath.Join(dir, "objects"), 0o755); err != nil {
+			return err
+		}
+		for name, body := range map[string]string{IncompleteMark: "", "precious": "x", "objects/kept": "y"} {
+			if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(name)), []byte(body), 0o600); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	leftovers := func(dir string) error {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dir, "."+IncompleteMark+".123"), nil, 0o600)
+	}
+
+	for _, tc := range []struct {
+		name string
+		// link is the path under root made a symbolic link to the
+		// witness, which fill writes in at what the link stands for.
+		link, under string
+		fill        func(dir string) error
+	}{
+		{"the target, marked", "alice/demo.git", "", marked},
+		{"the target, holding the mark's temporary files alone", "alice/demo.git", "", leftovers},
+		{"the owner's directory, the target marked", "alice", "demo.git", marked},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			witness := filepath.Join(t.TempDir(), "witness")
+			require.NoError(t, tc.fill(filepath.Join(witness, tc.under)))
+			link := filepath.Join(root, filepath.FromSlash(tc.link))
+			require.NoError(t, os.MkdirAll(filepath.Dir(link), 0o755))
+			require.NoError(t, os.Symlink(witness, link))
+			before := held(witness)
+
+			_, err := a.RestoreRepos(ctx, cp.Name(), root)
+			assert.Equal(t, before, held(witness), "nothing the link names is removed or written")
+			require.Error(t, err, "a linked target is refused")
+			assert.Contains(t, err.Error(), link, "the refusal names the link")
+			info, err := os.Lstat(link)
+			require.NoError(t, err, "the link itself is left")
+			assert.Equal(t, fs.ModeSymlink, info.Mode().Type())
+		})
+	}
+}
