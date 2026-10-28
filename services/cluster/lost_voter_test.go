@@ -108,6 +108,40 @@ func auditAt(r *Replicator, action Action, target consensus.NodeID) uint64 {
 // voters, the new member follows the leader, and the old id's key is never
 // admitted again (#209).
 func TestALostVoterOfThreeIsReplacedUnderItsSlot(t *testing.T) {
+	lostVoterReplaced(t, nil)
+}
+
+// A change of leader between the death of a voter of three and its
+// replacement starts the dead clock of the new leader again, at the fake
+// time it first leads: the replacement waits for DEAD_MEMBER_TIMEOUT more
+// of that clock, which the bench lets pass (untilDeadTimeout), and is made
+// under every guarantee of one made without a change (#317).
+func TestALostVoterIsReplacedAcrossALeaderChange(t *testing.T) {
+	lostVoterReplaced(t, func(b *autoBench, survivors []*autoNode) {
+		l := b.leader()
+		require.NotNil(t, l)
+		to := survivors[0]
+		if to == l {
+			to = survivors[1]
+		}
+		require.Eventually(t, func() bool {
+			cur := b.leader()
+			if cur == to {
+				return true
+			}
+			if cur != nil {
+				_ = cur.r().Engine().TransferLeadership(t.Context(), autopilotOperator, b.idOf(to))
+			}
+			return false
+		}, 10*time.Second, 50*time.Millisecond, "the leadership moves to %s", to.n.slot)
+		t.Logf("the leadership moved from %s to %s before DEAD_MEMBER_TIMEOUT passed", l.n.slot, to.n.slot)
+	})
+}
+
+// lostVoterReplaced is TestALostVoterOfThreeIsReplacedUnderItsSlot; before
+// DEAD_MEMBER_TIMEOUT passes, after the voter was out of reach for part of
+// it, it runs between, when given.
+func lostVoterReplaced(t *testing.T, between func(b *autoBench, survivors []*autoNode)) {
 	tc, b := newAutoCluster(t, 3, "node-a", "node-b", "node-c")
 	b.waitMembers(3, 3)
 	b.raisePayload()
@@ -123,6 +157,7 @@ func TestALostVoterOfThreeIsReplacedUnderItsSlot(t *testing.T) {
 	least := floorWatch(survivors)
 
 	b.kill(victim)
+	from := b.lead()
 	newID := b.lose(victim)
 	time.Sleep(benchDownAfter + 500*time.Millisecond)
 
@@ -132,9 +167,12 @@ func TestALostVoterOfThreeIsReplacedUnderItsSlot(t *testing.T) {
 	m := b.leader().r().Engine().Membership()
 	assert.Zero(t, Rank(m, newID), "not replaced before DEAD_MEMBER_TIMEOUT")
 	assert.Positive(t, Rank(m, oldID))
+	if between != nil {
+		between(b, survivors)
+	}
 
 	b.clock.advance(2 * time.Minute)
-	require.Eventually(t, func() bool {
+	b.untilDeadTimeout(from, func() bool {
 		l := b.leader()
 		if l == nil {
 			return false
@@ -142,7 +180,7 @@ func TestALostVoterOfThreeIsReplacedUnderItsSlot(t *testing.T) {
 		m = l.r().Engine().Membership()
 		i := Rank(m, newID)
 		return i > 0 && m.Members[i-1].Voter && Rank(m, oldID) == 0 && m.Voters() == 3
-	}, 30*time.Second, 20*time.Millisecond, "the new id replaces the old one: %+v", m)
+	}, "the new id replaces the old one: %+v", m)
 	assert.Contains(t, m.Retired, oldID)
 	assert.Equal(t, victim.n.slot, m.Members[Rank(m, newID)-1].Slot, "under the same slot")
 	assert.GreaterOrEqual(t, least(), 3, "never fewer than three voters listed")
