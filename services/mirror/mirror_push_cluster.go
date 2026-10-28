@@ -328,15 +328,23 @@ func readPushSource(ctx context.Context, m *repo_model.PushMirror, isWiki bool, 
 // meanwhile, and then its directory on this node, whose stamp may carry no
 // repository ID for the read guard to compare (#294).
 func pushSourceStillNamed(ctx context.Context, repo *repo_model.Repository, key string, isWiki bool) error {
+	return mirrorRepoStillNamed(ctx, repo, key, isWiki, "push mirror", func(err error) error { return pushRefused{err} })
+}
+
+// mirrorRepoStillNamed refuses with refused the sync of a mirror, whose
+// kind mirror names, of repo whose row no longer gives key: renamed,
+// transferred or deleted, it or its owner, since the sync loaded it. It
+// returns the database's error as it is.
+func mirrorRepoStillNamed(ctx context.Context, repo *repo_model.Repository, key string, isWiki bool, mirror string, refused func(error) error) error {
 	current, err := repo_model.GetRepositoryByID(ctx, repo.ID)
 	if repo_model.IsErrRepoNotExist(err) {
-		return pushRefused{fmt.Errorf("the repository of %s was deleted; the push mirror's sync is retried", key)}
+		return refused(fmt.Errorf("the repository of %s was deleted; the %s's sync is retried", key, mirror))
 	}
 	if err != nil {
 		return err
 	}
 	if now := clusterhook.RepoKey(current.OwnerName, current.Name, isWiki); now != key {
-		return pushRefused{fmt.Errorf("the repository of %s is %s now; the push mirror's sync is retried under its new name", key, now)}
+		return refused(fmt.Errorf("the repository of %s is %s now; the %s's sync is retried under its new name", key, now, mirror))
 	}
 	return nil
 }

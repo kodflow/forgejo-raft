@@ -99,7 +99,7 @@ func TestMirrorSyncInBatches(t *testing.T) {
 
 	// A small sync: the sync's own fetch runs.
 	gitIn(t, src, "", "commit", "-q", "--allow-empty", "-m", "two")
-	out, batched, err := fetchInBatches(t.Context(), dry(true), mirror, time.Minute, nil)
+	out, batched, err := fetchInBatches(t.Context(), dry(true), mirror, time.Minute, nil, nil)
 	require.NoError(t, err)
 	assert.False(t, batched)
 	assert.Empty(t, out)
@@ -119,7 +119,7 @@ func TestMirrorSyncInBatches(t *testing.T) {
 	gitIn(t, src, "", "branch", "-D", "gone")
 	gitIn(t, src, "", "update-ref", "refs/heads/moved", head)
 
-	out, batched, err = fetchInBatches(t.Context(), dry(true), mirror, time.Minute, nil)
+	out, batched, err = fetchInBatches(t.Context(), dry(true), mirror, time.Minute, nil, nil)
 	require.NoError(t, err)
 	require.True(t, batched)
 	counts := transactions()
@@ -145,7 +145,7 @@ func TestMirrorSyncInBatches(t *testing.T) {
 	assert.Equal(t, head, byRef["refs/heads/main"].newCommitID)
 
 	// Nothing left: the next sync's own fetch has nothing to write.
-	out, batched, err = fetchInBatches(t.Context(), dry(true), mirror, time.Minute, nil)
+	out, batched, err = fetchInBatches(t.Context(), dry(true), mirror, time.Minute, nil, nil)
 	require.NoError(t, err)
 	assert.False(t, batched)
 	assert.Empty(t, out)
@@ -196,7 +196,7 @@ func TestMirrorSyncInBatchesPrunesBeforeCreating(t *testing.T) {
 	gitIn(t, src, "", "branch", "b")
 
 	dry := git.NewCommand(t.Context(), "fetch", "--dry-run", "--porcelain", "--prune", "--tags").AddDynamicArguments("origin")
-	out, batched, err := fetchInBatches(t.Context(), dry, mirror, time.Minute, nil)
+	out, batched, err := fetchInBatches(t.Context(), dry, mirror, time.Minute, nil, nil)
 	require.NoError(t, err)
 	require.True(t, batched)
 	assert.Equal(t, head, gitIn(t, mirror, "", "rev-parse", "refs/heads/a/b"))

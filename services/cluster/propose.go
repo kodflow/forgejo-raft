@@ -39,6 +39,9 @@ func (r *Replicator) prepared(ctx context.Context, req *clusterhook.Request) *cl
 	if err := r.pushTargetGone(repo, req); err != nil {
 		return fail(err)
 	}
+	if err := r.writeTargetRefusal(repo, req); err != nil {
+		return fail(err)
+	}
 	tx, refs, err := r.buildTxn(ctx, repo, req)
 	if err != nil {
 		return fail(err)
@@ -142,6 +145,50 @@ func (r *Replicator) pushTargetGone(repo string, req *clusterhook.Request) error
 		return fmt.Errorf("the repository %s was renamed to %s in the cluster: push there; nothing was written", repo, to)
 	}
 	return nil
+}
+
+// writeTargetRefusal refuses a write of Forgejo's own, without a pusher,
+// whose writer names the repository it writes by its database ID, run in
+// a directory that holds another repository on this node, as ReadRefusal
+// judges it: by the directory's stamp, its ID among them, and the table.
+// A pull mirror's sync loaded its repository once, at its start, and
+// fetched, with the mirror's refspec and --prune, into the directory under
+// that name: a rename had put another repository's there meanwhile, a
+// private one, and the fetch's old values matched the table, which
+// rightly holds that repository under the name. Apply took the
+// transaction on every node, the other repository's branches rewritten
+// and pruned (#322). The sync's own checks before git started leave the
+// time git takes to start; this one judges the directory git works in,
+// which the hook names by git's working directory.
+//
+// A push is not judged here: it names its pusher, receive-pack runs once
+// the router refused a directory ReadRefusal refuses for the same ID, its
+// old values are the client's, which git checks against the directory,
+// and pushTargetGone refuses one into a key renamed away. A transaction
+// that writes no ref under refs/ is not judged either: HEAD written again
+// as it is, under the new ID of an adopted repository whose stamps keep
+// the ID of the row SQL lost, binds that ID (bindAdoptedID in
+// services/repository, #150), and moves no branch. It is a check of this
+// node alone: the entry is unchanged.
+func (r *Replicator) writeTargetRefusal(repo string, req *clusterhook.Request) error {
+	if req.RepoID <= 0 || req.PusherID != 0 || !writesRefs(req.Lines) {
+		return nil
+	}
+	if err := r.ReadRefusal(repo, req.RepoID); err != nil {
+		return fmt.Errorf("%w; nothing was written", err)
+	}
+	return nil
+}
+
+// writesRefs reports whether a line of the transaction is a ref under
+// refs/.
+func writesRefs(lines []clusterhook.Line) bool {
+	for _, l := range lines {
+		if strings.HasPrefix(l.Ref, "refs/") {
+			return true
+		}
+	}
+	return false
 }
 
 // gitWillApply refuses a push transaction git is about to reject in part.

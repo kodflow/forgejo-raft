@@ -39,7 +39,7 @@ func TestPullWikiRemoteAsksWithTheCredentialsAndKeepsThemOut(t *testing.T) {
 		return strings.TrimSuffix(remote, ".git") + ".wiki.git"
 	})()
 	m := &repo_model.Mirror{Repo: repo}
-	require.NoError(t, ensurePullWikiRemote(context.Background(), m, "https://u:secret@example.com/o/r.git", "https://u@example.com/o/r.git"))
+	require.NoError(t, ensurePullWikiRemote(context.Background(), m, "https://u:secret@example.com/o/r.git", "https://u@example.com/o/r.git", nil))
 	assert.Equal(t, []string{"https://u:secret@example.com/o/r.git"}, asked)
 	url, err := remoteURLOf(context.Background(), repo.WikiPath(), m.GetRemoteName())
 	require.NoError(t, err)
@@ -47,6 +47,6 @@ func TestPullWikiRemoteAsksWithTheCredentialsAndKeepsThemOut(t *testing.T) {
 	assert.Equal(t, filepath.Join(setting.RepoRootPath, "o", "r.wiki.git"), repo.WikiPath())
 
 	// Present, it is not asked again.
-	require.NoError(t, ensurePullWikiRemote(context.Background(), m, "https://u:secret@example.com/o/r.git", "https://u@example.com/o/r.git"))
+	require.NoError(t, ensurePullWikiRemote(context.Background(), m, "https://u:secret@example.com/o/r.git", "https://u@example.com/o/r.git", nil))
 	assert.Len(t, asked, 1)
 }

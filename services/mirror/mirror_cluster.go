@@ -7,9 +7,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,17 +56,147 @@ func remoteURLIn(ctx context.Context, path, name string) (url string, exists boo
 
 // addPullRemote adds the remote of a pull mirror as `git clone --mirror`
 // and the migration write it: every ref fetched under its own name, and
-// the tags.
-func addPullRemote(ctx context.Context, path, name, addr string) error {
+// the tags. check, if set, runs right before each git command, which it
+// refuses with its error (pullGuard).
+func addPullRemote(ctx context.Context, path, name, addr string, check func() error) error {
+	if err := checkDir(check); err != nil {
+		return err
+	}
 	if _, _, err := git.NewCommand(ctx, "remote", "add", "--mirror=fetch").AddDynamicArguments(name, addr).RunStdString(&git.RunOpts{Dir: path}); err != nil {
 		return fmt.Errorf("git remote add %s: %w", name, err)
 	}
 	for _, kv := range [][2]string{{"remote." + name + ".mirror", "true"}, {"remote." + name + ".fetch", "+refs/tags/*:refs/tags/*"}} {
+		if err := checkDir(check); err != nil {
+			return err
+		}
 		if _, _, err := git.NewCommand(ctx, "config", "--add").AddDynamicArguments(kv[0], kv[1]).RunStdString(&git.RunOpts{Dir: path}); err != nil {
 			return fmt.Errorf("git config --add %s: %w", kv[0], err)
 		}
 	}
 	return nil
+}
+
+// checkDir runs check, nil when there is none.
+func checkDir(check func() error) error {
+	if check == nil {
+		return nil
+	}
+	return check()
+}
+
+// pullRefusal is a pull mirror's sync this node of the cluster refused to
+// run, or to go on with, in a directory that may hold another repository
+// than the mirror's. The sync fails without writing anything more: it is
+// not recorded as done, the mirror stays due, and the next round of
+// update_mirrors, on any node, retries it, with the repository loaded
+// again, under its new name if it was renamed.
+type pullRefusal struct{ error }
+
+func (e pullRefusal) Unwrap() error { return e.error }
+
+func pullRefused(err error) error { return pullRefusal{err} }
+
+// isPullRefusal reports whether err is a pullRefusal.
+func isPullRefusal(err error) bool { return errors.As(err, new(pullRefusal)) }
+
+// pullGuard is, in a cluster, the checks that the directories a pull
+// mirror's sync works in on this node, of the repository and of its wiki,
+// under the name the sync loaded at its start, hold the mirror's
+// repository and nothing else.
+//
+// The sync loaded its repository once, and every later step worked on the
+// directory under that name, past no check at all: the mirror's remote,
+// recreated from SQL into its git config (#79), and the fetch, `--prune`
+// with the mirror's refspec +refs/*:refs/*. A rename, or a deletion, that
+// took the repository away and put another one, a private one, under its
+// name, projected on this node meanwhile, put that one's directory there:
+// the fetch rewrote and pruned its branches, and the cluster took the
+// transaction on every node, its old values the table's, which rightly
+// holds that repository under the name (#322, the pull side of #294).
+//
+// The first checks run before anything touches the directories: the
+// repository's row, read again by its ID, must still give the name, and
+// the directory must hold the repository (clusterhook.GuardDirectory).
+// Then check runs right before each git command that writes into a
+// directory, the remote's recreation, the fetch, each of its batches and
+// a prune, and once the reads that follow the fetch are done: a rename,
+// a transfer or a deletion that took the key or freed it, applied on this
+// node since the first check, refuses the sync, as a directory that holds
+// another repository now does. A git command that started in the
+// mirror's directory keeps working in it when the projector moves it, its
+// working directory following the move, and the cluster's hook names it
+// under its new key. The commands that write refs carry the repository's
+// ID (env), which the cluster refuses in a directory stamped with another
+// one (Replicator.prepared): what the checks leave, the time from a check
+// to the start of the next command, is covered there for every repository
+// written with its ID.
+//
+// A repository without an ID, moved under the name and projected here
+// before the first checks, the watch of renames starting after its move,
+// while SQL still gave the mirror the name, cannot be: Forgejo moves a
+// repository to a name only once SQL freed it (changeRepositoryName, a
+// transfer, an owner's rename check the name in SQL before they propose
+// the move), so the mirror's row had left the name in SQL before that
+// move was proposed, and the first checks read it under its new name. A
+// move applied after the first checks is still()'s. Without a cluster
+// nothing is checked, and nothing is added to git's environment.
+type pullGuard struct {
+	repo, wiki *clusterhook.DirectoryGuard
+	repoID     int64
+}
+
+// guardPullSync makes the first checks of a pull mirror's sync, before
+// anything touches its directories.
+func guardPullSync(ctx context.Context, m *repo_model.Mirror) (*pullGuard, error) {
+	g := &pullGuard{repoID: m.Repo.ID}
+	for _, isWiki := range []bool{false, true} {
+		key := clusterhook.RepoKey(m.Repo.OwnerName, m.Repo.Name, isWiki)
+		d, err := clusterhook.GuardDirectory(key, m.Repo.ID, func() error {
+			return mirrorRepoStillNamed(ctx, m.Repo, key, isWiki, "pull mirror", pullRefused)
+		}, func(err error) error {
+			return pullRefused(fmt.Errorf("%w; the pull mirror's sync is retried", err))
+		})
+		if err != nil {
+			return nil, err
+		}
+		if isWiki {
+			g.wiki = d
+		} else {
+			g.repo = d
+		}
+	}
+	return g, nil
+}
+
+// check is the check of the directory of the repository, or of its wiki,
+// right before a git command writes there.
+func (g *pullGuard) check(isWiki bool) error {
+	if isWiki {
+		return g.wiki.Check()
+	}
+	return g.repo.Check()
+}
+
+// checker is check as a function, for the helpers that run git.
+func (g *pullGuard) checker(isWiki bool) func() error {
+	return func() error { return g.check(isWiki) }
+}
+
+// environ is base, the environment of a git command that writes refs into
+// the directory of the repository or of its wiki, with, in a cluster, the
+// repository's ID and whether it is the wiki, which the cluster's hook
+// gives the transaction. base nil is this process's environment.
+func (g *pullGuard) environ(base []string, isWiki bool) []string {
+	if !clusterhook.Enabled() {
+		return base
+	}
+	if base == nil {
+		base = os.Environ()
+	}
+	return append(base,
+		repo_module.EnvRepoID+"="+strconv.FormatInt(g.repoID, 10),
+		repo_module.EnvRepoIsWiki+"="+strconv.FormatBool(isWiki),
+	)
 }
 
 // setPullRemoteURL points the pull mirror's remote at addr. In a cluster
@@ -78,7 +211,7 @@ func setPullRemoteURL(ctx context.Context, path, name, addr string) error {
 			if addr == "" {
 				return nil
 			}
-			return addPullRemote(ctx, path, name, addr)
+			return addPullRemote(ctx, path, name, addr, nil)
 		}
 	}
 	_, _, err := git.NewCommand(ctx, "remote", "set-url").AddDynamicArguments(name, addr).RunStdString(&git.RunOpts{Dir: path})
@@ -90,7 +223,8 @@ func setPullRemoteURL(ctx context.Context, path, name, addr string) error {
 // passes through a credential helper. A remote another address replaced
 // on another node follows SQL. A mirror from before the address was kept
 // in SQL has no other source than the git config, and is left as is.
-func ensurePullMirrorRemote(ctx context.Context, m *repo_model.Mirror) error {
+// check runs right before each git command that writes the git config.
+func ensurePullMirrorRemote(ctx context.Context, m *repo_model.Mirror, check func() error) error {
 	if !clusterhook.Enabled() {
 		return nil
 	}
@@ -110,11 +244,14 @@ func ensurePullMirrorRemote(ctx context.Context, m *repo_model.Mirror) error {
 	}
 	switch {
 	case !exists:
-		if err := addPullRemote(ctx, path, name, addr); err != nil {
+		if err := addPullRemote(ctx, path, name, addr, check); err != nil {
 			return err
 		}
 	case cur != addr:
-		if err := setPullRemoteURL(ctx, path, name, addr); err != nil {
+		if err := checkDir(check); err != nil {
+			return err
+		}
+		if _, _, err := git.NewCommand(ctx, "remote", "set-url").AddDynamicArguments(name, addr).RunStdString(&git.RunOpts{Dir: path}); err != nil {
 			return err
 		}
 	}
@@ -136,8 +273,9 @@ var wikiRemoteURL = repo_module.WikiRemoteURL
 // its credentials: a private wiki answers no other. The git config keeps
 // addr's form, without the password. A wiki the remote does not serve
 // keeps no remote, or an empty URL, as UpdateAddress writes it: never the
-// old address.
-func ensurePullWikiRemote(ctx context.Context, m *repo_model.Mirror, authAddr, addr string) error {
+// old address. check runs right before each git command that writes the
+// wiki's git config.
+func ensurePullWikiRemote(ctx context.Context, m *repo_model.Mirror, authAddr, addr string, check func() error) error {
 	if !clusterhook.Enabled() || addr == "" || !m.Repo.HasWiki() {
 		return nil
 	}
@@ -159,9 +297,11 @@ func ensurePullWikiRemote(ctx context.Context, m *repo_model.Mirror, authAddr, a
 	case !exists && want == "", exists && cur == want:
 		return nil
 	case !exists:
-		err = addPullRemote(ctx, wikiPath, name, want)
+		err = addPullRemote(ctx, wikiPath, name, want, check)
 	default:
-		_, _, err = git.NewCommand(ctx, "remote", "set-url").AddDynamicArguments(name, want).RunStdString(&git.RunOpts{Dir: wikiPath})
+		if err = checkDir(check); err == nil {
+			_, _, err = git.NewCommand(ctx, "remote", "set-url").AddDynamicArguments(name, want).RunStdString(&git.RunOpts{Dir: wikiPath})
+		}
 	}
 	if err != nil {
 		return util.SanitizeErrorCredentialURLs(err)
@@ -303,7 +443,8 @@ const syncRefBatch = 512
 // when it must (fetchInBatches), and writes its output to out. credURL, if
 // set, authenticates the fetch as the sync's own; tags adds --tags. It is
 // false, and nothing was written, when the sync's own fetch is to run.
-func syncInBatches(ctx context.Context, m *repo_model.Mirror, credURL, dir string, prune, tags bool, timeout time.Duration, env []string, out *strings.Builder) (bool, error) {
+// env and check are fetchInBatches's.
+func syncInBatches(ctx context.Context, m *repo_model.Mirror, credURL, dir string, prune, tags bool, timeout time.Duration, env []string, check func() error, out *strings.Builder) (bool, error) {
 	if !clusterhook.Enabled() {
 		return false, nil
 	}
@@ -323,7 +464,7 @@ func syncInBatches(ctx context.Context, m *repo_model.Mirror, credURL, dir strin
 		dry.AddArguments("--tags")
 	}
 	dry.AddDynamicArguments(m.GetRemoteName())
-	output, batched, err := fetchInBatches(ctx, dry, dir, timeout, env)
+	output, batched, err := fetchInBatches(ctx, dry, dir, timeout, env, check)
 	out.WriteString(output)
 	return batched, err
 }
@@ -338,7 +479,10 @@ func syncInBatches(ctx context.Context, m *repo_model.Mirror, credURL, dir strin
 // written by batches of syncRefBatch, each checked against the old value
 // the fetch read, and the output is the fetch's own, so the sync reports
 // the same results; batched is false when the sync's fetch can run as is.
-func fetchInBatches(ctx context.Context, dry *git.Command, dir string, timeout time.Duration, env []string) (output string, batched bool, err error) {
+// env is the environment of the fetch and of the batches, and check, if
+// set, runs right before each batch, which it refuses with its error
+// (pullGuard): the caller checks before the fetch.
+func fetchInBatches(ctx context.Context, dry *git.Command, dir string, timeout time.Duration, env []string, check func() error) (output string, batched bool, err error) {
 	if !clusterhook.Enabled() {
 		return "", false, nil
 	}
@@ -376,9 +520,12 @@ func fetchInBatches(ctx context.Context, dry *git.Command, dir string, timeout t
 				fmt.Fprintf(&in, "update %s %s %s\n", u.ref, u.newID, u.oldID)
 			}
 		}
+		if err := checkDir(check); err != nil {
+			return "", true, err
+		}
 		if _, _, err := git.NewCommand(ctx, "update-ref", "--stdin").
 			SetDescription(fmt.Sprintf("fetchInBatches(git update-ref): %s", dir)).
-			RunStdString(&git.RunOpts{Dir: dir, Timeout: timeout, Stdin: &in}); err != nil {
+			RunStdString(&git.RunOpts{Dir: dir, Timeout: timeout, Env: env, Stdin: &in}); err != nil {
 			return "", true, fmt.Errorf("git update-ref: %w", err)
 		}
 		for _, u := range updates[:n] {
