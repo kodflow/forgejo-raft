@@ -4,8 +4,11 @@
 package actions
 
 import (
+	"errors"
+	"net/http"
 	"net/url"
 
+	"forgejo.org/modules/clusterhook"
 	actions_service "forgejo.org/services/actions"
 	app_context "forgejo.org/services/context"
 )
@@ -31,8 +34,16 @@ func ManualRunWorkflow(ctx *app_context.Context) {
 		return
 	}
 
-	workflow, err := actions_service.GetWorkflowFromCommit(ctx.Repo.GitRepo, ref, workflowID)
+	workflow, err := actions_service.GetWorkflowToDispatch(ctx, ctx.Repo.Repository, ctx.Repo.GitRepo, ref, workflowID)
 	if err != nil {
+		if errors.Is(err, clusterhook.ErrBehind) {
+			// A node of the cluster behind on the repository would run the
+			// commit before the last push another node acknowledged, and
+			// cancel the run of that push's head: nothing was written, the
+			// user retries (#325).
+			ctx.Error(http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		ctx.ServerError("GetWorkflowFromCommit", err)
 		return
 	}

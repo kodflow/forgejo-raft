@@ -832,8 +832,15 @@ func DispatchWorkflow(ctx *context.APIContext) {
 		return
 	}
 
-	workflow, err := actions_service.GetWorkflowFromCommit(ctx.Repo().GitRepo, opt.Ref, name)
+	// The ref is resolved in this node's git: a node of the cluster behind
+	// on the repository answers 503 before anything is written, rather
+	// than run the commit before the last push another node acknowledged
+	// and cancel the run of that push's head (#325).
+	workflow, err := actions_service.GetWorkflowToDispatch(ctx, ctx.Repo().Repository, ctx.Repo().GitRepo, opt.Ref, name)
 	if err != nil {
+		if clusterBehind(ctx, err) {
+			return
+		}
 		switch {
 		case errors.Is(err, util.ErrInvalidArgument):
 			ctx.Error(http.StatusBadRequest, "GetWorkflowFromCommit", err)
