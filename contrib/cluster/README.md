@@ -64,6 +64,16 @@ derive in it is written by a single consumer, on the leader.
   --ignore-existing`). Names do not collide: LFS objects and package blobs
   are named by their digest, attachments by a random UUID, the others by
   the row they belong to.
+
+  The user Forgejo runs as writes into the shared volume's root, and a
+  volume created empty is root's: every node stops at start on the first
+  directory it cannot create there. The image's setup hands `/stored` (its
+  root only) to the git user at every start of a container when that user
+  cannot write there, which an export that squashes root refuses: make
+  that one writable by uid 1000 yourself. The Compose example does it in
+  `stored-init`, which every node waits for, so the plain `docker compose
+  up -d` that updates a deployment founded before the shared volume starts
+  the nodes on it; the Kubernetes one in the `cluster-init` container.
 - git 2.48 or later. Start-up fails with an older git: the cluster learns
   HEAD only from the reference-transaction hook, which git before 2.46
   bypasses for `git init` and `git symbolic-ref`, and git up to 2.47 reports

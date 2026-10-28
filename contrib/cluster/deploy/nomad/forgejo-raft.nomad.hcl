@@ -15,8 +15,11 @@
 #     (tls/), the consensus data directory and the repositories. The key is
 #     born there and never enters Nomad Variables or Vault;
 #   - on each machine, a host volume "forgejo-stored" (client config) on ONE
-#     filesystem every machine mounts, an NFS or CephFS export, writable by
-#     uid 1000. It holds what Forgejo keeps outside git: LFS objects,
+#     filesystem every machine mounts, an NFS or CephFS export. The image's
+#     setup hands its root to the git user (uid 1000) at each start when
+#     that user cannot write there; an export that squashes root refuses
+#     it, so make that one writable by uid 1000 yourself, or every node
+#     stops at start. It holds what Forgejo keeps outside git: LFS objects,
 #     attachments, avatars, packages, archives, Actions logs and artifacts.
 #     The cluster replicates git, not these files, and a file one node wrote
 #     is read by whichever node the load balancer picks next: a host volume

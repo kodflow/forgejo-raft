@@ -7,6 +7,16 @@ if [ -d /run/kitsunium-consensus ]; then
     chmod 0700 /run/kitsunium-consensus
 fi
 
+# The shared volume of the stored files, which the cluster's deployment
+# examples mount on /stored: the git user writes there. A volume created
+# empty (a new compose volume, a new NFS export, a host volume) is root's:
+# hand over its root, and only its root, since the other nodes may be
+# writing below it. A refused chown (a root-squashed export) leaves it as it
+# is, and Forgejo names the directory it cannot create there.
+if [ -d /stored ] && ! su-exec "${USER}" test -w /stored; then
+    chown "${USER}:git" /stored
+fi
+
 if [ ! -d /data/git/.ssh ]; then
     mkdir -p /data/git/.ssh
 fi
