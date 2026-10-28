@@ -13,6 +13,7 @@ import (
 	"forgejo.org/modules/web"
 	"forgejo.org/services/context"
 	"forgejo.org/services/convert"
+	repo_service "forgejo.org/services/repository"
 )
 
 // GetNote Get a note corresponding to a single commit from a repository
@@ -147,8 +148,17 @@ func SetNote(ctx *context.APIContext) {
 
 	form := web.GetForm(ctx).(*api.NoteOptions)
 
-	err := git.SetNote(ctx, ctx.Repo().GitRepo, sha, form.Message, ctx.Doer().Name, ctx.Doer().GetEmail())
+	// Before git notes builds on this node's notes: a node of the cluster
+	// behind on the repository would drop the notes another node
+	// acknowledged (#324).
+	if refWritesRefused(ctx) {
+		return
+	}
+	err := repo_service.SetNote(ctx, ctx.Doer(), ctx.Repo().Repository, ctx.Repo().GitRepo, sha, form.Message)
 	if err != nil {
+		if clusterBehind(ctx, err) {
+			return
+		}
 		if git.IsErrNotExist(err) {
 			ctx.NotFound(sha)
 		} else {
@@ -196,8 +206,15 @@ func RemoveNote(ctx *context.APIContext) {
 		return
 	}
 
-	err := git.RemoveNote(ctx, ctx.Repo().GitRepo, sha)
+	// As for SetNote (#324).
+	if refWritesRefused(ctx) {
+		return
+	}
+	err := repo_service.RemoveNote(ctx, ctx.Repo().Repository, ctx.Repo().GitRepo, sha)
 	if err != nil {
+		if clusterBehind(ctx, err) {
+			return
+		}
 		if git.IsErrNotExist(err) {
 			ctx.NotFound(sha)
 		} else {

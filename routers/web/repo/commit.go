@@ -20,6 +20,7 @@ import (
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/base"
 	"forgejo.org/modules/charset"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/log"
@@ -493,8 +494,14 @@ func setCommitNotes(ctx *context.Context, redirectURL string) {
 
 	commitID := ctx.Params(":sha")
 
-	err := git.SetNote(ctx, ctx.Repo.GitRepo, commitID, form.Notes, ctx.Doer.Name, ctx.Doer.GetEmail())
+	err := repo_service.SetNote(ctx, ctx.Doer, ctx.Repo.Repository, ctx.Repo.GitRepo, commitID, form.Notes)
 	if err != nil {
+		if errors.Is(err, clusterhook.ErrBehind) {
+			// A node of the cluster behind on the repository: nothing was
+			// written, the user retries (#324).
+			ctx.Error(http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		ctx.ServerError("SetNote", err)
 		return
 	}
@@ -509,8 +516,13 @@ func SetCommitNotes(ctx *context.Context) {
 func removeCommitNotes(ctx *context.Context, redirectURL string) {
 	commitID := ctx.Params(":sha")
 
-	err := git.RemoveNote(ctx, ctx.Repo.GitRepo, commitID)
+	err := repo_service.RemoveNote(ctx, ctx.Repo.Repository, ctx.Repo.GitRepo, commitID)
 	if err != nil {
+		if errors.Is(err, clusterhook.ErrBehind) {
+			// As for setCommitNotes (#324).
+			ctx.Error(http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		ctx.ServerError("RemoveNotes", err)
 		return
 	}
