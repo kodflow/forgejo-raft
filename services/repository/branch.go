@@ -677,6 +677,22 @@ func SetRepoDefaultBranch(ctx context.Context, repo *repo_model.Repository, gitR
 		return nil
 	}
 
+	// The new branch is looked up in this node's git, and the notifiers of
+	// the change read its head there: the actions notifier registers the
+	// scheduled workflows it holds, the code and language statistics
+	// indexers index it. In a cluster, a node behind on the repository
+	// would take for absent a branch another node pushed, or for present
+	// one another node deleted, and register for good the scheduled
+	// workflows of the branch's head before the last push another node
+	// acknowledged, which nothing detects again until the next push to the
+	// branch (#299). The change waits until this node serves the
+	// repository at the commit index the cluster confirms now, and is
+	// refused while it does not, before anything is written: the schedules
+	// registered are kept.
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
+		return err
+	}
+
 	if !gitRepo.IsBranchExist(newBranchName) {
 		return git_model.ErrBranchNotExist{
 			BranchName: newBranchName,
