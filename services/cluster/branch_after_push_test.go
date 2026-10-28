@@ -262,6 +262,13 @@ func TestReconcileRebuildsABranchRowAtAnotherCommit(t *testing.T) {
 	resp := tc.pushVia(b, work, laggingRepo, "refs/heads/lag-from", c1, c2)
 	require.True(t, resp.OK, resp.Message)
 	require.Eventually(t, func() bool { return gitRef(t, a, laggingRepo, "refs/heads/lag-from") == c2 }, 15*time.Second, 20*time.Millisecond)
+	// Reconcile rebuilds a row only once node-a projected the repository
+	// at the table's index, and node-a's projector certifies the push only
+	// after it wrote it to git: in between, apply skips the rebuild, as it
+	// must (#329). The test waits for the rebuild's own condition. The
+	// index is read once git shows the push, so node-a's table holds it.
+	_, at := a.r.table.Refs(laggingRepo)
+	require.Eventually(t, func() bool { return a.r.projector.Projected(laggingRepo) >= at }, 15*time.Second, 20*time.Millisecond, "node-a certifies the push")
 	defer test.MockVariableValue(&setting.RepoRootPath, a.r.root)()
 
 	lagFrom := func(ms []Mismatch) (Mismatch, bool) {
