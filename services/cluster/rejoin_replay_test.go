@@ -74,8 +74,7 @@ func TestARejoinUnderANewIDKeepsTheTable(t *testing.T) {
 
 	victim := b.follower()
 	old := b.idOf(victim)
-	b.expire(victim)
-	m := b.waitMembers(3, 3)
+	m := b.waitRemoved(b.expire(victim), 3, 3)
 	require.Contains(t, m.Retired, old)
 	b.restart(victim)
 	b.waitMembers(4, 4)

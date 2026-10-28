@@ -412,11 +412,145 @@ func (b *autoBench) waitMembers(members, voters int) consensus.Membership {
 }
 
 // expire kills a node and lets DEAD_MEMBER_TIMEOUT pass on the fake clock,
-// once the leader saw it out of reach.
-func (b *autoBench) expire(an *autoNode) {
+// once the leader saw it out of reach. It returns the leadership at the
+// death, for untilDeadTimeout.
+func (b *autoBench) expire(an *autoNode) leadTerm {
 	b.kill(an)
+	from := b.lead()
 	time.Sleep(benchDownAfter + 500*time.Millisecond)
 	b.clock.advance(benchDeadTimeout + time.Minute)
+	return from
+}
+
+// leadTerm is a leadership: the node that leads, and the term it leads in.
+// The zero leadTerm is no leader.
+type leadTerm struct {
+	an   *autoNode
+	term uint64
+}
+
+func (l leadTerm) String() string {
+	if l.an == nil {
+		return "no leader"
+	}
+	return fmt.Sprintf("%s in term %d", l.an.n.slot, l.term)
+}
+
+// lead is the leadership now.
+func (b *autoBench) lead() leadTerm {
+	for _, an := range b.alive() {
+		if e := an.r().Engine(); e != nil {
+			if st := e.Status(); st.Role == consensus.RoleLeader {
+				return leadTerm{an: an, term: st.Term}
+			}
+		}
+	}
+	return leadTerm{}
+}
+
+// Pacing of untilDeadTimeout: a leadership other than the one the test
+// advanced the fake clock for is given an advance of its own once it led
+// for leadSettle, and another at each readvance while the wait lasts.
+const (
+	leadSettle = time.Second
+	readvance  = 5 * time.Second
+)
+
+// untilDeadTimeout waits, within 30 s, for done: a condition the leader
+// meets only once it found a member out of reach for DEAD_MEMBER_TIMEOUT
+// by the autopilot's clock, as the removal of a dead member or the
+// replacement of a lost voter. The test advanced the fake clock past that
+// timeout after the member died while from led, which suffices while from
+// leads: its autopilot noted the member out of reach before the advance.
+//
+// A node that starts to lead starts its dead clock at the fake time of its
+// first pass as leader, and one that stops leading forgets its own
+// (autopilotStep, deadMember): after a change of leader, as CI's load
+// gives one under the bench's 100 ms election timeout, the leader would
+// wait for a timeout the fake clock never reaches again, and done would
+// never hold (#317). So once another leadership leads, and led for
+// leadSettle, by which its autopilot noted what it finds out of reach, the
+// clock is advanced by DEAD_MEMBER_TIMEOUT and markBackoff, since a
+// removal the change refused is tried again only after markBackoff
+// (removeDead); then again at each readvance while done does not hold,
+// should its first pass as leader have come later. Each advance waits for
+// a leader that finds every running node within reach (quiet): no live
+// member it found out of reach for a moment is removed by it. While from
+// leads the clock is never touched.
+func (b *autoBench) untilDeadTimeout(from leadTerm, done func() bool, msgAndArgs ...any) {
+	b.t.Helper()
+	// The condition runs on goroutines of its own, which must not log on
+	// b.t: one still running when the wait times out would log after the
+	// test ended (#200). The advances are logged once the wait is over.
+	var mu sync.Mutex
+	var advances []string
+	// seen is the leadership of the last poll, since when it was first
+	// seen or last given an advance, which it is given again after pause.
+	var seen leadTerm
+	var since time.Time
+	pause := leadSettle
+	ok := assert.Eventually(b.t, func() bool {
+		if done() {
+			return true
+		}
+		cur := b.lead()
+		if cur != seen {
+			seen, since, pause = cur, time.Now(), leadSettle
+		}
+		if cur.an == nil || cur == from || time.Since(since) < pause || !b.quiet(cur) {
+			return false
+		}
+		b.clock.advance(benchDeadTimeout + markBackoff)
+		since, pause = time.Now(), readvance
+		mu.Lock()
+		advances = append(advances, fmt.Sprintf("%s leads, not %s: the fake clock advances by %s", cur, from, benchDeadTimeout+markBackoff))
+		mu.Unlock()
+		return false
+	}, 30*time.Second, 20*time.Millisecond, msgAndArgs...)
+	mu.Lock()
+	for _, a := range advances {
+		b.t.Log(a)
+	}
+	mu.Unlock()
+	if !ok {
+		b.t.FailNow()
+	}
+}
+
+// quiet reports whether the leadership l finds every running node within
+// reach, by the autopilot's rule (deadMember).
+func (b *autoBench) quiet(l leadTerm) bool {
+	eng := l.an.r().Engine()
+	if eng == nil {
+		return false
+	}
+	live := map[consensus.NodeID]bool{}
+	for _, an := range b.alive() {
+		live[b.idOf(an)] = true
+	}
+	for _, p := range eng.Health().Peers {
+		if live[p.ID] && (p.Unreachable || p.LastContact > benchDownAfter) {
+			return false
+		}
+	}
+	return true
+}
+
+// waitRemoved is waitMembers for the membership a dead member's removal
+// gives, the fake clock advanced past DEAD_MEMBER_TIMEOUT after its death
+// while from led (untilDeadTimeout).
+func (b *autoBench) waitRemoved(from leadTerm, members, voters int) consensus.Membership {
+	b.t.Helper()
+	var m consensus.Membership
+	b.untilDeadTimeout(from, func() bool {
+		l := b.leader()
+		if l == nil {
+			return false
+		}
+		m = l.r().Engine().Membership()
+		return len(m.Members) == members && m.Voters() == voters
+	}, "%d members, %d voters: %+v", members, voters, m)
+	return m
 }
 
 func voterSlots(m consensus.Membership) (voters, learners []string) {
@@ -493,13 +627,14 @@ func TestDeadMemberRemovedAfterTimeout(t *testing.T) {
 	old := b.idOf(victim)
 
 	b.kill(victim)
+	from := b.lead()
 	time.Sleep(benchDownAfter + 500*time.Millisecond)
 	b.clock.advance(benchDeadTimeout - time.Minute)
 	time.Sleep(500 * time.Millisecond)
 	assert.Len(t, b.leader().r().Engine().Membership().Members, 4, "not before the timeout")
 
 	b.clock.advance(2 * time.Minute)
-	m := b.waitMembers(3, 3)
+	m := b.waitRemoved(from, 3, 3)
 	assert.Contains(t, m.Retired, old)
 	v := b.leader().r().View(context.Background())
 	i := slices.IndexFunc(v.Removed, func(x RemovedView) bool { return x.ID == old.String() })
@@ -526,8 +661,7 @@ func TestSequentialFailuresDownToTwo(t *testing.T) {
 	push(b.leader().n, "five")
 
 	for members := 4; members >= 3; members-- {
-		b.expire(b.follower())
-		b.waitMembers(members, members)
+		b.waitRemoved(b.expire(b.follower()), members, members)
 		push(b.leader().n, fmt.Sprintf("down to %d", members))
 	}
 
@@ -620,8 +754,7 @@ func TestRemovedNodeRejoinsUnderNewID(t *testing.T) {
 	b.waitMembers(4, 4)
 	victim := b.follower()
 	old := b.idOf(victim)
-	b.expire(victim)
-	m := b.waitMembers(3, 3)
+	m := b.waitRemoved(b.expire(victim), 3, 3)
 	require.Contains(t, m.Retired, old)
 
 	b.restart(victim)
@@ -789,9 +922,10 @@ func TestFullRebootWithAWipedFounderNeverFoundsTwice(t *testing.T) {
 
 	// The old node-a is removed after the timeout; the new one joins.
 	require.Eventually(t, func() bool { return b.leader() != nil }, 10*time.Second, 20*time.Millisecond)
+	from := b.lead()
 	time.Sleep(benchDownAfter + 500*time.Millisecond)
 	b.clock.advance(benchDeadTimeout + time.Minute)
-	require.Eventually(t, func() bool {
+	b.untilDeadTimeout(from, func() bool {
 		l := b.leader()
 		if l == nil {
 			return false
@@ -799,7 +933,7 @@ func TestFullRebootWithAWipedFounderNeverFoundsTwice(t *testing.T) {
 		m = l.r().Engine().Membership()
 		i := Rank(m, consensus.NodeID(id))
 		return slices.Contains(m.Retired, oldA) && i > 0 && m.Members[i-1].Voter && len(m.Members) == 4
-	}, 30*time.Second, 20*time.Millisecond, "node-a rejoins under its new id, a voter: %+v", m)
+	}, "node-a rejoins under its new id, a voter: %+v", m)
 	assert.Equal(t, consensus.ClusterID(b.cluster), b.leader().r().Engine().Status().Identity.Cluster, "one lineage")
 }
 
