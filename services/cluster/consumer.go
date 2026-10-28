@@ -140,6 +140,20 @@ type consumer struct {
 	// waitsBehind reports a repository whose projection waits behind
 	// another repository's in the projector's serial pass; nil in tests.
 	waitsBehind func(repo string) bool
+	// renamedAfter is the table's RenamedAfter: the renames that moved an
+	// event's repository on since the event, whose projection its work
+	// waits for (projectionGate, #326); nil in unit tests leaves an event
+	// at its own key.
+	renamedAfter func(from string, after uint64) (string, uint64, bool)
+	// rewrittenSince is the table's RewrittenSince, which holds whenever
+	// renamedAfter finds a rename: the gate asks it first, as renamedAfter
+	// gathers every rename target the table ever kept at each call, for
+	// each pending event of each pass. nil asks renamedAfter alone.
+	rewrittenSince func(repo string, index uint64) bool
+	// readCheck checks, around the post-receive work, that this node's
+	// directory under a repository's name holds that repository (#326);
+	// nil in unit tests, and without a projector.
+	readCheck func(key string, repoID int64) (still func() error, err error)
 
 	// fetch brings objects this node lacks from the members holding them:
 	// the object channel's fetchMissing; nil without one, in unit tests.
@@ -242,6 +256,11 @@ func newConsumer(r *Replicator) *consumer {
 	}
 	if r.projector != nil {
 		c.holds = r.projector.holds
+		c.readCheck = r.checkRead
+	}
+	if r.table != nil {
+		c.renamedAfter = r.table.RenamedAfter
+		c.rewrittenSince = r.table.RewrittenSince
 	}
 	c.ack = func(ctx context.Context, lineage string, index uint64) error {
 		data, err := reftable.Encode(reftable.KindAck, &reftable.Ack{Identity: lineage, Index: index})
@@ -362,14 +381,19 @@ func (c *consumer) forget() {
 }
 
 // projected reports whether the events of one entry are projected on this
-// node. When the head entry has waited longer than projectionStallBound,
-// its events are let through marked as failed, so dispatch parks them and
-// the queue moves on.
+// node, each at its projectionGate. When the head entry has waited longer
+// than projectionStallBound, its events are let through marked as failed,
+// so dispatch parks them and the queue moves on.
 func (c *consumer) projected(evs []reftable.Event) bool {
+	current := c.lineage()
 	var waiting string
+	var waitingAt uint64
+	gates := make([]string, 0, len(evs))
 	for _, ev := range evs {
-		if c.projectedAt(ev.Repo) < ev.Token.Index {
-			waiting = ev.Repo
+		key, at := c.projectionGate(ev.Repo, ev.Token.Index, ev.Token.Identity().String(), current)
+		gates = append(gates, key)
+		if c.projectedAt(key) < at {
+			waiting, waitingAt = key, at
 			break
 		}
 	}
@@ -379,8 +403,9 @@ func (c *consumer) projected(evs []reftable.Event) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if waiting == "" {
-		for _, ev := range evs {
+		for i, ev := range evs {
 			delete(c.stalledOut, ev.Repo)
+			delete(c.stalledOut, gates[i])
 		}
 		return true
 	}
@@ -409,7 +434,7 @@ func (c *consumer) projected(evs []reftable.Event) bool {
 	if c.stall.waited < projectionStallBound {
 		return false
 	}
-	log.Error("cluster consumer: %s is still not projected at %d after %s; parking its event", waiting, idx, projectionStallBound)
+	log.Error("cluster consumer: %s is still not projected at %d after %s; parking its event at %d", waiting, waitingAt, projectionStallBound, idx)
 	c.failures[idx] = maxAttempts
 	c.reasons[idx] = fmt.Sprintf("not projected after %s", projectionStallBound)
 	if c.stalledOut == nil {
@@ -417,6 +442,51 @@ func (c *consumer) projected(evs []reftable.Event) bool {
 	}
 	c.stalledOut[waiting] = true
 	return true
+}
+
+// lineage is the lineage the table applies now, "" when the consumer does
+// not know (a unit test).
+func (c *consumer) lineage() string {
+	if c.lineageNow == nil {
+		return ""
+	}
+	return c.lineageNow()
+}
+
+// projectionGate is the key, and the index, at which the repository of an
+// event written under key at index must be projected on this node before
+// its post-receive work runs: key at index, or, when renames moved the
+// repository on since, the key they led it to, at the index of the last of
+// them (#326). The work reads the repository under its name in SQL, which
+// follows those renames. Projected under the event's key alone, the
+// directory under the new name may still hold the repository renamed away
+// from it, kept there while a fetch of its objects is in flight or a pass
+// runs long: the work read that one's tags and branch heads for this one's
+// rows, fetched this one's commits into it, and dropped the work of a tag
+// it did not find. The wait is the one the rename's own event waits for
+// right after, and counts as a wait for projection, never as a failure.
+//
+// Renames are followed in the table's lineage only, now: indexes compare
+// within one lineage. An event of another lineage keeps its key, and the
+// work's read check (checkRead) refuses a directory that holds another
+// repository, as the follow through SQL's redirects of a parked entry of
+// such a lineage does not know the table's renames either (#238).
+func (c *consumer) projectionGate(key string, index uint64, lineage, now string) (string, uint64) {
+	if c.renamedAfter == nil || now == "" || lineage != now {
+		return key, index
+	}
+	at := index
+	for range 64 {
+		if c.rewrittenSince != nil && !c.rewrittenSince(key, at) {
+			break // no rename from key after at: renamedAfter finds none
+		}
+		to, idx, ok := c.renamedAfter(key, at)
+		if !ok {
+			break
+		}
+		key, at = to, idx
+	}
+	return key, at
 }
 
 func (c *consumer) clearStall() {
@@ -807,7 +877,7 @@ func (c *consumer) dispatch(ctx context.Context, lineage string, cur *cluster_mo
 				parked += len(group)
 				continue
 			}
-			err := c.work(withLostCommits(ctx, lost[group[0].Repo]), group)
+			err := c.work(c.withProbe(withLostCommits(ctx, lost[group[0].Repo])), group)
 			if err == nil {
 				err = waits.take()
 			}
@@ -1200,6 +1270,10 @@ type commitsNeed struct {
 	ids      []string
 	// events are the events' keys, which the work's lost commits go by.
 	events []string
+	// still says, once the directory was found to hold the repository,
+	// whether it may hold another one since (checkRead); nil without a
+	// read check.
+	still func() error
 }
 
 // obtain makes sure this node, the leader, holds the commits the
@@ -1245,13 +1319,18 @@ func (c *consumer) obtain(ctx context.Context, evs []reftable.Event) map[string]
 		n, ok := looked[er]
 		if !ok {
 			// The directory the work opens: the repository's name now.
+			// Never one that holds another repository on this node: its
+			// commits would be fetched there, under that one's rights,
+			// and the work refuses to read it anyway (#326).
 			if repo, err := lookupRepo(ctx, ev); err == nil {
-				key := clusterhook.RepoKey(repo.OwnerName, repo.Name, false)
-				dir := filepath.Join(c.r.root, filepath.FromSlash(key))
-				if n = byDir[dir]; n == nil {
-					n = &commitsNeed{key: key, dir: dir}
-					byDir[dir] = n
-					needs = append(needs, n)
+				if still, ok := c.servesHere(repo); ok {
+					key := clusterhook.RepoKey(repo.OwnerName, repo.Name, false)
+					dir := filepath.Join(c.r.root, filepath.FromSlash(key))
+					if n = byDir[dir]; n == nil {
+						n = &commitsNeed{key: key, dir: dir, still: still}
+						byDir[dir] = n
+						needs = append(needs, n)
+					}
 				}
 			}
 			// A repository not found: the work says what becomes of it.
@@ -1281,7 +1360,7 @@ func (c *consumer) obtain(ctx context.Context, evs []reftable.Event) map[string]
 			c.settle(n.dir, n.ids, nil)
 			continue
 		}
-		if done := c.startFetch(ctx, n.key, n.dir, missing); done != nil {
+		if done := c.startFetchChecked(ctx, n.key, n.dir, missing, n.still); done != nil {
 			select {
 			case <-done:
 			case <-time.After(obtainWait):
@@ -1328,6 +1407,16 @@ func (c *consumer) obtain(ctx context.Context, evs []reftable.Event) map[string]
 // rename and every later rename to that name (#275). A fetch ended so is
 // tried again by a later dispatch, as a failed one.
 func (c *consumer) startFetch(ctx context.Context, key, dir string, ids []string) <-chan struct{} {
+	return c.startFetchChecked(ctx, key, dir, ids, nil)
+}
+
+// startFetchChecked is startFetch for a directory found to hold the
+// repository the fetch is for: still, when not nil, is asked again before
+// each commit is fetched, and a refusal ends the fetch. The projector may
+// move another repository's directory under the name while the fetch runs,
+// a rename applied since: its commits must never be fetched into that one,
+// whose rights would then serve them (#326).
+func (c *consumer) startFetchChecked(ctx context.Context, key, dir string, ids []string, still func() error) <-chan struct{} {
 	c.mu.Lock()
 	if c.fetching[dir] {
 		c.mu.Unlock()
@@ -1357,6 +1446,12 @@ func (c *consumer) startFetch(ctx context.Context, key, dir string, ids []string
 			// answers that it does not hold them all.
 			if m, err := missingObjects(fctx, dir, []string{id}); err == nil && len(m) == 0 {
 				continue
+			}
+			if still != nil {
+				if err := still(); err != nil {
+					log.Warn("cluster consumer: not fetching %s of %s, which the post-receive work of its events reads: %v", id, key, err)
+					break
+				}
 			}
 			err := c.fetch(fctx, key, dir, []string{id})
 			c.noteFetch(dir, id, err)
@@ -1446,6 +1541,78 @@ func lostCommitsOf(ctx context.Context) map[string]bool {
 	return lost
 }
 
+// nodeProbeKey carries, to the post-receive work, what the consumer knows
+// of this node, whose git the work reads (nodeProbe).
+type nodeProbeKey struct{}
+
+type readCheckFunc func(key string, repoID int64) (still func() error, err error)
+
+// nodeProbe is what the consumer gives its post-receive work: the check of
+// the directory it reads (checkRead), and how far this node projected a
+// key. Either may be nil, in unit tests.
+type nodeProbe struct {
+	readCheck   readCheckFunc
+	projectedAt func(key string) uint64
+}
+
+// withProbe gives the work the consumer's probe of this node.
+func (c *consumer) withProbe(ctx context.Context) context.Context {
+	if c.readCheck == nil && c.projectedAt == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, nodeProbeKey{}, nodeProbe{readCheck: c.readCheck, projectedAt: c.projectedAt})
+}
+
+func probeOf(ctx context.Context) nodeProbe {
+	p, _ := ctx.Value(nodeProbeKey{}).(nodeProbe)
+	return p
+}
+
+// servesHere reports whether this node's directory under repo's name may
+// be read, and written, for repo: it holds no other repository
+// (ReadRefusal). still says later whether it may hold another one since.
+// Without a read check, it is not judged, and still is nil.
+func (c *consumer) servesHere(repo *repo_model.Repository) (still func() error, ok bool) {
+	if c.readCheck == nil {
+		return nil, true
+	}
+	still, err := c.readCheck(clusterhook.RepoKey(repo.OwnerName, repo.Name, false), repo.ID)
+	return still, err == nil
+}
+
+// checkRead is clusterhook.CheckRead on this node's replicator, the one
+// whose consumer runs the work: the global guard is the last replicator
+// started in the process. The post-receive work reads the directory under
+// the repository's name in SQL: its branch heads for the branch rows, its
+// tags, its commits for the notifications and the pull requests. That
+// directory may hold another repository on this node, the one renamed
+// away from the name (a fetch of its objects in flight, a long pass of the
+// projector), and the work then wrote that one's head commit and message,
+// a private repository's, into the rows of a public one (#326). err
+// refuses it now; once the work read it, still refuses it when the
+// directory holds another repository then, or a rename, a transfer or a
+// deletion that took the name or freed it was not projected here at the
+// call: the projector may have moved the directory while the work read
+// it. A refusal fails the work, and its transaction with it; it is
+// retried, as the projector catches up.
+func (r *Replicator) checkRead(key string, repoID int64) (func() error, error) {
+	// The watch starts before the check: a rename the check did not see
+	// is one the watch does.
+	rewritten := r.watchRewrite(key)
+	if err := r.ReadRefusal(key, repoID); err != nil {
+		return nil, err
+	}
+	return func() error {
+		if err := r.ReadRefusal(key, repoID); err != nil {
+			return err
+		}
+		if rewritten() {
+			return fmt.Errorf("a rename or a deletion of %s may have moved its directory on this node of the cluster while the work read it", key)
+		}
+		return nil
+	}, nil
+}
+
 // retryParked runs the work of the parked events, entry by entry, in
 // order; an entry's work and the removal of its rows commit together, so
 // it is applied exactly once. A repository whose entry fails or is not
@@ -1508,10 +1675,10 @@ func (c *consumer) retryParkedNoting(ctx context.Context, waits *[]parkedWait) (
 			_ = c.noteParked(ctx, lineage, index, "decoding the parked event: "+derr.Error())
 			continue
 		}
-		if lineage == now && c.projectedAt != nil && c.projectedAt(repo) < uint64(index) {
+		if wait, ok := c.awaitsProjection(lineage, now, index, evs); ok {
 			blocked[key] = true
 			if waits != nil {
-				*waits = append(*waits, parkedWait{Lineage: lineage, Index: index, Repo: repo})
+				*waits = append(*waits, wait)
 			}
 			continue
 		}
@@ -1533,7 +1700,7 @@ func (c *consumer) retryParkedNoting(ctx context.Context, waits *[]parkedWait) (
 		ran := false
 		err := c.tx(wctx, func(ctx context.Context) error {
 			ran = false
-			if err := c.work(withLostCommits(ctx, lost), evs); err != nil {
+			if err := c.work(c.withProbe(withLostCommits(ctx, lost)), evs); err != nil {
 				return err
 			}
 			if err := waits.take(); err != nil {
@@ -1596,12 +1763,43 @@ func (c *consumer) entryApplied(lineage string, index int64, repo string, rows i
 
 // parkedWait is a parked entry of the table's lineage whose retry waits
 // for its repository's projection on this node, the leader, and since when
-// the leader's retries found it so.
+// the leader's retries found it so. Repo is the key it waits for: the
+// entry's, or the one renames led its repository to since (projectionGate),
+// whose projection it waits for from at, the last of those renames' index;
+// at is 0 when no rename moved it.
 type parkedWait struct {
 	Lineage string
 	Index   int64
 	Repo    string
 	Since   time.Time
+	at      uint64
+}
+
+// awaitsProjection reports, for a parked entry of lineage at index whose
+// events are evs, the projection its retry waits for on this node: one of
+// the table's lineage, now, whose repository is not projected here at its
+// projectionGate.
+func (c *consumer) awaitsProjection(lineage, now string, index int64, evs []reftable.Event) (parkedWait, bool) {
+	if lineage != now || c.projectedAt == nil {
+		return parkedWait{}, false
+	}
+	for _, ev := range evs {
+		key, at := c.projectionGate(ev.Repo, uint64(index), lineage, now)
+		if c.projectedAt(key) >= at {
+			continue
+		}
+		w := parkedWait{Lineage: lineage, Index: index, Repo: key}
+		if at > uint64(index) {
+			w.at = at
+		}
+		return w, true
+	}
+	return parkedWait{}, false
+}
+
+// waitsFrom is the index from which w's key must be projected.
+func (w parkedWait) waitsFrom() uint64 {
+	return max(uint64(w.Index), w.at)
 }
 
 // unprojectedYieldAfter is how long the leader's retries go on finding a
@@ -1663,7 +1861,7 @@ func (c *consumer) stuckProjection() (parkedWait, bool) {
 		if time.Since(w.Since) < unprojectedYieldAfter {
 			break
 		}
-		if c.projectedAt != nil && c.projectedAt(w.Repo) < uint64(w.Index) {
+		if c.projectedAt != nil && c.projectedAt(w.Repo) < w.waitsFrom() {
 			return w, true
 		}
 	}
@@ -1943,6 +2141,28 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 		// out again. Its branch rows, webhooks and CI must not land there.
 		return fmt.Errorf("repository ID %d is %s/%s, which the event's %s does not lead to: the ID was reused; run `forgejo cluster reconcile`", first.RepoID, repo.OwnerName, repo.Name, first.Repo)
 	}
+	// The directory under the repository's name must hold it on this node,
+	// before the work reads it and once it did (checkRead, #326).
+	key := clusterhook.RepoKey(repo.OwnerName, repo.Name, false)
+	still := func() error { return nil }
+	if check := probeOf(ctx).readCheck; check != nil {
+		if still, err = check(key, repo.ID); err != nil {
+			return fmt.Errorf("the post-receive work of %s at %d does not read %s on this node now, retried: %w", first.Repo, first.Token.Index, key, err)
+		}
+	}
+	if err := derivePushes(ctx, evs, tbl, repo); err != nil {
+		return err
+	}
+	if err := still(); err != nil {
+		return fmt.Errorf("the post-receive work of %s at %d read %s on this node, which may not have held it meanwhile; retried: %w", first.Repo, first.Token.Index, key, err)
+	}
+	return nil
+}
+
+// derivePushes is the post-receive work of evs, the events of one pusher
+// in one entry, for repo, the repository their key leads to now.
+func derivePushes(ctx context.Context, evs []reftable.Event, tbl lifecycleTable, repo *repo_model.Repository) error {
+	first := evs[0]
 	u, err := getPusher(ctx, first.PusherID)
 	if err != nil && !user_model.IsErrUserNotExist(err) {
 		// Retried, never passed over: the lookup PushUpdatesNow repeats
@@ -2050,6 +2270,14 @@ func pushWorkWith(ctx context.Context, evs []reftable.Event, tbl lifecycleTable)
 // tagGone reports whether a tag update has nothing left to land on: a new
 // tag the cluster deleted since, or git no longer holds, or a deleted tag
 // without a release row.
+//
+// Git's word that the tag is gone is not taken while the table holds it
+// live under the repository's name now, and this node has not projected
+// that name up to the table (gitBehind): its git there is behind, or still
+// holds the repository a rename moved away from the name, and dropping the
+// work lost the tag's release row, its notifications, webhooks and
+// workflows for good (#326). The work fails instead, and is retried as
+// the projection catches up.
 func tagGone(ctx context.Context, repo *repo_model.Repository, ev reftable.Event, opt *repo_module.PushUpdateOptions, tbl lifecycleTable, openGit func() (*git.Repository, error)) (bool, error) {
 	name := opt.RefFullName.TagName()
 	if opt.IsDelRef() {
@@ -2066,7 +2294,47 @@ func tagGone(ctx context.Context, repo *repo_model.Repository, ev reftable.Event
 	if err != nil {
 		return false, err
 	}
-	return !gitRepo.IsTagExist(name), nil
+	if gitRepo.IsTagExist(name) {
+		return false, nil
+	}
+	if key := clusterhook.RepoKey(repo.OwnerName, repo.Name, false); tagLive(tbl, key, ev.Ref) && gitBehind(ctx, tbl, key) {
+		return false, fmt.Errorf("the tag %s of %s at %d is live in the cluster's table under %s, which this node's git, not projected there up to the table, does not show", name, ev.Repo, ev.Token.Index, key)
+	}
+	return true, nil
+}
+
+// tagLive reports whether the table holds ref of key live.
+func tagLive(tbl lifecycleTable, key, ref string) bool {
+	h, ok := tbl.(refHistory)
+	if !ok {
+		return false
+	}
+	v, held := h.Get(key, ref)
+	return held && v.Live()
+}
+
+// repoChanges is what gitBehind reads of the table: the index of a key's
+// last change.
+type repoChanges interface {
+	RepoHash(repo string) (reftable.Sum, uint64)
+}
+
+var _ repoChanges = (*reftable.Table)(nil)
+
+// gitBehind reports whether this node's git under key may not show the
+// table's refs there yet: the consumer's probe says this node projected
+// key below the table's last change of it, a rename that brought another
+// repository's refs there included. Git projected up to that change shows
+// what the table holds, and decides as before; so does the work run
+// without the consumer's probe, or without a table.
+func gitBehind(ctx context.Context, tbl lifecycleTable, key string) bool {
+	projectedAt := probeOf(ctx).projectedAt
+	h, ok := tbl.(repoChanges)
+	if projectedAt == nil || !ok {
+		return false
+	}
+	_, last := h.RepoHash(key)
+	return projectedAt(key) < last
 }
 
 // refHistory is what tagDeletedSince reads of the table the consumer
