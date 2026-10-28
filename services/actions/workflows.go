@@ -15,6 +15,7 @@ import (
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/user"
 	"forgejo.org/modules/actions"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/json"
 	"forgejo.org/modules/setting"
@@ -209,6 +210,29 @@ func (entry *Workflow) Dispatch(ctx context.Context, inputGetter InputValueGette
 	return run, jobNames, consistencyCheckRun(ctx, run)
 }
 
+// GetWorkflowToDispatch is GetWorkflowFromCommit for a dispatch of a
+// workflow of repo, as POST
+// /repos/{owner}/{repo}/actions/workflows/{workflowfilename}/dispatches and
+// the web's "Run workflow" serve it. The ref is resolved, and the workflow
+// read, in gitRepo, this node's git. In a cluster, a node behind on the
+// repository would resolve the ref to its head before the last push
+// another node acknowledged: Dispatch would write a run of that commit,
+// which cancels, through its concurrency group, the run of the
+// acknowledged head (#325). The dispatch waits until this node serves the
+// repository at the commit index the cluster confirms now, and is refused
+// with clusterhook.ErrBehind while it does not, before anything is read or
+// written. Without a cluster it is GetWorkflowFromCommit.
+func GetWorkflowToDispatch(ctx context.Context, repo *repo_model.Repository, gitRepo *git.Repository, ref, workflowID string) (*Workflow, error) {
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
+		return nil, err
+	}
+	return GetWorkflowFromCommit(gitRepo, ref, workflowID)
+}
+
+// GetWorkflowFromCommit looks the workflow workflowID up at ref in gitRepo
+// as it is now, without waiting for a node of the cluster to serve the
+// repository at the cluster's commit index: a dispatch uses
+// GetWorkflowToDispatch.
 func GetWorkflowFromCommit(gitRepo *git.Repository, ref, workflowID string) (*Workflow, error) {
 	ref, err := gitRepo.ExpandRef(ref)
 	if err != nil {
