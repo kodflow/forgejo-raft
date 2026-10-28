@@ -532,8 +532,13 @@ shares one host, so it survives the loss of a process, not of the machine.
   picks next reads the file another node wrote. Either a filesystem every
   node mounts at the same path (NFS, CephFS, a ReadWriteMany volume), the
   only kind the observers copy, or an S3-compatible store, without
-  observers (`CHECKPOINT_INTERVAL` refuses it). The deployment examples
-  mount one shared volume on `/stored`; see "Requirements" in
+  observers (`CHECKPOINT_INTERVAL` refuses it). The scratch files of the
+  uploads that take several requests (a `docker push` layer, a file added
+  in the web editor), `[packages] CHUNKED_UPLOAD_PATH` and
+  `[repository.upload] TEMP_PATH`, are local paths in either case: they
+  belong on a shared filesystem too, unless the load balancer keeps each
+  client on one node. The deployment examples mount one shared volume on
+  `/stored`; see "Requirements" in
   [contrib/cluster/README.md](../contrib/cluster/README.md).
 - **A CA** for the cluster, ideally Vault's PKI engine for in-process
   renewal, or cert-manager on Kubernetes.

@@ -341,4 +341,55 @@ else
   flunk C.lfs-token "no LFS object (C8) or no SSH key (C10) to ask a token for"
 fi
 
+# An upload that takes several requests, each one reaching another node
+# behind the load balancer: the node that takes a request reads the bytes
+# the node of the previous one wrote, under [packages] CHUNKED_UPLOAD_PATH
+# and [repository.upload] TEMP_PATH on the storage every node mounts
+# (#314).
+say "C13. Uploads in several requests, each on another node"
+head -c 65536 /dev/urandom >"$WORK/layer.bin"
+LAYER_DIGEST="sha256:$(sha256sum "$WORK/layer.bin" | cut -d' ' -f1)"
+BLOBS="/v2/$ORG/e2e-chunked/blobs"
+BEARER="Authorization: Bearer ${REGISTRY_TOKEN:-}"
+# What `docker push` does with a layer: open the upload, send the layer,
+# close it with its digest.
+location="$(curl -s -o /dev/null -D - -m 15 -X POST -H "$BEARER" "$(node_url 1)$BLOBS/uploads/" | tr -d '\r' | sed -n 's/^[Ll]ocation: //p')"
+patch_code="$(curl -s -o /dev/null -w '%{http_code}' -m 30 -X PATCH -H "$BEARER" -H 'Content-Type: application/octet-stream' \
+  -H 'Content-Range: 0-65535' --data-binary "@$WORK/layer.bin" "$(node_url 2)$location")"
+put_code="$(curl -s -o "$WORK/blob-put.json" -w '%{http_code}' -m 30 -X PUT -H "$BEARER" "$(node_url 3)$location?digest=$LAYER_DIGEST")"
+head_code="$(curl -s -o /dev/null -w '%{http_code}' -m 15 -I -H "$BEARER" "$(node_url 1)$BLOBS/$LAYER_DIGEST")"
+if [ -n "$location" ] && [ "$patch_code" = 202 ] && [ "$put_code" = 201 ] && [ "$head_code" = 200 ]; then
+  pass C.registry-chunked-upload "opened on node 1, the layer to node 2, closed on node 3, the blob served by node 1"
+else
+  flunk C.registry-chunked-upload "upload $([ -n "$location" ] && echo opened || echo "not opened") on node 1, PATCH HTTP $patch_code on node 2, PUT HTTP $put_code on node 3 $(jq -r '.errors[0].message // empty' "$WORK/blob-put.json" 2>/dev/null), HEAD HTTP $head_code on node 1"
+fi
+
+# "Upload file" in the web editor: the dropzone's request takes the file,
+# the form's commits it.
+JAR="$WORK/web-cookies"
+printf 'dropped on node 1, committed on node 2, %s\n' "$SUFFIX" >"$WORK/web-upload.txt"
+login_code="$(curl -s -o /dev/null -w '%{http_code}' -c "$JAR" -b "$JAR" -m 15 \
+  --data-urlencode "user_name=$USER_NAME" --data-urlencode "password=$E2E_USER_PASSWORD" "$(node_url 1)/user/login")"
+uuid="$(curl -s -c "$JAR" -b "$JAR" -m 30 -F "file=@$WORK/web-upload.txt" "$(node_url 1)/$REPO/upload-file" | jq -r '.uuid // empty' 2>/dev/null)"
+web_commit() {
+  curl -s -o "$WORK/web-commit.html" -w '%{http_code}' -c "$JAR" -b "$JAR" -m 60 \
+    --data-urlencode "tree_path=" --data-urlencode "files=$uuid" --data-urlencode "files_fullpath[$uuid]=web-upload.txt" \
+    --data-urlencode "commit_choice=commit-to-new-branch" --data-urlencode "new_branch_name=e2e-web-upload" \
+    --data-urlencode "commit_summary=a web upload across two nodes" --data-urlencode "commit_mail_id=-1" \
+    "$(node_url 2)/$REPO/_upload/main"
+}
+# A 503 is node 2 not serving the repository at the cluster's commit index
+# yet: nothing written, the upload kept for the next try.
+for _ in 1 2 3; do
+  commit_code="$(web_commit)"
+  [ "$commit_code" = 503 ] || break
+  sleep 2
+done
+web_file() { [ "$(api 3 GET "/repos/$REPO/contents/web-upload.txt?ref=e2e-web-upload" | jq -r .name)" = web-upload.txt ]; }
+if [ "$login_code" = 303 ] && [ -n "$uuid" ] && [ "$commit_code" = 303 ] && poll 30 web_file; then
+  pass C.web-upload-across-nodes "dropped on node 1, committed on node 2, read on node 3"
+else
+  flunk C.web-upload-across-nodes "login HTTP $login_code on node 1, file $([ -n "$uuid" ] && echo taken || echo refused) on node 1, commit HTTP $commit_code on node 2"
+fi
+
 finish

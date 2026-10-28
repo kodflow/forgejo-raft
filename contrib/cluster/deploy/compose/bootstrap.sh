@@ -51,6 +51,7 @@ offline() {
 echo "== PostgreSQL, the PKI and the stored files' volume"
 dc up -d --wait postgres
 dc run --rm pki
+# The nodes' `up` runs it too, the offline commands below (--no-deps) not.
 dc run --rm stored-init
 
 # The offline commands need the data directories: servers stopped.

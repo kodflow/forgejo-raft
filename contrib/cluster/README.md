@@ -64,6 +64,34 @@ derive in it is written by a single consumer, on the leader.
   --ignore-existing`). Names do not collide: LFS objects and package blobs
   are named by their digest, attachments by a random UUID, the others by
   the row they belong to.
+
+  The scratch files of the uploads that take several requests go there
+  too, since the next request rarely reaches the node that took the
+  previous one: `[packages] CHUNKED_UPLOAD_PATH` holds a `docker push`
+  layer between its `PATCH` and its `PUT` (on a node's own disk, the `PUT`
+  fails with a 500), and `[repository.upload] TEMP_PATH` a file added in
+  the web editor between the drop and the commit (there, the commit fails
+  on "no such file or directory"). The deployment examples set
+  `/stored/tmp/package-upload` and `/stored/tmp/uploads`. Both are local
+  paths whatever the storage type: beside an S3-compatible store, put them
+  on a filesystem every node mounts, or have the load balancer keep each
+  client on one node. Every `forgejo` command creates `CHUNKED_UPLOAD_PATH`
+  when it loads its configuration, so a container that runs one mounts the
+  shared volume as well. Forgejo alone empties `TEMP_PATH` when it starts;
+  a starting node of a cluster removes from it only the files older than
+  a day, never those the other nodes are serving. Uploads in flight in the
+  former directories on each node's volume are lost by the move, as at any
+  restart: the client starts them again.
+
+  The user Forgejo runs as writes into the shared volume's root, and a
+  volume created empty is root's: every node stops at start on the first
+  directory it cannot create there. The image's setup hands `/stored` (its
+  root only) to the git user at every start of a container when that user
+  cannot write there, which an export that squashes root refuses: make
+  that one writable by uid 1000 yourself. The Compose example does it in
+  `stored-init`, which every node waits for, so the plain `docker compose
+  up -d` that updates a deployment founded before the shared volume starts
+  the nodes on it; the Kubernetes one in the `cluster-init` container.
 - git 2.48 or later. Start-up fails with an older git: the cluster learns
   HEAD only from the reference-transaction hook, which git before 2.46
   bypasses for `git init` and `git symbolic-ref`, and git up to 2.47 reports

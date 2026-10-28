@@ -15,8 +15,11 @@
 #     (tls/), the consensus data directory and the repositories. The key is
 #     born there and never enters Nomad Variables or Vault;
 #   - on each machine, a host volume "forgejo-stored" (client config) on ONE
-#     filesystem every machine mounts, an NFS or CephFS export, writable by
-#     uid 1000. It holds what Forgejo keeps outside git: LFS objects,
+#     filesystem every machine mounts, an NFS or CephFS export. The image's
+#     setup hands its root to the git user (uid 1000) at each start when
+#     that user cannot write there; an export that squashes root refuses
+#     it, so make that one writable by uid 1000 yourself, or every node
+#     stops at start. It holds what Forgejo keeps outside git: LFS objects,
 #     attachments, avatars, packages, archives, Actions logs and artifacts.
 #     The cluster replicates git, not these files, and a file one node wrote
 #     is read by whichever node the load balancer picks next: a host volume
@@ -232,6 +235,14 @@ job "forgejo-raft" {
           destination = "/data"
         }
 
+        # Every forgejo command creates [packages] CHUNKED_UPLOAD_PATH when
+        # it loads the app.ini it shares with the server, which names it
+        # under /stored once the server has started.
+        volume_mount {
+          volume      = "stored"
+          destination = "/stored"
+        }
+
         env = merge(local.cluster_env, {
           FORGEJO__cluster__SLOT        = group.key
           FORGEJO__cluster__LISTEN_ADDR = "${var.addresses[group.key]}:7480"
@@ -338,6 +349,14 @@ job "forgejo-raft" {
             FORGEJO__attachment__PATH                       = "/stored/attachments"
             FORGEJO__picture__AVATAR_UPLOAD_PATH            = "/stored/avatars"
             FORGEJO__picture__REPOSITORY_AVATAR_UPLOAD_PATH = "/stored/repo-avatars"
+            # The scratch files of the uploads that take several requests,
+            # each reaching whichever node the load balancer picks: a
+            # `docker push` layer between its PATCH and its PUT, a file
+            # added in the web editor between the drop and the commit. A
+            # starting node removes from TEMP_PATH only the files older
+            # than a day, never the ones the other nodes are serving.
+            FORGEJO__packages__CHUNKED_UPLOAD_PATH     = "/stored/tmp/package-upload"
+            FORGEJO__repository_0X2E_upload__TEMP_PATH = "/stored/tmp/uploads"
 
             FORGEJO__cluster__SLOT               = group.key
             FORGEJO__cluster__LISTEN_ADDR        = "${var.addresses[group.key]}:7480"

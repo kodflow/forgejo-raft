@@ -11,7 +11,10 @@
 #
 #   ./bootstrap.sh
 #
-# Afterwards, an ordinary `docker compose up -d` / `docker compose down`.
+# Afterwards, an ordinary `docker compose up -d` / `docker compose down`,
+# which also updates a cluster founded with an older version of this file:
+# every `up` first hands the shared volume of the stored files to the git
+# user (stored-init), the volume compose creates for it being root's.
 # `docker compose down -v` wipes the cluster, the repositories and the
 # database: run ./bootstrap.sh again after it.
 #
@@ -35,6 +38,8 @@ x-node: &node
   depends_on:
     postgres:
       condition: service_healthy
+    stored-init:
+      condition: service_completed_successfully
   environment: &node-env
     USER_UID: "1000"
     USER_GID: "1000"
@@ -76,6 +81,13 @@ x-node: &node
     FORGEJO__attachment__PATH: /stored/attachments
     FORGEJO__picture__AVATAR_UPLOAD_PATH: /stored/avatars
     FORGEJO__picture__REPOSITORY_AVATAR_UPLOAD_PATH: /stored/repo-avatars
+    # The scratch files of the uploads that take several requests, which
+    # reach any node each: a `docker push` layer between its PATCH and its
+    # PUT, a file added in the web editor between the drop and the commit.
+    # A starting node of a cluster removes from TEMP_PATH only the files
+    # older than a day, never the ones the other nodes are serving.
+    FORGEJO__packages__CHUNKED_UPLOAD_PATH: /stored/tmp/package-upload
+    FORGEJO__repository_0X2E_upload__TEMP_PATH: /stored/tmp/uploads
     # Any node may serve the next request. Sessions live in the shared
     # database. The cache stays in each node's memory, kept short: a value
     # cached on one node can lag a change made through another for up to
@@ -142,11 +154,14 @@ services:
       - node-b:/nodes/node-b
       - node-c:/nodes/node-c
 
-  # One-shot: the shared volume of the stored files, handed to the git user
-  # (uid 1000) of every node.
+  # One-shot, before every start of a node (each depends on it): the shared
+  # volume of the stored files, handed to the git user (uid 1000) of every
+  # node. Only its root, so a rerun changes nothing below it. Never behind a
+  # profile: on a cluster founded before this volume existed, the
+  # `docker compose up -d` that creates it would leave it root's, and every
+  # node would stop at start on the directories it cannot create there.
   stored-init:
     image: ${PKI_IMAGE:-alpine:3.22}
-    profiles: [setup]
     entrypoint: ["/bin/sh", "-c", "chown 1000:1000 /stored && chmod 0750 /stored"]
     volumes: [stored:/stored]
     network_mode: none
@@ -169,6 +184,7 @@ services:
     # After node-a, which then runs the database migrations alone.
     depends_on:
       postgres: {condition: service_healthy}
+      stored-init: {condition: service_completed_successfully}
       node-a: {condition: service_started}
     environment:
       <<: *node-env
@@ -183,6 +199,7 @@ services:
     hostname: node-c
     depends_on:
       postgres: {condition: service_healthy}
+      stored-init: {condition: service_completed_successfully}
       node-a: {condition: service_started}
     environment:
       <<: *node-env
