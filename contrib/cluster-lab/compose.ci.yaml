@@ -31,6 +31,10 @@ x-ci-forgejo-env: &ci-forgejo-env
   FORGEJO__attachment__PATH: /shared/attachments
   FORGEJO__picture__AVATAR_UPLOAD_PATH: /shared/avatars
   FORGEJO__picture__REPOSITORY_AVATAR_UPLOAD_PATH: /shared/repo-avatars
+  # The scratch files of the uploads that take several requests, which the
+  # suite sends to three nodes (features.sh, C13).
+  FORGEJO__packages__CHUNKED_UPLOAD_PATH: /shared/tmp/package-upload
+  FORGEJO__repository_0X2E_upload__TEMP_PATH: /shared/tmp/uploads
   # The receiver lives on the lab's private network.
   FORGEJO__webhook__ALLOWED_HOST_LIST: private
   FORGEJO__webhook__DELIVER_TIMEOUT: "10"

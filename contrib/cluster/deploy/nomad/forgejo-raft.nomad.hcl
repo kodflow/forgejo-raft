@@ -235,6 +235,14 @@ job "forgejo-raft" {
           destination = "/data"
         }
 
+        # Every forgejo command creates [packages] CHUNKED_UPLOAD_PATH when
+        # it loads the app.ini it shares with the server, which names it
+        # under /stored once the server has started.
+        volume_mount {
+          volume      = "stored"
+          destination = "/stored"
+        }
+
         env = merge(local.cluster_env, {
           FORGEJO__cluster__SLOT        = group.key
           FORGEJO__cluster__LISTEN_ADDR = "${var.addresses[group.key]}:7480"
@@ -341,6 +349,14 @@ job "forgejo-raft" {
             FORGEJO__attachment__PATH                       = "/stored/attachments"
             FORGEJO__picture__AVATAR_UPLOAD_PATH            = "/stored/avatars"
             FORGEJO__picture__REPOSITORY_AVATAR_UPLOAD_PATH = "/stored/repo-avatars"
+            # The scratch files of the uploads that take several requests,
+            # each reaching whichever node the load balancer picks: a
+            # `docker push` layer between its PATCH and its PUT, a file
+            # added in the web editor between the drop and the commit. A
+            # starting node removes from TEMP_PATH only the files older
+            # than a day, never the ones the other nodes are serving.
+            FORGEJO__packages__CHUNKED_UPLOAD_PATH     = "/stored/tmp/package-upload"
+            FORGEJO__repository_0X2E_upload__TEMP_PATH = "/stored/tmp/uploads"
 
             FORGEJO__cluster__SLOT               = group.key
             FORGEJO__cluster__LISTEN_ADDR        = "${var.addresses[group.key]}:7480"

@@ -8,6 +8,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"path/filepath"
+	"time"
 
 	"forgejo.org/models/db"
 	"forgejo.org/models/git"
@@ -22,6 +25,7 @@ import (
 	repo_module "forgejo.org/modules/repository"
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/structs"
+	"forgejo.org/modules/util"
 	notify_service "forgejo.org/services/notify"
 	pull_service "forgejo.org/services/pull"
 )
@@ -96,12 +100,81 @@ func Init(ctx context.Context) error {
 	if err := repo_module.LoadRepoConfig(); err != nil {
 		return err
 	}
-	system_model.RemoveAllWithNotice(ctx, "Clean up temporary repository uploads", setting.Repository.Upload.TempPath)
+	cleanUpUploadTempPath(ctx)
 	system_model.RemoveAllWithNotice(ctx, "Clean up temporary repositories", repo_module.LocalCopyPath())
 	if err := initPushQueue(); err != nil {
 		return err
 	}
 	return initBranchSyncQueue(graceful.GetManager().ShutdownContext())
+}
+
+// clusterUploadTempMaxAge is how old a file of [repository.upload]
+// TEMP_PATH must be before a starting node of a cluster removes it. There,
+// TEMP_PATH is on the storage every node mounts: a file added in the web
+// editor is taken by the node the dropzone's request reaches and committed
+// by the one the form's request reaches, while a third may be starting. A
+// day is longer than an upload form is left open between the two.
+const clusterUploadTempMaxAge = 24 * time.Hour
+
+// cleanUpUploadTempPath empties [repository.upload] TEMP_PATH when the node
+// starts. Outside a cluster the whole directory goes, as it always did:
+// nothing but this process uses it. In a cluster only the regular files
+// older than clusterUploadTempMaxAge go, never a link nor what it points
+// to, and no directory: the other nodes serve uploads from it, and may be
+// creating a file in any of its directories.
+func cleanUpUploadTempPath(ctx context.Context) {
+	const title = "Clean up temporary repository uploads"
+	root := setting.Repository.Upload.TempPath
+	if !setting.Cluster.Enabled {
+		system_model.RemoveAllWithNotice(ctx, title, root)
+		return
+	}
+
+	cutoff := time.Now().Add(-clusterUploadTempMaxAge)
+	failed := 0
+	var firstErr error
+	fail := func(err error) {
+		if failed == 0 {
+			firstErr = err
+		}
+		failed++
+	}
+	_ = filepath.WalkDir(root, func(file string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// A TEMP_PATH never created, or a file another node removed
+			// meanwhile.
+			if !errors.Is(err, fs.ErrNotExist) {
+				fail(err)
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				fail(err)
+			}
+			return nil
+		}
+		if !info.ModTime().Before(cutoff) {
+			return nil
+		}
+		if err := util.Remove(file); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			fail(err)
+		}
+		return nil
+	})
+	if failed == 0 {
+		return
+	}
+	desc := fmt.Sprintf("%s [%s]: %d file(s) not removed, the first: %v", title, root, failed, firstErr)
+	log.Warn("%s", desc)
+	// As RemoveAllWithNotice: the context may be cancelled.
+	if err := system_model.CreateNotice(db.DefaultContext, system_model.NoticeRepository, desc); err != nil {
+		log.Error("CreateRepositoryNotice: %v", err)
+	}
 }
 
 // UpdateRepository updates a repository

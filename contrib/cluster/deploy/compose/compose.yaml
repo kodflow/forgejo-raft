@@ -81,6 +81,13 @@ x-node: &node
     FORGEJO__attachment__PATH: /stored/attachments
     FORGEJO__picture__AVATAR_UPLOAD_PATH: /stored/avatars
     FORGEJO__picture__REPOSITORY_AVATAR_UPLOAD_PATH: /stored/repo-avatars
+    # The scratch files of the uploads that take several requests, which
+    # reach any node each: a `docker push` layer between its PATCH and its
+    # PUT, a file added in the web editor between the drop and the commit.
+    # A starting node of a cluster removes from TEMP_PATH only the files
+    # older than a day, never the ones the other nodes are serving.
+    FORGEJO__packages__CHUNKED_UPLOAD_PATH: /stored/tmp/package-upload
+    FORGEJO__repository_0X2E_upload__TEMP_PATH: /stored/tmp/uploads
     # Any node may serve the next request. Sessions live in the shared
     # database. The cache stays in each node's memory, kept short: a value
     # cached on one node can lag a change made through another for up to
