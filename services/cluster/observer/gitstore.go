@@ -306,6 +306,42 @@ func writeMark(target string) error {
 	return syncDir(target)
 }
 
+// removeAll is os.RemoveAll; a test replaces it to stop a removal
+// midway, as a kill would.
+var removeAll = os.RemoveAll
+
+// marked reports whether target holds the IncompleteMark: the regular file
+// Materialize creates there first, and nothing else under that name.
+func marked(target string) bool {
+	info, err := os.Lstat(filepath.Join(target, IncompleteMark))
+	return err == nil && info.Mode().IsRegular()
+}
+
+// unmark empties target, holding entries and marked by a restore that did
+// not end, for Materialize to write it again: everything but the mark
+// first, then, once target is synced holding the mark alone, the mark.
+// Removed whole by os.RemoveAll, in the order the file system lists the
+// entries, the mark could go first (XFS and Btrfs list a small directory
+// in creation order, the mark created first) and a kill or a power loss
+// before the last unlink left part of a repository and no mark: refused
+// as not empty by every rerun, or, its refs left and its pack gone, kept
+// as restored (#320). Cut anywhere here, the removal leaves target marked,
+// or empty.
+func unmark(target string, entries []os.DirEntry) error {
+	for _, e := range entries {
+		if e.Name() == IncompleteMark {
+			continue
+		}
+		if err := removeAll(filepath.Join(target, e.Name())); err != nil {
+			return err
+		}
+	}
+	if err := syncDir(target); err != nil {
+		return err
+	}
+	return removeAll(filepath.Join(target, IncompleteMark))
+}
+
 // markLeftovers reports whether entries, a target's, are only the
 // temporary files under which an older restore wrote the IncompleteMark:
 // one killed before the rename left target holding them alone, a target
@@ -319,16 +355,23 @@ func markLeftovers(entries []os.DirEntry) bool {
 	return len(entries) > 0
 }
 
-// restoredRefs reports whether target already holds exactly refs: a
-// repository an earlier run of the same restore wrote whole.
+// restoredRefs reports whether target already holds exactly refs, each
+// naming an object target holds: a repository an earlier run of the same
+// restore wrote whole. for-each-ref lists a ref whose object is missing
+// unless asked for something of the object itself: %(objecttype) makes it
+// fail on such a ref (#320).
 func (g gitStore) restoredRefs(ctx context.Context, target string, refs map[string]string) bool {
-	out, err := g.run(ctx, target, nil, "for-each-ref", "--format=%(objectname) %(refname)", "refs/")
+	out, err := g.run(ctx, target, nil, "for-each-ref", "--format=%(objectname) %(objecttype) %(refname)", "refs/")
 	if err != nil {
 		return false
 	}
 	have := map[string]string{}
 	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
-		if sha, name, ok := strings.Cut(line, " "); ok {
+		sha, rest, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		if _, name, ok := strings.Cut(rest, " "); ok {
 			have[name] = sha
 		}
 	}

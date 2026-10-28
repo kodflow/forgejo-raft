@@ -336,9 +336,18 @@ running the same command again resumes from `<out>/progress.json`. A step
 cut midway (SSH lost, kill, power loss, an error) is replayed: the
 PostgreSQL step empties again `--pgdata` and the WAL restore directory,
 which it found empty and began writing; the repository step keeps every
-repository already written whole, writes again one it left marked
-`forgejo-restore-incomplete`, and refuses any other non-empty directory;
-the stored files already copied with the same bytes are kept:
+repository already written whole (the checkpoint's refs exactly, each
+naming an object it holds), writes again one it left marked
+`forgejo-restore-incomplete` or holding only that mark's temporary files,
+removing the mark last, once the rest is gone and synced, so that a cut
+during that removal leaves the directory marked or empty, and refuses any
+other non-empty directory, of which it removes nothing, as it refuses a
+repository or owner directory that is a symbolic link, which it neither
+follows nor removes; the stored files already copied with the same bytes
+are kept. Before that order, a cut while it removed a marked directory
+could leave part of a repository and no mark: the command refuses such a
+directory as not empty, naming it, and the operator removes it by hand
+before running the command again. The steps:
 
 1. Forgejo stays fenced and offline: the command refuses while the node
    answers on its socket. The old cluster is fenced and silent: both

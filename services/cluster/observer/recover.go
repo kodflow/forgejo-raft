@@ -171,9 +171,12 @@ func (a *Archive) OpenSecrets(name string, priv *[32]byte) (*Bundle, error) {
 
 // RestoreRepos writes every repository of a checkpoint under root, which
 // must hold none of them yet. Run again after an interruption, it keeps a
-// repository an earlier run wrote whole (the checkpoint's refs exactly, no
-// mark left), writes again one it left marked incomplete or holding only
-// the mark's temporary files, and refuses any other.
+// repository an earlier run wrote whole (the checkpoint's refs exactly,
+// each naming an object it holds, no mark left), writes again one it left
+// marked incomplete (its mark removed last: a removal cut midway leaves it
+// marked) or holding only the mark's temporary files, and refuses any
+// other. A target, or the owner's directory above it, that is a symbolic
+// link is refused, neither followed nor removed.
 func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, error) {
 	m, err := a.store.ReadManifest(name)
 	if err != nil {
@@ -198,9 +201,15 @@ func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, err
 			continue
 		}
 		target := filepath.Join(root, filepath.FromSlash(repo))
+		// Neither the target nor the owner's directory above it is
+		// followed: through a link, the takeover below would remove,
+		// and Materialize write, what it names, wherever that is.
+		if err := realDirs(root, target); err != nil {
+			return n, fmt.Errorf("%s: %w", repo, err)
+		}
 		if entries, err := os.ReadDir(target); err == nil && len(entries) > 0 {
-			if _, err := os.Stat(filepath.Join(target, IncompleteMark)); err == nil {
-				if err := os.RemoveAll(target); err != nil {
+			if marked(target) {
+				if err := unmark(target, entries); err != nil {
 					return n, fmt.Errorf("%s: %w", repo, err)
 				}
 			} else if markLeftovers(entries) {
@@ -235,6 +244,36 @@ func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, err
 		n++
 	}
 	return n, nil
+}
+
+// realDirs refuses a path from root's child down to target that exists
+// and is not a directory: a symbolic link, which os.ReadDir and every
+// removal through it follow out of root (#320), a file, or anything else.
+// root itself is the operator's, and may be a link. A path that does not
+// exist ends the check: nothing exists below it.
+func realDirs(root, target string) error {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return err
+	}
+	p := filepath.Clean(root)
+	for part := range strings.SplitSeq(rel, string(filepath.Separator)) {
+		p = filepath.Join(p, part)
+		info, err := os.Lstat(p)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is a symbolic link: the restore neither follows nor removes it", p)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("%s is not a directory", p)
+		}
+	}
+	return nil
 }
 
 // RestoreFiles copies a checkpoint's stored files under their storages'
