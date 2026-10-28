@@ -61,27 +61,37 @@ env:
   # then the -run pattern of its tests. A pattern selects top-level tests by
   # name, so it has no "/" (that would cut a test's subtests apart). The one
   # line without a pattern is the rest: it runs every test no other line
-  # selects (-skip of all their patterns), TestT to TestZ today, so a new
-  # test always lands in exactly one shard, whatever its name, and checks
-  # verifies that no two patterns select the same test.
+  # selects (-skip of all their patterns), TestS and TestU to TestZ today,
+  # so a new test always lands in exactly one shard, whatever its name, and
+  # checks verifies that no two patterns select the same test.
   #
-  # Balanced on the time each shard took under -race (GOMAXPROCS=4) on
-  # 1e8c66f2e1, in this order: 236, 285, 292, 225, 256, 201, 259 and 188 s,
-  # the slowest under half of SHARD_TIMEOUT. The runners took about 0.9 of
-  # that for the two halves this replaces (A to K 1090-1200 s, L to Z
-  # 580-609 s). The race job reports every shard's time and its tests' on
-  # each run: split a shard that nears 70 % of the bound rather than raise
-  # it, since the bound is there to catch a test that hangs.
+  # Balanced on the spans of the tests of 08ea240278 under -race
+  # (GOMAXPROCS=4) on the runners, over three runs (40650502782,
+  # 40648749629 and 40692204121): in this order 249, 230, 251, 250, 277,
+  # 265, 236, 268, 186, 243, 264, 234 and 271 s, the slowest under half of
+  # SHARD_TIMEOUT. The eight shards this replaces took 375, 600 (A[M-Z], cut
+  # at the bound), 375, 403, 268, 429, 399 and 370 s: A[M-Z] had grown from
+  # 285 s in three days, most new tests being named TestA<phrase> (#330).
+  # The race job reports every shard's time and its tests' on each run, and
+  # warns past SHARD_WARN_PERCENT of the bound: split such a shard rather
+  # than raise the bound, since the bound is there to catch a test that
+  # hangs.
   CLUSTER_SHARDS: |
-    A[A-L]    ^TestA[A-L]
-    A[M-Z]    ^TestA[M-Z]
-    A[a-z]+B  ^Test(A[a-z]|B)
-    C-G       ^Test[C-G]
-    H-K       ^Test[H-K]
-    L-P       ^Test[L-P]
-    Q-S       ^Test[Q-S]
-    T-Z+rest
+    A[A-D]      ^TestA[A-D]
+    A[E-O]      ^TestA[E-O]
+    AP          ^TestAP
+    A[Q-Z]      ^TestA[Q-Z]
+    A[a-z]      ^TestA[a-z]
+    B-D         ^Test[B-D]
+    E-G         ^Test[E-G]
+    H-K         ^Test[H-K]
+    L-N         ^Test[L-N]
+    O-Q         ^Test[O-Q]
+    R           ^TestR
+    T           ^TestT
+    S+U-Z+rest
   SHARD_TIMEOUT: 10m
+  SHARD_WARN_PERCENT: 60
 
 # The race tests of services/cluster outgrew one job, then two: the half from
 # TestA to TestK reached its 20 minute bound under -race (#240). They now run
@@ -383,6 +393,21 @@ jobs:
           line="shard $SHARD: $(wc -l < "$RUNNER_TEMP/durations.tsv") tests, ${total:-unfinished} s (bound $SHARD_TIMEOUT)"
           echo "$line, the longest spans:"
           head -n 15 "$RUNNER_TEMP/durations.tsv"
+          # A shard past SHARD_WARN_PERCENT of its bound is the next to cut
+          # at it (#330): the warning reaches the run's annotations, and the
+          # pull request's checks, before the shard turns red.
+          bound=
+          if [[ $SHARD_TIMEOUT =~ ^([0-9]+)([hms])$ ]]; then
+            case ${BASH_REMATCH[2]} in
+              h) bound=$((BASH_REMATCH[1] * 3600)) ;;
+              m) bound=$((BASH_REMATCH[1] * 60)) ;;
+              s) bound=${BASH_REMATCH[1]} ;;
+            esac
+          fi
+          if [ -n "$bound" ] && [ -n "$total" ] \
+            && awk -v t="$total" -v b="$bound" -v p="$SHARD_WARN_PERCENT" 'BEGIN { exit !(t * 100 > b * p) }'; then
+            echo "::warning title=shard $SHARD near its bound::shard $SHARD took $total s under -race, over $SHARD_WARN_PERCENT % of its bound ($SHARD_TIMEOUT): split it in CLUSTER_SHARDS"
+          fi
           {
             echo "### services/cluster under -race, $line"
             echo
