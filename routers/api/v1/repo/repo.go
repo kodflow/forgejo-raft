@@ -747,6 +747,22 @@ func Convert(ctx *context.APIContext) {
 }
 
 // updateBasicProperties updates the basic properties of a repo: Name, Description, Website and Visibility
+// readsDefaultBranchHead reports whether the edit opts of repo reads a
+// branch in this node's git: a new default branch, which is looked up
+// there (#299), or the head of the default branch, whose scheduled
+// workflows enabling the Actions unit or lifting the archiving registers
+// (#313).
+func readsDefaultBranchHead(ctx *context.APIContext, repo *repo_model.Repository, opts api.EditRepoOption) bool {
+	if opts.DefaultBranch != nil && repo.DefaultBranch != *opts.DefaultBranch {
+		return true
+	}
+	enablesActions := opts.HasActions != nil && *opts.HasActions && !unit_model.TypeActions.UnitGlobalDisabled()
+	if enablesActions {
+		return true
+	}
+	return opts.Archived != nil && !*opts.Archived && !repo.IsMirror && repo.UnitEnabled(ctx, unit_model.TypeActions)
+}
+
 func updateBasicProperties(ctx *context.APIContext, opts api.EditRepoOption) error {
 	owner := ctx.Repo().Owner
 	repo := ctx.Repo().Repository
@@ -780,11 +796,14 @@ func updateBasicProperties(ctx *context.APIContext, opts api.EditRepoOption) err
 	// A new default branch is looked up in this node's git. In a cluster, a
 	// node behind on the repository would take for absent a branch another
 	// node pushed, and answer 200 without changing it, or point HEAD to a
-	// branch another node deleted. The request waits until this node serves
-	// the repository at the commit index the cluster confirms now, and is
-	// refused with 503 while it does not, before the rename for the same
-	// reason as the visibility (#299).
-	if opts.DefaultBranch != nil && repo.DefaultBranch != *opts.DefaultBranch {
+	// branch another node deleted. Enabling the Actions unit and lifting
+	// the archiving register the scheduled workflows of the default
+	// branch's head read there too: a node behind would register those of
+	// the head before the last push another node acknowledged (#313). The
+	// request waits until this node serves the repository at the commit
+	// index the cluster confirms now, and is refused with 503 while it does
+	// not, before the rename for the same reason as the visibility (#299).
+	if readsDefaultBranchHead(ctx, repo, opts) {
 		if err := clusterFresh(ctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false)); err != nil {
 			ctx.Error(http.StatusServiceUnavailable, "", err.Error())
 			return err
@@ -1130,7 +1149,9 @@ func updateRepoUnits(ctx *context.APIContext, owner string, repo *repo_model.Rep
 
 	if len(units)+len(deleteUnitTypes) > 0 {
 		if err := repo_service.UpdateRepositoryUnits(ctx, repo, units, deleteUnitTypes); err != nil {
-			ctx.Error(http.StatusInternalServerError, "UpdateRepositoryUnits", err)
+			if !clusterBehind(ctx, err) {
+				ctx.Error(http.StatusInternalServerError, "UpdateRepositoryUnits", err)
+			}
 			return err
 		}
 	}
@@ -1160,15 +1181,13 @@ func updateRepoArchivedState(ctx *context.APIContext, opts api.EditRepoOption) e
 			}
 			log.Trace("Repository was archived: %s/%s", ctx.Repo().Owner.Name, repo.Name)
 		} else {
-			if err := repo_model.SetArchiveRepoState(ctx, repo, *opts.Archived); err != nil {
+			if err := repo_service.UnarchiveRepository(ctx, repo); err != nil {
+				if clusterBehind(ctx, err) {
+					return err
+				}
 				log.Error("Tried to un-archive a repo: %s", err)
 				ctx.Error(http.StatusInternalServerError, "ArchiveRepoState", err)
 				return err
-			}
-			if ctx.Repo().Repository.UnitEnabled(ctx, unit_model.TypeActions) {
-				if err := actions_service.DetectAndHandleSchedules(ctx, repo); err != nil {
-					log.Error("DetectAndHandleSchedules for un-archived repo %s/%s: %v", ctx.Repo().Owner.Name, repo.Name, err)
-				}
 			}
 			log.Trace("Repository was un-archived: %s/%s", ctx.Repo().Owner.Name, repo.Name)
 		}
