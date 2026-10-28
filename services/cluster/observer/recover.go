@@ -171,9 +171,11 @@ func (a *Archive) OpenSecrets(name string, priv *[32]byte) (*Bundle, error) {
 
 // RestoreRepos writes every repository of a checkpoint under root, which
 // must hold none of them yet. Run again after an interruption, it keeps a
-// repository an earlier run wrote whole (the checkpoint's refs exactly, no
-// mark left), writes again one it left marked incomplete or holding only
-// the mark's temporary files, and refuses any other.
+// repository an earlier run wrote whole (the checkpoint's refs exactly,
+// each naming an object it holds, no mark left), writes again one it left
+// marked incomplete (its mark removed last: a removal cut midway leaves it
+// marked) or holding only the mark's temporary files, and refuses any
+// other.
 func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, error) {
 	m, err := a.store.ReadManifest(name)
 	if err != nil {
@@ -199,8 +201,8 @@ func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, err
 		}
 		target := filepath.Join(root, filepath.FromSlash(repo))
 		if entries, err := os.ReadDir(target); err == nil && len(entries) > 0 {
-			if _, err := os.Stat(filepath.Join(target, IncompleteMark)); err == nil {
-				if err := os.RemoveAll(target); err != nil {
+			if marked(target) {
+				if err := unmark(target, entries); err != nil {
 					return n, fmt.Errorf("%s: %w", repo, err)
 				}
 			} else if markLeftovers(entries) {
