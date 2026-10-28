@@ -22,6 +22,7 @@ import (
 	unit_model "forgejo.org/models/unit"
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/base"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/indexer/code"
 	"forgejo.org/modules/indexer/issues"
@@ -283,6 +284,13 @@ func UnitsPost(ctx *context.Context) {
 	}
 
 	if err := repo_service.UpdateRepositoryUnits(ctx, repo, units, deleteUnitTypes); err != nil {
+		if errors.Is(err, clusterhook.ErrBehind) {
+			// A node of the cluster behind on the repository would
+			// register the scheduled workflows of a stale head: nothing
+			// was changed, the user retries (#313).
+			ctx.Error(http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		ctx.ServerError("UpdateRepositoryUnits", err)
 		return
 	}
@@ -1086,17 +1094,18 @@ func SettingsPost(ctx *context.Context) {
 			return
 		}
 
-		if err := repo_model.SetArchiveRepoState(ctx, repo, false); err != nil {
+		if err := repo_service.UnarchiveRepository(ctx, repo); err != nil {
+			if errors.Is(err, clusterhook.ErrBehind) {
+				// A node of the cluster behind on the repository would
+				// register the scheduled workflows of a stale head: the
+				// repository stays archived, the user retries (#313).
+				ctx.Error(http.StatusServiceUnavailable, err.Error())
+				return
+			}
 			log.Error("Tried to unarchive a repo: %s", err)
 			ctx.Flash.Error(ctx.Tr("repo.settings.unarchive.error"))
 			ctx.Redirect(ctx.Repo.RepoLink + "/settings")
 			return
-		}
-
-		if ctx.Repo.Repository.UnitEnabled(ctx, unit_model.TypeActions) {
-			if err := actions_service.DetectAndHandleSchedules(ctx, repo); err != nil {
-				log.Error("DetectAndHandleSchedules for un-archived repo %s/%s: %v", ctx.Repo.Owner.Name, repo.Name, err)
-			}
 		}
 
 		ctx.Flash.Success(ctx.Tr("repo.settings.unarchive.success"))
