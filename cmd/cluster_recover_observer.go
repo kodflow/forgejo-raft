@@ -951,6 +951,17 @@ func storedPresent(what, root string, keys []string, rel func(string) string) (i
 // branchMismatch compares the branch rows of SQL with the refs/heads of
 // the checkpoint, and returns what differs, the repositories it differs
 // in, and how many branches the refs hold.
+//
+// A symbolic ref under refs/heads/, the alias refs/heads/master ->
+// refs/heads/main a renamed default branch leaves, is in the checkpoint's
+// symbolic refs, not in its refs, and Forgejo lists it as a branch all the
+// same, at the commit of the ref it resolves to (for-each-ref refs/heads/
+// in GetBranchNames, then SyncRepoBranchesWithRepo). Its row, which a
+// synchronisation of the repository's branches writes, the derivation
+// below included, needs not be there; once there, it is compared with the
+// commit the alias resolves to in the checkpoint. It was "in SQL, not in
+// the refs" at every run (#338). A dangling one is no branch to Forgejo: a
+// row of it is not in the refs, and the derivation removes it.
 func branchMismatch(ctx context.Context, m *observer.Manifest) (mismatch []string, repos map[string]bool, refs int, err error) {
 	rows, err := db.GetEngine(ctx).Query(`SELECT r.owner_name AS owner, r.lower_name AS repo, b.name AS branch, b.commit_id AS sha
 		FROM branch b JOIN repository r ON r.id = b.repo_id WHERE b.is_deleted = ?`, false)
@@ -974,6 +985,21 @@ func branchMismatch(ctx context.Context, m *observer.Manifest) (mismatch []strin
 			key := repo + " " + ref
 			if sql[key] != sha {
 				mismatch = append(mismatch, fmt.Sprintf("%s: refs %s, SQL %q", key, sha, sql[key]))
+				repos[repo] = true
+			}
+			delete(sql, key)
+		}
+		for ref := range rm.Symbolic {
+			if !strings.HasPrefix(ref, "refs/heads/") {
+				continue
+			}
+			sha, ok := rm.Resolve(ref)
+			if !ok {
+				continue
+			}
+			key := repo + " " + ref
+			if row, held := sql[key]; held && row != sha {
+				mismatch = append(mismatch, fmt.Sprintf("%s: refs %s through its symbolic ref, SQL %q", key, sha, row))
 				repos[repo] = true
 			}
 			delete(sql, key)

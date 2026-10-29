@@ -337,7 +337,9 @@ cut midway (SSH lost, kill, power loss, an error) is replayed: the
 PostgreSQL step empties again `--pgdata` and the WAL restore directory,
 which it found empty and began writing; the repository step keeps every
 repository already written whole (the checkpoint's refs exactly, each
-naming an object it holds), writes again one it left marked
+naming an object it holds, and its symbolic refs, HEAD and an alias such
+as `refs/heads/master` -> `refs/heads/main` alike, each naming the ref the
+checkpoint names), writes again one it left marked
 `forgejo-restore-incomplete` or holding only that mark's temporary files,
 removing the mark last, once the rest is gone and synced, so that a cut
 during that removal leaves the directory marked or empty, and refuses any
@@ -404,6 +406,13 @@ before running the command again. The steps:
 5. A fresh archive configuration for the recovered primary.
 6. Verification: the refs against the SQL branch rows, every LFS object
    present, every 2FA secret opening with the restored `SECRET_KEY`.
+   A symbolic branch the checkpoint holds, such as the alias
+   `refs/heads/master` -> `refs/heads/main` a renamed default branch
+   leaves, is a branch to Forgejo, listed at the commit of the branch it
+   names: its row, which a synchronisation of the repository's
+   branches writes, may be missing, and is otherwise compared with that
+   commit; a row of a dangling one is removed with the rows derived from
+   the restored refs.
    A repository the checkpoint holds and SQL has no row for is an orphan of
    the old cluster: its table held it alive and SQL did not know it (a
    deletion or a creation the cluster did not record, a loss on the SQL

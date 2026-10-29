@@ -355,27 +355,59 @@ func markLeftovers(entries []os.DirEntry) bool {
 	return len(entries) > 0
 }
 
-// restoredRefs reports whether target already holds exactly refs, each
-// naming an object target holds: a repository an earlier run of the same
-// restore wrote whole. for-each-ref lists a ref whose object is missing
-// unless asked for something of the object itself: %(objecttype) makes it
-// fail on such a ref (#320).
-func (g gitStore) restoredRefs(ctx context.Context, target string, refs map[string]string) bool {
-	out, err := g.run(ctx, target, nil, "for-each-ref", "--format=%(objectname) %(objecttype) %(refname)", "refs/")
+// restoredRefs reports whether target already holds exactly rm's refs,
+// each naming an object target holds, and its symbolic refs, each naming
+// the ref rm names: a repository an earlier run of the same restore wrote
+// whole, Materialize writing both. for-each-ref lists a ref whose object
+// is missing unless asked for something of the object itself:
+// %(objecttype) makes it fail on such a ref (#320). It lists a symbolic
+// ref under refs/ too, an alias such as refs/heads/master ->
+// refs/heads/main, at the value it resolves to and naming the end of its
+// chain, and a dangling one not at all: compared with rm's refs alone, a
+// repository holding one was refused as not empty at every rerun (#338).
+// Each symbolic ref is also read on its own, one level deep.
+func (g gitStore) restoredRefs(ctx context.Context, target string, rm RepoManifest) bool {
+	out, err := g.run(ctx, target, nil, "for-each-ref", "--format=%(objectname) %(objecttype) %(refname) %(symref)", "refs/")
 	if err != nil {
 		return false
 	}
-	have := map[string]string{}
+	type value struct {
+		sha      string
+		symbolic bool
+	}
+	have := map[string]value{}
 	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
-		sha, rest, ok := strings.Cut(line, " ")
-		if !ok {
+		// A ref's name holds no space; %(symref) is empty for a ref that
+		// is not symbolic.
+		f := strings.Fields(line)
+		if len(f) < 3 {
 			continue
 		}
-		if _, name, ok := strings.Cut(rest, " "); ok {
-			have[name] = sha
+		have[f[2]] = value{sha: f[0], symbolic: len(f) > 3}
+	}
+	want := make(map[string]value, len(rm.Refs)+len(rm.Symbolic))
+	for name, sha := range rm.Refs {
+		want[name] = value{sha: sha}
+	}
+	for name := range rm.Symbolic {
+		// HEAD is outside the listing, a dangling one absent from it.
+		if !strings.HasPrefix(name, "refs/") {
+			continue
+		}
+		if sha, ok := rm.Resolve(name); ok {
+			want[name] = value{sha: sha, symbolic: true}
 		}
 	}
-	return maps.Equal(have, refs)
+	if !maps.Equal(have, want) {
+		return false
+	}
+	for name, to := range rm.Symbolic {
+		got, err := g.run(ctx, target, nil, "symbolic-ref", "--no-recurse", name)
+		if err != nil || strings.TrimSpace(got) != to {
+			return false
+		}
+	}
+	return true
 }
 
 // Materialize writes a checkpoint's repository into target, an absent or
