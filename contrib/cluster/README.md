@@ -926,6 +926,24 @@ Watch, Custom, Releases on GitHub, or the tags of
   it, at its first sync there; until then it pushes from that node only.
   `forgejo doctor` never removes a push mirror in a cluster because one
   node lacks its remote.
+- The LFS garbage collection ("Garbage collect LFS meta objects", the
+  `gc_lfs` cron task) takes an LFS object for orphaned when its pointer is
+  missing from the git of the node that runs it, and deletes its row and
+  its file for every member. A node therefore skips, and logs, a
+  repository whose objects it may lack: while its projector has work
+  pending on it, as for `git gc` (projected again after a lost disk or
+  `forgejo cluster reproject`, its objects still being fetched; not
+  reconciled since the node's start; or a push whose event is not trimmed
+  yet, which waits for `ACK_MARGIN` entries and a checkpoint), and while
+  the node does not serve it at the commit index the cluster confirms
+  (no leader, cut off, behind). The repository is examined at a later
+  run. A pointer git gives no answer for (a `cat-file` that fails) keeps
+  the object, and ends the repository's pass. `forgejo doctor check --run
+  gc-lfs --fix`, `--all --fix` included, runs without the replicator and
+  refuses that check, naming the cron task; without `--fix` it reports
+  what this node's git alone would collect. The `storages` and
+  `storage-lfs` checks delete a stored file that no row of the shared
+  database names, whatever any node's git holds: they stay as they are.
 - A push mirror's sync pushes `--mirror --force` from a copy of the
   node's directory. A node pushes only once it serves the repository, and
   its wiki, at the commit index the cluster confirms, from a copy read
