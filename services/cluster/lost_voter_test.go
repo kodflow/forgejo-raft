@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"forgejo.org/modules/json"
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/consensus/kitsunium"
 	"forgejo.org/services/cluster/reftable"
@@ -100,6 +101,124 @@ func auditAt(r *Replicator, action Action, target consensus.NodeID) uint64 {
 	return 0
 }
 
+// madeChange is a membership change made through a changeEngine, with the
+// configuration it was made on: the engine's membership just before it.
+type madeChange struct {
+	action Action
+	target consensus.NodeID
+	on     consensus.Membership
+}
+
+// memberChanges records the membership changes made through the engines
+// watchChanges wraps, on any node.
+type memberChanges struct {
+	mu   sync.Mutex
+	made []madeChange
+}
+
+// watchChanges wraps the engine of each node, from now on, in one that
+// records each membership change made through it. The autopilot makes its
+// changes through the engine its node holds (autopilotStep).
+func watchChanges(nodes ...*autoNode) *memberChanges {
+	c := &memberChanges{}
+	for _, an := range nodes {
+		an.r().setEngine(&changeEngine{Engine: an.r().Engine(), changes: c})
+	}
+	return c
+}
+
+func (c *memberChanges) note(action Action, target consensus.NodeID, on consensus.Membership) {
+	c.mu.Lock()
+	c.made = append(c.made, madeChange{action: action, target: target, on: on})
+	c.mu.Unlock()
+}
+
+// only is the one change of action on target that was made.
+func (c *memberChanges) only(t *testing.T, action Action, target consensus.NodeID) madeChange {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []madeChange
+	for _, x := range c.made {
+		if x.action == action && x.target == target {
+			out = append(out, x)
+		}
+	}
+	require.Len(t, out, 1, "one %s of %s made", action, target)
+	return out[0]
+}
+
+// changeEngine is an engine that records each membership change made
+// through it, once the engine accepted it.
+type changeEngine struct {
+	consensus.Engine
+	changes *memberChanges
+}
+
+func (e *changeEngine) AddLearner(ctx context.Context, op consensus.Operator, m consensus.Member) error {
+	on := e.Membership()
+	err := e.Engine.AddLearner(ctx, op, m)
+	if err == nil {
+		e.changes.note(ActionAddLearner, m.ID, on)
+	}
+	return err
+}
+
+func (e *changeEngine) Promote(ctx context.Context, op consensus.Operator, id consensus.NodeID) error {
+	on := e.Membership()
+	err := e.Engine.Promote(ctx, op, id)
+	if err == nil {
+		e.changes.note(ActionPromote, id, on)
+	}
+	return err
+}
+
+func (e *changeEngine) Remove(ctx context.Context, op consensus.Operator, id consensus.NodeID) error {
+	on := e.Membership()
+	err := e.Engine.Remove(ctx, op, id)
+	if err == nil {
+		e.changes.note(ActionRemove, id, on)
+	}
+	return err
+}
+
+// voterIn and learnerIn say how m lists id.
+func voterIn(m consensus.Membership, id consensus.NodeID) bool {
+	i := Rank(m, id)
+	return i > 0 && m.Members[i-1].Voter
+}
+
+func learnerIn(m consensus.Membership, id consensus.NodeID) bool {
+	i := Rank(m, id)
+	return i > 0 && !m.Members[i-1].Voter
+}
+
+// proposeHookEngine is an engine whose proposals pass through hook first,
+// on the goroutine that makes them: the autopilot audits a change through
+// the engine its node holds (audit, proposeSettled).
+type proposeHookEngine struct {
+	consensus.Engine
+	hook func(ctx context.Context, data []byte)
+}
+
+func (e *proposeHookEngine) Propose(ctx context.Context, data []byte) (consensus.Token, any, error) {
+	e.hook(ctx, data)
+	return e.Engine.Propose(ctx, data)
+}
+
+// auditOf decodes an audit record's envelope (reftable.EncodeVersion), nil
+// for any other command.
+func auditOf(data []byte) *reftable.Audit {
+	if len(data) < 2 || reftable.Kind(data[1]) != reftable.KindAudit {
+		return nil
+	}
+	var a reftable.Audit
+	if json.Unmarshal(data[2:], &a) != nil {
+		return nil
+	}
+	return &a
+}
+
 // An autonomous cluster of three loses a voter's disk (#186). The node
 // starts again on an empty directory under a new id, with a new key: once
 // its old id has been out of reach for DEAD_MEMBER_TIMEOUT, the leader adds
@@ -138,6 +257,63 @@ func TestALostVoterIsReplacedAcrossALeaderChange(t *testing.T) {
 	})
 }
 
+// The audit of a membership change is a proposal of its own, made by the
+// autopilot that made the change, after it, and retried until a leader
+// commits it (autoChange, audit, proposeSettled). A leader that adds the
+// learner and loses the leadership right after may see its audit of the
+// addition commit after the next leader promoted the learner and audited
+// the promotion, as CI's load had it (#346): the replacement is the same,
+// made in the same order, and holds every guarantee of one led throughout
+// by one node. This forces that interleaving: the proposal of the audit of
+// the addition first moves the leadership to the other survivor, then
+// waits until that one audited the promotion. A run where the bench did
+// not reach that point in time is skipped once checked, never failed: it
+// proved nothing of the interleaving.
+func TestALostVoterIsReplacedWhenItsAdditionIsAuditedLast(t *testing.T) {
+	var forced atomic.Bool
+	var how atomic.Value
+	how.Store("the audit of the addition was never proposed")
+	lostVoterReplaced(t, func(b *autoBench, survivors []*autoNode) {
+		var once sync.Once
+		for i, s := range survivors {
+			inner, other := s.r().Engine(), survivors[1-i]
+			s.r().setEngine(&proposeHookEngine{Engine: inner, hook: func(ctx context.Context, data []byte) {
+				a := auditOf(data)
+				if a == nil || a.Action != string(ActionAddLearner) || a.Outcome != "ok" {
+					return
+				}
+				id, err := ParseNodeID(a.Target)
+				if err != nil {
+					return
+				}
+				once.Do(func() {
+					// Both waits fit in the 10 s the audit is given
+					// (audit), so that it still commits after them.
+					deadline := time.Now().Add(3 * time.Second)
+					for time.Now().Before(deadline) && b.leader() != other {
+						_ = inner.TransferLeadership(ctx, autopilotOperator, b.idOf(other))
+						time.Sleep(20 * time.Millisecond)
+					}
+					deadline = time.Now().Add(4 * time.Second)
+					for time.Now().Before(deadline) && auditAt(s.r(), ActionPromote, id) == 0 {
+						time.Sleep(10 * time.Millisecond)
+					}
+					if auditAt(s.r(), ActionPromote, id) == 0 {
+						how.Store("no promotion audited in time after " + s.n.slot + " added the learner")
+						return
+					}
+					forced.Store(true)
+					how.Store(s.n.slot + " added the learner, " + other.n.slot + " led, promoted it and audited the promotion, then the audit of the addition was proposed")
+				})
+			}})
+		}
+	})
+	if !forced.Load() {
+		t.Skipf("the interleaving was not forced: %s", how.Load())
+	}
+	t.Log(how.Load())
+}
+
 // lostVoterReplaced is TestALostVoterOfThreeIsReplacedUnderItsSlot; before
 // DEAD_MEMBER_TIMEOUT passes, after the voter was out of reach for part of
 // it, it runs between, when given.
@@ -159,6 +335,9 @@ func lostVoterReplaced(t *testing.T, between func(b *autoBench, survivors []*aut
 	b.kill(victim)
 	from := b.lead()
 	newID := b.lose(victim)
+	// Before DEAD_MEMBER_TIMEOUT, so before any change: the replaced node
+	// too, which may lead once it votes and remove the old id itself.
+	changes := watchChanges(survivors[0], survivors[1], victim)
 	time.Sleep(benchDownAfter + 500*time.Millisecond)
 
 	// Not before DEAD_MEMBER_TIMEOUT: the old id may come back.
@@ -186,15 +365,30 @@ func lostVoterReplaced(t *testing.T, between func(b *autoBench, survivors []*aut
 	assert.GreaterOrEqual(t, least(), 3, "never fewer than three voters listed")
 
 	// Each change is audited once it is made, by the autopilot that made
-	// it: the record of the last one may commit after the membership.
+	// it: the record of the last one may commit after the membership. The
+	// audit is a proposal of its own, retried until a leader commits it
+	// (autoChange, audit, proposeSettled): the audit of a change made by a
+	// leader that lost the leadership right after may commit after the
+	// next leader's changes and their audits (#346). The audits say that
+	// each change was made, and ok; not in which order.
 	l := b.leader().r()
 	var added, promoted, removed uint64
 	require.Eventually(t, func() bool {
 		added, promoted, removed = auditAt(l, ActionAddLearner, newID), auditAt(l, ActionPromote, newID), auditAt(l, ActionRemove, oldID)
 		return added != 0 && promoted != 0 && removed != 0
 	}, 10*time.Second, 20*time.Millisecond, "the autopilot audits the addition, the promotion and the removal")
-	assert.Less(t, added, promoted, "promoted after it was added")
-	assert.Less(t, promoted, removed, "the old id removed after the new one votes")
+	// The order is the log's: each change is recorded with the membership
+	// it was made on, whichever leader made it, and a configuration that
+	// lists the learner, or the new id as a voter, comes after the change
+	// that wrote it.
+	add, promote, remove := changes.only(t, ActionAddLearner, newID), changes.only(t, ActionPromote, newID), changes.only(t, ActionRemove, oldID)
+	t.Logf("changes made on the configurations at %d, %d and %d; audited at %d, %d and %d",
+		add.on.At.Index, promote.on.At.Index, remove.on.At.Index, added, promoted, removed)
+	assert.True(t, voterIn(add.on, oldID) && Rank(add.on, newID) == 0, "added while the old id votes: %+v", add.on)
+	assert.True(t, learnerIn(promote.on, newID) && voterIn(promote.on, oldID), "promoted once a learner, the old id still voting: %+v", promote.on)
+	assert.True(t, voterIn(remove.on, newID), "the old id removed once the new one votes: %+v", remove.on)
+	assert.Less(t, add.on.At.Index, promote.on.At.Index, "promoted after it was added")
+	assert.Less(t, promote.on.At.Index, remove.on.At.Index, "the old id removed after the new one votes")
 
 	// The new member follows the leader: a write reaches its repositories.
 	work := t.TempDir()
