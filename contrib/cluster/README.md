@@ -777,7 +777,10 @@ These commands run with the server stopped, on the data directory.
   `refs/heads/master` -> `refs/heads/main` a renamed default branch
   leaves, is restored as such, kept by a resumed repository step, and its
   branch row, when SQL holds one, is verified at the commit it resolves
-  to.
+  to. Its step 6 also stops on an attachment row whose file the
+  checkpoint lacks, so `forgejo restore-repo` of a dump made without the
+  `release_assets` unit restores the releases without their assets, whose
+  files that dump does not hold, and logs each asset it skips.
 
 ## Observers
 
