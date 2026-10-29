@@ -651,7 +651,11 @@ func (p *projector) project(base, ctx context.Context, repo string) error {
 		}
 	}
 
-	have, err := readGitRefs(ctx, dir)
+	// A symbolic ref the table holds is read even when dangling, which
+	// for-each-ref lists nowhere: written again at every pass, it was
+	// never certified (#348).
+	symbolic := symbolicNames(refs)
+	have, err := readGitRefs(ctx, dir, symbolic...)
 	if err != nil {
 		return err
 	}
@@ -715,14 +719,16 @@ func (p *projector) project(base, ctx context.Context, repo string) error {
 	// repository stays dirty for the next pass.
 	var verr error
 	p.registry.certify(repo, func() {
-		now, err := readGitRefs(ctx, dir)
+		now, err := readGitRefs(ctx, dir, symbolic...)
 		if err != nil {
 			verr = err
 			return
 		}
-		got := reftable.ProjectionDigest(filterTracked(now, refs))
-		if got != reftable.ProjectionDigest(want) {
-			verr = errors.New("git does not match the table after projection")
+		got := filterTracked(now, refs)
+		if reftable.ProjectionDigest(got) != reftable.ProjectionDigest(want) {
+			// The refs are named: an operator finds which keeps the
+			// repository uncertified (#348).
+			verr = fmt.Errorf("git does not match the table after projection: %s", projectionDiff(got, want))
 			return
 		}
 		p.certify(repo, at, writeStamp(dir, repo, id, at, reftable.ProjectionDigest(want)))
@@ -1011,12 +1017,14 @@ func (p *projector) Verify(ctx context.Context, repo string) (bool, error) {
 		p.markDirty(repo)
 		return false, nil
 	}
-	have, err := readGitRefs(ctx, dir)
+	have, err := readGitRefs(ctx, dir, symbolicNames(refs)...)
 	if err != nil {
 		return false, err
 	}
-	same := reftable.ProjectionDigest(filterTracked(have, refs)) == reftable.ProjectionDigest(want)
+	got := filterTracked(have, refs)
+	same := reftable.ProjectionDigest(got) == reftable.ProjectionDigest(want)
 	if !same {
+		log.Info("cluster: %s differs from the table: %s", repo, projectionDiff(got, want))
 		p.markDirty(repo)
 	}
 	return same, nil

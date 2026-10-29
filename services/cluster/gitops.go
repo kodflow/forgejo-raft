@@ -10,8 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 
 	"forgejo.org/modules/git"
@@ -35,17 +38,29 @@ func gitRun(ctx context.Context, dir string, stdin io.Reader, args ...string) (s
 	return stdout.String(), nil
 }
 
-// readGitRefs lists what git shows of a repository: every ref under refs/
-// with its value, symbolic refs by target, and HEAD. Fields are separated by
-// NUL, which no ref name holds, and the name comes last, byte for byte: git
-// accepts Unicode spaces in a name (U+00A0, U+3000), and a split on white
-// space would read "refs/heads/main<U+00A0>x" as refs/heads/main.
-func readGitRefs(ctx context.Context, dir string) (map[string]reftable.ProjectedRef, error) {
+// readGitRefs lists what git holds of a repository: every ref under refs/
+// with its value, HEAD, and each symbolic ref by the ref it names, one
+// level deep, as the table holds it. Fields are separated by NUL, which no
+// ref name holds, and the name comes last, byte for byte: git accepts
+// Unicode spaces in a name (U+00A0, U+3000), and a split on white space
+// would read "refs/heads/main<U+00A0>x" as refs/heads/main.
+//
+// for-each-ref names the end of a symbolic ref's chain, and lists a
+// dangling symbolic ref, one whose target git does not hold, nowhere: the
+// alias refs/heads/master -> refs/heads/main left once main was renamed or
+// deleted, which the table keeps, never matched it, and the repository was
+// never certified again; nor was HEAD -> refs/heads/master ->
+// refs/heads/main (#348). Each symbolic ref it lists, HEAD, and each name
+// in symbolic, the refs the table holds as symbolic, are read again one
+// level deep: one more git process per symbolic ref, none for a repository
+// whose only symbolic ref is HEAD.
+func readGitRefs(ctx context.Context, dir string, symbolic ...string) (map[string]reftable.ProjectedRef, error) {
 	out, err := gitRun(ctx, dir, nil, "for-each-ref", "--format=%(objectname)%00%(symref)%00%(refname)")
 	if err != nil {
 		return nil, err
 	}
 	refs := map[string]reftable.ProjectedRef{}
+	links := []string{"HEAD"}
 	for line := range strings.SplitSeq(out, "\n") {
 		if line == "" {
 			continue
@@ -56,15 +71,113 @@ func readGitRefs(ctx context.Context, dir string) (map[string]reftable.Projected
 		}
 		if f[1] != "" {
 			refs[f[2]] = reftable.ProjectedRef{Symbolic: f[1]}
+			links = append(links, f[2])
 			continue
 		}
 		refs[f[2]] = reftable.ProjectedRef{SHA: f[0]}
 	}
-	head, err := gitRun(ctx, dir, nil, "symbolic-ref", "-q", "HEAD")
-	if head = strings.TrimSuffix(head, "\n"); err == nil && head != "" {
-		refs["HEAD"] = reftable.ProjectedRef{Symbolic: head}
+	for _, name := range symbolic {
+		// A name listed is read already, or holds a value of its own.
+		if _, listed := refs[name]; !listed && name != "HEAD" {
+			links = append(links, name)
+		}
+	}
+	for _, name := range links {
+		// A name the table cannot hold, which git alone shows, stays as
+		// for-each-ref lists it: filterTracked leaves it out. A valid one
+		// starts no option.
+		if reftable.ValidRefName(name) != nil {
+			continue
+		}
+		to, err := readSymbolicRef(ctx, dir, name)
+		switch {
+		case err != nil:
+			return nil, err
+		case to != "" && reftable.ValidRefName(to) == nil && to != "HEAD":
+			refs[name] = reftable.ProjectedRef{Symbolic: to}
+		case to != "":
+			// A first link no table holds, as Apply refuses it: HEAD or
+			// a name outside refs/, which git alone writes
+			// (refs/heads/x -> HEAD). It stays as for-each-ref lists it,
+			// at the end of its chain, or unseen when dangling: import
+			// takes what it took before, never a value Apply refuses.
+		case refs[name].Symbolic != "":
+			// Listed as symbolic a moment ago: what git holds now is
+			// unknown, and the end of its chain is no first link.
+			return nil, fmt.Errorf("git symbolic-ref %s: no longer a symbolic ref once listed", name)
+		}
 	}
 	return refs, nil
+}
+
+// readSymbolicRef returns the ref that git's symbolic ref name names, one
+// level deep, or "" when git holds no symbolic ref under name, which git
+// tells by its exit code 1. Any other failure is returned: a symbolic ref
+// git could not read would show as absent, or at the end of its chain.
+func readSymbolicRef(ctx context.Context, dir, name string) (string, error) {
+	out, err := gitRun(ctx, dir, nil, "symbolic-ref", "-q", "--no-recurse", "--end-of-options", name)
+	if err != nil {
+		if git.IsErrorExitCode(err, 1) {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSuffix(out, "\n"), nil
+}
+
+// symbolicNames returns the refs the table holds live and symbolic, HEAD
+// aside, for readGitRefs to read even when for-each-ref lists them nowhere.
+func symbolicNames(refs map[string]reftable.RefValue) []string {
+	var names []string
+	for name, v := range refs {
+		if name != "HEAD" && v.Live() && v.Symbolic != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// projectionDiff names the refs git and the table hold otherwise, in
+// order and at most three, with both values: a repository that is never
+// certified tells an operator which ref keeps it so (#348).
+func projectionDiff(have, table map[string]reftable.ProjectedRef) string {
+	differ := map[string]bool{}
+	for name, v := range have {
+		if w, ok := table[name]; !ok || w != v {
+			differ[name] = true
+		}
+	}
+	for name := range table {
+		if _, ok := have[name]; !ok {
+			differ[name] = true
+		}
+	}
+	const shown = 3
+	names := slices.Sorted(maps.Keys(differ))
+	var b strings.Builder
+	for i, name := range names[:min(len(names), shown)] {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		fmt.Fprintf(&b, "%q: git %s, table %s", name, projectedValue(have, name), projectedValue(table, name))
+	}
+	if len(names) > shown {
+		fmt.Fprintf(&b, "; and %d more", len(names)-shown)
+	}
+	return b.String()
+}
+
+// projectedValue shows what refs holds under name for projectionDiff.
+func projectedValue(refs map[string]reftable.ProjectedRef, name string) string {
+	v, ok := refs[name]
+	switch {
+	case !ok:
+		return "nothing"
+	case v.Symbolic != "":
+		return strconv.Quote("ref:" + v.Symbolic)
+	default:
+		return strconv.Quote(v.SHA)
+	}
 }
 
 // tableProjection is the table's side of the projection digest: live refs
@@ -113,6 +226,12 @@ func missingObjects(ctx context.Context, dir string, shas []string) ([]string, e
 // and a created refs/heads/a/b, or the reverse, would fail at every pass
 // (#73). Between the two, the node serves neither ref, which the next
 // write closes; the table is what holds the refs.
+//
+// Each line writes the ref it names, never the one a symbolic ref there
+// points to: update-ref follows a symbolic ref unless told not to, so the
+// deletion of the alias refs/heads/master -> refs/heads/main deleted main,
+// and a value of master's own moved main, on every node but the writer's
+// (#348).
 func writeRefs(ctx context.Context, dir string, set map[string]reftable.RefValue, del []string) error {
 	var deletes, updates strings.Builder
 	var symbolic [][2]string
@@ -133,7 +252,7 @@ func writeRefs(ctx context.Context, dir string, set map[string]reftable.RefValue
 		if stdin == "" {
 			continue
 		}
-		if _, err := gitRun(ctx, dir, strings.NewReader(stdin), "update-ref", "--stdin"); err != nil {
+		if _, err := gitRun(ctx, dir, strings.NewReader(stdin), "update-ref", "--no-deref", "--stdin"); err != nil {
 			return err
 		}
 	}
