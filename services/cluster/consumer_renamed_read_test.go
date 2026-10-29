@@ -258,15 +258,15 @@ func testTagPushedBeforeARenameIntoAFreedName(t *testing.T, block string) {
 	assert.Equal(t, r.cB1, rel.Sha1)
 }
 
-func TestConsumerTagPushedBeforeARenameIntoAFreedNameControl(t *testing.T) {
+func TestLeaderDerivesATagPushedBeforeARenameIntoAFreedNameControl(t *testing.T) {
 	testTagPushedBeforeARenameIntoAFreedName(t, "")
 }
 
-func TestConsumerTagPushedBeforeARenameIntoAFreedName(t *testing.T) {
+func TestLeaderDerivesATagPushedBeforeARenameIntoAFreedName(t *testing.T) {
 	testTagPushedBeforeARenameIntoAFreedName(t, "fetch")
 }
 
-func TestConsumerTagPushedBeforeARenameIntoAFreedNameLongPass(t *testing.T) {
+func TestLeaderDerivesATagPushedBeforeARenameIntoAFreedNameLongPass(t *testing.T) {
 	testTagPushedBeforeARenameIntoAFreedName(t, "pass")
 }
 
@@ -293,11 +293,11 @@ func testBranchPushedBeforeARenameIntoAFreedName(t *testing.T, block string, fro
 	return r
 }
 
-func TestConsumerBranchPushedBeforeARenameIntoAFreedNameControl(t *testing.T) {
+func TestLeaderDerivesABranchPushedBeforeARenameIntoAFreedNameControl(t *testing.T) {
 	r := testBranchPushedBeforeARenameIntoAFreedName(t, "", nil)
 	pushedUnderTheFreedName(t, r)
 }
 
-func TestConsumerBranchPushedBeforeARenameIntoAFreedName(t *testing.T) {
+func TestLeaderDerivesABranchPushedBeforeARenameIntoAFreedName(t *testing.T) {
 	testBranchPushedBeforeARenameIntoAFreedName(t, "fetch", readCheckRefusesTheFreedName)
 }
