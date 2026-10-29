@@ -756,7 +756,11 @@ These commands run with the server stopped, on the data directory.
   cluster from an observer's protected checkpoint, every member lost
   ([observer.md](observer.md)). It needs the same `--fenced` receipts of
   both witnesses for every voter the checkpoint names, and the same probe
-  of the old members.
+  of the old members. A symbolic branch the table holds, such as the alias
+  `refs/heads/master` -> `refs/heads/main` a renamed default branch
+  leaves, is restored as such, kept by a resumed repository step, and its
+  branch row, when SQL holds one, is verified at the commit it resolves
+  to.
 
 ## Observers
 
