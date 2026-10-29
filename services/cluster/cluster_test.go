@@ -28,6 +28,7 @@ import (
 	cluster_model "forgejo.org/models/cluster"
 	"forgejo.org/models/unittest"
 	"forgejo.org/modules/clusterhook"
+	"forgejo.org/modules/git"
 	"forgejo.org/modules/setting"
 	"forgejo.org/services/cluster/consensus"
 	"forgejo.org/services/cluster/consensus/kitsunium"
@@ -51,17 +52,45 @@ func TestMain(m *testing.M) {
 
 // runtimeDirOptions gives the engine a boot-scoped marker directory of this
 // binary's own, which a runner cannot create at its Linux default,
-// /run/kitsunium-consensus. SetUp runs only in the suite, never in the git
-// hooks that run this binary, and TearDown removes the directory.
+// /run/kitsunium-consensus, and turns git's automatic maintenance off in
+// the suite's git home (quietGitHome). SetUp runs only in the suite, never
+// in the git hooks that run this binary, and TearDown removes the
+// directory.
 func runtimeDirOptions() *unittest.TestOptions {
 	return &unittest.TestOptions{
 		SetUp: func() error {
 			dir, err := os.MkdirTemp("", "kitsunium-consensus-")
 			kitsunium.RuntimeDir = dir
-			return err
+			if err != nil {
+				return err
+			}
+			return quietGitHome()
 		},
 		TearDown: func() error { return os.RemoveAll(kitsunium.RuntimeDir) },
 	}
+}
+
+// quietGitConfig turns git's automatic maintenance off, as a cluster
+// node's git home has it (modules/git/git.go, syncGitConfig, which sets it
+// only with setting.Cluster.Enabled, never in the suite): gc.auto,
+// maintenance.auto and receive.autogc, and maintenance.autoDetach for
+// whatever git would still maintain, in the foreground.
+var quietGitConfig = [][2]string{{"gc.auto", "0"}, {"maintenance.auto", "false"}, {"maintenance.autoDetach", "false"}, {"receive.autogc", "false"}}
+
+// quietGitHome writes quietGitConfig into the global config of the suite's
+// git home, which every git of the bench reads: Forgejo's git module, the
+// projector's fetch among it (gitRun), and the tests' own git (run, gitIn,
+// gitStdin). Otherwise git starts "git maintenance run --auto --detach"
+// after a fetch, a commit or a push: it runs on in the test's directory
+// after the command returned, and writes under objects/ while the cleanup
+// of t.TempDir removes it, "directory not empty" (#347).
+func quietGitHome() error {
+	for _, kv := range quietGitConfig {
+		if _, _, err := git.NewCommand(git.DefaultContext, "config", "--global").AddDynamicArguments(kv[0], kv[1]).RunStdString(nil); err != nil {
+			return fmt.Errorf("git config --global %s %s: %w", kv[0], kv[1], err)
+		}
+	}
+	return nil
 }
 
 // ---- test PKI ----
