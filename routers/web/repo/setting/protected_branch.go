@@ -17,6 +17,7 @@ import (
 	access_model "forgejo.org/models/perm/access"
 	"forgejo.org/modules/base"
 	"forgejo.org/modules/clusterhook"
+	"forgejo.org/modules/git"
 	"forgejo.org/modules/web"
 	"forgejo.org/routers/web/repo"
 	"forgejo.org/services/context"
@@ -324,6 +325,11 @@ func RenameBranchPost(ctx *context.Context) {
 			ctx.Redirect(fmt.Sprintf("%s/branches", ctx.Repo.RepoLink))
 		} else if git_model.IsErrBranchAlreadyExists(err) {
 			ctx.Flash.Error(ctx.Tr("repo.branch.branch_already_exists", form.To))
+			ctx.Redirect(fmt.Sprintf("%s/branches", ctx.Repo.RepoLink))
+		} else if git.IsErrSymbolicBranch(err) {
+			// An alias of another branch, which git branch -m refuses to
+			// rename too: nothing was renamed (#356).
+			ctx.Flash.Error(ctx.Tr("repo.settings.rename_branch_failed_symbolic", form.From))
 			ctx.Redirect(fmt.Sprintf("%s/branches", ctx.Repo.RepoLink))
 		} else if errors.Is(err, clusterhook.ErrBehind) {
 			// A node of the cluster behind on the repository, or whose

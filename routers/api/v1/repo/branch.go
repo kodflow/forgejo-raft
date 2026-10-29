@@ -470,6 +470,12 @@ func UpdateBranch(ctx *context.APIContext) {
 		if clusterBehind(ctx, err) {
 			return
 		}
+		if git.IsErrSymbolicBranch(err) {
+			// An alias of another branch, which git branch -m refuses to
+			// rename too: nothing was renamed (#356).
+			ctx.Error(http.StatusUnprocessableEntity, "", err.Error())
+			return
+		}
 		ctx.Error(http.StatusInternalServerError, "RenameBranch", err)
 		return
 	}

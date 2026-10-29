@@ -4,6 +4,7 @@
 package git
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -64,6 +65,25 @@ func (err ErrBranchNotExist) Error() string {
 
 func (err ErrBranchNotExist) Unwrap() error {
 	return util.ErrNotExist
+}
+
+// ErrSymbolicBranch refuses to rename a branch that is a symbolic ref, an
+// alias of the ref it names (refs/heads/master -> refs/heads/main), as
+// `git branch -m` refuses it: a rename moves the branch's own ref, and an
+// alias has none, only the branch it names.
+type ErrSymbolicBranch struct {
+	Name   string
+	Target string
+}
+
+// IsErrSymbolicBranch reports whether err is or wraps an ErrSymbolicBranch.
+func IsErrSymbolicBranch(err error) bool {
+	_, ok := errors.AsType[ErrSymbolicBranch](err)
+	return ok
+}
+
+func (err ErrSymbolicBranch) Error() string {
+	return fmt.Sprintf("branch %s is a symbolic ref to %s, renaming it is not supported", err.Name, err.Target)
 }
 
 // ErrPushOutOfDate represents an error if merging fails due to the base branch being updated
