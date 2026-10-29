@@ -94,6 +94,30 @@ type RepoManifest struct {
 	Tombstones []string          `json:"tombstones,omitempty"`
 }
 
+// symrefReads is how many refs git reads to resolve one (SYMREF_MAXDEPTH
+// in refs.h): a chain of more symbolic refs is broken to git.
+const symrefReads = 5
+
+// Resolve returns the value name resolves to in the checkpoint, its
+// symbolic refs followed as git follows them, and false where git resolves
+// nothing: a chain ending on a ref the checkpoint does not hold, or longer
+// than git follows. git lists such a dangling symbolic ref nowhere, and
+// Forgejo holds no branch for it; one that resolves, git lists at the
+// value it resolves to, and Forgejo lists it as a branch at that commit.
+func (rm RepoManifest) Resolve(name string) (string, bool) {
+	for range symrefReads {
+		if sha, ok := rm.Refs[name]; ok {
+			return sha, true
+		}
+		to, ok := rm.Symbolic[name]
+		if !ok {
+			return "", false
+		}
+		name = to
+	}
+	return "", false
+}
+
 // FileBlob is a stored file of a checkpoint and the digest it is kept by.
 type FileBlob struct {
 	clusterhook.FileEntry

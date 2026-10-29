@@ -172,11 +172,12 @@ func (a *Archive) OpenSecrets(name string, priv *[32]byte) (*Bundle, error) {
 // RestoreRepos writes every repository of a checkpoint under root, which
 // must hold none of them yet. Run again after an interruption, it keeps a
 // repository an earlier run wrote whole (the checkpoint's refs exactly,
-// each naming an object it holds, no mark left), writes again one it left
-// marked incomplete (its mark removed last: a removal cut midway leaves it
-// marked) or holding only the mark's temporary files, and refuses any
-// other. A target, or the owner's directory above it, that is a symbolic
-// link is refused, neither followed nor removed.
+// its symbolic ones included, each naming an object it holds, no mark
+// left), writes again one it left marked incomplete (its mark removed
+// last: a removal cut midway leaves it marked) or holding only the mark's
+// temporary files, and refuses any other. A target, or the owner's
+// directory above it, that is a symbolic link is refused, neither followed
+// nor removed.
 func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, error) {
 	m, err := a.store.ReadManifest(name)
 	if err != nil {
@@ -220,7 +221,7 @@ func (a *Archive) RestoreRepos(ctx context.Context, name, root string) (int, err
 						return n, fmt.Errorf("%s: %w", repo, err)
 					}
 				}
-			} else if a.store.git.restoredRefs(ctx, target, rm.Refs) {
+			} else if a.store.git.restoredRefs(ctx, target, rm) {
 				n++
 				continue
 			}

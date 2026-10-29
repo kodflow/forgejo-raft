@@ -276,7 +276,7 @@ func TestHuntR2ProveStep4ResumeAfterFilesError(t *testing.T) {
 		n, err := a.RestoreRepos(ctx, cp.Name(), root)
 		require.NoError(t, err)
 		assert.Equal(t, 2, n)
-		assert.True(t, o.store.git.restoredRefs(ctx, target, m.Repos["bob/other.git"].Refs))
+		assert.True(t, o.store.git.restoredRefs(ctx, target, m.Repos["bob/other.git"]))
 	})
 
 	t.Run("a repository this restore did not write", func(t *testing.T) {
@@ -488,7 +488,7 @@ func TestRestoreReposTakesUpATargetLeftBeforeItsMark(t *testing.T) {
 	n, err := a.RestoreRepos(ctx, cp.Name(), root)
 	require.NoError(t, err, "the rerun of step 4 takes the target up")
 	assert.Equal(t, 1, n)
-	assert.True(t, o.store.git.restoredRefs(ctx, target, m.Repos["alice/demo.git"].Refs))
+	assert.True(t, o.store.git.restoredRefs(ctx, target, m.Repos["alice/demo.git"]))
 	assert.NoFileExists(t, tmp)
 	assert.NoFileExists(t, filepath.Join(target, IncompleteMark))
 
