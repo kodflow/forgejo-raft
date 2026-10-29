@@ -683,9 +683,14 @@ These commands run with the server stopped, on the data directory.
   cluster again and two forges write.
 - After a restore or a PostgreSQL failover, `forgejo cluster reconcile` lists
   the differences between the table and SQL. `--apply` rebuilds the rows that
-  can be regenerated (branches, tags); the others are reported with what to
-  do, such as a pull request marked merged whose commit is missing from its
-  base branch.
+  can be regenerated (branches, tags, a release at another commit than its
+  tag); the others are reported with what to do, such as a pull request
+  marked merged whose commit is missing from its base branch, or a draft
+  release without a commit whose tag the table holds: a published release a
+  synchronisation of the tags from a git behind the cluster took for
+  deleted reads exactly like a draft its author saved on an existing tag,
+  so `--apply` never publishes it; publish it again from its edit page if
+  it was published.
 - A repository the table holds alive and SQL does not know is reported by
   `reconcile` with the index of its last change and since when it is
   unchanged. `reconcile`, `--apply` included, never deletes it. After a loss
@@ -900,6 +905,14 @@ Watch, Custom, Releases on GitHub, or the tags of
   later, is refused before its objects are shipped: push in several
   smaller pushes. A fork and a migration take their refs by batches of
   512, whatever their number.
+- `forgejo admin repo-sync-releases` refuses to run on a node of a
+  cluster, before it opens the database: it would rewrite every
+  repository's releases from that node's git, which may be behind the
+  cluster's last writes, in the database every node shares. Use Site
+  administration > Dashboard > "Sync tags from Git data to database" on a
+  running node instead: it synchronises each repository once that node
+  serves it at the cluster's last writes, and skips with a warning those it
+  is behind on.
 - A mirror's remote is a node's git config, which the cluster does not
   replicate: a node that lacks it recreates it from the database before
   each mirror operation, without any password, and a node that holds it

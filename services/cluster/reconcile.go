@@ -109,7 +109,8 @@ type Mismatch struct {
 	Kind string `json:"kind,omitempty"`
 	Ref  string `json:"ref,omitempty"`
 	// Regenerable rows are rebuilt from the table; the others are reported,
-	// with Action naming what the operator does (R7-30).
+	// with Action naming what the operator does (R7-30). A regenerable
+	// row's Action, when set, says what its rebuild changes.
 	Regenerable bool   `json:"regenerable"`
 	Action      string `json:"action,omitempty"`
 	Applied     bool   `json:"applied,omitempty"`
@@ -135,7 +136,14 @@ const (
 	ActionDemotePR     = "demote: the pull request is marked merged, its merge commit is not in the base branch the table holds; reopen it or merge it again"
 	ActionPRHeadGone   = "the head branch of the open pull request is not in the table: close it or push the branch again"
 	ActionReleaseNoTag = "the release names a tag the table does not hold: push the tag again or delete the release"
+	// SQL does not tell the two apart: a draft saved as such has no
+	// commit either, so the row is never published here.
+	ActionReleaseDraftTagHeld = "the release is a draft without a commit while the table holds its tag: either a draft its author saved on an existing tag, or a published release that a synchronisation of the tags from a git behind the cluster took for deleted. Nothing is changed: if it was published, publish it again from its edit page"
 )
+
+// ActionReleaseOldCommit says what the rebuild of a regenerable release row
+// at another commit than its tag changes, for the operator.
+const ActionReleaseOldCommit = "the release names another commit than its tag in the table: a synchronisation of the tags from a git behind the cluster wrote the tag's older commit. --apply writes it again at the tag's commit, as a push of the tag does"
 
 // Reconcile compares the table with SQL's branch rows. Branch rows are
 // REGENERABLE: with apply, they are rebuilt from the table and git, once the
@@ -556,9 +564,13 @@ func (r *Replicator) reconcileParked(ctx context.Context, apply bool) ([]Mismatc
 
 // reconcileNonRegenerable checks the rows the table cannot rebuild: pull
 // requests marked merged whose merge commit the base branch does not hold,
-// open pull requests whose head branch is gone, releases whose tag is gone.
-// They are reported with the operator's action, never changed. Tag-only
-// release rows are regenerable and, with apply, rebuilt from git.
+// open pull requests whose head branch is gone, releases whose tag is gone,
+// drafts without a commit whose tag the table holds. They are reported
+// with the operator's action, never changed. Tag-only release rows are
+// regenerable and, with apply, rebuilt from git. So is a published release
+// or tag-only row a synchronisation from a git behind left at another
+// commit than its tag in the table (#341), rebuilt from the tag once git
+// shows it at the table's value.
 func (r *Replicator) reconcileNonRegenerable(ctx context.Context, key string, repo *repo_model.Repository, refs map[string]reftable.RefValue, apply bool) ([]Mismatch, error) {
 	var out []Mismatch
 	live := func(ref string) (reftable.RefValue, bool) {
@@ -597,19 +609,39 @@ func (r *Replicator) reconcileNonRegenerable(ctx context.Context, key string, re
 		return out, err
 	}
 	sqlTags := map[string]bool{}
+	var behind []*repo_model.Release
 	for _, rel := range rels {
 		sqlTags[rel.TagName] = true
+		v, ok := live("refs/tags/" + rel.TagName)
 		if rel.IsDraft {
+			// A draft without a commit is how the deletion of its tag
+			// leaves a release (PushUpdateDeleteTag): while the table
+			// holds the tag, a synchronisation from a git behind may have
+			// taken it for deleted (#341). It is also how its author saves
+			// a draft, on an existing tag or not (createTag sets the
+			// commit of a published release only), and nothing in the row
+			// tells the two apart: it is reported, never published. A
+			// published release its author turned draft keeps its commit.
+			if ok && !rel.IsTag && rel.Sha1 == "" {
+				out = append(out, Mismatch{Repo: key, Category: RefsAheadOfSQL, Kind: "release", Ref: rel.TagName, Action: ActionReleaseDraftTagHeld})
+			}
 			continue
 		}
-		if _, ok := live("refs/tags/" + rel.TagName); !ok {
+		if !ok {
 			m := Mismatch{Repo: key, Category: SQLAheadOfRefs, Kind: "tag", Ref: rel.TagName, Regenerable: rel.IsTag}
 			if !rel.IsTag {
 				m.Kind, m.Action = "release", ActionReleaseNoTag
 			}
 			out = append(out, m)
+			continue
+		}
+		if rel.Sha1 != v.SHA {
+			// Equal, the tag is lightweight and the row at its commit;
+			// else the tag may be annotated, its object peeled below.
+			behind = append(behind, rel)
 		}
 	}
+	stale, behindRows := releasesBehindTags(ctx, key, dir, refs, behind)
 	missingTags := false
 	for name, v := range refs {
 		if tag, ok := strings.CutPrefix(name, "refs/tags/"); ok && v.Live() && !sqlTags[tag] {
@@ -624,21 +656,174 @@ func (r *Replicator) reconcileNonRegenerable(ctx context.Context, key string, re
 		}
 	}
 	if apply && regenerableTags {
-		gitRepo, err := gitrepo.OpenRepository(ctx, repo)
-		if err == nil {
-			err = repo_module.SyncReleasesWithTags(ctx, repo, gitRepo)
-			gitRepo.Close()
+		r.rebuildTagRows(ctx, key, repo, out)
+	}
+	if apply && len(stale) > 0 {
+		r.rebuildReleases(ctx, key, repo, stale, behindRows)
+	}
+	out = append(out, stale...)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Kind+out[i].Ref < out[j].Kind+out[j].Ref })
+	return out, nil
+}
+
+// rebuildTagRows writes the regenerable tag-only rows reported in out, and
+// only those: a tag the table holds without a row is added as a push of it
+// does (PushUpdateAddTag), read in git only while the table holds it at
+// that same value; a tag-only row whose tag the table does not hold goes,
+// as a deletion of the tag does. SyncReleasesWithTags would also publish
+// every draft whose tag git holds, a draft its author saved included, and
+// turn into a draft a release whose tag is gone, which reconcile reports
+// and never changes (#341).
+func (r *Replicator) rebuildTagRows(ctx context.Context, key string, repo *repo_model.Repository, out []Mismatch) {
+	gitRepo, err := gitrepo.OpenRepository(ctx, repo)
+	if err != nil {
+		log.Warn("cluster: reconcile of %s: %v", key, err)
+		return
+	}
+	defer gitRepo.Close()
+	for i := range out {
+		if out[i].Kind != "tag" || !out[i].Regenerable {
+			continue
 		}
-		if err == nil {
-			for i := range out {
-				if out[i].Kind == "tag" {
-					out[i].Applied = true
-				}
+		ref := git.TagPrefix + out[i].Ref
+		v, held := r.table.Get(key, ref)
+		held = held && v.Live()
+		switch out[i].Category {
+		case RefsAheadOfSQL:
+			sha, err := gitRepo.GetTagID(out[i].Ref)
+			if err != nil || !held || v.SHA != sha {
+				continue
+			}
+			// A row written since, a draft its author saved on the tag
+			// above all, would be published.
+			if exists, err := repo_model.IsReleaseExist(ctx, repo.ID, out[i].Ref); err != nil || exists {
+				continue
+			}
+			if err := repo_module.PushUpdateAddTag(ctx, repo, gitRepo, out[i].Ref, sha, ref); err != nil {
+				log.Warn("cluster: reconcile of %s: the row of %s: %v", key, ref, err)
+				continue
+			}
+		case SQLAheadOfRefs:
+			if held {
+				continue
+			}
+			// A release made of the row since would be turned into a
+			// draft: only a row still tag-only goes.
+			if rel, err := repo_model.GetRelease(ctx, repo.ID, out[i].Ref); err != nil || !rel.IsTag {
+				continue
+			}
+			if err := repo_model.PushUpdateDeleteTag(ctx, repo, out[i].Ref); err != nil {
+				log.Warn("cluster: reconcile of %s: the row of %s: %v", key, ref, err)
+				continue
+			}
+		default:
+			continue
+		}
+		out[i].Applied = true
+	}
+}
+
+// releasesBehindTags reports, among rels, the published release and
+// tag-only rows whose commit is not the one their tag's value in the table
+// peels to, as a synchronisation of the tags from a git behind the cluster
+// leaves a moved tag's row (#341), with the rows reported, in the same
+// order. Neither the consumer, its work done, nor a later push revisits
+// them. The tag's value is peeled in this node's git; a tag whose object
+// it lacks is not compared, `forgejo cluster objects verify` reports it.
+func releasesBehindTags(ctx context.Context, key, dir string, refs map[string]reftable.RefValue, rels []*repo_model.Release) ([]Mismatch, []*repo_model.Release) {
+	if len(rels) == 0 {
+		return nil, nil
+	}
+	shas := make([]string, 0, len(rels))
+	for _, rel := range rels {
+		shas = append(shas, refs[git.TagPrefix+rel.TagName].SHA)
+	}
+	commits, err := peelCommits(ctx, dir, shas)
+	if err != nil {
+		log.Warn("cluster: reconcile of %s: the commits of its tags: %v", key, err)
+	}
+	var out []Mismatch
+	var rows []*repo_model.Release
+	for _, rel := range rels {
+		commit, ok := commits[refs[git.TagPrefix+rel.TagName].SHA]
+		if !ok || commit == rel.Sha1 {
+			continue
+		}
+		m := Mismatch{Repo: key, Category: RefsAheadOfSQL, Kind: "release", Ref: rel.TagName, Regenerable: true, Action: ActionReleaseOldCommit}
+		if rel.IsTag {
+			m.Kind = "tag"
+		}
+		out = append(out, m)
+		rows = append(rows, rel)
+	}
+	return out, rows
+}
+
+// peelCommits returns the commit each of shas, a tag object or a commit,
+// peels to in dir, by sha. A sha whose object dir lacks, or that peels to
+// no commit, is absent.
+func peelCommits(ctx context.Context, dir string, shas []string) (map[string]string, error) {
+	commits := make(map[string]string, len(shas))
+	if len(shas) == 0 {
+		return commits, nil
+	}
+	var in strings.Builder
+	for _, sha := range shas {
+		in.WriteString(sha + "^{commit}\n")
+	}
+	out, err := gitRun(ctx, dir, strings.NewReader(in.String()), "cat-file", "--batch-check=%(objectname)")
+	if err != nil {
+		return commits, err
+	}
+	// One line per line of input, in its order: the commit, or the input
+	// followed by "missing".
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	for i, sha := range shas {
+		if i < len(lines) {
+			if f := strings.Fields(lines[i]); len(f) == 1 {
+				commits[sha] = f[0]
 			}
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Kind+out[i].Ref < out[j].Kind+out[j].Ref })
-	return out, nil
+	return commits, nil
+}
+
+// rebuildReleases writes again the release rows releasesBehindTags
+// reported, rows, from this node's git, as a push of their tag does
+// (PushUpdateAddTag): the row takes its tag's commit. A tag is read in git
+// only while the table holds it at that same value, as branchCommitAsTable
+// reads a branch: a write the table applied after reconcile read it, which
+// this node's git may not show yet, would otherwise bring a row the
+// consumer derived since back to an older commit. A row changed since it
+// was read, turned into a draft by its author above all, which
+// PushUpdateAddTag would publish, is not written either. Such a row is
+// left to the next pass.
+func (r *Replicator) rebuildReleases(ctx context.Context, key string, repo *repo_model.Repository, stale []Mismatch, rows []*repo_model.Release) {
+	gitRepo, err := gitrepo.OpenRepository(ctx, repo)
+	if err != nil {
+		log.Warn("cluster: reconcile of %s: %v", key, err)
+		return
+	}
+	defer gitRepo.Close()
+	for i := range stale {
+		ref := git.TagPrefix + stale[i].Ref
+		sha, err := gitRepo.GetTagID(stale[i].Ref)
+		if err != nil {
+			continue
+		}
+		if v, ok := r.table.Get(key, ref); !ok || !v.Live() || v.SHA != sha {
+			continue
+		}
+		now, err := repo_model.GetReleaseByID(ctx, rows[i].ID)
+		if err != nil || now.IsDraft || now.IsTag != rows[i].IsTag || now.Sha1 != rows[i].Sha1 || now.TagName != rows[i].TagName {
+			continue
+		}
+		if err := repo_module.PushUpdateAddTag(ctx, repo, gitRepo, stale[i].Ref, sha, ref); err != nil {
+			log.Warn("cluster: reconcile of %s: the release of %s: %v", key, ref, err)
+			continue
+		}
+		stale[i].Applied = true
+	}
 }
 
 func isAncestor(ctx context.Context, dir, commit, tip string) bool {
