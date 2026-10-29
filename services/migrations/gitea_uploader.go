@@ -357,30 +357,41 @@ func (g *GiteaLocalUploader) CreateReleases(releases ...*base.Release) error {
 
 			// SECURITY: We cannot check the DownloadURL and DownloadFunc are safe here
 			// ... we must assume that they are safe and simply download the attachment
-			err := func() error {
+			saved, err := func() (bool, error) {
 				// asset.DownloadURL maybe a local file
 				var rc io.ReadCloser
 				var err error
 				if asset.DownloadFunc != nil {
 					rc, err = asset.DownloadFunc()
 					if err != nil {
-						return err
+						return false, err
 					}
 				} else if asset.DownloadURL != nil {
 					rc, err = uri.Open(*asset.DownloadURL)
 					if err != nil {
-						return err
+						return false, err
 					}
 				}
 				if rc == nil {
-					return nil
+					return false, nil
 				}
 				_, err = storage.Attachments.Save(attach.RelativePath(), rc, int64(*asset.Size))
 				rc.Close()
-				return err
+				return err == nil, err
 			}()
 			if err != nil {
 				return err
+			}
+			if !saved {
+				// Nothing to read the asset from: a dump made without the
+				// release_assets unit lists the assets of a release, not
+				// their files, and the GitHub and GitLab downloaders give
+				// them no URL the dump could keep. A row for it would name
+				// a file never written: its download fails, and step 6 of
+				// `forgejo cluster recover --from-observer` refuses every
+				// checkpoint holding it. The release is restored without it.
+				log.Warn("Release asset %q of release %q has no content to restore, skipped in %s/%s", asset.Name, release.TagName, g.repoOwner, g.repoName)
+				continue
 			}
 
 			rel.Attachments = append(rel.Attachments, &attach)
