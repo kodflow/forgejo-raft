@@ -382,7 +382,10 @@ func operatorOrLocal(s string) consensus.Operator {
 }
 
 // Operate runs one online operation on behalf of op. It can be submitted on
-// any node: the engine forwards it to the leader (D17, Q8). The request and
+// any node: the engine forwards it to the leader (D17, Q8). A Remove or a
+// DenyPin first waits for this node to apply a commit boundary a quorum
+// confirmed, and is refused MEMBERSHIP_INVALID when the node does not list
+// its target then: the key it revokes is read here (#337). The request and
 // its outcome are written to the replicated audit and logged at Warn; an
 // audit that cannot be written does not block the operation, so clearing a
 // no-space alarm stays possible while ordinary entries are refused.
@@ -505,6 +508,20 @@ func (r *Replicator) operate(ctx context.Context, eng consensus.Engine, op conse
 	case ActionPromote:
 		return eng.Promote(ctx, op, id)
 	case ActionRemove, ActionDenyPin:
+		// The membership this node reads is the configuration it last
+		// appended. On a node behind the log (after a restart or a snapshot
+		// install, the operator's confirmation routed there by a load
+		// balancer), it may not list a member added since, which the
+		// operator saw on another node's page: the engine forwarded the
+		// change to the leader, which made it, while no key was read here
+		// to ask the revocation of, and the removed key joined again
+		// (#337). Once this node applied a commit boundary a quorum
+		// confirmed, it lists every member whose addition committed before
+		// the request, as authorizeJoin reads the table then (#70); a
+		// target it still does not list is refused (revokeMember).
+		if err := r.appliedToBoundary(ctx); err != nil {
+			return fmt.Errorf("the membership cannot be confirmed on this node, nothing is changed: %w", err)
+		}
 		change := eng.DenyPin
 		if o.Action == ActionRemove {
 			if err := r.removable(eng, id); err != nil {
@@ -718,8 +735,24 @@ var ErrRevocationPending = errors.New("the key is not revoked yet: some members 
 // numbered it by: a change the engine refuses for certain withdraws it,
 // and only it (settleRefusedRevocation). Below, an open request is reused
 // and request is 0: it stays, as before (#171).
+//
+// An id the membership does not list is refused MEMBERSHIP_INVALID, and
+// the caller makes no change: no key is read to ask the revocation of, and
+// the engine would forward the change to a leader that may list the
+// member, remove it or deny its pin, and leave its key usable (#337). The
+// operator's Remove and DenyPin read the membership once the node applied
+// a confirmed commit boundary; the autopilot reads its own, the leader's.
+// A member without a pin, its pin denied already, holds no key: nothing is
+// asked, and the change is made.
 func (r *Replicator) revokeMember(ctx context.Context, eng consensus.Engine, op consensus.Operator, id consensus.NodeID) (k reftable.RevokeKey, asked bool, request uint64, err error) {
-	for _, m := range eng.Membership().Members {
+	ms := eng.Membership()
+	if Rank(ms, id) == 0 {
+		if slices.Contains(ms.Retired, id) {
+			return k, false, 0, fmt.Errorf("%w: %s is retired, removed already: nothing is changed", consensus.ErrMembershipInvalid, id)
+		}
+		return k, false, 0, fmt.Errorf("%w: %s is not a member on this node, so its key cannot be read to revoke it: nothing is changed", consensus.ErrMembershipInvalid, id)
+	}
+	for _, m := range ms.Members {
 		if m.ID != id || m.SPKI == ([32]byte{}) {
 			continue
 		}

@@ -148,7 +148,7 @@ func restoreReposCut(t *testing.T, order func([]string)) {
 			refused = append(refused, fmt.Sprintf("k=%d: %s / again: %s", k, short(err), short(again)))
 			continue
 		}
-		assert.True(t, a.store.git.restoredRefs(ctx, target, rm.Refs), "k=%d: the checkpoint's refs", k)
+		assert.True(t, a.store.git.restoredRefs(ctx, target, rm), "k=%d: the checkpoint's refs", k)
 		assert.NoFileExists(t, filepath.Join(target, IncompleteMark), "k=%d", k)
 		if _, err := a.store.git.run(ctx, target, nil, "fsck", "--full", "--no-dangling"); err != nil {
 			corrupt = append(corrupt, fmt.Sprintf("k=%d: %s", k, short(err)))
@@ -215,7 +215,7 @@ func TestRestoreReposSyncsTheTargetBeforeItsMarkGoes(t *testing.T) {
 	i := slices.Index(events, "remove the mark")
 	require.Positive(t, i, "the mark is removed on its own, after a sync of the target: %v", events)
 	assert.Equal(t, "sync: "+IncompleteMark, events[i-1], "the target is synced holding the mark alone before the mark goes")
-	assert.True(t, a.store.git.restoredRefs(ctx, target, rm.Refs))
+	assert.True(t, a.store.git.restoredRefs(ctx, target, rm))
 	assert.NoFileExists(t, mark)
 }
 
