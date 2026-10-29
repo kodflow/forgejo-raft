@@ -424,11 +424,19 @@ type Report struct {
 	// (a crash, a write that failed): it resumes with the same list.
 	BootstrapPending bool
 	HardTerm         uint64
-	LastIndex        uint64
-	// LastTerm is the term of the entry at LastIndex, or of the newest
-	// snapshot when it holds LastIndex: with it, the key a Recover's
-	// survivor is chosen by, (LastTerm, LastIndex) in that order, never
-	// HardTerm, the term of the last vote.
+	// LastIndex is the last index the directory holds as the node's start
+	// and a Recover keep it: the log's last index, or the index of the
+	// snapshot an install a crash interrupted published, past the log's end
+	// or inside the log under another term, which they move the log onto,
+	// the log's entries past it then dropped (kitsunium/sdk#746). It is
+	// not the log's own extent, which Detail gives, nor the log's last
+	// index after a Recover, which may still drop a suffix that does not
+	// verify.
+	LastIndex uint64
+	// LastTerm is the term at LastIndex, of the log's entry there or of
+	// that snapshot: with it, the key a Recover's survivor is chosen by,
+	// (LastTerm, LastIndex) in that order, never HardTerm, the term of the
+	// last vote.
 	LastTerm    uint64
 	Snapshot    *SnapshotMeta
 	Quarantined bool
@@ -541,7 +549,9 @@ var (
 	// asked again. From opening a data directory, offline or at the node's
 	// start, it says the directory holds what a newer build wrote, such as
 	// a snapshot metadata of a version this one does not know: nothing in
-	// it was removed (kitsunium/sdk#665).
+	// it was removed (kitsunium/sdk#665). Inspect says it too of the
+	// snapshot an install a crash interrupted published, when it is of a
+	// version this build does not read (kitsunium/sdk#746).
 	ErrVersionUnsupported = errors.New("VERSION_UNSUPPORTED")
 )
 

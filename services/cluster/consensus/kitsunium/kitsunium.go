@@ -40,10 +40,53 @@ var RuntimeDir string
 // start as cluster inspect, recover and restore.
 func openDataDir(dir string) (sdk.DataDir, error) {
 	d, err := sdk.NewDataDirWith(dir, sdk.DataDirOptions{RuntimeDir: RuntimeDir})
+	return d, newerRelease(dir, err)
+}
+
+// newerRelease names the directory dir and the remedy in a
+// VERSION_UNSUPPORTED of what reads it, which says neither.
+func newerRelease(dir string, err error) error {
 	if errors.Is(err, sdk.VersionUnsupported) {
-		return d, fmt.Errorf("the data directory %s holds what a newer release wrote, which this one does not read: run that release, or a later one, on it: %w", dir, err)
+		return fmt.Errorf("the data directory %s holds what a newer release wrote, which this one does not read: run that release, or a later one, on it: %w", dir, err)
 	}
-	return d, err
+	return err
+}
+
+// inspect is sdk.Inspect of d, the directory dir. For an install a crash
+// interrupted once its snapshot was published, Inspect reads and checks
+// that snapshot, the one the start and Recover move the log onto, and
+// refuses VERSION_UNSUPPORTED one of a version this build does not read, as
+// they do (kitsunium/sdk#746): what a newer release wrote, said here as
+// openDataDir says it. With no install interrupted it reads no snapshot:
+// the node's start inspects its directory several times before it opens it
+// (the witness check, the autonomous mode, Open), and pays for these reads
+// only at the first start after such a crash, which finishes the install.
+func inspect(d sdk.DataDir, dir string) (sdk.ReportValue, error) {
+	r, err := sdk.Inspect(d)
+	return r, newerRelease(dir, err)
+}
+
+// logDetail says what the log of d holds and, when it is not that, what
+// the start and Recover keep of it, which r.Last and r.LastTerm report
+// (kitsunium/sdk#746): the snapshot an install a crash interrupted
+// published, past the log's end or inside the log under another term,
+// which they move the log onto. A log the engine refuses reads as empty,
+// and Inspect reports it 0..0.
+func logDetail(d sdk.DataDir, r *sdk.ReportValue) []string {
+	if r.First == 0 {
+		return []string{fmt.Sprintf("log %d..%d, last term %d", r.First, r.Last, r.LastTerm)}
+	}
+	l := d.Log()
+	_, last := l.Bounds()
+	term, err := l.Term(last)
+	if err != nil {
+		term = 0
+	}
+	lines := []string{fmt.Sprintf("log %d..%d, last term %d", r.First, last, term)}
+	if last != r.Last || term != r.LastTerm {
+		lines = append(lines, fmt.Sprintf("interrupted install: the start and Recover move the log onto the snapshot at %d, term %d", r.Last, r.LastTerm))
+	}
+	return lines
 }
 
 type driver struct{}
@@ -59,7 +102,7 @@ func (driver) Open(ctx context.Context, cfg consensus.Config) (consensus.Engine,
 	if err != nil {
 		return nil, mapErr(err)
 	}
-	rep, err := sdk.Inspect(d)
+	rep, err := inspect(d, cfg.DataDir)
 	if err != nil {
 		_ = d.Close()
 		return nil, mapErr(err)
@@ -202,7 +245,7 @@ func (driver) Init(dir string, cluster consensus.ClusterID, slot string) (consen
 // with the identical member list.
 func (driver) Bootstrap(ctx context.Context, cfg consensus.Config, members []consensus.Member) error {
 	_, err := withDir(cfg.DataDir, func(d sdk.DataDir) (struct{}, error) {
-		rep, err := sdk.Inspect(d)
+		rep, err := inspect(d, cfg.DataDir)
 		if err != nil {
 			return struct{}{}, err
 		}
@@ -223,7 +266,7 @@ func (driver) Bootstrap(ctx context.Context, cfg consensus.Config, members []con
 
 func (driver) Inspect(dir string) (consensus.Report, error) {
 	return withDir(dir, func(d sdk.DataDir) (consensus.Report, error) {
-		r, err := sdk.Inspect(d)
+		r, err := inspect(d, dir)
 		if err != nil {
 			return consensus.Report{}, err
 		}
@@ -234,8 +277,8 @@ func (driver) Inspect(dir string) (consensus.Report, error) {
 			HardTerm: r.HardState.Term, LastIndex: r.Last, LastTerm: r.LastTerm,
 			Quarantined: r.Quarantine != "", Markers: r.Markers,
 		}
-		out.Detail = append(out.Detail, fmt.Sprintf("stamp state %d, epoch %d", r.Stamp.State, r.Stamp.Log.Epoch),
-			fmt.Sprintf("log %d..%d, last term %d", r.First, r.Last, r.LastTerm))
+		out.Detail = append(out.Detail, fmt.Sprintf("stamp state %d, epoch %d", r.Stamp.State, r.Stamp.Log.Epoch))
+		out.Detail = append(out.Detail, logDetail(d, &r)...)
 		if r.Quarantine != "" {
 			out.Detail = append(out.Detail, "quarantine: "+r.Quarantine)
 		}
