@@ -644,6 +644,18 @@ These commands run with the server stopped, on the data directory.
   quarantine.
 - `forgejo cluster quarantine clear --exit wipe-and-rejoin` or
   `--exit truncate-and-stay-silent` leaves a quarantine after a corrupt log.
+  The engine refuses `truncate-and-stay-silent` with `RECOVER_REFUSED`
+  before it changes the log, the directory still quarantined, when the cut
+  would leave the node no configuration (kitsunium/sdk#723), or one none of
+  whose other members the newest configuration still readable in the log
+  lists (kitsunium/sdk#758): either way the node would restart silent for
+  good. The way out is `wipe-and-rejoin`, which both errors name, then, as
+  for a lost data directory (see
+  [Adding or replacing a node](#adding-or-replacing-a-node)), "Remove" the
+  node's old id on the cluster, after promoting one more voter when the
+  floor of three voters refuses the removal; the second error names these
+  steps too. The second refusal is at best: when the damage took the newer
+  configuration entries, nothing is known and the cut is made.
 - `forgejo cluster recover --new-cluster <id> --members ... --fenced id:method:receipt`
   forces a new configuration after the majority is lost. Every old voter but
   this node must be fenced, and every fence carries a receipt signed by each
