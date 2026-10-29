@@ -138,8 +138,14 @@ func newClusterHookEnv(t *testing.T) *clusterHookEnv {
 	defer test.MockVariableValue(&setting.ScriptType, "bash")()
 	require.NoError(t, git.InitDelegateHooks(e.home))
 
+	// git's automatic maintenance is off, as on a cluster node
+	// (modules/git/git.go, syncGitConfig): a commit or a push otherwise
+	// starts "git maintenance run --auto --detach", which goes on in the
+	// test's directory after git returned, under t.TempDir's cleanup
+	// (#347).
 	gcfg := filepath.Join(base, "gitconfig")
-	require.NoError(t, os.WriteFile(gcfg, []byte("[user]\n\tname = t\n\temail = t@t\n[commit]\n\tgpgSign = false\n[init]\n\tdefaultBranch = main\n"), 0o644))
+	require.NoError(t, os.WriteFile(gcfg, []byte("[user]\n\tname = t\n\temail = t@t\n[commit]\n\tgpgSign = false\n[init]\n\tdefaultBranch = main\n"+
+		"[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n\tautoDetach = false\n[receive]\n\tautogc = false\n"), 0o644))
 	// The hook's temporary directory is the test's own: t.TempDir() is
 	// under the system's.
 	require.NoError(t, os.MkdirAll(filepath.Join(base, "tmp"), 0o755))
@@ -176,6 +182,26 @@ func (e *clusterHookEnv) push(into, ref string) (string, error) {
 func (e *clusterHookEnv) refExists(dir, ref string) bool {
 	_, err := e.run(dir, "rev-parse", "--verify", "-q", ref)
 	return err == nil
+}
+
+// The bench's git, as its pushes and commits run it, starts no maintenance
+// of its own after a commit, as a cluster node's does not (#347). Before,
+// each one started one, detached, which went on in the test's directory
+// after git returned.
+func TestClusterHookBenchsGitStartsNoMaintenance(t *testing.T) {
+	e := newClusterHookEnv(t)
+	for _, kv := range [][2]string{{"gc.auto", "0"}, {"maintenance.auto", "false"}, {"maintenance.autoDetach", "false"}, {"receive.autogc", "false"}} {
+		out, err := e.run(e.bare, "config", "--get", kv[0])
+		require.NoError(t, err, "the bench's git reads %s: %s", kv[0], out)
+		assert.Equal(t, kv[1], strings.TrimSpace(out), kv[0])
+	}
+	trace := filepath.Join(t.TempDir(), "trace")
+	e.env = append(e.env, "GIT_TRACE="+trace)
+	e.git(t, e.work, "commit", "-q", "--allow-empty", "-m", "two")
+	out, err := os.ReadFile(trace)
+	require.NoError(t, err)
+	require.Contains(t, string(out), "commit", "the commit is traced")
+	assert.NotContains(t, string(out), "maintenance", "the commit starts no maintenance")
 }
 
 // The wrapper fails closed in "prepared" when the cluster's hook is missing,
