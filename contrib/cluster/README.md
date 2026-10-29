@@ -156,6 +156,19 @@ with its error on the administration page and warned under
 of its bound (64 MiB), `cluster:event_queue` warns and the administration
 says so, before pushes are refused.
 
+The work of an event whose repository was renamed since (by its own
+rename, its owner's or a transfer) waits until the leader projects the name
+those renames led it to, at the last of them: until then, the leader's
+directory under that name may still hold the repository that left it. The
+renames are followed in the table's lineage. That wait counts as one for
+the projection: the event is parked after 10 minutes, never after 5 failed
+attempts, and a parked event's retry waits the same way. The work also
+refuses to read a directory that holds another repository than the one the
+database names, and the consumer refuses to fetch commits into it. The
+work fails, to be retried, when a rename or a deletion of the name was not
+projected while it read. A tag the table holds live is never taken for
+gone on the word of a git not projected up to the table.
+
 A parked event of another lineage than the table's (one a Recover, a
 restore or a recovery from an observer ended) is also followed to its
 repository through SQL's redirects: the table may not hold the renames it
@@ -361,13 +374,25 @@ node trusts every member presenting such a certificate (set `PEER_PINS` to
 trust given keys only). Keep the CA offline or in Vault, and sign one
 certificate per expected slot.
 
-**Revoking a node.** An operator's Remove or Deny pin of a member first
-revokes its key: the revocation is a replicated entry, so every member
-refuses that key at the JOIN, under any id and whatever grant the slot has,
-and the object channel no longer admits it. The node comes back only with a
-new key, which the CA signs. The autopilot's removal of a dead member marks
-its key the same way, from payload version 7: a key serves one node id for
-the life of the cluster, and a node that was only out of reach returns by
+**Revoking a node.** An operator's Remove or Deny pin of a member revokes
+its key. The request comes first, a replicated entry committed before the
+change: from then on every member refuses that key at the JOIN, under any
+id and whatever grant the slot has. The revocation is written once the
+change is made, and the object channel then no longer admits the key. The
+node comes back only with a new key, which the CA signs. The node that
+serves the Remove or the Deny pin reads the member's key in its own view of
+the membership, once it has applied the log as far as a majority confirms:
+a node behind (restarted, catching up from a snapshot, or reached through a
+load balancer right after the member joined) catches up first. A node that
+still does not list the member then refuses the change with
+`MEMBERSHIP_INVALID` ("not a member on this node") and changes nothing,
+rather than have the leader remove a member whose key it could not revoke.
+A node that cannot confirm the log within a few seconds (no leader, no
+answering majority) refuses the change too, and changes nothing. Submit it
+again once that node has caught up, or on another node. A Remove of an id
+already removed is refused `MEMBERSHIP_INVALID` as well. The autopilot's
+removal of a dead member marks its key the same way, from payload version
+7: a key serves one node id for the life of the cluster, and a node that was only out of reach returns by
 itself under a new key (see [A node that comes back](#a-node-that-comes-back)).
 Below version 7 the autopilot asks for nothing, since a member's binary
 could not withdraw a request the engine refuses: a node that rejoins after
@@ -516,7 +541,16 @@ which its leader logs), replace it by hand, addition first:
 3. In the administration, "Add a learner" with that line: the engine adds
    it under the slot the old id still holds.
 4. "Promote" it once it caught up: four voters.
-5. "Remove" the old id: three voters again, and its key is revoked.
+5. "Remove" the old id: three voters again. Its key is refused at the JOIN
+   from the moment the Remove commits its request, and revoked once the
+   old id has left; while the cluster writes a payload version below 3 (a
+   member on an older binary), the administration says the key is not
+   revoked yet, and the revocation is written once every member runs this
+   version. A node that does not list the old id once it has applied the
+   log as far as a majority confirms refuses the Remove with
+   `MEMBERSHIP_INVALID` and changes nothing: submit it again on a node that
+   has caught up (see "Revoking a node" under
+   [The autonomous mode](#the-autonomous-mode)).
 
 In the autonomous mode the autopilot does steps 4 and 5 once the learner
 is added. The cluster never lists fewer than three voters.
@@ -595,8 +629,12 @@ permission: the account's link when the permission is granted, or
 link from the account settings changes nothing. Without an active source or a
 pinned identity, the operation is refused. Only the break-glass accounts in
 `STEP_UP_PASSWORD_OPERATORS` keep password and TOTP. An operation may be
-submitted on any node, which forwards it to the leader. No API route leads to
-it.
+submitted on any node, which forwards it to the leader. A Remove or a Deny
+pin is refused with `MEMBERSHIP_INVALID` by a node that does not list its
+target once it has applied the log as far as a majority confirms, with
+nothing changed: that node reads the key the change revokes (see "Revoking
+a node" under [The autonomous mode](#the-autonomous-mode)). No API route
+leads to the operations.
 
 ## Recovery
 
