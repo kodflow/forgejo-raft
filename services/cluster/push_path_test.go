@@ -4,8 +4,10 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -314,20 +316,70 @@ func TestObjectChannelAcceptsWhatForgejoAccepts(t *testing.T) {
 	require.NoError(t, err)
 	tree := gitStdin(t, work, "0100644 f\x00"+string(raw), "hash-object", "-t", "tree", "--literally", "-w", "--stdin")
 	c := run(t, work, "commit-tree", tree, "-m", "zero-padded")
-	pack := gitStdin(t, work, c+"\n", "pack-objects", "--revs", "--stdout", "-q")
+	// Byte for byte: the pack's last byte is its checksum's (#345).
+	pack := gitStdinRaw(t, work, c+"\n", "pack-objects", "--revs", "--stdout", "-q")
 
 	dst := filepath.Join(t.TempDir(), "dst.git")
 	run(t, filepath.Dir(dst), "init", "-q", "--bare", dst)
-	require.NoError(t, receivePack(context.Background(), dst, strings.NewReader(pack)))
+	require.NoError(t, receivePack(context.Background(), dst, bytes.NewReader(pack)))
 	missing, err := missingObjects(context.Background(), dst, []string{c, tree, blob})
 	require.NoError(t, err)
 	assert.Empty(t, missing)
 	// Corruption is still refused.
-	require.Error(t, receivePack(context.Background(), dst, strings.NewReader(pack[:len(pack)/2])))
+	require.Error(t, receivePack(context.Background(), dst, bytes.NewReader(pack[:len(pack)/2])))
 }
 
-// gitStdin runs git with stdin and returns its raw output.
+// A pack ends with its SHA-1, whose last byte is a newline once in 256. The
+// commit's date is the one input of TestObjectChannelAcceptsWhatForgejoAccepts
+// that changes from run to run: under a date whose pack ends so, the test
+// read the pack as text, cut that byte, and index-pack refused a pack one
+// byte short, "fatal: early EOF" (#345). The test runs here under such a
+// date, found from a fixed second on.
+func TestObjectChannelAcceptsAPackEndingWithANewline(t *testing.T) {
+	at := newlinePackDate(t, 1793000238)
+	date := fmt.Sprintf("%d +0000", at)
+	t.Setenv("GIT_AUTHOR_DATE", date)
+	t.Setenv("GIT_COMMITTER_DATE", date)
+	require.True(t, t.Run("TestObjectChannelAcceptsWhatForgejoAccepts", TestObjectChannelAcceptsWhatForgejoAccepts),
+		"the pack of the commit dated %d ends with a newline", at)
+}
+
+// newlinePackDate is the first second from from on at which the pack of
+// TestObjectChannelAcceptsWhatForgejoAccepts ends with a newline: the same
+// objects, the commit dated at that second. The pack of a given commit is
+// the same on every run, and one date in 256 ends it so: 4096 dates leave
+// a git without one by a chance of about one in nine million.
+func newlinePackDate(t *testing.T, from int64) int64 {
+	t.Helper()
+	work := t.TempDir()
+	run(t, work, "init", "-q")
+	blob := gitStdin(t, work, "hello\n", "hash-object", "-w", "--stdin")
+	raw, err := hex.DecodeString(blob)
+	require.NoError(t, err)
+	tree := gitStdin(t, work, "0100644 f\x00"+string(raw), "hash-object", "-t", "tree", "--literally", "-w", "--stdin")
+	for at := from; at < from+4096; at++ {
+		date := fmt.Sprintf("%d +0000", at)
+		t.Setenv("GIT_AUTHOR_DATE", date)
+		t.Setenv("GIT_COMMITTER_DATE", date)
+		c := run(t, work, "commit-tree", tree, "-m", "zero-padded")
+		if pack := gitStdinRaw(t, work, c+"\n", "pack-objects", "--revs", "--stdout", "-q"); pack[len(pack)-1] == '\n' {
+			return at
+		}
+	}
+	require.FailNow(t, "no date whose pack ends with a newline", "4096 seconds from %d", from)
+	return 0
+}
+
+// gitStdin runs git with stdin and returns its output as text, without the
+// newline that ends it: an object id, a line.
 func gitStdin(t *testing.T, dir, stdin string, args ...string) string {
+	t.Helper()
+	return strings.TrimSuffix(string(gitStdinRaw(t, dir, stdin, args...)), "\n")
+}
+
+// gitStdinRaw runs git with stdin and returns its output byte for byte, as a
+// pack must be read: its last byte is its checksum's, a newline once in 256.
+func gitStdinRaw(t *testing.T, dir, stdin string, args ...string) []byte {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-c", "core.hooksPath=/dev/null", "-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
 	cmd.Dir = dir
@@ -335,7 +387,7 @@ func gitStdin(t *testing.T, dir, stdin string, args ...string) string {
 	cmd.Env = append(os.Environ(), "HOME="+setting.Git.HomePath)
 	out, err := cmd.Output()
 	require.NoError(t, err, "git %v", args)
-	return strings.TrimSuffix(string(out), "\n")
+	return out
 }
 
 // A member that stalls in the middle of a pack is cut once no byte arrived
