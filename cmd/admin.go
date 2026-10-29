@@ -6,6 +6,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"forgejo.org/models/db"
@@ -14,6 +15,7 @@ import (
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/log"
 	repo_module "forgejo.org/modules/repository"
+	"forgejo.org/modules/setting"
 
 	"github.com/urfave/cli/v3"
 )
@@ -35,8 +37,10 @@ func cmdAdmin() *cli.Command {
 
 func subcmdRepoSyncReleases() *cli.Command {
 	return &cli.Command{
-		Name:   "repo-sync-releases",
-		Usage:  "Synchronize repository releases with tags",
+		Name:  "repo-sync-releases",
+		Usage: "Synchronize repository releases with tags",
+		Description: "Refused on a node of a cluster, whose git may be behind the cluster's last writes: " +
+			`use Site administration > Dashboard > "Sync tags from Git data to database" on a running node there.`,
 		Before: noDanglingArgs,
 		Action: runRepoSyncReleases,
 	}
@@ -106,7 +110,22 @@ func idFlag() *cli.Int64Flag {
 	}
 }
 
+// errRepoSyncReleasesInCluster refuses `forgejo admin repo-sync-releases` on
+// a node of a cluster. The command rewrites every repository's releases
+// from this node's git, in a process without the replicator, so without the
+// wait for freshness the site administration's synchronisation has (#191):
+// from a git behind the cluster, a release of a tag another node wrote
+// turns into a draft and a moved tag's release goes back to its old commit,
+// in the database every node shares, and nothing writes them again (#341).
+var errRepoSyncReleasesInCluster = errors.New(`repo-sync-releases does not run on a node of a cluster: it would rewrite every repository's releases from this node's git, which may be behind the cluster's last writes; nothing was written.
+Use Site administration > Dashboard > "Sync tags from Git data to database" on a running node instead: it synchronises each repository once that node serves it at the cluster's last writes, and skips with a warning those it is behind on.
+"forgejo cluster reconcile" reports the release rows that disagree with the cluster's tags, and "forgejo cluster reconcile --apply" writes again from its tag a release at another commit`)
+
 func runRepoSyncReleases(ctx context.Context, c *cli.Command) error {
+	if setting.Cluster.Enabled {
+		return errRepoSyncReleasesInCluster
+	}
+
 	ctx, cancel := installSignals(ctx)
 	defer cancel()
 
@@ -118,6 +137,12 @@ func runRepoSyncReleases(ctx context.Context, c *cli.Command) error {
 		return err
 	}
 
+	return syncAllReposReleases(ctx)
+}
+
+// syncAllReposReleases synchronises the releases of every repository with
+// the tags of its git on this host.
+func syncAllReposReleases(ctx context.Context) error {
 	log.Trace("Synchronizing repository releases (this may take a while)")
 	for page := 1; ; page++ {
 		repos, count, err := repo_model.SearchRepositoryByName(ctx, &repo_model.SearchRepoOptions{
