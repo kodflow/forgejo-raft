@@ -633,8 +633,14 @@ submitted on any node, which forwards it to the leader. A Remove or a Deny
 pin is refused with `MEMBERSHIP_INVALID` by a node that does not list its
 target once it has applied the log as far as a majority confirms, with
 nothing changed: that node reads the key the change revokes (see "Revoking
-a node" under [The autonomous mode](#the-autonomous-mode)). No API route
-leads to the operations.
+a node" under [The autonomous mode](#the-autonomous-mode)). An "Update the
+address" of a voter that answers is refused with `MEMBERSHIP_INVALID` while
+a voter that does not answer, or lags behind the membership, may know that
+voter only at its current address and be left with no one to vouch for the
+leader once it is back (kitsunium/sdk#761). Submitted on the leader, the
+message names the voter to bring back first; on another node it lists the
+causes the leader may have. The leader's own move is never refused on this
+ground. No API route leads to the operations.
 
 ## Recovery
 
