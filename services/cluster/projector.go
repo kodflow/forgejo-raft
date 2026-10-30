@@ -653,9 +653,9 @@ func (p *projector) project(base, ctx context.Context, repo string) error {
 
 	// A symbolic ref the table holds is read even when dangling, which
 	// for-each-ref lists nowhere: written again at every pass, it was
-	// never certified (#348).
-	symbolic := symbolicNames(refs)
-	have, err := readGitRefs(ctx, dir, symbolic...)
+	// never certified (#348). So is one the table deleted: kept, it was
+	// never deleted, and certified (#359).
+	have, err := readTrackedRefs(ctx, dir, refs)
 	if err != nil {
 		return err
 	}
@@ -719,7 +719,7 @@ func (p *projector) project(base, ctx context.Context, repo string) error {
 	// repository stays dirty for the next pass.
 	var verr error
 	p.registry.certify(repo, func() {
-		now, err := readGitRefs(ctx, dir, symbolic...)
+		now, err := readTrackedRefs(ctx, dir, refs)
 		if err != nil {
 			verr = err
 			return
@@ -1017,7 +1017,7 @@ func (p *projector) Verify(ctx context.Context, repo string) (bool, error) {
 		p.markDirty(repo)
 		return false, nil
 	}
-	have, err := readGitRefs(ctx, dir, symbolicNames(refs)...)
+	have, err := readTrackedRefs(ctx, dir, refs)
 	if err != nil {
 		return false, err
 	}
