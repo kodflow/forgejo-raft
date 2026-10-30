@@ -438,6 +438,11 @@ func RenameBranch(ctx context.Context, repo *repo_model.Repository, doer *user_m
 			// Another node of the cluster created it meanwhile.
 			return "target_exist", nil
 		}
+		if symbolic, ok := errors.AsType[git.ErrSymbolicBranch](err); ok && symbolic.Name == to {
+			// The new name is an alias, which git does not show as a
+			// branch while it dangles: the name is taken (#356).
+			return "target_exist", nil
+		}
 		return "", err
 	}
 	refNameTo := git.RefNameFromBranch(to)

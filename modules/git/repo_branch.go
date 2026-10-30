@@ -173,23 +173,55 @@ func (repo *Repository) RenameBranch(from, to string) error {
 // of its own: git refuses HEAD and its referent in one. The new name is
 // created only if absent, which this node's git alone was asked: the hook
 // is told, and the cluster refuses a name another node holds (#189).
+//
+// A symbolic branch, as the old or the new name, is refused, and each line
+// of the transaction writes the ref it names, never the one a symbolic ref
+// names (#356).
 func (repo *Repository) renameBranchInOneTransaction(from, to string) error {
 	// A ref name holds no whitespace nor control character: none may reach
 	// update-ref's command stream either.
 	if strings.ContainsFunc(from+to, func(r rune) bool { return r <= ' ' || r == 0x7f }) {
 		return fmt.Errorf("invalid branch name %q or %q", from, to)
 	}
+	// An alias, refs/heads/master -> refs/heads/main, has no value of its
+	// own to move: its deletion deleted main, the default branch maybe,
+	// protected or not, on every node, and left HEAD and the alias
+	// dangling. git branch -m refuses it. As the new name, a dangling alias,
+	// which this node's git does not show as a branch, made update-ref
+	// create main, a name the rename never asked for. With --no-deref,
+	// git 2.51 replaces the alias, which the cluster refuses to create
+	// while it holds it, and git 2.56 refuses to write over it: it is
+	// refused here, whatever git does.
+	for _, name := range []string{from, to} {
+		target, _, symErr := NewCommand(repo.Ctx, "symbolic-ref", "-q", "--no-recurse", "--end-of-options").AddDynamicArguments(BranchPrefix + name).RunStdString(&RunOpts{Dir: repo.Path})
+		if symErr == nil {
+			return ErrSymbolicBranch{Name: name, Target: strings.TrimSpace(target)}
+		}
+		// Exit code 1: not a symbolic ref, or absent.
+		if !IsErrorExitCode(symErr, 1) {
+			return symErr
+		}
+	}
 	sha, _, err := NewCommand(repo.Ctx, "rev-parse", "--verify", "--end-of-options").AddDynamicArguments(BranchPrefix + from).RunStdString(&RunOpts{Dir: repo.Path})
 	if err != nil {
 		return err
 	}
 	sha = strings.TrimSpace(sha)
-	head, _, headErr := NewCommand(repo.Ctx, "symbolic-ref", "-q", "HEAD").RunStdString(&RunOpts{Dir: repo.Path})
+	// HEAD names the old branch by its first link, or at the end of its
+	// chain, HEAD -> an alias -> the old branch, which git branch -m reads
+	// and moves HEAD for.
+	first, _, firstErr := NewCommand(repo.Ctx, "symbolic-ref", "-q", "--no-recurse", "HEAD").RunStdString(&RunOpts{Dir: repo.Path})
+	end, _, endErr := NewCommand(repo.Ctx, "symbolic-ref", "-q", "HEAD").RunStdString(&RunOpts{Dir: repo.Path})
+	followsHEAD := firstErr == nil && strings.TrimSpace(first) == BranchPrefix+from ||
+		endErr == nil && strings.TrimSpace(end) == BranchPrefix+from
+	// --no-deref: update-ref follows a symbolic ref otherwise, and either
+	// name may have become one since it was checked; each line then writes
+	// or refuses the ref it names, never the branch an alias names.
 	stdin := fmt.Sprintf("create %s%s %s\ndelete %s%s %s\n", BranchPrefix, to, sha, BranchPrefix, from, sha)
-	if _, _, err := NewCommand(repo.Ctx, "update-ref", "--stdin").RunStdString(&RunOpts{Dir: repo.Path, Stdin: strings.NewReader(stdin), Env: clusterhook.CreateOnlyEnv()}); err != nil {
+	if _, _, err := NewCommand(repo.Ctx, "update-ref", "--no-deref", "--stdin").RunStdString(&RunOpts{Dir: repo.Path, Stdin: strings.NewReader(stdin), Env: clusterhook.CreateOnlyEnv()}); err != nil {
 		return err
 	}
-	if headErr == nil && strings.TrimSpace(head) == BranchPrefix+from {
+	if followsHEAD {
 		_, _, err = NewCommand(repo.Ctx, "symbolic-ref", "HEAD").AddDynamicArguments(BranchPrefix + to).RunStdString(&RunOpts{Dir: repo.Path})
 	}
 	return err

@@ -1407,5 +1407,6 @@
 	"admin.dashboard.raft_release_pending": "The forgejo-raft build of Forgejo %[1]s is not available yet, you are running %[3]s. It is published once its tests pass: watch <a target=\"_blank\" rel=\"noreferrer\" href=\"%[2]s\">the forgejo-raft releases</a>.",
 	"admin.dashboard.raft_checker_error": "forgejo-raft failed while checking for its own releases. Check <a target=\"_blank\" rel=\"noreferrer\" href=\"%[2]s\">the forgejo-raft releases</a> manually. Error was: %[1]s",
 	"repo.branch.deletion_behind": "Branch \"%s\" was not deleted: this server has not caught up yet with the latest changes to the repository. Try again in a moment.",
+	"repo.settings.rename_branch_failed_symbolic": "Cannot rename branch %s because it is an alias of another branch (a symbolic reference).",
 	"meta.last_line": "Thank you for translating Forgejo! This line isn't seen by the users but it serves other purposes in the translation management. You can place a fun fact in the translation instead of translating it."
 }
