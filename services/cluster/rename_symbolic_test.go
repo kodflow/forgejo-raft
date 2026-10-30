@@ -6,6 +6,7 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -166,9 +167,9 @@ func TestRenamingAnAliasBranchKeepsItsTarget(t *testing.T) {
 // --stdin followed the symbolic ref there too: it created main, a name the
 // rename never asked for, the default or a protected branch before, and
 // the cluster took that creation, for every node; "master" stayed the
-// alias. The update now names the alias itself, which the cluster holds:
-// the proposer refuses to create it, so the rename answers that the target
-// exists, nothing written (#356).
+// alias. A rename onto a symbolic branch is now refused before anything
+// reaches the hook, whatever git's version does with it, and the rename
+// answers that the target exists (#356).
 func TestRenamingOntoADanglingAliasNeverCreatesItsTarget(t *testing.T) {
 	b := newSymbolicBench(t)
 	c1 := b.commit("one")
@@ -199,6 +200,7 @@ func TestRenamingOntoADanglingAliasNeverCreatesItsTarget(t *testing.T) {
 	reqs := recorded()
 	refusals := b.propose(reqs)
 	t.Logf("proposer's refusals: %v", refusals)
+	certified, failure = b.project()
 
 	var named []string
 	for _, req := range reqs {
@@ -206,22 +208,21 @@ func TestRenamingOntoADanglingAliasNeverCreatesItsTarget(t *testing.T) {
 			named = append(named, l.Ref)
 		}
 	}
+	symbolic, ok := errors.AsType[git.ErrSymbolicBranch](err)
+	assert.True(t, ok && symbolic.Name == "master", "the rename onto the alias is refused, and says why: %v", err)
 	assert.NotContains(t, named, "refs/heads/main", "the rename's transaction never names the alias's target")
-	assert.Contains(t, named, "refs/heads/master", "the rename's transaction names the alias itself")
-	require.Len(t, refusals, 1, "the cluster refuses to create a name it holds")
-	assert.True(t, clusterhook.IsStaleCreate(refusals[0]), "refused as a name the cluster holds, which the rename answers as a target that exists: %v", refusals[0])
+	assert.Empty(t, named, "nothing of the rename reaches the cluster's hook")
 	main, ok := b.tbl.Get(symbolicRepo, "refs/heads/main")
 	assert.False(t, ok && main.Live(), "main was never created in the table")
 	assert.Empty(t, b.git("refs/heads/main"), "nor in git")
-	// The cluster's hook refuses the transaction the proposer refuses, so
-	// git writes nothing of it; this bench's hook only records:
-	// TestRenamingASymbolicBranchKeepsEveryMember runs the real one.
+	assert.Equal(t, "ref:refs/heads/main", b.git("refs/heads/master"), "the alias stays as the table holds it")
+	assert.Equal(t, c2, b.git("refs/heads/feature"), "feature stays as the table holds it")
+	assert.True(t, certified, failure)
 }
 
 // The same two renames through Forgejo's git on a node of a three-node
-// cluster, its hook the real one: the alias is refused before anything is
-// proposed, the rename onto the dangling alias is refused by the cluster,
-// and every member keeps main, the alias, and feature (#356).
+// cluster, its hook the real one: both are refused before anything is
+// proposed, and every member keeps main, feature and both aliases (#356).
 func TestRenamingASymbolicBranchKeepsEveryMember(t *testing.T) {
 	tc := newTestCluster(t, "node-a", "node-b", "node-c")
 	n := tc.nodes[0]
@@ -263,7 +264,7 @@ func TestRenamingASymbolicBranchKeepsEveryMember(t *testing.T) {
 	t.Logf("RenameBranch(master, legacy): %v", errAlias)
 	t.Logf("RenameBranch(feature, old): %v", errOnto)
 	assert.True(t, git.IsErrSymbolicBranch(errAlias), "the rename of the alias is refused: %v", errAlias)
-	assert.True(t, clusterhook.IsStaleCreate(errOnto), "the rename onto the dangling alias is refused by the cluster: %v", errOnto)
+	assert.True(t, git.IsErrSymbolicBranch(errOnto), "the rename onto the dangling alias is refused: %v", errOnto)
 
 	after, now := n.r.table.Refs(repo)
 	assert.Equal(t, before, after, "nothing was written to the repository in the table")

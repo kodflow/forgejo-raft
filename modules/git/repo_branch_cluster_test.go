@@ -4,6 +4,7 @@
 package git_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,7 +87,10 @@ func renameBench(t *testing.T, setup [][]string) (repo *git.Repository, dir stri
 // on every node, where git branch -m refuses to rename a symbolic ref; and
 // a rename onto a dangling alias created the branch it names, not the
 // alias (#356). A symbolic branch is now refused as git branch -m refuses
-// it, with an error that says so.
+// it, with an error that says so. Onto a dangling alias, what git branch
+// -m does depends on git's version (git 2.51 replaces the alias); in a
+// cluster the rename is refused, and neither creates the branch the alias
+// names.
 func TestRenameBranchInAClusterEndsAsGitBranchM(t *testing.T) {
 	alias := []string{"symbolic-ref", "refs/heads/alias", "refs/heads/master"}
 	headOnAlias := []string{"symbolic-ref", "HEAD", "refs/heads/alias"}
@@ -96,11 +100,13 @@ func TestRenameBranchInAClusterEndsAsGitBranchM(t *testing.T) {
 		setup    [][]string
 		from, to string
 		refused  bool
+		// clusterOnly: refused in a cluster, outside as git's version does.
+		clusterOnly bool
 	}{
 		{name: "a branch", from: "branch1", to: "trunk"},
 		{name: "the branch HEAD names", from: "master", to: "trunk"},
 		{name: "the branch HEAD names through an alias", setup: [][]string{alias, headOnAlias}, from: "master", to: "trunk"},
-		{name: "a branch onto a dangling alias", setup: [][]string{dangling}, from: "branch1", to: "dangling"},
+		{name: "a branch onto a dangling alias", setup: [][]string{dangling}, from: "branch1", to: "dangling", clusterOnly: true},
 		{name: "an alias", setup: [][]string{alias}, from: "alias", to: "legacy", refused: true},
 		{name: "the alias HEAD names", setup: [][]string{alias, headOnAlias}, from: "alias", to: "legacy", refused: true},
 		{name: "a dangling alias", setup: [][]string{dangling}, from: "dangling", to: "legacy", refused: true},
@@ -119,12 +125,17 @@ func TestRenameBranchInAClusterEndsAsGitBranchM(t *testing.T) {
 			t.Logf("refs outside a cluster: %v", refsOf(t, outsideDir))
 			t.Logf("refs in a cluster:      %v", refsOf(t, insideDir))
 
-			if tc.refused {
-				require.Error(t, errOutside, "git branch -m refuses to rename a symbolic ref")
-				assert.True(t, git.IsErrSymbolicBranch(errInside), "the rename of a symbolic branch is refused in a cluster too, and says why: %v", errInside)
+			if tc.refused || tc.clusterOnly {
+				symbolic, ok := errors.AsType[git.ErrSymbolicBranch](errInside)
+				assert.True(t, ok, "a rename from or onto a symbolic branch is refused in a cluster, and says why: %v", errInside)
+				assert.Contains(t, []string{tc.from, tc.to}, symbolic.Name)
 				assert.Empty(t, prepared(), "nothing reaches the cluster's hook")
 				assert.Equal(t, before, refsOf(t, insideDir), "nothing was renamed in a cluster")
-				assert.Equal(t, before, refsOf(t, outsideDir), "nothing was renamed outside a cluster")
+				assert.NotContains(t, refsOf(t, outsideDir), "refs/heads/gone", "git branch -m never creates the branch an alias names")
+				if tc.refused {
+					require.Error(t, errOutside, "git branch -m refuses to rename a symbolic ref")
+					assert.Equal(t, before, refsOf(t, outsideDir), "nothing was renamed outside a cluster")
+				}
 				return
 			}
 			require.NoError(t, errOutside)

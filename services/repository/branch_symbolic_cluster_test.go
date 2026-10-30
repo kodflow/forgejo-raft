@@ -94,3 +94,38 @@ func TestRenameASymbolicBranchChangesNothingInACluster(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, rule, "the protection of master is kept")
 }
+
+// repo1 holds the dangling alias refs/heads/legacy -> refs/heads/gone,
+// which git does not show as a branch. In a cluster, renaming branch2 onto
+// it created gone, a name the rename never asked for, while SQL renamed
+// branch2's row to legacy (#356). The rename now answers that the target
+// exists, as for any branch the name holds, and nothing changes.
+func TestRenameOntoADanglingAliasChangesNothingInACluster(t *testing.T) {
+	unittest.PrepareTestEnv(t)
+	defer test.MockVariableValue(&setting.Cluster.Enabled, true)()
+	ctx := db.DefaultContext
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	dir := repo.RepoPath()
+	branch2 := gitIn(t, dir, "", "rev-parse", "refs/heads/branch2")
+	gitIn(t, dir, "", "symbolic-ref", "refs/heads/legacy", "refs/heads/gone")
+	t.Cleanup(func() { gitIn(t, dir, "", "update-ref", "--no-deref", "-d", "refs/heads/legacy") })
+	gitRepo, err := gitrepo.OpenRepository(ctx, repo)
+	require.NoError(t, err)
+	defer gitRepo.Close()
+	require.False(t, gitRepo.IsBranchExist("legacy"), "Forgejo does not see a dangling alias as a branch")
+
+	msg, err := RenameBranch(ctx, repo, doer, gitRepo, "branch2", "legacy")
+	t.Logf("RenameBranch(branch2, legacy): %q, %v", msg, err)
+	t.Logf("git after: branch2=%q legacy=%q gone=%q", refOneLevel(dir, "refs/heads/branch2"), refOneLevel(dir, "refs/heads/legacy"), refOneLevel(dir, "refs/heads/gone"))
+
+	require.NoError(t, err)
+	assert.Equal(t, "target_exist", msg)
+	assert.Equal(t, branch2, refOneLevel(dir, "refs/heads/branch2"))
+	assert.Equal(t, "ref:refs/heads/gone", refOneLevel(dir, "refs/heads/legacy"))
+	assert.Empty(t, refOneLevel(dir, "refs/heads/gone"), "the branch the alias names is never created")
+	row := unittest.AssertExistsAndLoadBean(t, &git_model.Branch{RepoID: 1, Name: "branch2"})
+	assert.False(t, row.IsDeleted)
+	unittest.AssertNotExistsBean(t, &git_model.Branch{RepoID: 1, Name: "legacy"})
+	unittest.AssertNotExistsBean(t, &git_model.RenamedBranch{RepoID: 1, From: "branch2"})
+}
