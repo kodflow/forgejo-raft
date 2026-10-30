@@ -4,7 +4,6 @@
 package cluster
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -36,7 +35,11 @@ const (
 
 // runTestHook is what `forgejo hook reference-transaction` does, run by the
 // test binary: one phase of a git ref transaction handed to the replicator
-// over its socket, failing closed in "prepared".
+// over its socket, failing closed in "prepared". Its lines are read as the
+// production hook reads them (clusterhook.ParseLines), which refuses a
+// name that is not valid UTF-8: split on white space, such a name reached
+// the replicator changed by JSON, and the bench took a transaction the
+// production hook refuses (#365).
 func runTestHook(sock string) int {
 	if len(os.Args) < 2 || os.Args[1] == "preparing" {
 		return 0
@@ -57,12 +60,15 @@ func runTestHook(sock string) int {
 		return 0
 	}
 	req := &clusterhook.Request{Op: state, Nonce: os.Getenv(clusterhook.EnvTxn), GitDir: gitDir, PID: os.Getppid(), CreateOnly: clusterhook.CreateOnlyFromEnv()}
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		if f := strings.Fields(scanner.Text()); len(f) == 3 {
-			req.Lines = append(req.Lines, clusterhook.Line{Old: f[0], New: f[1], Ref: f[2]})
+	lines, err := clusterhook.ParseLines(os.Stdin)
+	if err != nil {
+		if state != clusterhook.OpPrepared {
+			return 0
 		}
+		fmt.Fprintln(os.Stderr, "cluster: the cluster cannot replicate this ref transaction, nothing was written:", err)
+		return 1
 	}
+	req.Lines = lines
 	if len(req.Lines) == 0 {
 		return 0
 	}

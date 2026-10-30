@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
@@ -205,4 +206,142 @@ func TestMirrorSyncInBatchesPrunesBeforeCreating(t *testing.T) {
 	assert.Empty(t, gitIn(t, mirror, "", "for-each-ref", "refs/heads/b/c"), "pruned")
 	results := parseRemoteUpdateOutput(out, "origin")
 	assert.Len(t, results, reftable.MaxUpdatesPerTxn+100+4, "every tag, a, b/c, a/b and b")
+}
+
+// localRefs lists the refs of the repository at dir.
+func localRefs(t *testing.T, dir string) []string {
+	t.Helper()
+	return strings.Fields(gitIn(t, dir, "", "for-each-ref", "--format=%(refname)"))
+}
+
+// A sync without prune whose upstream replaced a by a/b, and b/c by b, as
+// its main moved on: git rejects a/b and b, which conflict as a directory
+// and a file with the refs the mirror keeps, and writes main. From git
+// 2.51 the fetch is one transaction that tolerates a failure per ref, and
+// the cluster's hook reads the rejected refs too: the cluster refused the
+// whole transaction, and every later sync the same way (#365). The sync
+// leaves them, writes the rest, and fails naming them, as git does.
+func TestMirrorSyncLeavesTheRefsGitRejects(t *testing.T) {
+	t.Setenv("GIT_CONFIG_COUNT", "2")
+	t.Setenv("GIT_CONFIG_KEY_0", "gc.auto")
+	t.Setenv("GIT_CONFIG_VALUE_0", "0")
+	t.Setenv("GIT_CONFIG_KEY_1", "maintenance.auto")
+	t.Setenv("GIT_CONFIG_VALUE_1", "false")
+	defer clusterhook.SetEnabled(clusterhook.Enabled())
+	clusterhook.SetEnabled(true)
+
+	src := filepath.Join(t.TempDir(), "src.git")
+	gitIn(t, filepath.Dir(src), "", "init", "-q", src)
+	gitIn(t, src, "", "commit", "-q", "--allow-empty", "-m", "one")
+	gitIn(t, src, "", "branch", "a")
+	gitIn(t, src, "", "branch", "b/c")
+	root := t.TempDir()
+	mirror := filepath.Join(root, "mirror.git")
+	gitIn(t, root, "", "clone", "-q", "--mirror", src, mirror)
+	before := gitIn(t, mirror, "", "rev-parse", "refs/heads/main")
+
+	gitIn(t, src, "", "branch", "-D", "a", "b/c")
+	gitIn(t, src, "", "commit", "-q", "--allow-empty", "-m", "two")
+	gitIn(t, src, "", "branch", "a/b")
+	gitIn(t, src, "", "branch", "b")
+	head := gitIn(t, src, "", "rev-parse", "HEAD")
+
+	dry := func(prune bool) *git.Command {
+		cmd := git.NewCommand(t.Context(), "fetch", "--dry-run", "--porcelain")
+		if prune {
+			cmd.AddArguments("--prune")
+		}
+		return cmd.AddArguments("--tags").AddDynamicArguments("origin")
+	}
+
+	// With prune, the deletions free the names: the sync's own fetch runs.
+	out, batched, err := fetchInBatches(t.Context(), dry(true), mirror, time.Minute, nil, nil)
+	require.NoError(t, err)
+	assert.False(t, batched)
+	assert.Empty(t, out)
+
+	out, batched, err = fetchInBatches(t.Context(), dry(false), mirror, time.Minute, nil, nil)
+	require.True(t, batched)
+	var left errRefsNotUpdated
+	require.ErrorAs(t, err, &left)
+	var names []string
+	for _, r := range left {
+		names = append(names, r.ref)
+	}
+	assert.ElementsMatch(t, []string{"refs/heads/a/b", "refs/heads/b"}, names)
+	assert.Contains(t, err.Error(), "refs/heads/a/b (it conflicts with refs/heads/a, which the mirror keeps)")
+	assert.Contains(t, err.Error(), "refs/heads/b (it conflicts with refs/heads/b/c, which the mirror keeps)")
+
+	assert.Equal(t, head, gitIn(t, mirror, "", "rev-parse", "refs/heads/main"), "main moved on")
+	assert.ElementsMatch(t, []string{"refs/heads/a", "refs/heads/b/c", "refs/heads/main"}, localRefs(t, mirror))
+	assert.Equal(t, before, gitIn(t, mirror, "", "rev-parse", "refs/heads/a"), "a is kept")
+	results := parseRemoteUpdateOutput(out, "origin")
+	require.Len(t, results, 1, "main alone was written")
+	assert.Equal(t, "refs/heads/main", results[0].refName.String())
+
+	// The next sync has nothing else to write, and reports them again.
+	out, batched, err = fetchInBatches(t.Context(), dry(false), mirror, time.Minute, nil, nil)
+	require.True(t, batched)
+	require.ErrorAs(t, err, &left)
+	assert.Len(t, left, 2)
+	assert.Empty(t, out)
+
+	// Control: git alone writes main and rejects the same two.
+	plain := filepath.Join(t.TempDir(), "plain.git")
+	gitIn(t, filepath.Dir(plain), "", "clone", "-q", "--mirror", mirror, plain)
+	gitIn(t, plain, "", "remote", "set-url", "origin", src)
+	gitIn(t, plain, "", "update-ref", "refs/heads/main", before)
+	cmd := exec.Command("git", "-c", "core.hooksPath=/dev/null", "fetch", "--tags", "origin")
+	cmd.Dir = plain
+	cmd.Env = append(os.Environ(), "HOME="+setting.Git.HomePath)
+	ctl, cerr := cmd.CombinedOutput()
+	require.Error(t, cerr, "control: %s", ctl)
+	assert.Equal(t, head, gitIn(t, plain, "", "rev-parse", "refs/heads/main"), "control: git writes main")
+	assert.ElementsMatch(t, []string{"refs/heads/a", "refs/heads/b/c", "refs/heads/main"}, localRefs(t, plain), "control: git rejects the same refs")
+}
+
+// An upstream ref whose name git takes and the cluster cannot hold, not
+// valid UTF-8 or too long: the cluster's hook refuses the whole
+// transaction that holds one, and every sync was refused whole, the
+// upstream's other refs with it (#365). The sync leaves it out, writes
+// the rest, and fails naming it, quoted.
+func TestMirrorSyncLeavesTheNamesTheClusterCannotHold(t *testing.T) {
+	t.Setenv("GIT_CONFIG_COUNT", "2")
+	t.Setenv("GIT_CONFIG_KEY_0", "gc.auto")
+	t.Setenv("GIT_CONFIG_VALUE_0", "0")
+	t.Setenv("GIT_CONFIG_KEY_1", "maintenance.auto")
+	t.Setenv("GIT_CONFIG_VALUE_1", "false")
+	defer clusterhook.SetEnabled(clusterhook.Enabled())
+	clusterhook.SetEnabled(true)
+
+	src := filepath.Join(t.TempDir(), "src.git")
+	gitIn(t, filepath.Dir(src), "", "init", "-q", src)
+	gitIn(t, src, "", "commit", "-q", "--allow-empty", "-m", "one")
+	root := t.TempDir()
+	mirror := filepath.Join(root, "mirror.git")
+	gitIn(t, root, "", "clone", "-q", "--mirror", src, mirror)
+
+	gitIn(t, src, "", "commit", "-q", "--allow-empty", "-m", "two")
+	head := gitIn(t, src, "", "rev-parse", "HEAD")
+	notUTF8 := "refs/heads/caf\xe9"
+	long := "refs/heads/" + strings.TrimSuffix(strings.Repeat(strings.Repeat("x", 200)+"/", 6), "/")
+	require.Error(t, reftable.ValidRefName(long))
+	gitIn(t, src, "", "update-ref", notUTF8, head)
+	gitIn(t, src, "", "update-ref", long, head)
+
+	dry := git.NewCommand(t.Context(), "fetch", "--dry-run", "--porcelain", "--prune", "--tags").AddDynamicArguments("origin")
+	out, batched, err := fetchInBatches(t.Context(), dry, mirror, time.Minute, nil, nil)
+	require.True(t, batched)
+	var left errRefsNotUpdated
+	require.ErrorAs(t, err, &left)
+	require.Len(t, left, 2)
+	assert.ElementsMatch(t, []string{notUTF8, long}, []string{left[0].ref, left[1].ref})
+	assert.Contains(t, err.Error(), strconv.Quote(notUTF8)+" (ref name is not valid UTF-8, which the cluster cannot hold)")
+	assert.True(t, utf8.ValidString(err.Error()), "a notice holds the error")
+
+	assert.Equal(t, head, gitIn(t, mirror, "", "rev-parse", "refs/heads/main"), "main moved on")
+	assert.Equal(t, []string{"refs/heads/main"}, localRefs(t, mirror))
+	results := parseRemoteUpdateOutput(out, "origin")
+	require.Len(t, results, 1, "main alone was written")
+	assert.Equal(t, "refs/heads/main", results[0].refName.String())
 }

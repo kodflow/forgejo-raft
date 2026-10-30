@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/modules/clusterhook"
@@ -470,15 +471,28 @@ func syncInBatches(ctx context.Context, m *repo_model.Mirror, credURL, dir strin
 }
 
 // fetchInBatches runs, in a cluster, the fetch of a mirror's sync when it
-// would update more refs than the cluster takes in one transaction. git
-// 2.54 and later write a whole fetch in one transaction, which the cluster
-// refuses past reftable.MaxUpdatesPerTxn: the sync failed, and every later
-// one fetched the same refs and failed the same way (#134). dry is the
-// sync's fetch with --dry-run --porcelain, which brings the objects and
-// lists the updates without writing a ref. Past the bound, the updates are
-// written by batches of syncRefBatch, each checked against the old value
-// the fetch read, and the output is the fetch's own, so the sync reports
-// the same results; batched is false when the sync's fetch can run as is.
+// would update more refs than the cluster takes in one transaction, or a
+// ref git rejects or the cluster cannot hold. git 2.54 and later write a
+// whole fetch in one transaction, which the cluster refuses past
+// reftable.MaxUpdatesPerTxn: the sync failed, and every later one fetched
+// the same refs and failed the same way (#134). dry is the sync's fetch
+// with --dry-run --porcelain, which brings the objects and lists the
+// updates without writing a ref. Past the bound, the updates are written
+// by batches of syncRefBatch, each checked against the old value the fetch
+// read, and the output is the fetch's own, so the sync reports the same
+// results; batched is false when the sync's fetch can run as is.
+//
+// That transaction tolerates a failure per ref (measured with git 2.51):
+// git rejects a ref that conflicts as a directory and a file with a ref
+// the mirror keeps (a, without prune, against its upstream's a/b), and
+// writes the others. The reference-transaction hook reads the rejected ref
+// too, and the cluster, which commits a transaction whole or not at all,
+// refused all of it: git aborted the fetch, and every later sync did the
+// same, the mirror behind its upstream for good on every node (#365).
+// Such a ref, and one whose name the cluster cannot hold, are not written
+// (refusedUpdates); the rest is, by batches, which git and the cluster
+// both take whole or not at all, and the sync fails as git's own does
+// outside a cluster, its error naming the refs left (errRefsNotUpdated).
 // env is the environment of the fetch and of the batches, and check, if
 // set, runs right before each batch, which it refuses with its error
 // (pullGuard): the caller checks before the fetch.
@@ -492,8 +506,23 @@ func fetchInBatches(ctx context.Context, dry *git.Command, dir string, timeout t
 		return "", false, nil
 	}
 	updates, ok := parsePorcelainFetch(stdout.String())
-	if !ok || len(updates) <= reftable.MaxUpdatesPerTxn {
+	if !ok || len(updates) == 0 {
 		return "", false, nil
+	}
+	refused, err := refusedUpdates(ctx, dir, updates)
+	if err != nil {
+		// The sync's own fetch reads the same directory and reports it.
+		return "", false, nil
+	}
+	if len(refused) == 0 && len(updates) <= reftable.MaxUpdatesPerTxn {
+		return "", false, nil
+	}
+	if len(refused) > 0 {
+		left := make(map[string]bool, len(refused))
+		for _, r := range refused {
+			left[r.ref] = true
+		}
+		updates = slices.DeleteFunc(updates, func(u porcelainUpdate) bool { return left[u.ref] })
 	}
 	// git fetch prunes in a transaction of its own before it writes the
 	// rest. In one batch, git refuses to create a/b while a, pruned in the
@@ -533,7 +562,122 @@ func fetchInBatches(ctx context.Context, dry *git.Command, dir string, timeout t
 		}
 		updates = updates[n:]
 	}
+	if len(refused) > 0 {
+		return out.String(), true, errRefsNotUpdated(refused)
+	}
 	return out.String(), true, nil
+}
+
+// refusedRef is an update of a mirror's sync that is not written, and why.
+type refusedRef struct{ ref, why string }
+
+// refusedUpdates returns the updates of a mirror's sync into the
+// repository at dir that are not to be written. One is a name the cluster
+// cannot hold (reftable.ValidRefName: not valid UTF-8, too long), which
+// git takes: the reference-transaction hook refuses the whole transaction
+// that holds one (clusterhook.ParseLines), and every sync was refused
+// whole (#365). The other is what git rejects: a ref created or updated
+// that conflicts as a directory and a file with a ref the repository keeps
+// once the sync's own deletions are written, or with another ref the sync
+// writes. That check is git's own rule, on this node's refs: a conflict it
+// misses fails its batch, which git and the cluster take whole or not at
+// all, and the sync fails as before, nothing written apart.
+func refusedUpdates(ctx context.Context, dir string, updates []porcelainUpdate) ([]refusedRef, error) {
+	var refused []refusedRef
+	invalid := map[string]bool{}
+	for _, u := range updates {
+		if err := reftable.ValidRefName(u.ref); err != nil {
+			refused = append(refused, refusedRef{ref: u.ref, why: err.Error() + ", which the cluster cannot hold"})
+			invalid[u.ref] = true
+		}
+	}
+	stdout, _, err := git.NewCommand(ctx, "for-each-ref", "--format=%(refname)").RunStdString(&git.RunOpts{Dir: dir})
+	if err != nil {
+		return nil, err
+	}
+	deleted := map[string]bool{}
+	for _, u := range updates {
+		if u.flag == '-' && !invalid[u.ref] {
+			deleted[u.ref] = true
+		}
+	}
+	// The refs once the sync is written, and under each proper prefix of
+	// one, at a slash, the smallest of them.
+	after := map[string]bool{}
+	for name := range strings.SplitSeq(stdout, "\n") {
+		if name != "" && !deleted[name] {
+			after[name] = true
+		}
+	}
+	for _, u := range updates {
+		if u.flag != '-' && !invalid[u.ref] {
+			after[u.ref] = true
+		}
+	}
+	under := map[string]string{}
+	for name := range after {
+		for i := strings.IndexByte(name, '/'); i > 0; {
+			if cur, ok := under[name[:i]]; !ok || name < cur {
+				under[name[:i]] = name
+			}
+			j := strings.IndexByte(name[i+1:], '/')
+			if j < 0 {
+				break
+			}
+			i += 1 + j
+		}
+	}
+	for _, u := range updates {
+		if u.flag == '-' || invalid[u.ref] {
+			continue
+		}
+		conflict := under[u.ref]
+		for i := strings.IndexByte(u.ref, '/'); i > 0 && conflict == ""; {
+			if after[u.ref[:i]] {
+				conflict = u.ref[:i]
+				break
+			}
+			j := strings.IndexByte(u.ref[i+1:], '/')
+			if j < 0 {
+				break
+			}
+			i += 1 + j
+		}
+		if conflict != "" {
+			refused = append(refused, refusedRef{ref: u.ref, why: "it conflicts with " + refLabel(conflict) + ", which the mirror keeps"})
+		}
+	}
+	return refused, nil
+}
+
+// errRefsNotUpdated is a mirror's sync that wrote every update but these,
+// as git fetch outside a cluster reports "some local refs could not be
+// updated" once it wrote the others.
+type errRefsNotUpdated []refusedRef
+
+// refsNotUpdatedShown bounds the refs the error names.
+const refsNotUpdatedShown = 20
+
+func (e errRefsNotUpdated) Error() string {
+	var b strings.Builder
+	b.WriteString("these refs could not be updated, the others were written:")
+	for i, r := range e {
+		if i == refsNotUpdatedShown {
+			fmt.Fprintf(&b, " and %d more;", len(e)-i)
+			break
+		}
+		fmt.Fprintf(&b, " %s (%s);", refLabel(r.ref), r.why)
+	}
+	return strings.TrimSuffix(b.String(), ";")
+}
+
+// refLabel is a ref name as a log line or a notice may hold it: quoted
+// when it is not valid UTF-8.
+func refLabel(name string) string {
+	if utf8.ValidString(name) {
+		return name
+	}
+	return strconv.Quote(name)
 }
 
 // porcelainUpdate is one line of `git fetch --porcelain`.
