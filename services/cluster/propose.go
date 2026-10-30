@@ -462,7 +462,17 @@ func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook
 		tx.Updates = append(tx.Updates, u)
 		refs = append(refs, l.Ref)
 	}
-	if tx.Format == "" {
+	tx.Init = initsRepo(ctx, req.GitDir, tx.Updates)
+	if tx.Init {
+		cur, _ := r.table.Refs(repo)
+		if ref := heldRef(cur); ref != "" {
+			return nil, nil, errKeyHeld{repo: repo, ref: ref}
+		}
+	}
+	// git init's HEAD names a new repository: a HEAD the table may still
+	// hold alive under the key is a former one's, whose format says
+	// nothing of the new one.
+	if tx.Format == "" && !tx.Init {
 		cur, _ := r.table.Refs(repo)
 		for _, v := range cur {
 			if v.Format != "" {
@@ -471,28 +481,74 @@ func (r *Replicator) buildTxn(ctx context.Context, repo string, req *clusterhook
 			}
 		}
 	}
-	tx.Init = initsRepo(ctx, req.GitDir, tx.Updates)
-	if tx.Init {
-		cur, _ := r.table.Refs(repo)
-		if ref := heldRef(cur); ref != "" {
-			return nil, nil, errKeyHeld{repo: repo, ref: ref}
-		}
-	}
 	if tx.Format == "" {
-		// A new repository's first entry is often HEAD alone: ask git.
-		tx.Format = "sha1"
-		if out, err := gitRun(ctx, req.GitDir, nil, "rev-parse", "--show-object-format"); err == nil && strings.TrimSpace(out) == "sha256" {
-			tx.Format = "sha256"
+		// A new repository's first entry is HEAD alone, which git init
+		// hands the hook before the directory is a repository git opens:
+		// `git rev-parse --show-object-format` failed there and the entry
+		// went in sha1, a sha256 repository's too, which the other members
+		// then created in sha1 and whose pushes were refused (#372).
+		format, err := objectFormat(ctx, req.GitDir, req.Lines)
+		if err != nil {
+			return nil, nil, err
 		}
+		tx.Format = format
 	}
 	return tx, refs, nil
+}
+
+// objectFormat is the object format of the repository a transaction
+// writes, for one whose new values hold no object id. git writes every id
+// of the hook's lines in the repository's format, the null id included:
+// 40 hexadecimal digits in sha1, 64 in sha256; git init's HEAD carries the
+// null id as its old value. Lines symbolic on both sides carry none: the
+// directory's config tells it then.
+func objectFormat(ctx context.Context, gitDir string, lines []clusterhook.Line) (string, error) {
+	format := ""
+	for _, l := range lines {
+		for _, id := range []string{l.Old, l.New} {
+			switch {
+			case strings.HasPrefix(id, "ref:"):
+			case len(id) == 64:
+				return "sha256", nil
+			case len(id) == 40:
+				format = "sha1"
+			}
+		}
+	}
+	if format != "" {
+		return format, nil
+	}
+	return configFormat(ctx, gitDir)
+}
+
+// configFormat reads the object format of the repository at gitDir in its
+// config, which git init writes before HEAD; a config that names none is
+// sha1, git's default. A directory without a readable config is refused
+// rather than taken for sha1.
+func configFormat(ctx context.Context, gitDir string) (string, error) {
+	config := filepath.Join(gitDir, "config")
+	if _, err := os.Stat(config); err != nil {
+		return "", fmt.Errorf("the object format of %s cannot be read: %w; nothing was written", gitDir, err)
+	}
+	out, err := gitRun(ctx, gitDir, nil, "config", "--file", config, "--default", "sha1", "--get", "extensions.objectformat")
+	if err != nil {
+		return "", fmt.Errorf("the object format of %s cannot be read: %w; nothing was written", gitDir, err)
+	}
+	switch format := strings.ToLower(strings.TrimSpace(out)); format {
+	case "sha1", "sha256":
+		return format, nil
+	default:
+		return "", fmt.Errorf("the repository %s has the unknown object format %q; nothing was written", gitDir, format)
+	}
 }
 
 // initsRepo reports whether a transaction of HEAD alone is git init's:
 // git gives a change of the default branch the same zero old value, so
 // the directory tells them apart, which holds no ref before git init's
-// HEAD. A directory that cannot be read keeps the reading the table had
-// before InitVersion, a creation (#136).
+// HEAD. git init hands the hook its HEAD before it writes the file, in a
+// directory git does not open yet (#372): one without HEAD is git init's.
+// A directory that cannot be read otherwise keeps the reading the table
+// had before InitVersion, a creation (#136).
 func initsRepo(ctx context.Context, gitDir string, updates []reftable.RefUpdate) bool {
 	if len(updates) == 0 {
 		return false
@@ -501,6 +557,9 @@ func initsRepo(ctx context.Context, gitDir string, updates []reftable.RefUpdate)
 		if u.Ref != "HEAD" || u.Symbolic == "" {
 			return false
 		}
+	}
+	if _, err := os.Lstat(filepath.Join(gitDir, "HEAD")); os.IsNotExist(err) {
+		return true
 	}
 	out, err := gitRun(ctx, gitDir, nil, "for-each-ref", "--count=1", "--format=%(refname)")
 	if err != nil {
