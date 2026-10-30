@@ -11,7 +11,10 @@ import (
 	"time"
 
 	"forgejo.org/models/db"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/log"
+	"forgejo.org/modules/setting"
+	"forgejo.org/modules/storage"
 )
 
 // The cut of a checkpoint is one lock for the whole cluster, in the
@@ -171,12 +174,58 @@ func (r *Replicator) gateDelete(del func() error) error {
 	if r.cut == nil {
 		return del()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cutDeleteBound)
+	return deleteUnderCut(context.Background(), r.cut, del)
+}
+
+// deleteUnderCut runs del while it holds cut shared, so that it waits for
+// a checkpoint listing the stored files. It waits cutDeleteBound at most,
+// and no longer than ctx: the deletion is then refused, and del never runs
+// without the cut.
+func deleteUnderCut(ctx context.Context, cut cutLock, del func() error) error {
+	ctx, cancel := context.WithTimeout(ctx, cutDeleteBound)
 	defer cancel()
-	release, err := r.cut.Shared(ctx)
+	release, err := cut.Shared(ctx)
 	if err != nil {
 		return fmt.Errorf("waiting for the cluster's checkpoint to list the stored files: %w", err)
 	}
 	defer release()
 	return del()
+}
+
+// cutWithoutReplicator is the cut as a process of a cluster node that runs
+// no replicator reaches it: the replicator's advisory lock, in the
+// PostgreSQL every member shares. Without PostgreSQL no checkpoint runs,
+// and it is nil. It is read at each deletion: `forgejo doctor` loads the
+// database's settings after it registered its gate. Tests give another.
+var cutWithoutReplicator = func() cutLock {
+	if !setting.Database.Type.IsPostgreSQL() {
+		return nil
+	}
+	return pgCut{db: cutDB}
+}
+
+// GateDeletionsWithoutReplicator registers, in a process of a cluster node
+// that runs no replicator (`forgejo doctor`), the deletion gate a running
+// node's replicator registers: a stored file of the storages a checkpoint
+// covers is deleted under the cluster's cut, which the process takes in
+// PostgreSQL as a member does. Without it, `forgejo doctor check --run
+// storages --fix` deleted a file it found without a row at once, while a
+// checkpoint listed the files, and the checkpoint missed a file the SQL at
+// its L names (#358). A deletion waits cutDeleteBound at most, and no
+// longer than ctx: it is then refused, and the file stays, an orphan a
+// later run deletes. Outside a cluster, and in the process of a
+// replicator, whose own gate stays, it registers nothing. release removes
+// the gate.
+func GateDeletionsWithoutReplicator(ctx context.Context) (release func()) {
+	if !setting.Cluster.Enabled || clusterhook.Enabled() {
+		return func() {}
+	}
+	storage.SetDeleteGate(func(del func() error) error {
+		cut := cutWithoutReplicator()
+		if cut == nil {
+			return del()
+		}
+		return deleteUnderCut(ctx, cut, del)
+	})
+	return func() { storage.SetDeleteGate(nil) }
 }
