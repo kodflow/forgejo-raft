@@ -2169,7 +2169,7 @@ func derivePushes(ctx context.Context, evs []reftable.Event, tbl lifecycleTable,
 		// checks only that the account exists, not that it pushed.
 		return fmt.Errorf("looking up the pusher %d of %s at %d: %w", first.PusherID, first.Repo, first.Token.Index, err)
 	}
-	if err == nil && pusherReissued(ctx, u, first) {
+	if err == nil && !pusherOwnsRepo(u, first, repo) && pusherReissued(ctx, u, first) {
 		// The same loss reissues user IDs: another account now holds the
 		// pusher's ID, and must not be credited with the push.
 		return fmt.Errorf("pusher ID %d is %s, not the account that pushed at %d: the ID was reused; run `forgejo cluster reconcile`", first.PusherID, u.Name, first.Token.Index)
@@ -2405,6 +2405,28 @@ func pusherReissued(ctx context.Context, u *user_model.User, ev reftable.Event) 
 	return time.Unix(int64(u.CreatedUnix), 0).After(time.Unix(0, ev.Time).Add(pusherClockSkew))
 }
 
+// pusherOwnsRepo reports whether u is the event's pusher as the owner of
+// the repository it pushed to, whatever u is named now. A deploy key
+// pushes as the repository's owner (routers/private/serv.go: UserID is
+// repo.OwnerID, UserName its OwnerName), often an organization, and an
+// owner pushes to its own repositories: the event then names as pusher
+// the owner segment of its key, the account owning that repository then.
+// repo is the event's repository by ID, which pushWork checked the event's
+// key still leads to (a reissued repository ID is refused there), owned
+// by u's ID now: the account that owned it at the push, renamed or not
+// since. A reissued pusher ID names an account created after SQL lost the
+// pusher's row, and the owner's repositories with it; it owns none of
+// them. Without this, a rename of the owner whose old name another
+// account took since read as a reissued ID, pusherRenamedSince holding
+// that an organization never pushes, and parked the push for good (#367).
+func pusherOwnsRepo(u *user_model.User, ev reftable.Event, repo *repo_model.Repository) bool {
+	if ev.PusherName == "" || ev.RepoID <= 0 || repo == nil || repo.ID != ev.RepoID || repo.OwnerID != u.ID {
+		return false
+	}
+	owner, _, ok := strings.Cut(ev.Repo, "/")
+	return ok && strings.EqualFold(owner, ev.PusherName)
+}
+
 // pusherRenamedSince reports whether u, under another name than the
 // event's and without a redirect from that name, is still the account
 // that pushed: renamed since the push, its redirect removed afterwards.
@@ -2420,11 +2442,13 @@ func pusherReissued(ctx context.Context, u *user_model.User, ev reftable.Event) 
 // name is another account's, or redirects to another account (one that
 // took it, then left it), or u holds as many redirects as
 // MAX_USER_REDIRECTS keeps, all made since the push. An organization never
-// pushed. Anything else stays a reissued ID: an account created around or
-// after the push, an old name nobody took. Left uncaught: a reissued ID
-// whose account seems to predate the push (SQL restored from a backup of
-// another timeline, clocks more than pusherClockSkew apart, a creation time
-// an administrator set) while another account took the event's name since.
+// pushes under its own name, only as the owner of a repository, which
+// pusherOwnsRepo answers before (#367). Anything else stays a reissued ID:
+// an account created around or after the push, an old name nobody took.
+// Left uncaught: a reissued ID whose account seems to predate the push (SQL
+// restored from a backup of another timeline, clocks more than
+// pusherClockSkew apart, a creation time an administrator set) while
+// another account took the event's name since.
 func pusherRenamedSince(ctx context.Context, u *user_model.User, ev reftable.Event, redirectedElsewhere bool) bool {
 	if u.IsOrganization() || ev.Time <= 0 || u.CreatedUnix <= 0 {
 		return false
