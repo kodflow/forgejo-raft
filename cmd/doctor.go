@@ -24,6 +24,7 @@ import (
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/setting"
 	"forgejo.org/modules/storage"
+	"forgejo.org/services/cluster"
 	"forgejo.org/services/doctor"
 
 	"github.com/urfave/cli/v3"
@@ -323,6 +324,9 @@ func runDoctorCheck(stdCtx context.Context, ctx *cli.Command) error {
 			}
 		}
 	}
+	// On a node of a cluster, the stored files this process deletes wait,
+	// as a running node's do, for a checkpoint listing them (#358).
+	defer cluster.GateDeletionsWithoutReplicator(stdCtx)()
 	return doctor.RunChecks(stdCtx, colorize, ctx.Bool("fix"), checks)
 }
 

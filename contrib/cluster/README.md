@@ -959,6 +959,11 @@ Watch, Custom, Releases on GitHub, or the tags of
   what this node's git alone would collect. The `storages` and
   `storage-lfs` checks delete a stored file that no row of the shared
   database names, whatever any node's git holds: they stay as they are.
+  Their deletions, `storage-attachments`' and `storage-packages`' too,
+  wait like a running node's for a checkpoint listing the stored files
+  (the doctor takes the checkpoint's cut in PostgreSQL): a deletion still
+  waiting after ten minutes, or when the doctor is interrupted, is refused,
+  and the file stays for a later `--fix`.
 - A push mirror's sync pushes `--mirror --force` from a copy of the
   node's directory. A node pushes only once it serves the repository, and
   its wiki, at the commit index the cluster confirms, from a copy read
