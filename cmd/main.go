@@ -13,6 +13,7 @@ import (
 	"forgejo.org/cmd/forgejo"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/setting"
+	"forgejo.org/services/cluster"
 
 	"github.com/urfave/cli/v3"
 )
@@ -110,8 +111,26 @@ func prepareWorkPathAndCustomConf(action cli.ActionFunc) func(_ context.Context,
 			// the default behavior of "urfave/cli": "nil action" means "show help"
 			return cmdHelp().Action(ctx, cli)
 		}
+		if !runsTheReplicator(cli) {
+			// On a node of a cluster, a stored file a command deletes
+			// waits, as a running node's does, for a checkpoint listing
+			// the stored files: `forgejo doctor check --fix` deletes the
+			// files it finds without a row (#358), `forgejo admin user
+			// delete --purge` the attachments, LFS objects and packages
+			// of what it purges (#363), and any command may.
+			defer cluster.GateDeletionsWithoutReplicator(ctx)()
+		}
 		return action(ctx, cli)
 	}
+}
+
+// runsTheReplicator reports whether c is `forgejo web`, the only command
+// whose process runs the cluster's replicator: the replicator registers
+// its own deletion gate once it started (cluster.Init), which the gate of
+// a process without one must not stand in for. clusterhook is not enabled
+// yet when the command starts: the command is told apart by its name.
+func runsTheReplicator(c *cli.Command) bool {
+	return c.Name == "web" && len(c.Lineage()) == 2
 }
 
 func NewMainApp(version, versionExtra string) *cli.Command {

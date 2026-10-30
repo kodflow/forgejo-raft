@@ -960,10 +960,14 @@ Watch, Custom, Releases on GitHub, or the tags of
   `storage-lfs` checks delete a stored file that no row of the shared
   database names, whatever any node's git holds: they stay as they are.
   Their deletions, `storage-attachments`' and `storage-packages`' too,
-  wait like a running node's for a checkpoint listing the stored files
-  (the doctor takes the checkpoint's cut in PostgreSQL): a deletion still
+  wait like a running node's for a checkpoint listing the stored files,
+  and so do those of every other command of the CLI but `forgejo web`,
+  whose replicator gates them itself: `forgejo admin user delete --purge`
+  deletes the attachments, LFS objects and packages of what it purges.
+  The command takes the checkpoint's cut in PostgreSQL: a deletion still
   waiting after ten minutes, or when the doctor is interrupted, is refused,
-  and the file stays for a later `--fix`.
+  and the file stays, an orphan for a later `forgejo doctor check --run
+  storages --fix`.
 - A push mirror's sync pushes `--mirror --force` from a copy of the
   node's directory. A node pushes only once it serves the repository, and
   its wiki, at the commit index the cluster confirms, from a copy read

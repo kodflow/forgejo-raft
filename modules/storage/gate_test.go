@@ -51,3 +51,44 @@ func TestDeleteGoesThroughTheGate(t *testing.T) {
 	require.NoError(t, s.Delete("free"))
 	assert.False(t, exists("free"))
 }
+
+// A registered gate goes with its release, which puts back the gate
+// registered before it, and only while it is still the registered one: a
+// gate registered after it, a replicator's that started meanwhile, stays,
+// and a second release changes nothing.
+func TestRegisteredGateGoesWithItsRelease(t *testing.T) {
+	local, err := NewLocalStorage(t.Context(), &setting.Storage{Path: t.TempDir()})
+	require.NoError(t, err)
+	s := WithDeleteGate(local)
+	t.Cleanup(func() { SetDeleteGate(nil) })
+	var through []string
+	gate := func(name string) func(del func() error) error {
+		return func(del func() error) error {
+			through = append(through, name)
+			return del()
+		}
+	}
+	deletes := func() []string {
+		t.Helper()
+		through = nil
+		_, err := s.Save("f", strings.NewReader("f"), 1)
+		require.NoError(t, err)
+		require.NoError(t, s.Delete("f"))
+		return through
+	}
+
+	outer := RegisterDeleteGate(gate("outer"))
+	inner := RegisterDeleteGate(gate("inner"))
+	assert.Equal(t, []string{"inner"}, deletes())
+	inner()
+	assert.Equal(t, []string{"outer"}, deletes(), "the inner release puts back the outer gate")
+	inner()
+	assert.Equal(t, []string{"outer"}, deletes(), "a second release changes nothing")
+	outer()
+	assert.Empty(t, deletes(), "the outer release puts back no gate")
+
+	release := RegisterDeleteGate(gate("command"))
+	SetDeleteGate(gate("replicator"))
+	release()
+	assert.Equal(t, []string{"replicator"}, deletes(), "a gate registered after the released one stays")
+}
