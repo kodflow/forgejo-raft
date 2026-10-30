@@ -84,9 +84,10 @@ dco build observer
 # was killed in the middle of the installation, which left the database
 # marked up to date without its tables, and every member then died in the
 # migrations at each start (#369). A member answers /api/healthz only once
-# its migrations are done.
+# its migrations are done; each probe is bounded, so a member that accepts
+# the connection and never answers cannot hold the wait past its bound.
 for n in 1 2 3; do
-  wait_for 300 "forgejo-$n healthy before its recreation" curl -sf "$(forgejo_url "$n")/api/healthz"
+  wait_for 300 "forgejo-$n healthy before its recreation" curl -sf --connect-timeout 2 --max-time 5 "$(forgejo_url "$n")/api/healthz"
 done
 # The overlay's PostgreSQL archives: the nodes are recreated with it.
 dco up -d --wait --no-build pg-1 pg-2 pg-3 haproxy
