@@ -649,13 +649,17 @@ These commands run with the server stopped, on the data directory.
   would leave the node no configuration (kitsunium/sdk#723), or one none of
   whose other members the newest configuration still readable in the log
   lists (kitsunium/sdk#758): either way the node would restart silent for
-  good. The way out is `wipe-and-rejoin`, which both errors name, then, as
-  for a lost data directory (see
+  good. The command's error then reads only
+  `[0.3.92.13 RECOVER_REFUSED] The recovery was refused`: the engine keeps
+  the reason in the error's `why` field, which the command does not print,
+  and refuses a missing or unreadable quarantine marker with the same
+  error. The way out of both refusals is `wipe-and-rejoin`, then, as for a
+  lost data directory (see
   [Adding or replacing a node](#adding-or-replacing-a-node)), "Remove" the
   node's old id on the cluster, after promoting one more voter when the
-  floor of three voters refuses the removal; the second error names these
-  steps too. The second refusal is at best: when the damage took the newer
-  configuration entries, nothing is known and the cut is made.
+  floor of three voters refuses the removal. The second refusal is at best:
+  when the damage took the newer configuration entries, nothing is known
+  and the cut is made.
 - `forgejo cluster recover --new-cluster <id> --members ... --fenced id:method:receipt`
   forces a new configuration after the majority is lost. Every old voter but
   this node must be fenced, and every fence carries a receipt signed by each
