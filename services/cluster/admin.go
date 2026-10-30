@@ -563,7 +563,15 @@ func (r *Replicator) operate(ctx context.Context, eng consensus.Engine, op conse
 		if _, _, err := net.SplitHostPort(o.Address); err != nil {
 			return fmt.Errorf("address: %w", err)
 		}
-		return eng.UpdateAddress(ctx, op, id, o.Address)
+		if err := movable(eng, id); err != nil {
+			return err
+		}
+		err := eng.UpdateAddress(ctx, op, id, o.Address)
+		if errors.Is(err, consensus.ErrMembershipInvalid) {
+			// The engine's refusal names no cause: say which ones it has.
+			return fmt.Errorf("%w: the leader refused to move %s: either it is not a member, or a majority of the voters does not answer, or a voter that does not answer or lags behind the membership may know %s only at its current address (kitsunium/sdk#761); bring that voter back, then move %s again", err, id, id, id)
+		}
+		return err
 	}
 	return fmt.Errorf("unknown operation %q", o.Action)
 }
@@ -906,6 +914,28 @@ func (r *Replicator) removable(eng consensus.Engine, id consensus.NodeID) error 
 	}
 	if v, ok := strandedBy(m, eng.Health(), eng.Status().ID, id); ok {
 		return fmt.Errorf("%w: %s does not answer or lags behind the membership: removing %s, which answers, may leave it no member it knows to vouch for the leader once it is back; bring %s back, or remove it first", consensus.ErrMembershipInvalid, v, id, v)
+	}
+	return nil
+}
+
+// movable refuses up front a move of a voter's address the engine's leader
+// refuses MEMBERSHIP_INVALID as one that may strand a voter
+// (kitsunium/sdk#761): a voter that knows target only at its current
+// address sends its PreVote there, and once target serves elsewhere nothing
+// answers it. It names that voter, which the engine's refusal does not. The
+// leader's own move is never refused on this ground: it dials every voter
+// that lists it. As for removable, the engine still decides, on the leader.
+func movable(eng consensus.Engine, id consensus.NodeID) error {
+	st := eng.Status()
+	if st.Leader == id || (st.Role == consensus.RoleLeader && st.ID == id) {
+		return nil
+	}
+	m := eng.Membership()
+	if i := Rank(m, id) - 1; i < 0 || !m.Members[i].Voter {
+		return nil
+	}
+	if v, ok := strandedBy(m, eng.Health(), st.ID, id); ok {
+		return fmt.Errorf("%w: %s does not answer or lags behind the membership: moving %s, which answers, may leave it no member it knows at its address to vouch for the leader once it is back; bring %s back first", consensus.ErrMembershipInvalid, v, id, v)
 	}
 	return nil
 }
