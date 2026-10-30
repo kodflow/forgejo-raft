@@ -195,8 +195,9 @@ func deleteUnderCut(ctx context.Context, cut cutLock, del func() error) error {
 // cutWithoutReplicator is the cut as a process of a cluster node that runs
 // no replicator reaches it: the replicator's advisory lock, in the
 // PostgreSQL every member shares. Without PostgreSQL no checkpoint runs,
-// and it is nil. It is read at each deletion: `forgejo doctor` loads the
-// database's settings after it registered its gate. Tests give another.
+// and it is nil. It is read at each deletion: a command of the CLI loads
+// the database's settings after its gate was registered. Tests give
+// another.
 var cutWithoutReplicator = func() cutLock {
 	if !setting.Database.Type.IsPostgreSQL() {
 		return nil
@@ -205,27 +206,31 @@ var cutWithoutReplicator = func() cutLock {
 }
 
 // GateDeletionsWithoutReplicator registers, in a process of a cluster node
-// that runs no replicator (`forgejo doctor`), the deletion gate a running
-// node's replicator registers: a stored file of the storages a checkpoint
-// covers is deleted under the cluster's cut, which the process takes in
-// PostgreSQL as a member does. Without it, `forgejo doctor check --run
-// storages --fix` deleted a file it found without a row at once, while a
-// checkpoint listed the files, and the checkpoint missed a file the SQL at
-// its L names (#358). A deletion waits cutDeleteBound at most, and no
-// longer than ctx: it is then refused, and the file stays, an orphan a
-// later run deletes. Outside a cluster, and in the process of a
-// replicator, whose own gate stays, it registers nothing. release removes
-// the gate.
+// that runs no replicator, the deletion gate a running node's replicator
+// registers: a stored file of the storages a checkpoint covers is deleted
+// under the cluster's cut, which the process takes in PostgreSQL as a
+// member does. Every command of the CLI but `forgejo web` registers it
+// (cmd's prepareWorkPathAndCustomConf), and `forgejo doctor` again, bound
+// to its interruption. Without it, `forgejo doctor check --run storages
+// --fix` deleted a file it found without a row at once (#358), and
+// `forgejo admin user delete --purge` the attachments, LFS objects and
+// packages of what it purged (#363), while a checkpoint listed the files:
+// the checkpoint missed a file the SQL at its L names. A deletion waits
+// cutDeleteBound at most, and no longer than ctx: it is then refused, and
+// the file stays, an orphan a later `forgejo doctor check --fix` deletes.
+// Outside a cluster, and in the process of a replicator, whose own gate
+// stays, it registers nothing. release puts back the gate registered
+// before it, unless another one was registered since: a replicator's
+// registered later stays.
 func GateDeletionsWithoutReplicator(ctx context.Context) (release func()) {
 	if !setting.Cluster.Enabled || clusterhook.Enabled() {
 		return func() {}
 	}
-	storage.SetDeleteGate(func(del func() error) error {
+	return storage.RegisterDeleteGate(func(del func() error) error {
 		cut := cutWithoutReplicator()
 		if cut == nil {
 			return del()
 		}
 		return deleteUnderCut(ctx, cut, del)
 	})
-	return func() { storage.SetDeleteGate(nil) }
 }

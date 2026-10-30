@@ -325,7 +325,9 @@ func runDoctorCheck(stdCtx context.Context, ctx *cli.Command) error {
 		}
 	}
 	// On a node of a cluster, the stored files this process deletes wait,
-	// as a running node's do, for a checkpoint listing them (#358).
+	// as a running node's do, for a checkpoint listing them (#358): the
+	// gate every command registers, bound here to the doctor's
+	// interruption, which refuses a deletion still waiting.
 	defer cluster.GateDeletionsWithoutReplicator(stdCtx)()
 	return doctor.RunChecks(stdCtx, colorize, ctx.Bool("fix"), checks)
 }

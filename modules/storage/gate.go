@@ -22,6 +22,17 @@ func SetDeleteGate(gate func(del func() error) error) {
 	deleteGate.Store(&gate)
 }
 
+// RegisterDeleteGate registers gate in place of the registered one, and
+// returns the function that puts that one back. release does so only while
+// gate is still the registered one: a gate registered after it, as a
+// replicator registers its own once it started, stays. Releases go in the
+// reverse order of the registrations, as deferred calls do.
+func RegisterDeleteGate(gate func(del func() error) error) (release func()) {
+	registered := &gate
+	previous := deleteGate.Swap(registered)
+	return func() { deleteGate.CompareAndSwap(registered, previous) }
+}
+
 // gatedStorage deletes through the gate, when one is registered.
 type gatedStorage struct {
 	ObjectStorage
