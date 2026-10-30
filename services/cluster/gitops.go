@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"forgejo.org/modules/git"
 	"forgejo.org/services/cluster/reftable"
@@ -55,6 +56,47 @@ func gitRun(ctx context.Context, dir string, stdin io.Reader, args ...string) (s
 // level deep: one more git process per symbolic ref, none for a repository
 // whose only symbolic ref is HEAD.
 func readGitRefs(ctx context.Context, dir string, symbolic ...string) (map[string]reftable.ProjectedRef, error) {
+	return readRefs(ctx, dir, symbolic, nil)
+}
+
+// readTrackedRefs reads git as the projector compares it with refs, the
+// table's entries of the repository: readGitRefs with every symbolic ref
+// the table holds, and with each of its tombstones git may still hold as a
+// dangling symbolic ref.
+//
+// A tombstone no longer says what the ref held. When the table deleted the
+// dangling alias refs/heads/master -> refs/heads/main, every node but the
+// one that ran `git symbolic-ref -d` kept it in git, unread, and certified
+// the repository: receive-pack followed it there, and a push creating a
+// new branch master landed on main, which came back on every node; a
+// branch master/x never reached their git, which stopped certifying
+// (#359). Read, the alias is deleted like any ref the table deleted, and a
+// node whose git keeps it does not certify.
+func readTrackedRefs(ctx context.Context, dir string, refs map[string]reftable.RefValue) (map[string]reftable.ProjectedRef, error) {
+	var symbolic, gone []string
+	for name, v := range refs {
+		switch {
+		case name == "HEAD":
+		case !v.Live():
+			gone = append(gone, name)
+		case v.Symbolic != "":
+			symbolic = append(symbolic, name)
+		}
+	}
+	return readRefs(ctx, dir, symbolic, gone)
+}
+
+// readRefs is readGitRefs, which also reads one level deep each name in
+// gone that for-each-ref does not list and git may hold as a symbolic ref.
+// git's files backend holds a symbolic ref in a file of its own, never in
+// packed-refs: a name with no file under it holds none, which a stat tells
+// without a git process, and a repository rarely holds such a file.
+// Measured, 2.5 µs per tombstone: 25 ms for 10,000 beside the 6 ms of
+// for-each-ref over 2,000 packed refs. The reftable backend keeps no file
+// per ref: git reads each name, one process, 1.5 ms, per tombstone.
+// Neither Forgejo nor the projector creates such a repository unless git's
+// own configuration asks for it (init.defaultRefFormat).
+func readRefs(ctx context.Context, dir string, symbolic, gone []string) (map[string]reftable.ProjectedRef, error) {
 	out, err := gitRun(ctx, dir, nil, "for-each-ref", "--format=%(objectname)%00%(symref)%00%(refname)")
 	if err != nil {
 		return nil, err
@@ -79,6 +121,21 @@ func readGitRefs(ctx context.Context, dir string, symbolic ...string) (map[strin
 	for _, name := range symbolic {
 		// A name listed is read already, or holds a value of its own.
 		if _, listed := refs[name]; !listed && name != "HEAD" {
+			links = append(links, name)
+		}
+	}
+	if len(gone) > 0 {
+		// A directory the stat cannot tell about counts as the reftable
+		// backend: git reads each name, and fails as the stat did.
+		_, err := os.Stat(filepath.Join(dir, "reftable"))
+		files := errors.Is(err, os.ErrNotExist)
+		for _, name := range gone {
+			if _, listed := refs[name]; listed || name == "HEAD" || reftable.ValidRefName(name) != nil {
+				continue
+			}
+			if files && !looseRefMayExist(dir, name) {
+				continue
+			}
 			links = append(links, name)
 		}
 	}
@@ -125,16 +182,22 @@ func readSymbolicRef(ctx context.Context, dir, name string) (string, error) {
 	return strings.TrimSuffix(out, "\n"), nil
 }
 
-// symbolicNames returns the refs the table holds live and symbolic, HEAD
-// aside, for readGitRefs to read even when for-each-ref lists them nowhere.
-func symbolicNames(refs map[string]reftable.RefValue) []string {
-	var names []string
-	for name, v := range refs {
-		if name != "HEAD" && v.Live() && v.Symbolic != "" {
-			names = append(names, name)
-		}
+// looseRefMayExist reports whether git's files backend may hold a loose
+// ref, a symbolic one among them, under name in the repository dir: no
+// entry, or a directory, under its path, or a file where a directory of it
+// would be, holds none. Any other failure of the stat says yes: git reads
+// the name, and reports what it cannot read. The name is valid
+// (reftable.ValidRefName): no ".." component, no absolute path.
+func looseRefMayExist(dir, name string) bool {
+	st, err := os.Lstat(filepath.Join(dir, filepath.FromSlash(name)))
+	switch {
+	case err == nil:
+		return !st.IsDir()
+	case errors.Is(err, os.ErrNotExist), errors.Is(err, syscall.ENOTDIR):
+		return false
+	default:
+		return true
 	}
-	return names
 }
 
 // projectionDiff names the refs git and the table hold otherwise, in

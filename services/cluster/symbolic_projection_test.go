@@ -32,13 +32,19 @@ type symbolicBench struct {
 const symbolicRepo = "o/r.git"
 
 func newSymbolicBench(t *testing.T) *symbolicBench {
+	return newSymbolicBenchOf(t, "files")
+}
+
+// newSymbolicBenchOf is newSymbolicBench with git's ref backend refFormat,
+// "files" or "reftable".
+func newSymbolicBenchOf(t *testing.T, refFormat string) *symbolicBench {
 	base := t.TempDir()
 	b := &symbolicBench{t: t, root: filepath.Join(base, "repos"), work: filepath.Join(base, "work"), tbl: reftable.New()}
 	require.NoError(t, os.MkdirAll(b.work, 0o755))
 	run(t, b.work, "init", "-q")
 	b.dir = filepath.Join(b.root, "o", "r.git")
 	require.NoError(t, os.MkdirAll(filepath.Dir(b.dir), 0o755))
-	run(t, base, "init", "-q", "--bare", b.dir)
+	run(t, base, "init", "-q", "--bare", "--ref-format="+refFormat, b.dir)
 	b.p = newProjector(b.root, b.tbl, newRegistry(time.Minute, 1, 1))
 	b.p.unfence()
 	return b
@@ -189,9 +195,12 @@ func TestDanglingSymbolicBranchIsProjected(t *testing.T) {
 }
 
 // The remedy to #348, the dangling alias deleted on one node: the others
-// keep a dangling symbolic ref git lists nowhere, which Forgejo never sees,
-// and certify the repository. When its target comes back, the alias
-// resolves again: the projector removes it, never the branch it names.
+// delete it too, though git lists it nowhere, before they certify the
+// repository. Kept, it was not unseen: receive-pack and update-ref follow
+// it, a push creating a new branch master landed on main, and a branch
+// master/x was never written (#359, TestTombstonedDanglingAliasLeavesEveryNode).
+// When its target comes back, main alone is written, never through the
+// alias.
 func TestDeletedDanglingSymbolicBranch(t *testing.T) {
 	b := newSymbolicBench(t)
 	c1 := b.commit("one")
@@ -212,6 +221,7 @@ func TestDeletedDanglingSymbolicBranch(t *testing.T) {
 	b.apply(reftable.RefUpdate{Ref: "refs/heads/master", Delete: true})
 	certified, failure = b.project()
 	assert.True(t, certified, "certified once the alias is deleted (projected %d, applied %d): %s", b.p.Projected(symbolicRepo), b.idx, failure)
+	assert.Empty(t, b.git("refs/heads/master"), "the alias the table deleted leaves git")
 	same, err := b.p.Verify(context.Background(), symbolicRepo)
 	require.NoError(t, err)
 	assert.True(t, same)
