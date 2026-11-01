@@ -254,17 +254,36 @@ func StoreMissingLfsObjectsInRepository(ctx context.Context, repo *repo_model.Re
 			log.Error("Repo[%-v]: Error querying LFS meta object %-v: %v", repo, pointerBlob.Pointer, err)
 			return err
 		}
-		if meta != nil {
+		// In a cluster, an object whose row exists is checked against the
+		// storage, and downloaded again when its file is missing, through
+		// the content store every LFS write of the cluster takes. A node
+		// that died between the row and the file, before the file came
+		// first (#289), left such a row for good: every synchronisation
+		// skipped the object, and recover --from-observer refused every
+		// checkpoint taken since (#302). Outside a cluster, the row is
+		// trusted, as Forgejo does.
+		checkRow := meta != nil && clusterhook.Enabled()
+		if meta != nil && !checkRow {
 			log.Trace("Repo[%-v]: Skipping unknown LFS meta object %-v", repo, pointerBlob.Pointer)
 			continue
 		}
 
-		log.Trace("Repo[%-v]: LFS object %-v not present in repository", repo, pointerBlob.Pointer)
+		if !checkRow {
+			log.Trace("Repo[%-v]: LFS object %-v not present in repository", repo, pointerBlob.Pointer)
+		}
 
 		exist, err := contentStore.Exists(pointerBlob.Pointer)
 		if err != nil {
 			log.Error("Repo[%-v]: Error checking if LFS object %-v exists: %v", repo, pointerBlob.Pointer, err)
 			return err
+		}
+
+		if checkRow {
+			if exist {
+				log.Trace("Repo[%-v]: Skipping LFS meta object %-v, its file present", repo, pointerBlob.Pointer)
+				continue
+			}
+			log.Warn("Repo[%-v]: LFS object %-v has a row and no file in the LFS storage: it is downloaded again", repo, pointerBlob.Pointer)
 		}
 
 		if exist {
