@@ -299,6 +299,39 @@ func TestGetUnmergedPullRequestsByHeadInfoMax(t *testing.T) {
 	}
 }
 
+// GetUnmergedPullRequestsByHeadInfoAfter returns the pull requests
+// GetUnmergedPullRequestsByHeadInfoMax passes over for the same time, and
+// those only.
+func TestGetUnmergedPullRequestsByHeadInfoAfter(t *testing.T) {
+	defer unittest.OverrideFixtures("models/fixtures/TestGetUnmergedPullRequestsByHeadInfoMax")()
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ctx := db.DefaultContext
+	const created = int64(111111111)
+
+	prs, err := issues_model.GetUnmergedPullRequestsByHeadInfoAfter(ctx, 1, created-1, "branchmax")
+	require.NoError(t, err)
+	require.Len(t, prs, 1)
+	assert.Equal(t, int64(1001), prs[0].ID)
+	older, err := issues_model.GetUnmergedPullRequestsByHeadInfoMax(ctx, 1, created-1, "branchmax")
+	require.NoError(t, err)
+	assert.Empty(t, older)
+
+	prs, err = issues_model.GetUnmergedPullRequestsByHeadInfoAfter(ctx, 1, created, "branchmax")
+	require.NoError(t, err)
+	assert.Empty(t, prs, "created at the time given: GetUnmergedPullRequestsByHeadInfoMax takes it")
+
+	// A NULL created field is always taken by GetUnmergedPullRequestsByHeadInfoMax.
+	prs, err = issues_model.GetUnmergedPullRequestsByHeadInfoAfter(ctx, 1, 0, "branch2")
+	require.NoError(t, err)
+	assert.Empty(t, prs)
+
+	_, err = db.GetEngine(ctx).Exec("UPDATE `pull_request` SET `flow` = ? WHERE `id` = ?", issues_model.PullRequestFlowAGit, 1001)
+	require.NoError(t, err)
+	prs, err = issues_model.GetUnmergedPullRequestsByHeadInfoAfter(ctx, 1, created-1, "branchmax")
+	require.NoError(t, err)
+	assert.Empty(t, prs, "an AGit pull request's head comes with its own push")
+}
+
 func TestGetUnmergedPullRequestsByBaseInfo(t *testing.T) {
 	require.NoError(t, unittest.PrepareTestDatabase())
 	prs, err := issues_model.GetUnmergedPullRequestsByBaseInfo(db.DefaultContext, 1, "master")
