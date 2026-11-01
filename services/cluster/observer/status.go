@@ -140,6 +140,12 @@ func (o *Observer) prune(ctx context.Context) error {
 		}
 		if m != nil {
 			for repo, rm := range m.Repos {
+				// A repository without refs got none in the store, as
+				// ingest and Check skip it: an empty one has no store at
+				// all, and the prune failed on it at every pass (#379).
+				if len(rm.Refs) == 0 {
+					continue
+				}
 				if err := o.store.git.dropRefs(ctx, o.store.git.dirFor(repo, rm.Format), a.Name); err != nil {
 					return err
 				}
