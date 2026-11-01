@@ -1049,11 +1049,12 @@ const staleDirName = ".cluster-stale"
 
 // holdsRenamed reports whether src, the directory of a rename's old key, is
 // the repository the rename at renIdx moved to to: the one certified under
-// from before the rename. The old key may have been taken again since (a
-// repository created anew under the freed name), and moving that one would
-// take a live repository away from its name. Without a keyed stamp, the
-// directory moves only while from was not taken again and its newest
-// rename is this one.
+// from before the rename, or under to before a chain of renames that left
+// to and comes back by this one. The old key may have been taken again
+// since (a repository created anew under the freed name), and moving that
+// one would take a live repository away from its name. Without a keyed
+// stamp, the directory moves only while from was not taken again and its
+// newest rename is this one.
 func (p *projector) holdsRenamed(src, from, to string, renIdx uint64) bool {
 	if _, err := os.Stat(src); err != nil {
 		return false
@@ -1063,10 +1064,20 @@ func (p *projector) holdsRenamed(src, from, to string, renIdx uint64) bool {
 		// directory certified under from holds that one only while the
 		// repository certified then stayed, never deleted (#98) nor
 		// renamed away by renames that did not come back (#181).
-		if s.Repo != from || s.Watermark >= renIdx {
+		//
+		// A directory still certified under to holds it too when the
+		// repository certified there then reached from by renames before
+		// this one, which brings it back: Forgejo moved the directory
+		// under from, the database then failed to record the rename, and
+		// the undo applied while the directory stayed there, its move back
+		// never done (a crash, a failed rename). Refused, this node fetched
+		// the whole repository again under to and kept the directory,
+		// certified, under the freed name from, for a repository created
+		// there later to adopt and serve (#383).
+		if (s.Repo != from && s.Repo != to) || s.Watermark >= renIdx {
 			return false
 		}
-		holder, _, ok := p.heldAfter(from, s.Watermark, renIdx)
+		holder, _, ok := p.heldAfter(s.Repo, s.Watermark, renIdx)
 		return ok && holder == from
 	}
 	moved, ok := p.table.MovedAway(from)
