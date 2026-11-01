@@ -77,6 +77,18 @@ BASE="http://10.89.0.41:3000"
 
 say "1. Members, observer, keys"
 dco build observer
+# The members end their first start before this script recreates any of
+# them or their PostgreSQL (the overlay below, OBSERVER_RECIPIENTS further
+# down). That start installs the schema of the database the three share;
+# the CI recreated them a few seconds after bootstrap.sh started them, one
+# was killed in the middle of the installation, which left the database
+# marked up to date without its tables, and every member then died in the
+# migrations at each start (#369). A member answers /api/healthz only once
+# its migrations are done; each probe is bounded, so a member that accepts
+# the connection and never answers cannot hold the wait past its bound.
+for n in 1 2 3; do
+  wait_for 300 "forgejo-$n healthy before its recreation" curl -sf --connect-timeout 2 --max-time 5 "$(forgejo_url "$n")/api/healthz"
+done
 # The overlay's PostgreSQL archives: the nodes are recreated with it.
 dco up -d --wait --no-build pg-1 pg-2 pg-3 haproxy
 via_haproxy "DO \$\$ BEGIN CREATE ROLE forgejo_checkpoint NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;

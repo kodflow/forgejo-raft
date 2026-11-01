@@ -371,11 +371,12 @@ func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newR
 
 	// In a cluster, nothing of the cluster writes under the directories of
 	// the repository and its wiki, old and new names, on this node while
-	// they move, back too when the cluster refuses the rename: until the
-	// rename is applied, the replicated table names the repository under
-	// its old key, and a directory the cluster created there meanwhile kept
-	// the repository's objects under the freed name, for a repository
-	// created there later to serve (#274).
+	// they move, back too when the cluster refuses the rename or the
+	// database fails to record it (#383): until the rename is applied, the
+	// replicated table names the repository under its old key, and a
+	// directory the cluster created there meanwhile kept the repository's
+	// objects under the freed name, for a repository created there later
+	// to serve (#274). It is released last, after any move back.
 	releaseDirs, err := clusterhook.HoldRepoDirectories(ctx, repo.Owner.Name, oldRepoName, repo.Owner.Name, newRepoName)
 	if err != nil {
 		return fmt.Errorf("rename repository in the cluster: %w", err)
@@ -407,6 +408,19 @@ func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newR
 		}
 	}
 
+	// moveBack moves the directories back under the old name on this node's
+	// disk, under the hold of their keys.
+	moveBack := func(after string) {
+		if rerr := util.Rename(newRepoPath, repo.RepoPath()); rerr != nil {
+			log.Critical("Unable to move repository %s back after %s: %v", newRepoPath, after, rerr)
+		}
+		if isExist {
+			if rerr := util.Rename(repo_model.WikiPath(repo.Owner.Name, newRepoName), wikiPath); rerr != nil {
+				log.Critical("Unable to move the wiki of %s back after %s: %v", newRepoPath, after, rerr)
+			}
+		}
+	}
+
 	// In a cluster, the move is replicated before it is committed, and undone
 	// here when the other members cannot follow.
 	if err := clusterhook.RepoRenamed(ctx, repo.Owner.Name, oldRepoName, repo.Owner.Name, newRepoName); err != nil {
@@ -415,25 +429,56 @@ func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newR
 			log.Critical("Renaming repository %s to %s: %v; the directories stay under the new name, run `forgejo cluster reconcile`", repo.RepoPath(), newRepoPath, err)
 			return fmt.Errorf("rename repository in the cluster: %w", err)
 		}
-		if rerr := util.Rename(newRepoPath, repo.RepoPath()); rerr != nil {
-			log.Critical("Unable to move repository %s back after a refused cluster rename: %v", newRepoPath, rerr)
-		}
-		if isExist {
-			if rerr := util.Rename(repo_model.WikiPath(repo.Owner.Name, newRepoName), wikiPath); rerr != nil {
-				log.Critical("Unable to move the wiki of %s back after a refused cluster rename: %v", newRepoPath, rerr)
-			}
-		}
+		moveBack("a refused cluster rename")
 		return fmt.Errorf("rename repository in the cluster: %w", err)
 	}
 
+	// The database records the new name once the cluster did. When it does
+	// not, the rename is undone in the cluster first, so that every member
+	// follows the database, then the directories move back on this node's
+	// disk, under the hold, as a transfer and an owner's rename do: left
+	// under the new name, their stamp naming the old key the undo gave the
+	// repository back, the projector of this node fetched the whole
+	// repository again under the old key and kept this copy, certified,
+	// under the freed name, for a repository created there later to adopt
+	// and serve (#383). They move back whatever the undo answers: undone,
+	// the table names the old key again and the projector takes the
+	// directory where it is (#43); refused, or its outcome unknown, the
+	// table may still name the new key, and the projector moves the
+	// directory there itself, its stamp naming the rename's source.
+	if err := recordRepositoryName(ctx, repo, oldRepoName, newRepoName, displayName); err != nil {
+		// A commit whose answer was lost may have been recorded all the
+		// same: the rename then stands, and an undo would leave the
+		// database naming a repository the table and the disk moved away.
+		// A name that cannot be read back is taken for not recorded, as
+		// before.
+		if got, gerr := repo_model.GetRepositoryByID(ctx, repo.ID); gerr == nil && got.LowerName == newRepoName {
+			log.Warn("Renaming repository %s/%s to %s: %v, but the database recorded the new name: the rename stands", repo.Owner.Name, oldRepoName, newRepoName, err)
+			return nil
+		}
+		if uerr := clusterhook.UndoRepoRenamed(ctx, repo.Owner.Name, oldRepoName, repo.Owner.Name, newRepoName); uerr != nil {
+			log.Critical("Unable to move repository %s/%s back in the cluster after a failed rename: %v; run `forgejo cluster reconcile`", repo.Owner.Name, oldRepoName, uerr)
+		}
+		moveBack("a failed rename")
+		return err
+	}
+	return nil
+}
+
+// commitRename commits the transaction that records a repository's new
+// name. A test makes it fail, as a lost connection or a deadlock does.
+var commitRename = db.Committer.Commit
+
+// recordRepositoryName writes a renamed repository's redirect and new name
+// in one transaction, rolled back on an error.
+func recordRepositoryName(ctx context.Context, repo *repo_model.Repository, oldName, newName, displayName string) error {
 	ctx, committer, err := db.TxContext(ctx)
 	if err != nil {
 		return err
 	}
 	defer committer.Close()
 
-	if err := repo_model.NewRedirect(ctx, repo.Owner.ID, repo.ID, oldRepoName, newRepoName); err != nil {
-		undoClusterRename(ctx, repo.Owner.Name, oldRepoName, newRepoName)
+	if err := repo_model.NewRedirect(ctx, repo.Owner.ID, repo.ID, oldName, newName); err != nil {
 		return err
 	}
 
@@ -442,24 +487,10 @@ func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newR
 	// this function returned, before writing it, left the database under
 	// the old name and the directories, on every node of a cluster, under
 	// the new one (#135).
-	if err := repo_model.UpdateRepositoryCols(ctx, &repo_model.Repository{ID: repo.ID, Name: displayName, LowerName: newRepoName}, "name", "lower_name"); err != nil {
-		undoClusterRename(ctx, repo.Owner.Name, oldRepoName, newRepoName)
+	if err := repo_model.UpdateRepositoryCols(ctx, &repo_model.Repository{ID: repo.ID, Name: displayName, LowerName: newName}, "name", "lower_name"); err != nil {
 		return err
 	}
-
-	if err := committer.Commit(); err != nil {
-		undoClusterRename(ctx, repo.Owner.Name, oldRepoName, newRepoName)
-		return err
-	}
-	return nil
-}
-
-// undoClusterRename moves a renamed repository back in the cluster when the
-// database did not record the new name.
-func undoClusterRename(ctx context.Context, owner, oldName, newName string) {
-	if err := clusterhook.UndoRepoRenamed(ctx, owner, oldName, owner, newName); err != nil {
-		log.Critical("Unable to move repository %s/%s back in the cluster after a failed rename: %v; run `forgejo cluster reconcile`", owner, oldName, err)
-	}
+	return commitRename(committer)
 }
 
 // ChangeRepositoryName changes all corresponding setting from old repository name to new one.

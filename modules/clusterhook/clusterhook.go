@@ -508,9 +508,11 @@ func RepoRenamed(ctx context.Context, oldOwner, oldName, newOwner, newName strin
 
 // UndoRepoRenamed moves a repository and its wiki back in the replicated
 // table after RepoRenamed succeeded and Forgejo's SQL then failed: every
-// projector, the origin's included, follows the table, so without it the
-// directories would stay under names the database does not know. It runs on
-// a context detached from the failed request.
+// other member's projector follows the table, so without it their
+// directories would stay under names the database does not know. The
+// caller then moves its own directories back, under the hold of
+// HoldRepoDirectories, whatever it returns (#383). It runs on a context
+// detached from the failed request.
 func UndoRepoRenamed(ctx context.Context, oldOwner, oldName, newOwner, newName string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultTimeout)
 	defer cancel()
@@ -612,14 +614,14 @@ func HoldOwnerDirectories(ctx context.Context, owners ...string) (func(), error)
 // HoldRepoDirectories is HoldOwnerDirectories for a repository's rename or
 // transfer: the keys of the repository and of its wiki, under their old
 // and their new names. Forgejo moves their directories before RepoRenamed
-// proposes the move, and back when the cluster refuses it, while the
-// replicated table still names the repository under its old key: the
-// cluster fetched the whole repository again into a directory it created
-// there meanwhile, which stayed under the freed name, and a repository
-// created later under that name adopted it and served the moved
-// repository's objects under its own rights (#274). Forgejo holds them
-// from before the move until the rename or the transfer ends, its move
-// back included.
+// proposes the move, and back when the cluster refuses it or, after
+// UndoRepoRenamed, when the database fails to record it (#383), while the
+// replicated table names the repository under its old key: the cluster
+// fetched the whole repository again into a directory it created there
+// meanwhile, which stayed under the freed name, and a repository created
+// later under that name adopted it and served the moved repository's
+// objects under its own rights (#274). Forgejo holds them from before the
+// move until the rename or the transfer ends, its move back included.
 func HoldRepoDirectories(ctx context.Context, oldOwner, oldName, newOwner, newName string) (func(), error) {
 	return holdDirectories(ctx, []string{
 		RepoKey(oldOwner, oldName, false), RepoKey(oldOwner, oldName, true),
