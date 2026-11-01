@@ -59,7 +59,7 @@ func parkedRows(t *testing.T, tc *testCluster) int {
 // trimmed, and the leader that yielded says so in its hello, so the
 // leadership is not handed back to it for its checkpoints (#249).
 func TestALeaderThatCannotProjectARepositoryHandsTheLeadershipToAVoterThatDoes(t *testing.T) {
-	handsOverAnUnprojectedRepository(t, nil)
+	_ = handsOverAnUnprojectedRepository(t, nil)
 }
 
 // A leader elected by the bench itself before the damaged one parked the
@@ -70,7 +70,7 @@ func TestALeaderThatCannotProjectARepositoryHandsTheLeadershipToAVoterThatDoes(t
 // not count, and the hand-off is played again on another repository
 // (#384).
 func TestALeaderChangeBeforeTheParkPlaysTheHandOffAgain(t *testing.T) {
-	handsOverAnUnprojectedRepository(t, func(b *autoBench, attempt int, l *autoNode) {
+	missed := handsOverAnUnprojectedRepository(t, func(b *autoBench, attempt int, l *autoNode) {
 		if attempt > 1 {
 			return
 		}
@@ -86,6 +86,8 @@ func TestALeaderChangeBeforeTheParkPlaysTheHandOffAgain(t *testing.T) {
 		time.Sleep(2 * time.Second)
 		cut(false)
 	})
+	require.NotEmpty(t, missed, "the cut spoiled the first attempt")
+	assert.True(t, strings.HasPrefix(missed[0], "o/broken-1.git: "), "the first attempt did not count: %v", missed)
 }
 
 // handOffAttempts bounds handsOverAnUnprojectedRepository's attempts.
@@ -94,7 +96,8 @@ const handOffAttempts = 3
 // handsOverAnUnprojectedRepository plays the hand-off of
 // TestALeaderThatCannotProjectARepositoryHandsTheLeadershipToAVoterThatDoes.
 // disturb, when set, runs right after each attempt's second push, given
-// the leader whose copy that attempt damaged.
+// the leader whose copy that attempt damaged. It returns why the attempts
+// that did not count did not.
 //
 // The scenario needs that leader to lead from the second push until it
 // hands the leadership over, for seconds, while the autonomous bench, with
@@ -107,7 +110,7 @@ const handOffAttempts = 3
 // not count: once the new leader applied the event, the scenario is played
 // again on another repository, the copy of the leader of the moment
 // damaged, at most handOffAttempts times.
-func handsOverAnUnprojectedRepository(t *testing.T, disturb func(b *autoBench, attempt int, l *autoNode)) {
+func handsOverAnUnprojectedRepository(t *testing.T, disturb func(b *autoBench, attempt int, l *autoNode)) []string {
 	mockUnprojectedBounds(t)
 	tc, b := newAutoClusterTimed(t, 3, nil, wideBenchTiming, "node-a", "node-b", "node-c")
 	b.waitMembers(3, 3)
@@ -204,6 +207,7 @@ func handsOverAnUnprojectedRepository(t *testing.T, disturb func(b *autoBench, a
 	})
 	assert.True(t, audited, "the transfer is audited with why")
 	t.Logf("parked at %d, applied by %s after the leadership left %s; attempts that did not count: %v", parkedAt, next.n.slot, first.n.slot, missed)
+	return missed
 }
 
 // workRun is how many events of repo the consumers of the bench's live
