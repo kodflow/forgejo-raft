@@ -925,11 +925,15 @@ Watch, Custom, Releases on GitHub, or the tags of
   tracking kept intact for events still queued), so it is not done yet:
   an instance that deletes repositories by the hundred thousand should
   watch the snapshot size.
-- One git transaction updates at most 4096 refs. A larger one, a
-  `push --mirror` or `push --tags` of thousands of refs with git 2.54 and
-  later, is refused before its objects are shipped: push in several
-  smaller pushes. A fork and a migration take their refs by batches of
-  512, whatever their number.
+- One git transaction updates at most 4096 refs, and is one replicated
+  entry of at most 1 MiB, which long ref names fill with fewer refs: some
+  1 000 names of 1 000 bytes, fewer still with `&`, `<` or `>`, which an
+  entry writes on six bytes each. A larger one, a `push --mirror` or
+  `push --tags` of thousands of refs with git 2.54 and later, is refused
+  before its objects are shipped: push in several smaller pushes. A fork,
+  a migration, a pull mirror's sync and `forgejo cluster import` take
+  their refs by batches of at most 512 refs and some 960 KiB, whatever
+  their number.
 - `forgejo admin repo-sync-releases` refuses to run on a node of a
   cluster, before it opens the database: it would rewrite every
   repository's releases from that node's git, which may be behind the
