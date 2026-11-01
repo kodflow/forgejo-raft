@@ -20,6 +20,12 @@ import (
 
 // createVia plays Forgejo's creation of repo on node n: git init, whose
 // HEAD the hook proposes without a pusher, as services/repository does.
+//
+// Its git init runs without the hook: it writes a whole repository before
+// the proposal that takes the key again, and a pass of n's projector still
+// due on a deletion of the key removes it under createVia. After a
+// deletion it is called once n settled, as a user's next action on n
+// comes after its projector caught up (#391).
 func (tc *testCluster) createVia(n *testNode, repo string) {
 	t := tc.t
 	dir := filepath.Join(n.r.root, filepath.FromSlash(repo))
@@ -89,6 +95,7 @@ func TestHuntR2ProveRecreateSameFormatKeepsDeletedObjects(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, os.RemoveAll(filepath.Join(origin.r.root, "s", "x.git")))
 	require.NoError(t, origin.r.proposeRepoDelete(ctx, "s/x.git", 1))
+	settle(t, origin)
 	tc.createVia(origin, "s/x.git")
 	require.True(t, tc.pushVia(origin, work, "s/x.git", "refs/heads/main", zero, c3).OK)
 	release()
@@ -131,6 +138,7 @@ func TestHuntR7ProveRmkRenameMark(t *testing.T) {
 		require.NoError(t, origin.r.proposeRepoRename(ctx, "s/x.git", "s/z.git"))
 		require.NoError(t, os.RemoveAll(filepath.Join(root, "s", "z.git")))
 		require.NoError(t, origin.r.proposeRepoDelete(ctx, "s/z.git", 1))
+		settle(t, origin)
 		tc.createVia(origin, "s/z.git")
 		require.True(t, tc.pushVia(origin, work, "s/z.git", "refs/heads/main", zero, c2).OK)
 		release()
@@ -167,6 +175,7 @@ func TestHuntR7ProveRmkRenameMark(t *testing.T) {
 		root := origin.r.root
 		require.NoError(t, os.RemoveAll(filepath.Join(root, "o", "r.git")))
 		require.NoError(t, origin.r.proposeRepoDelete(ctx, "o/r.git", 1))
+		settle(t, origin)
 		tc.createVia(origin, "o/r.git")
 		require.True(t, tc.pushVia(origin, work, "o/r.git", "refs/heads/main", zero, c2).OK)
 		require.NoError(t, os.Rename(filepath.Join(root, "o", "r.git"), filepath.Join(root, "o", "new.git")))

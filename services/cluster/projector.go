@@ -584,8 +584,8 @@ func (p *projector) project(base, ctx context.Context, repo string) error {
 	withRenamedAway(p.table, repo, refs)
 
 	if _, deleted := p.table.Deleted(repo); deleted {
-		if err := os.RemoveAll(dir); err != nil {
-			return err
+		if removed, err := p.removeDeleted(repo, dir); err != nil || !removed {
+			return err // retried at the next pass
 		}
 		p.mu.Lock()
 		delete(p.deletedAt, repo)
@@ -1240,6 +1240,58 @@ func (p *projector) setAsideStale(repo, dir string) error {
 	}
 	log.Warn("cluster: %s was taken by a rename of %s while this node still held its previous repository: that directory is set aside in %s", repo, from, aside)
 	return nil
+}
+
+// removeDeleted removes the directory under a deleted key, and reports
+// whether nothing is left of it. Forgejo creating a repository anew under
+// the freed name, on this node, makes the directory first: git init writes
+// config, refs and HEAD.lock, then waits for the hook in "prepared", which
+// registers the transaction only once its request reached the replicator,
+// and renames HEAD.lock once the table took the key again. Until the
+// registration nothing fenced the key, and a pass of the deletion still
+// due removed the directory under git init, which failed the creation
+// (#391). A directory that is no git repository yet, carries no stamp and
+// changed lately, as setAsideInvalid judges one git may still be writing,
+// is left to the next pass: its HEAD takes the key within moments, or it
+// is an interrupted init, removed once it aged. Anything else under the
+// key, the deleted repository's directory, a file or a link, is removed at
+// once, as is a directory that cannot be judged. The key is read again
+// after the directory: a git init that completed is one whose HEAD the
+// table took first.
+func (p *projector) removeDeleted(repo, dir string) (bool, error) {
+	st, err := os.Lstat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		// Nothing to remove: a directory made from now on is a creation's.
+		return true, nil
+	}
+	if err == nil && st.IsDir() && p.mayBeInit(dir, st) {
+		return false, nil
+	}
+	if _, deleted := p.table.Deleted(repo); !deleted || p.registry.inFlight(repo) {
+		return false, nil
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// mayBeInit reports whether dir, a directory under a deleted key, may be
+// one Forgejo's git init still writes for a repository created anew: no
+// git repository yet, no stamp of a projection, and changed within the
+// registration's TTL and staleLockAge of now. A time further ahead is no
+// write of this node's git, and never holds the removal for good.
+func (p *projector) mayBeInit(dir string, st os.FileInfo) bool {
+	if _, known := readStamp(dir); known {
+		return false
+	}
+	invalid, err := invalidRepoDir(dir)
+	if err != nil || !invalid {
+		return false
+	}
+	window := max(p.registry.ttl, staleLockAge)
+	age := time.Since(st.ModTime())
+	return age > -window && age <= window
 }
 
 // setAsideInvalid moves aside a directory under repo's key that is no git
