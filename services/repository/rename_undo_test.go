@@ -165,6 +165,45 @@ func TestARenameTheDatabaseFailsToRecordMovesTheDirectoriesBackUnderTheHold(t *t
 	}
 }
 
+// A commit whose answer was lost after the database recorded it is no
+// failure to undo: the rename stands in the database, the table and on
+// disk, and an undo would leave the database naming a repository the
+// table and the directories moved away.
+func TestARenameWhoseCommitWasRecordedDespiteItsErrorStands(t *testing.T) {
+	const newName = "recorded-rename"
+	unittest.PrepareTestEnv(t)
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	t.Cleanup(test.MockVariableValue(&commitRename, func(c db.Committer) error {
+		require.NoError(t, c.Commit())
+		return errors.New("connection lost on the commit's answer: test")
+	}))
+	var proposals [][][2]string
+	clusterhook.SetOwnerDirectoryHold(func(context.Context, []string) (func(), error) { return func() {}, nil })
+	clusterhook.SetRepoLifecycle(nil, func(_ context.Context, moves [][2]string) error {
+		proposals = append(proposals, moves)
+		return nil
+	})
+	t.Cleanup(func() {
+		clusterhook.SetOwnerDirectoryHold(nil)
+		clusterhook.SetRepoLifecycle(nil, nil)
+	})
+
+	require.NoError(t, ChangeRepositoryName(db.DefaultContext, doer, repo, newName))
+	assert.Len(t, proposals, 1, "the rename, never undone")
+	for path, want := range map[string]bool{
+		repo_model.RepoPath("user2", "repo1"): false, repo_model.RepoPath("user2", newName): true,
+		repo_model.WikiPath("user2", "repo1"): false, repo_model.WikiPath("user2", newName): true,
+	} {
+		ok, err := util.IsExist(path)
+		require.NoError(t, err)
+		assert.Equal(t, want, ok, path)
+	}
+	got := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	assert.Equal(t, newName, got.LowerName)
+	unittest.AssertExistsAndLoadBean(t, &repo_model.Redirect{OwnerID: 2, LowerName: "repo1", RedirectRepoID: 1})
+}
+
 // createUnderNewName creates, in the database alone, a repository of user2
 // under name, as another node's creation does while the rename waits.
 func createUnderNewName(name string) func(t *testing.T) {

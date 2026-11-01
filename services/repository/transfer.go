@@ -447,6 +447,15 @@ func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newR
 	// table may still name the new key, and the projector moves the
 	// directory there itself, its stamp naming the rename's source.
 	if err := recordRepositoryName(ctx, repo, oldRepoName, newRepoName, displayName); err != nil {
+		// A commit whose answer was lost may have been recorded all the
+		// same: the rename then stands, and an undo would leave the
+		// database naming a repository the table and the disk moved away.
+		// A name that cannot be read back is taken for not recorded, as
+		// before.
+		if got, gerr := repo_model.GetRepositoryByID(ctx, repo.ID); gerr == nil && got.LowerName == newRepoName {
+			log.Warn("Renaming repository %s/%s to %s: %v, but the database recorded the new name: the rename stands", repo.Owner.Name, oldRepoName, newRepoName, err)
+			return nil
+		}
 		if uerr := clusterhook.UndoRepoRenamed(ctx, repo.Owner.Name, oldRepoName, repo.Owner.Name, newRepoName); uerr != nil {
 			log.Critical("Unable to move repository %s/%s back in the cluster after a failed rename: %v; run `forgejo cluster reconcile`", repo.Owner.Name, oldRepoName, uerr)
 		}
