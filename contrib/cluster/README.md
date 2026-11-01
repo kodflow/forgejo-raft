@@ -813,7 +813,12 @@ These commands run with the server stopped, on the data directory.
   to. Its step 6 also stops on an attachment row whose file the
   checkpoint lacks, so `forgejo restore-repo` of a dump made without the
   `release_assets` unit restores the releases without their assets, whose
-  files that dump does not hold, and logs each asset it skips.
+  files that dump does not hold, and logs each asset it skips. It stops
+  on an LFS row whose file the checkpoint lacks too, and
+  `--accept-missing-lfs`, the operator's decision, lists such rows with
+  their repositories, deletes them and goes on (observer.md, step 6); in a
+  cluster, a mirror's synchronisation downloads again an LFS object whose
+  row has no file.
 
 ## Observers
 
