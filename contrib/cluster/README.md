@@ -779,6 +779,29 @@ These commands run with the server stopped, on the data directory.
   while it stays. `reconcile` reports it (`"kind": "wiki"`), and only it is deleted
   by `forgejo cluster reconcile --delete-orphan <owner>/<repo>.wiki --expect-index <index> --reason "..."`,
   refused when it is the wiki of the repository SQL has.
+- A rename or a transfer of a repository, or the rename of an owner, whose
+  outcome the cluster could not confirm (no quorum within the bound, a
+  leader change, a lost nonce: the request fails with "the cluster may or
+  may not have recorded it") leaves, on the node that served it, the
+  directories under the new name and SQL under the old one. That node logs
+  an error naming the repository and its ID, or the owner, both names, the
+  directories under the new name and those under the old one, with this
+  procedure. Run `forgejo cluster reconcile` on that node. Once it reports
+  the move, and before aligning SQL on it, which frees the old name,
+  restart that node, or remove the directories the log line names under
+  the old name, the repository's and its wiki's, if they are there: the
+  node released its hold of the directories while the move could still
+  apply, and until it applied it, its projector could create a directory
+  under the old name, which its table still named, fetch the whole
+  repository into it and certify it. A repository created later under the
+  freed name adopted that copy and served the moved repository's objects
+  under its own rights. A restart sets that copy aside. Under an owner's
+  old name, remove only the directories of the repositories the rename
+  moved, those `reconcile` reports under the new name: until SQL is
+  aligned, it names the owner by the old name, and a repository the owner
+  creates there meanwhile is its own. The hold is not kept until the
+  table tells, which would stop the node's projection for as long as the
+  quorum is lost.
 - `forgejo cluster recover --from-observer <checkpoint> ...` rebuilds a
   cluster from an observer's protected checkpoint, every member lost
   ([observer.md](observer.md)). It needs the same `--fenced` receipts of

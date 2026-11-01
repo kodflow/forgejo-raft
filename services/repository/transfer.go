@@ -114,8 +114,12 @@ func transferOwnership(ctx context.Context, doer *user_model.User, newOwnerName 
 			return
 		}
 		if recoverErr == nil && !clusterRenamed && clusterhook.IsOutcomeUnresolved(err) {
-			// The members may follow the transfer: the directories stay.
-			log.Critical("Transferring repository %s/%s to %s: %v; the directories stay under the new owner, run `forgejo cluster reconcile`", oldOwnerName, repo.Name, newOwnerName, err)
+			// The members may follow the transfer: the directories stay,
+			// and the line gives the operator the procedure that keeps a
+			// copy under the old owner from being served (#282).
+			log.Critical("Transferring repository %s/%s (ID %d) to %s: %v; the directories stay under the new owner, %s, and SQL keeps the old one: %s",
+				oldOwnerName, repo.Name, repo.ID, newOwnerName, err, repo_model.RepoPath(newOwnerName, repo.Name),
+				clusterhook.UnresolvedMoveProcedure(oldOwnerName+"/"+repo.Name, repo_model.RepoPath(oldOwnerName, repo.Name)+" and "+repo_model.WikiPath(oldOwnerName, repo.Name)))
 			return
 		}
 
@@ -425,8 +429,12 @@ func changeRepositoryName(ctx context.Context, repo *repo_model.Repository, newR
 	// here when the other members cannot follow.
 	if err := clusterhook.RepoRenamed(ctx, repo.Owner.Name, oldRepoName, repo.Owner.Name, newRepoName); err != nil {
 		if clusterhook.IsOutcomeUnresolved(err) {
-			// The members may follow the rename: the directories stay.
-			log.Critical("Renaming repository %s to %s: %v; the directories stay under the new name, run `forgejo cluster reconcile`", repo.RepoPath(), newRepoPath, err)
+			// The members may follow the rename: the directories stay,
+			// and the line gives the operator the procedure that keeps a
+			// copy under the old name from being served (#282).
+			log.Critical("Renaming repository %s/%s (ID %d) to %s/%s: %v; the directories stay under the new name, %s, and SQL keeps the old one: %s",
+				repo.Owner.Name, oldRepoName, repo.ID, repo.Owner.Name, newRepoName, err, newRepoPath,
+				clusterhook.UnresolvedMoveProcedure(repo.Owner.Name+"/"+oldRepoName, repo.RepoPath()+" and "+wikiPath))
 			return fmt.Errorf("rename repository in the cluster: %w", err)
 		}
 		moveBack("a refused cluster rename")
