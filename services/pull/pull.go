@@ -324,10 +324,17 @@ func TestPullRequest(ctx context.Context, doer *user_model.User, repoID, olderTh
 	// * TestPullRequest runs and ignores P because it was created after the commit was received
 	//
 	// In other words, a PR must not be updated based on events that happened before it existed
+	//
+	// In a cluster, olderThan is the time the push's transaction was built,
+	// before the cluster committed it: a PR created in between, on the head
+	// the push replaced, is taken too (pullRequestsOnReplacedHead).
 	prs, err := issues_model.GetUnmergedPullRequestsByHeadInfoMax(ctx, repoID, olderThan, branch)
 	if err != nil {
 		log.Error("Find pull requests [head_repo_id: %d, head_branch: %s]: %v", repoID, branch, err)
 		return
+	}
+	if isSync {
+		prs = append(prs, pullRequestsOnReplacedHead(ctx, repoID, olderThan, branch, oldCommitID, newCommitID)...)
 	}
 
 	for _, pr := range prs {
@@ -388,6 +395,71 @@ func TestPullRequest(ctx context.Context, doer *user_model.User, repoID, olderTh
 		}
 		AddToTaskQueue(ctx, pr)
 	}
+}
+
+// pullRequestsOnReplacedHead returns, in a cluster, the pull requests of
+// branch of repoID that TestPullRequest passes over for being created
+// after olderThan, but whose head, refs/pull/N/head, is oldCommitID: the
+// commit the push to newCommitID replaced.
+//
+// The cluster's consumer derives a push with the time its transaction was
+// built, before its objects reached a majority and the cluster committed
+// it; upstream's post-receive takes the time once git published the ref.
+// A pull request created in between waited for the writes the cluster had
+// confirmed (requireFreshRepos), which did not include the push still in
+// flight, and its head was written at the commit before the push. Passed
+// over, it stayed there until the next push: broken, without a
+// synchronize event, its approvals of that commit still counted (#366).
+//
+// Its head tells it apart from a pull request created on the pushed
+// commit, or on a later one, which the push must not update again: a push
+// comment, a synchronize event, approvals marked stale or dismissed, for
+// commits it already had. refs/pull/N/head is read once this node serves
+// the base repository at the cluster's commit index, which includes the
+// pull request's own write of it: its row is committed after that write.
+// A node still behind leaves the pull request as it is. Once moved to the
+// push, its head is no longer the replaced commit, and another run of the
+// same work, an after-commit effect run again, passes it over.
+func pullRequestsOnReplacedHead(ctx context.Context, repoID, olderThan int64, branch, oldCommitID, newCommitID string) []*issues_model.PullRequest {
+	if !clusterhook.Enabled() || oldCommitID == newCommitID || git.IsEmptyCommitID(oldCommitID, nil) || git.IsEmptyCommitID(newCommitID, nil) {
+		return nil
+	}
+	prs, err := issues_model.GetUnmergedPullRequestsByHeadInfoAfter(ctx, repoID, olderThan, branch)
+	if err != nil {
+		log.Error("Find pull requests created after %d [head_repo_id: %d, head_branch: %s]: %v", olderThan, repoID, branch, err)
+		return nil
+	}
+	var taken []*issues_model.PullRequest
+	for _, pr := range prs {
+		head, err := freshPullHead(ctx, pr)
+		if err != nil {
+			log.Warn("TestPullRequest: the head of %-v, created after the push of %s to %s began, is not read, and the pull request is left as it is: %v", pr, newCommitID, branch, err)
+			continue
+		}
+		if head != oldCommitID {
+			continue
+		}
+		log.Info("TestPullRequest: %-v was created while the push of %s to %s was in flight, on %s, the commit the push replaced: it is updated with the push", pr, newCommitID, branch, oldCommitID)
+		taken = append(taken, pr)
+	}
+	return taken
+}
+
+// freshPullHead reads refs/pull/N/head of pr from this node's git, once
+// this node serves the base repository at the cluster's commit index.
+func freshPullHead(ctx context.Context, pr *issues_model.PullRequest) (string, error) {
+	if err := pr.LoadBaseRepo(ctx); err != nil {
+		return "", err
+	}
+	if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(pr.BaseRepo.OwnerName, pr.BaseRepo.Name, false)); err != nil {
+		return "", err
+	}
+	gitRepo, err := gitrepo.OpenRepository(ctx, pr.BaseRepo)
+	if err != nil {
+		return "", err
+	}
+	defer gitRepo.Close()
+	return gitRepo.GetRefCommitID(pr.GetGitRefName())
 }
 
 // Mark old reviews as stale if diff to mergebase has changed.
