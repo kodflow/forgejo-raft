@@ -172,8 +172,10 @@ func TestImportCutsItsBatchesOnTheEntryBound(t *testing.T) {
 // entry the engine refused past consensus.MaxEntryBytes. git aborted the
 // fetch, and every later sync fetched the same refs and was refused the
 // same way: the mirror never moved again, its master included, on every
-// node (#385). The sync now goes by batches, each within the bound.
-func TestPullMirrorSyncPastTheEntryBound(t *testing.T) {
+// node (#385). The sync now goes by batches, each within the bound. Its
+// bench takes some 50 s under -race: its name puts it in the race shard
+// T, the O-Q one near its bound (CLUSTER_SHARDS).
+func TestTheSyncOfAPullMirrorPastTheEntryBoundGoesByBatches(t *testing.T) {
 	s := newPullMirrorSwap(t)
 	ctx := db.DefaultContext
 	bounds := boundEngines(s.a, s.b, s.c)
