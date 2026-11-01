@@ -267,8 +267,17 @@ func (g gitStore) createRefs(ctx context.Context, dir, checkpoint string, refs m
 	return nil
 }
 
-// dropRefs removes a pruned checkpoint's refs; the objects stay.
+// dropRefs removes a pruned checkpoint's refs; the objects stay. A store
+// whose directory does not exist holds none: an empty repository's is
+// never created, having nothing to fetch, and git cannot run there. Any
+// other failure to read the store, a damaged one included, is an error,
+// which the next pass retries (#379).
 func (g gitStore) dropRefs(ctx context.Context, dir, checkpoint string) error {
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
 	refs, err := g.refs(ctx, dir, checkpoint)
 	if err != nil || len(refs) == 0 {
 		return err
