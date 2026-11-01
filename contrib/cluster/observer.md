@@ -276,8 +276,12 @@ reach: the ingestion process cannot delete a version. In the live
 directory, a protected checkpoint older than 72 hours is let go of (never the
 newest protected one, never while the hook fails), and with it the base
 backups, WAL and stored files no remaining checkpoint needs; its snapshots
-keep it. Staging is bounded by `OBSERVER_STAGING_QUOTA`: at the quota,
-ingestion stops; nothing protected is deleted.
+keep it. A git killed while it removes a checkpoint's refs (an OOM kill,
+a power loss) leaves its locks in the observer's git store: the next pass
+removes them before it removes the refs again, as it does for the git that
+creates a checkpoint's refs. Staging is bounded by
+`OBSERVER_STAGING_QUOTA`: at the quota, ingestion stops; nothing protected
+is deleted.
 
 Once the newest base backup is older than `OBSERVER_BASE_EVERY` (default
 `168h`, one hour at least), a pass takes another after its checkpoint is

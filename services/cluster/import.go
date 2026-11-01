@@ -99,7 +99,11 @@ func (r *Replicator) importRepo(ctx context.Context, key string) (int, error) {
 	sort.Strings(names)
 	total := 0
 	for len(names) > 0 {
-		n := min(len(names), 512)
+		// A chunk is one entry, which the engine refuses past
+		// consensus.MaxEntryBytes: 512 names that encoding/json escapes
+		// passed it, and the import of the repository failed every time
+		// (#385). It is cut on its weight as on its count.
+		n := reftable.BatchLen(len(names), 512, func(i int) int { return reftable.UpdateBytes(names[i], have[names[i]].Symbolic) })
 		chunk := names[:n]
 		names = names[n:]
 		read, _ := r.table.Applied()

@@ -659,28 +659,6 @@ func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.
 		return fail(err)
 	}
 
-	// Objects before refs: written and synced on a majority first.
-	var wants, haves []string
-	for _, u := range tx.Updates {
-		if u.New != "" {
-			wants = append(wants, u.New)
-		}
-	}
-	if len(wants) > 0 {
-		cur, _ := r.table.Refs(repo)
-		for _, v := range cur {
-			if v.Live() && v.SHA != "" {
-				haves = append(haves, v.SHA)
-			}
-		}
-		dir := filepath.Join(r.root, filepath.FromSlash(repo))
-		if err := r.objects.shipToMajority(ctx, repo, dir, tx.Format, wants, haves); err != nil {
-			objectShipsTotal.WithLabelValues("failed").Inc()
-			return fail(fmt.Errorf("%w; nothing was written", err))
-		}
-		objectShipsTotal.WithLabelValues("ok").Inc()
-	}
-
 	// From payload version 2, Apply itself refuses a push into a key
 	// deleted or renamed away by an entry this node had not applied yet
 	// when pushTargetGone looked.
@@ -698,6 +676,36 @@ func (r *Replicator) propose(ctx context.Context, repo string, req *clusterhook.
 	data, err := reftable.EncodeVersion(v, reftable.KindRefTxn, tx)
 	if err != nil {
 		return fail(err)
+	}
+	// Encoded before the objects travel: an entry the engine refuses as
+	// ENTRY_TOO_LARGE, at every attempt, went to a majority for nothing
+	// first, and the push was answered with the engine's code alone. A
+	// transaction of fewer refs than MaxUpdatesPerTxn reaches it with long
+	// names (#385); the pusher splits it as one past the count.
+	if err := r.tooLarge(len(data)); err != nil {
+		return fail(fmt.Errorf("the transaction is %w; push its refs in several smaller pushes; nothing was written", err))
+	}
+
+	// Objects before refs: written and synced on a majority first.
+	var wants, haves []string
+	for _, u := range tx.Updates {
+		if u.New != "" {
+			wants = append(wants, u.New)
+		}
+	}
+	if len(wants) > 0 {
+		cur, _ := r.table.Refs(repo)
+		for _, held := range cur {
+			if held.Live() && held.SHA != "" {
+				haves = append(haves, held.SHA)
+			}
+		}
+		dir := filepath.Join(r.root, filepath.FromSlash(repo))
+		if err := r.objects.shipToMajority(ctx, repo, dir, tx.Format, wants, haves); err != nil {
+			objectShipsTotal.WithLabelValues("failed").Inc()
+			return fail(fmt.Errorf("%w; nothing was written", err))
+		}
+		objectShipsTotal.WithLabelValues("ok").Inc()
 	}
 	return r.proposeWithRetry(ctx, repo, req.Nonce, tx, data)
 }
