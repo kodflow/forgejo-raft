@@ -104,14 +104,27 @@ func newAutoCluster(t *testing.T, expected int, slots ...string) (*testCluster, 
 }
 
 func newAutoClusterWith(t *testing.T, expected int, hooks map[string]WriterHook, slots ...string) (*testCluster, *autoBench) {
+	return newAutoClusterTimed(t, expected, hooks, sdk.TimingContractSpec{
+		HeartbeatInterval:  10 * time.Millisecond,
+		ElectionTimeoutMin: 100 * time.Millisecond, ElectionTimeoutMax: 200 * time.Millisecond,
+	}, slots...)
+}
+
+// wideBenchTiming is wide enough that a loaded runner rarely gives the
+// autonomous bench an election, for a scenario that needs its leader to
+// keep the leadership for seconds (#384).
+var wideBenchTiming = sdk.TimingContractSpec{
+	HeartbeatInterval:  50 * time.Millisecond,
+	ElectionTimeoutMin: 500 * time.Millisecond, ElectionTimeoutMax: time.Second,
+}
+
+// newAutoClusterTimed is newAutoClusterWith under the Raft timing given.
+func newAutoClusterTimed(t *testing.T, expected int, hooks map[string]WriterHook, timing sdk.TimingContractSpec, slots ...string) (*testCluster, *autoBench) {
 	b := &autoBench{
 		t: t, network: sdk.NewMemoryNetwork(), cluster: sdk.ClusterID{0x0f, 0x07, 0x9e, 0x30}, expected: expected,
-		timing: sdk.TimingContractSpec{
-			HeartbeatInterval:  10 * time.Millisecond,
-			ElectionTimeoutMin: 100 * time.Millisecond, ElectionTimeoutMax: 200 * time.Millisecond,
-		},
-		clock: &fakeClock{t: time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)},
-		hooks: hooks, byAddr: map[string]*autoNode{},
+		timing: timing,
+		clock:  &fakeClock{t: time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)},
+		hooks:  hooks, byAddr: map[string]*autoNode{},
 	}
 	tc := newTestClusterWith(t, consensus.ClusterID(b.cluster), func(tc *testCluster, _ map[string][32]byte) {
 		b.tc, b.ctx = tc, tc.ctx

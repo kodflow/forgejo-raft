@@ -5,6 +5,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -58,53 +59,188 @@ func parkedRows(t *testing.T, tc *testCluster) int {
 // trimmed, and the leader that yielded says so in its hello, so the
 // leadership is not handed back to it for its checkpoints (#249).
 func TestALeaderThatCannotProjectARepositoryHandsTheLeadershipToAVoterThatDoes(t *testing.T) {
-	mockUnprojectedBounds(t)
-	tc, b := newAutoCluster(t, 3, "node-a", "node-b", "node-c")
-	b.waitMembers(3, 3)
-	first := b.leader()
-	require.NotNil(t, first)
-	via := b.follower()
-	leader := first.n
+	handsOverAnUnprojectedRepository(t, nil)
+}
 
+// A leader elected by the bench itself before the damaged one parked the
+// event, as CI's load gave one (run 41135477872), projects the repository
+// and applies the event at once, and nothing is ever parked. Here the
+// leader is cut from both followers for two seconds, past the election
+// timeout, right after the first attempt's second push: that attempt does
+// not count, and the hand-off is played again on another repository
+// (#384).
+func TestALeaderChangeBeforeTheParkPlaysTheHandOffAgain(t *testing.T) {
+	handsOverAnUnprojectedRepository(t, func(b *autoBench, attempt int, l *autoNode) {
+		if attempt > 1 {
+			return
+		}
+		cut := func(on bool) {
+			for _, an := range b.alive() {
+				if an != l {
+					b.network.Cut(l.id, an.id, on)
+					b.network.Cut(an.id, l.id, on)
+				}
+			}
+		}
+		cut(true)
+		time.Sleep(2 * time.Second)
+		cut(false)
+	})
+}
+
+// handOffAttempts bounds handsOverAnUnprojectedRepository's attempts.
+const handOffAttempts = 3
+
+// handsOverAnUnprojectedRepository plays the hand-off of
+// TestALeaderThatCannotProjectARepositoryHandsTheLeadershipToAVoterThatDoes.
+// disturb, when set, runs right after each attempt's second push, given
+// the leader whose copy that attempt damaged.
+//
+// The scenario needs that leader to lead from the second push until it
+// hands the leadership over, for seconds, while the autonomous bench, with
+// its election timeout of 100 to 200 ms, elected another one by itself
+// once a few heartbeats were lost under load. A leader elected before the
+// park projects the repository and applies the event, and one elected
+// after the park, before the hand-off, applies the parked event without
+// the first leader ever yielding (#384). The bench runs here under
+// wideBenchTiming, and an attempt that a leader change still spoiled does
+// not count: once the new leader applied the event, the scenario is played
+// again on another repository, the copy of the leader of the moment
+// damaged, at most handOffAttempts times.
+func handsOverAnUnprojectedRepository(t *testing.T, disturb func(b *autoBench, attempt int, l *autoNode)) {
+	mockUnprojectedBounds(t)
+	tc, b := newAutoClusterTimed(t, 3, nil, wideBenchTiming, "node-a", "node-b", "node-c")
+	b.waitMembers(3, 3)
 	work := t.TempDir()
 	run(t, work, "init", "-q")
 	zero := strings.Repeat("0", 40)
-	c1, ok, msg := pushOne(tc, via.n, work, "o/broken.git", zero, "one")
-	require.True(t, ok, msg)
-	require.Eventually(t, func() bool { return leader.work.count() == 1 }, 10*time.Second, 10*time.Millisecond)
-	require.Eventually(t, func() bool { return leader.r.table.EventCount() == 0 }, 10*time.Second, 10*time.Millisecond, "trimmed while healthy")
 
-	damageCopy(t, leader, "o/broken.git")
-	c2, ok, msg := pushOne(tc, via.n, work, "o/broken.git", c1, "two")
-	require.True(t, ok, msg)
-	for _, an := range b.alive() {
-		if an == first {
+	var first, next *autoNode
+	var repo string
+	var parkedAt int64
+	var missed []string
+	for attempt := 1; ; attempt++ {
+		require.LessOrEqual(t, attempt, handOffAttempts, "the leadership moved by itself before the hand-off at every attempt: %s", strings.Join(missed, "; "))
+		repo = fmt.Sprintf("o/broken-%d.git", attempt)
+		via := b.follower()
+
+		// Whichever node leads applies c1's event, and the queue is
+		// trimmed everywhere.
+		c1, ok, msg := pushOne(tc, via.n, work, repo, zero, "one")
+		require.True(t, ok, msg)
+		require.Eventually(t, func() bool { return workRun(b, repo) >= 1 }, 10*time.Second, 10*time.Millisecond, "the event of %s is applied", repo)
+		for _, an := range b.alive() {
+			require.Eventually(t, func() bool { return an.r().table.EventCount() == 0 }, 10*time.Second, 10*time.Millisecond, "trimmed while healthy on %s", an.n.slot)
+		}
+
+		first = b.leader()
+		require.NotNil(t, first)
+		if via == first {
+			// The leadership went to via meanwhile: the second push goes
+			// through a node whose copy stays readable.
+			for _, an := range b.alive() {
+				if an != first {
+					via = an
+					break
+				}
+			}
+		}
+		require.Eventually(t, func() bool { return gitRef(t, first.n, repo, "refs/heads/main") == c1 }, 10*time.Second, 10*time.Millisecond)
+		damageCopy(t, first.n, repo)
+		c2, ok, msg := pushOne(tc, via.n, work, repo, c1, "two")
+		require.True(t, ok, msg)
+		if disturb != nil {
+			disturb(b, attempt, first)
+		}
+		for _, an := range b.alive() {
+			if an == first {
+				continue
+			}
+			require.Eventually(t, func() bool { return gitRef(t, an.n, repo, "refs/heads/main") == c2 },
+				10*time.Second, 20*time.Millisecond, "%s projects it", an.n.slot)
+		}
+
+		// first, the only node that does not project it, parks the event
+		// as long as it leads; a leader elected meanwhile applies it.
+		parkedAt = 0
+		require.Eventually(t, func() bool {
+			rows, err := tc.parked.list(context.Background())
+			if err == nil && len(rows) == 1 {
+				parkedAt = rows[0].LogIndex
+				return true
+			}
+			return workRun(b, repo) >= 2
+		}, 4*projectionStallBound, 20*time.Millisecond, "the leader parks the event")
+		if parkedAt == 0 {
+			missed = append(missed, fmt.Sprintf("%s: %s applied the event before %s parked it", repo, leaderSlot(b), first.n.slot))
+			for _, an := range b.alive() {
+				require.Eventually(t, func() bool { return an.r().table.EventCount() == 0 }, 10*time.Second, 20*time.Millisecond, "the leader elected meanwhile applied it: trimmed on %s", an.n.slot)
+			}
+			assert.Zero(t, parkedRows(t, tc), "nothing parked")
 			continue
 		}
-		require.Eventually(t, func() bool { return gitRef(t, an.n, "o/broken.git", "refs/heads/main") == c2 },
-			10*time.Second, 20*time.Millisecond, "%s projects it", an.n.slot)
-	}
-	require.Eventually(t, func() bool { return parkedRows(t, tc) == 1 }, 4*projectionStallBound, 20*time.Millisecond, "the leader parks the event")
-	rows, err := tc.parked.list(context.Background())
-	require.NoError(t, err)
-	parkedAt := rows[0].LogIndex
-	assert.Zero(t, leader.r.consumerFails.Load(), "no failed pass: the passes alone never made it yield")
+		assert.Zero(t, first.n.r.consumerFails.Load(), "no failed pass: the passes alone never made it yield")
 
-	require.Eventually(t, func() bool {
-		l := b.leader()
-		return l != nil && l != first
-	}, 20*time.Second, 20*time.Millisecond, "the leadership goes to a voter that projects it")
-	require.Eventually(t, func() bool { return parkedRows(t, tc) == 0 }, 10*time.Second, 20*time.Millisecond, "the new leader applies the parked event")
-	next := b.leader()
-	require.NotNil(t, next)
+		require.Eventually(t, func() bool {
+			l := b.leader()
+			return l != nil && l != first
+		}, 20*time.Second, 20*time.Millisecond, "the leadership goes to a voter that projects it")
+		require.Eventually(t, func() bool { return parkedRows(t, tc) == 0 }, 10*time.Second, 20*time.Millisecond, "the new leader applies the parked event")
+		next = b.leader()
+		require.NotNil(t, next)
+		// sql_yield is stored once the transfer returned.
+		if !holdsWithin(2*time.Second, func() bool { return first.r().sqlYield.Load() != 0 }) {
+			missed = append(missed, fmt.Sprintf("%s: %s parked the event at %d, then the leadership went to %s without its hand-off", repo, first.n.slot, parkedAt, next.n.slot))
+			continue
+		}
+		break
+	}
+
 	require.Eventually(t, func() bool { return next.r().table.EventCount() == 0 }, 10*time.Second, 20*time.Millisecond, "and the queue is trimmed again")
 	assert.NotEqual(t, consensus.RoleLeader, first.r().Engine().Status().Role)
 	assert.NotZero(t, first.r().sqlYield.Load(), "its hello says it gave the leadership away")
 	audited := slices.ContainsFunc(next.r().table.Audit(), func(a reftable.AuditRecord) bool {
-		return a.Action == string(ActionTransfer) && strings.Contains(a.Detail, "does not project o/broken.git")
+		return a.Action == string(ActionTransfer) && strings.Contains(a.Detail, "does not project "+repo)
 	})
 	assert.True(t, audited, "the transfer is audited with why")
-	t.Logf("parked at %d, applied by %s after the leadership left %s", parkedAt, next.n.slot, first.n.slot)
+	t.Logf("parked at %d, applied by %s after the leadership left %s; attempts that did not count: %v", parkedAt, next.n.slot, first.n.slot, missed)
+}
+
+// workRun is how many events of repo the consumers of the bench's live
+// nodes ran, whichever led.
+func workRun(b *autoBench, repo string) int {
+	n := 0
+	for _, an := range b.alive() {
+		w := an.n.work
+		w.mu.Lock()
+		for _, ev := range w.events {
+			if ev.Repo == repo {
+				n++
+			}
+		}
+		w.mu.Unlock()
+	}
+	return n
+}
+
+// leaderSlot is the slot of the bench's leader, "none" without one.
+func leaderSlot(b *autoBench) string {
+	if l := b.leader(); l != nil {
+		return l.n.slot
+	}
+	return "none"
+}
+
+// holdsWithin reports whether cond holds within d, polled every 20 ms.
+func holdsWithin(d time.Duration, cond func() bool) bool {
+	for deadline := time.Now().Add(d); ; time.Sleep(20 * time.Millisecond) {
+		if cond() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+	}
 }
 
 // In the manual mode nothing moves the leadership by itself (#47): the
