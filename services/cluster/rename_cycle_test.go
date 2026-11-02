@@ -91,6 +91,22 @@ func lagCertifies(t *testing.T, origin, lag *testNode, keys ...string) {
 	t.FailNow()
 }
 
+// othersCertify waits until every node but lag applied what origin applied
+// and certified every key. They are not fenced and project the renames as
+// they come, but the last ones may still be on their way when lag
+// certified: a check of their directories then finds one where a rename
+// found it, as node-b's under tmp/x.git in a run of the CI.
+func othersCertify(t *testing.T, tc *testCluster, origin, lag *testNode) {
+	t.Helper()
+	for _, n := range tc.nodes {
+		if n == lag {
+			continue
+		}
+		waitApplied(t, origin, n)
+		settle(t, n)
+	}
+}
+
 // sameDir asserts that key's directory on n is the directory want was.
 func sameDir(t *testing.T, n *testNode, key string, want os.FileInfo) {
 	t.Helper()
@@ -117,6 +133,7 @@ func TestASwapOfTwoNamesOnALaggingNodeIsProjected(t *testing.T) {
 		renameOn(t, origin, m[0], m[1])
 	}
 	lagCertifies(t, origin, lag, "s/a.git", "s/b.git")
+	othersCertify(t, tc, origin, lag)
 
 	for _, n := range tc.nodes {
 		assert.Equal(t, c[1], gitRef(t, n, "s/a.git", "refs/heads/main"), n.slot)
@@ -150,6 +167,7 @@ func TestAnOwnerSwapOnALaggingNodeIsProjected(t *testing.T) {
 		renameOwnerOn(t, origin, m[0], m[1])
 	}
 	lagCertifies(t, origin, lag, "alice/x.git", "bob/x.git", "bob/only.git")
+	othersCertify(t, tc, origin, lag)
 
 	for _, n := range tc.nodes {
 		assert.Equal(t, c[1], gitRef(t, n, "alice/x.git", "refs/heads/main"), n.slot)
@@ -181,6 +199,7 @@ func TestARotationOfThreeNamesOnALaggingNodeIsProjected(t *testing.T) {
 		renameOn(t, origin, m[0], m[1])
 	}
 	lagCertifies(t, origin, lag, "s/a.git", "s/b.git", "s/c.git")
+	othersCertify(t, tc, origin, lag)
 
 	for _, n := range tc.nodes {
 		assert.Equal(t, c[1], gitRef(t, n, "s/a.git", "refs/heads/main"), n.slot)
