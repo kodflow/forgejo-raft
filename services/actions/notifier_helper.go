@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	actions_model "forgejo.org/models/actions"
@@ -21,6 +22,8 @@ import (
 	unit_model "forgejo.org/models/unit"
 	user_model "forgejo.org/models/user"
 	actions_module "forgejo.org/modules/actions"
+	"forgejo.org/modules/cache"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/json"
@@ -198,12 +201,20 @@ var Notify = func(ctx context.Context, input *NotifyInput) error {
 	return handleWorkflows(ctx, detectedWorkflows, commit, input, ref.String())
 }
 
+// getGitRepoAndCommit opens the repository of the event in this node's git
+// and resolves the commit its workflows run at: the event's own commit, or
+// else its ref as this node's git holds it. In a cluster, a node behind on
+// the repository would resolve the ref to its head before the last push
+// another node acknowledged: an event a request triggers without a commit
+// of its own (a comment, an issue's or a pull request's label, assignee,
+// review request, a wiki page, a release) wrote a run of that commit,
+// which cancels, through its concurrency group, the run of the
+// acknowledged head (#335). A ref name is therefore resolved once this
+// node serves the repository at the commit index the cluster confirms
+// (waitFreshToResolve), within READ_AFTER_WRITE_TIMEOUT. Past it, it is
+// resolved as the node has it, as before, with a warning. Without a
+// cluster nothing waits.
 func getGitRepoAndCommit(ctx context.Context, input *NotifyInput) (*git.Repository, *git.Commit, git.RefName, error) {
-	gitRepo, err := gitrepo.OpenRepository(ctx, input.Repo)
-	if err != nil {
-		return nil, nil, "", fmt.Errorf("git.OpenRepository: %w", err)
-	}
-
 	ref := input.Ref
 	if ref.BranchName() != input.Repo.DefaultBranch && actions_module.IsDefaultBranchWorkflow(input.Event) {
 		if ref != "" {
@@ -217,11 +228,27 @@ func getGitRepoAndCommit(ctx context.Context, input *NotifyInput) (*git.Reposito
 		ref = git.RefNameFromBranch(input.Repo.DefaultBranch)
 	}
 
+	// A commit ID, the event's or its ref (a merge's), names the same
+	// commit on every node: only a ref name may lag.
+	fresh, waited := true, time.Duration(0)
+	if input.Commit == "" && strings.HasPrefix(ref.String(), "refs/") {
+		fresh, waited = waitFreshToResolve(ctx, input.Repo)
+	}
+
+	gitRepo, err := gitrepo.OpenRepository(ctx, input.Repo)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("git.OpenRepository: %w", err)
+	}
+
 	commitID := input.Commit
 	if commitID == "" {
 		if commitID, err = gitRepo.GetRefCommitID(ref.String()); err != nil {
 			gitRepo.Close()
 			return nil, nil, "", fmt.Errorf("gitRepo.GetRefCommitID: %w", err)
+		}
+		if !fresh {
+			log.Warn("Actions: the %s event of %s resolves %s at %s, the commit this node of the cluster holds: the node may still be behind the cluster's last writes to the repository after waiting %v (READ_AFTER_WRITE_TIMEOUT), and its workflows may run a commit before a push another node acknowledged",
+				input.Event, input.Repo.FullName(), ref, commitID, waited.Round(time.Millisecond))
 		}
 	}
 
@@ -232,6 +259,51 @@ func getGitRepoAndCommit(ctx context.Context, input *NotifyInput) (*git.Reposito
 		return nil, nil, "", fmt.Errorf("gitRepo.GetCommit: %w", err)
 	}
 	return gitRepo, commit, ref, nil
+}
+
+// notifyFreshBudget is how long a request has waited, in all, for this
+// node of the cluster to serve fresh the repositories its Actions events
+// resolve a ref of. One request may notify several events, an event per
+// label it adds, or a comment and the closing of its issue: together they
+// wait at most one READ_AFTER_WRITE_TIMEOUT, as a request served alone.
+type notifyFreshBudget struct {
+	spent atomic.Int64
+}
+
+// notifyFreshBudgetKey keys the request's notifyFreshBudget in its cache
+// context.
+const notifyFreshBudgetKey = "actions-notify-fresh-budget"
+
+// waitFreshToResolve waits until this node of the cluster serves repo at
+// the commit index the cluster confirms at the call, so that a ref
+// resolved in its git right after is at least the one every node
+// acknowledged before (clusterhook.WaitFresh), and says whether it does,
+// with how long it waited. The wait is bounded by READ_AFTER_WRITE_TIMEOUT
+// for the whole request, what its earlier events waited deducted; outside
+// a request, each event has its own bound. The event's notification is
+// already due: past the bound, the caller resolves the ref as the node has
+// it. Nothing waits under the log consumer's replicated command, whose
+// events must not wait for the writes after the one it derives (#311,
+// #325), nor in a database transaction, whose locks the wait would hold:
+// both resolve at once, as before. Without a cluster it returns at once.
+func waitFreshToResolve(ctx context.Context, repo *repo_model.Repository) (fresh bool, waited time.Duration) {
+	if _, replicated := clusterhook.CommandIdentity(ctx); replicated || db.InTransaction(ctx) {
+		return true, 0
+	}
+	budget, _ := cache.GetContextData(ctx, notifyFreshBudgetKey, notifyFreshBudgetKey).(*notifyFreshBudget)
+	if budget == nil {
+		budget = &notifyFreshBudget{}
+		cache.SetContextData(ctx, notifyFreshBudgetKey, notifyFreshBudgetKey, budget)
+	}
+	// A spent budget leaves a context already done: the wait answers at
+	// once, fresh only if the node can tell without waiting.
+	wctx, cancel := context.WithTimeout(ctx, setting.Cluster.ReadAfterWriteTimeout-time.Duration(budget.spent.Load()))
+	defer cancel()
+	start := time.Now()
+	fresh = clusterhook.WaitFresh(wctx, clusterhook.RepoKey(repo.OwnerName, repo.Name, false))
+	waited = time.Since(start)
+	budget.spent.Add(int64(waited))
+	return fresh, waited
 }
 
 func detectWorkflows(ctx context.Context, input *NotifyInput, gitRepo *git.Repository, commit *git.Commit, shouldDetectSchedules bool) ([]*actions_module.DetectedWorkflow, []*actions_module.DetectedWorkflow, error) {
