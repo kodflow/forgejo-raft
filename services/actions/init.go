@@ -22,5 +22,9 @@ func Init() {
 	}
 	go graceful.GetManager().RunWithCancel(jobEmitterQueue)
 
+	// The events a node of a cluster deferred until a node serves their
+	// repository fresh (deferred.go).
+	go graceful.GetManager().RunWithShutdownContext(runDeferredReplayer)
+
 	notify_service.RegisterNotifier(NewNotifier())
 }

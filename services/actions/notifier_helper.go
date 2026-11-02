@@ -168,7 +168,10 @@ var Notify = func(ctx context.Context, input *NotifyInput) error {
 	}
 
 	gitRepo, commit, ref, err := getGitRepoAndCommit(ctx, input)
-	if err != nil {
+	if errors.Is(err, errDeferred) {
+		// A node that serves the repository fresh replays it (deferred.go).
+		return nil
+	} else if err != nil {
 		return err
 	} else if gitRepo == nil && commit == nil {
 		return nil
@@ -211,9 +214,14 @@ var Notify = func(ctx context.Context, input *NotifyInput) error {
 // which cancels, through its concurrency group, the run of the
 // acknowledged head (#335). A ref name is therefore resolved once this
 // node serves the repository at the commit index the cluster confirms
-// (waitFreshToResolve), within READ_AFTER_WRITE_TIMEOUT. Past it, it is
-// resolved as the node has it, as before, with a warning. Without a
-// cluster nothing waits.
+// (waitFreshToResolve), within READ_AFTER_WRITE_TIMEOUT. Past it, or
+// without a leader, the event is deferred (errDeferred): a node that
+// serves the repository fresh replays it at the ref's acknowledged head
+// (deferred.go). So is an event of a repository whose earlier events are
+// deferred, behind them, so the repository's events keep their order.
+// When the event cannot be deferred (the bound of deferred events is
+// reached, or the deferral is off), it is resolved as the node has it, as
+// before, with a warning. Without a cluster nothing waits.
 func getGitRepoAndCommit(ctx context.Context, input *NotifyInput) (*git.Repository, *git.Commit, git.RefName, error) {
 	ref := input.Ref
 	if ref.BranchName() != input.Repo.DefaultBranch && actions_module.IsDefaultBranchWorkflow(input.Event) {
@@ -230,9 +238,24 @@ func getGitRepoAndCommit(ctx context.Context, input *NotifyInput) (*git.Reposito
 
 	// A commit ID, the event's or its ref (a merge's), names the same
 	// commit on every node: only a ref name may lag.
-	fresh, waited := true, time.Duration(0)
-	if input.Commit == "" && strings.HasPrefix(ref.String(), "refs/") {
-		fresh, waited = waitFreshToResolve(ctx, input.Repo)
+	stale := ""
+	if input.Commit == "" && strings.HasPrefix(ref.String(), "refs/") && mayWaitToResolve(ctx) {
+		if deferredBehind(ctx, input) {
+			err := deferNotification(ctx, input, "earlier events of the repository are deferred")
+			if err == nil {
+				return nil, nil, "", errDeferred
+			}
+			log.Warn("Actions: the %s event of %s is not deferred behind the repository's deferred events, it may run before them: %v",
+				input.Event, input.Repo.FullName(), err)
+		}
+		if fresh, waited := waitFreshToResolve(ctx, input.Repo); !fresh {
+			why := fmt.Sprintf("this node of the cluster may still be behind the cluster's last writes to the repository after waiting %v (READ_AFTER_WRITE_TIMEOUT)", waited.Round(time.Millisecond))
+			err := deferNotification(ctx, input, why)
+			if err == nil {
+				return nil, nil, "", errDeferred
+			}
+			stale = fmt.Sprintf("%s, and the event cannot be deferred: %v", why, err)
+		}
 	}
 
 	gitRepo, err := gitrepo.OpenRepository(ctx, input.Repo)
@@ -246,9 +269,9 @@ func getGitRepoAndCommit(ctx context.Context, input *NotifyInput) (*git.Reposito
 			gitRepo.Close()
 			return nil, nil, "", fmt.Errorf("gitRepo.GetRefCommitID: %w", err)
 		}
-		if !fresh {
-			log.Warn("Actions: the %s event of %s resolves %s at %s, the commit this node of the cluster holds: the node may still be behind the cluster's last writes to the repository after waiting %v (READ_AFTER_WRITE_TIMEOUT), and its workflows may run a commit before a push another node acknowledged",
-				input.Event, input.Repo.FullName(), ref, commitID, waited.Round(time.Millisecond))
+		if stale != "" {
+			log.Warn("Actions: the %s event of %s resolves %s at %s, the commit this node of the cluster holds: %s; its workflows may run a commit before a push another node acknowledged",
+				input.Event, input.Repo.FullName(), ref, commitID, stale)
 		}
 	}
 
@@ -274,20 +297,30 @@ type notifyFreshBudget struct {
 // context.
 const notifyFreshBudgetKey = "actions-notify-fresh-budget"
 
+// mayWaitToResolve reports whether an event notified under ctx may wait
+// for this node to serve its repository fresh, or be deferred. Neither
+// happens under the log consumer's replicated command, whose events must
+// not wait for the writes after the one it derives (#311, #325), nor in a
+// database transaction, whose locks the wait would hold: both resolve at
+// once, as before. Nor in the replay of a deferred event, which runs once
+// the node serves the repository fresh, in the transaction that removes
+// it.
+func mayWaitToResolve(ctx context.Context) bool {
+	_, replicated := clusterhook.CommandIdentity(ctx)
+	return !replicated && !db.InTransaction(ctx) && !isDeferredReplay(ctx)
+}
+
 // waitFreshToResolve waits until this node of the cluster serves repo at
 // the commit index the cluster confirms at the call, so that a ref
 // resolved in its git right after is at least the one every node
 // acknowledged before (clusterhook.WaitFresh), and says whether it does,
 // with how long it waited. The wait is bounded by READ_AFTER_WRITE_TIMEOUT
 // for the whole request, what its earlier events waited deducted; outside
-// a request, each event has its own bound. The event's notification is
-// already due: past the bound, the caller resolves the ref as the node has
-// it. Nothing waits under the log consumer's replicated command, whose
-// events must not wait for the writes after the one it derives (#311,
-// #325), nor in a database transaction, whose locks the wait would hold:
-// both resolve at once, as before. Without a cluster it returns at once.
+// a request, each event has its own bound. Past the bound, the caller
+// defers the event. Where mayWaitToResolve says no, it reports fresh at
+// once. Without a cluster it returns at once.
 func waitFreshToResolve(ctx context.Context, repo *repo_model.Repository) (fresh bool, waited time.Duration) {
-	if _, replicated := clusterhook.CommandIdentity(ctx); replicated || db.InTransaction(ctx) {
+	if !mayWaitToResolve(ctx) {
 		return true, 0
 	}
 	budget, _ := cache.GetContextData(ctx, notifyFreshBudgetKey, notifyFreshBudgetKey).(*notifyFreshBudget)
