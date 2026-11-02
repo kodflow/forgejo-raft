@@ -121,10 +121,24 @@ func commentVia(t *testing.T, n *testNode) ([]*actions_model.ActionRun, time.Dur
 	start := time.Now()
 	actions_service.NewNotifier().CreateIssueComment(ctx, doer, repo, issue, comment, nil)
 	took := time.Since(start)
+	return commentRuns(t), took
+}
 
+// commentRuns is the runs the "/deploy" comments of issue 1 wrote.
+func commentRuns(t *testing.T) []*actions_model.ActionRun {
+	t.Helper()
 	var runs []*actions_model.ActionRun
-	require.NoError(t, db.GetEngine(ctx).Where("repo_id = ? AND event = ?", 1, webhook_module.HookEventIssueComment).Find(&runs))
-	return runs, took
+	require.NoError(t, db.GetEngine(db.DefaultContext).Where("repo_id = ? AND event = ?", 1, webhook_module.HookEventIssueComment).OrderBy("id").Find(&runs))
+	return runs
+}
+
+// deferredEvents counts the Actions events deferred until a node serves
+// their repository fresh.
+func deferredEvents(t *testing.T) int64 {
+	t.Helper()
+	n, err := actions_model.CountDeferredNotifications(db.DefaultContext)
+	require.NoError(t, err)
+	return n
 }
 
 // pendingDeploys is the commits of the runs of the deploy group still
@@ -182,29 +196,66 @@ func TestACommentOnALaggingNodeRunsTheAcknowledgedHeadOnceCaughtUp(t *testing.T)
 }
 
 // The same comment, served by node-a while it stays behind past
-// READ_AFTER_WRITE_TIMEOUT: the notifier gives up waiting at the bound and
-// keeps the behaviour it had, the workflow run at the head node-a holds,
-// c1, with a warning that names the repository, the event and the wait.
-func TestACommentOnANodeBehindPastTheBoundRunsItsHeadAndWarns(t *testing.T) {
+// READ_AFTER_WRITE_TIMEOUT. The notifier used to give up waiting at the
+// bound and run the workflow at the head node-a held, c1, whose run
+// cancelled the deployment of c2 through the concurrency group (#335,
+// option A). The event is now deferred, in the database the nodes share:
+// no run at c1, the deployment of c2 left alone, and a warning names the
+// event and the wait. node-a then stops, catches up and starts again: its
+// replay of the deferred events runs the comment at c2, the acknowledged
+// head, once, however many passes follow.
+func TestACommentOnANodeBehindPastTheBoundRunsTheAcknowledgedHeadOnceReplayed(t *testing.T) {
 	const bound = 500 * time.Millisecond
 	defer test.MockVariableValue(&setting.Cluster.ReadAfterWriteTimeout, bound)()
-	_, a, _, c1, c2, _ := commentCluster(t)
+	_, a, b, c1, c2, hold := commentCluster(t)
+	deployed := deployVia(t, b)
+	require.Equal(t, c2, deployed.CommitSHA)
+	t.Logf("run %d (dispatched through node-b at c2 = %.10s)", deployed.ID, c2)
 
 	lc, cleanup := test.NewLogChecker(log.DEFAULT, log.WARN)
 	defer cleanup()
-	want := []string{"issue_comment", "user2/repo1", "refs/heads/master", c1, "after waiting"}
-	lc.Filter(want...).StopMark("may still be behind the cluster's last writes")
+	want := []string{"issue_comment", "user2/repo1", "is deferred", "after waiting"}
+	lc.Filter(want...).StopMark("its workflows run once a node of the cluster serves the repository")
 
+	// node-a's replay runs while node-a is behind: it replays nothing.
+	stop := actions_service.StartDeferredReplayer(db.DefaultContext)
+	t.Cleanup(stop)
 	runs, took := commentVia(t, a)
 	for _, r := range runs {
-		t.Logf("run %d (issue_comment through node-a, after %v): commit %.10s; the table: %.10s", r.ID, took, r.CommitSHA, c2)
+		t.Logf("run %d (issue_comment through node-a, after %v): commit %.10s; node-a's git: %.10s, the table: %.10s", r.ID, took, r.CommitSHA, c1, c2)
 	}
 	filtered, stopped := lc.Check(5 * time.Second)
-	require.True(t, stopped, "the warning of a workflow resolved on a node that may be behind")
+	assert.True(t, stopped, "the warning of an event deferred on a node that may be behind")
 	for i, part := range want {
 		assert.True(t, filtered[i], "the warning names %q", part)
 	}
-	require.Len(t, runs, 1, "the comment triggers the workflow")
-	assert.Equal(t, c1, runs[0].CommitSHA, "past the bound, the workflow runs the head of the node, as before")
+	assert.Empty(t, runs, "past the bound, the comment runs nothing at the head node-a holds")
+	assert.Equal(t, []string{c2}, pendingDeploys(t), "the deployment of the acknowledged head is not cancelled")
 	assert.GreaterOrEqual(t, took, bound, "the notifier waited for node-a up to the bound")
+	require.Equal(t, int64(1), deferredEvents(t), "the comment's event is deferred")
+
+	// node-a stops, its replay with it, and catches up meanwhile.
+	stop()
+	a.r.registry.release(hold)
+	a.r.projector.signal()
+	require.Eventually(t, func() bool { return gitRef(t, a, laggingRepo, "refs/heads/master") == c2 },
+		15*time.Second, 20*time.Millisecond, "node-a catches up")
+	require.Empty(t, commentRuns(t), "nothing replays the event while no node replays")
+
+	// node-a starts again: its replay reads the deferred event from the
+	// database, and node-a now serves the repository fresh.
+	stop = actions_service.StartDeferredReplayer(db.DefaultContext)
+	t.Cleanup(stop)
+	require.Eventually(t, func() bool { return len(commentRuns(t)) > 0 }, 10*time.Second, 20*time.Millisecond, "the restarted node replays the comment")
+	stop()
+	assert.Zero(t, actions_service.ReplayDeferredNotifications(db.DefaultContext), "a later pass has nothing left to replay")
+
+	runs = commentRuns(t)
+	for _, r := range runs {
+		t.Logf("run %d (issue_comment, replayed): commit %.10s, status %s", r.ID, r.CommitSHA, r.Status)
+	}
+	require.Len(t, runs, 1, "the comment runs once")
+	assert.Equal(t, c2, runs[0].CommitSHA, "the comment runs the acknowledged head")
+	assert.Equal(t, []string{c2}, pendingDeploys(t), "the deployment left to run is the acknowledged head's")
+	assert.Zero(t, deferredEvents(t), "the replayed event left the queue")
 }

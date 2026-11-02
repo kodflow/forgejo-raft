@@ -159,6 +159,15 @@ var Cluster = struct {
 	// ConfigError is set when the section is enabled and invalid. The
 	// replicator refuses to start on it; the hook refuses every push.
 	ConfigError error
+
+	// ActionsDeferredMaxEvents bounds the Actions events deferred, in the
+	// shared database, until a node serves their repository fresh (#335):
+	// once the bound is reached, an event is resolved on the node as it
+	// is, with a warning. 0 turns the deferral off. ActionsDeferredMaxAge
+	// is how long a deferred event may wait: older, it is dropped with a
+	// warning; 0 is no limit but the count.
+	ActionsDeferredMaxEvents int
+	ActionsDeferredMaxAge    time.Duration
 }{
 	Driver:                "kitsunium",
 	ObjectPort:            "7481",
@@ -173,6 +182,9 @@ var Cluster = struct {
 	DeadMemberTimeout:     5 * time.Minute,
 	MaxTxnPerRepo:         64,
 	MaxTxnTotal:           4096,
+
+	ActionsDeferredMaxEvents: 10000,
+	ActionsDeferredMaxAge:    24 * time.Hour,
 }
 
 var clusterSlotPattern = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
@@ -318,6 +330,8 @@ func loadClusterFrom(rootCfg ConfigProvider) {
 	Cluster.RenewVaultCAFile = sec.Key("RENEW_VAULT_CA_FILE").String()
 	Cluster.NomadCAFile = sec.Key("NOMAD_CA_FILE").String()
 	Cluster.MaxTxnTotal = sec.Key("MAX_TXN_TOTAL").MustInt(Cluster.MaxTxnTotal)
+	Cluster.ActionsDeferredMaxEvents = sec.Key("ACTIONS_DEFERRED_MAX_EVENTS").MustInt(10000)
+	Cluster.ActionsDeferredMaxAge = clusterDuration(sec, "ACTIONS_DEFERRED_MAX_AGE", 24*time.Hour)
 
 	Cluster.CheckpointInterval = clusterDuration(sec, "CHECKPOINT_INTERVAL", 0)
 	Cluster.CheckpointRole = sec.Key("CHECKPOINT_ROLE").MustString("forgejo_checkpoint")

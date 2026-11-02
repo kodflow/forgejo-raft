@@ -151,13 +151,18 @@ func TestNotifyDoesNotWaitWithoutARefToResolveOrUnderTheConsumer(t *testing.T) {
 	assert.Equal(t, repo1Master, commitID, "in a transaction")
 
 	assert.Empty(t, *calls)
+	assert.Zero(t, countDeferred(t), "nothing is deferred")
 }
 
 // A request that notifies several events (one per label it adds, a
 // comment that closes an issue) waits READ_AFTER_WRITE_TIMEOUT in all, not
-// once per event: once spent, the next events of the request do not wait
-// and are resolved on the node as it is, with the warning. Outside a
-// request, each event has its own bound.
+// once per event: once spent, the next events of the request do not wait.
+// Past the bound each event is deferred, for a node that serves the
+// repository fresh to replay it (#335, option C), where option A resolved
+// it on the node as it is. Outside a request, each event has its own
+// bound. The cluster is off here, so that every event reaches the wait: in
+// a cluster, the events that follow a deferred one of the same repository
+// are deferred behind it without waiting (TestDeferredEventsKeepTheirOrder).
 func TestNotifyWaitsOneBoundPerRequest(t *testing.T) {
 	require.NoError(t, unittest.PrepareTestDatabase())
 	const bound = 200 * time.Millisecond
@@ -167,19 +172,19 @@ func TestNotifyWaitsOneBoundPerRequest(t *testing.T) {
 	request := cache.WithCacheContext(db.DefaultContext)
 	start := time.Now()
 	for range 3 {
-		_, commitID := resolve(request, t, commentInput(t))
-		assert.Equal(t, repo1Master, commitID, "resolved on the node as it is, past the bound")
+		requireDeferred(request, t, commentInput(t))
 	}
 	took := time.Since(start)
 	require.Len(t, *calls, 3)
 	assert.False(t, (*calls)[0].doneAtCall, "the request's first event waits")
 	assert.True(t, (*calls)[1].doneAtCall, "the bound is spent: no second wait")
 	assert.True(t, (*calls)[2].doneAtCall, "the bound is spent: no third wait")
+	assert.Equal(t, int64(3), countDeferred(t), "past the bound, every event is deferred")
 	t.Logf("three events of one request on a node behind: %v", took)
 
 	*calls = (*calls)[:0]
 	for range 2 {
-		resolve(db.DefaultContext, t, commentInput(t))
+		requireDeferred(db.DefaultContext, t, commentInput(t))
 	}
 	require.Len(t, *calls, 2)
 	for _, c := range *calls {
