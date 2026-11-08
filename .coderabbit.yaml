@@ -1,6 +1,11 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 # Review the PRs of this repository, whose default branch is `forgejo`, not
 # `main`: the cluster branch, its stacked PRs and the documentation.
+# inheritance: true merges the central kodflow/coderabbit/.coderabbit.yaml under
+# this file: it carries the title keywords that keep the post-commit and
+# runner-template sync PRs out of review. Keys set here still win.
+inheritance: true
+
 reviews:
   auto_review:
     base_branches:
