@@ -101,8 +101,9 @@ func lfsWriters(t *testing.T) (map[string]func(name string, content []byte) erro
 // and whether its file is stored.
 func lfsState(t *testing.T, content []byte) (int64, bool) {
 	t.Helper()
-	p, err := lfs.GeneratePointer(bytes.NewReader(content))
+	generated, err := lfs.GeneratePointer(bytes.NewReader(content))
 	require.NoError(t, err)
+	p := *generated
 	rows, err := db.GetEngine(db.DefaultContext).Where("oid = ?", p.Oid).Count(new(git_model.LFSMetaObject))
 	require.NoError(t, err)
 	stored, err := lfs.NewContentStore().Exists(p)
