@@ -505,30 +505,23 @@ func TestGitPushMirror(t *testing.T) {
 			require.NoError(t, err)
 
 			// wait for new commit to arrive to the mirror
-			start := time.Now()
-			for {
+			const maxDelay = 30 * time.Second
+			require.Eventuallyf(t, func() bool {
 				updatedSha, err := gitMirror.GetBranchCommitID(mirror.DefaultBranch)
 				require.NoError(t, err)
-				if updatedSha != initialSha {
-					break
-				}
-				const maxDelay = 5 * time.Second
-				if time.Since(start) >= maxDelay {
-					t.Errorf("mirror not updated within %s", maxDelay)
-					break
-				}
-				time.Sleep(time.Second)
-			}
+				return updatedSha != initialSha
+			}, maxDelay, time.Second, "mirror not updated with %s", maxDelay)
 
 			// check that the refs got deleted from the mirror and cannot be fetched anymore
-			err = git.NewCommand(git.DefaultContext, "fetch").
-				AddDynamicArguments(
-					mirror.HTMLURL(),
-					fmt.Sprintf("refs/pull/%d/head:%s", 2, "second-branch-pr"),
-				).
-				Run(&git.RunOpts{Dir: repoPath})
-			require.Error(t, err)
-			require.True(t, git.IsErrorExitCode(err, 128), err)
+			require.EventuallyWithTf(t, func(t *assert.CollectT) {
+				err = git.NewCommand(git.DefaultContext, "fetch").
+					AddDynamicArguments(
+						mirror.HTMLURL(),
+						fmt.Sprintf("refs/pull/%d/head:%s", 2, "second-branch-pr"),
+					).
+					Run(&git.RunOpts{Dir: repoPath})
+				require.True(t, git.IsErrorExitCode(err, 128), err)
+			}, maxDelay, time.Second, "pull ref not deleted within %s", maxDelay)
 		})
 	})
 }
@@ -642,15 +635,22 @@ func TestGitPushAGit(t *testing.T) {
 
 		newAgitPR := func(repoPath string) (string, error) {
 			branchName := "agit-pr"
+			topicName := "agit-topic"
 			doGitCreateBranch(repoPath, branchName)(t)
 			doGitAddSomeCommits(repoPath, branchName)(t)
 			_, stdErr, err := git.NewCommand(git.DefaultContext, "push", "origin").
-				AddDynamicArguments(fmt.Sprintf("%s:refs/for/main/%s", branchName, branchName)).RunStdString(&git.RunOpts{Dir: repoPath})
+				AddDynamicArguments(fmt.Sprintf("%s:refs/for/main/%s", branchName, topicName)).RunStdString(&git.RunOpts{Dir: repoPath})
 			if err != nil {
 				return "", err
 			}
 			require.NoError(t, err)
-			return prRegex.FindStringSubmatch(stdErr)[1], nil
+
+			matches := prRegex.FindStringSubmatch(stdErr)
+			require.Len(t, matches, 2, stdErr)
+
+			assert.Contains(t, stdErr, "Visit the created pull request:")
+			assert.Contains(t, stdErr, fmt.Sprintf("git config set branch.%s.merge %s", topicName, matches[0]))
+			return matches[1], nil
 		}
 		fetchAgitPR := func(repoPath, branchName, prIndex string) error {
 			return git.NewCommand(git.DefaultContext, "fetch", "origin").
@@ -664,6 +664,11 @@ func TestGitPushAGit(t *testing.T) {
 			if err != nil {
 				return fmt.Errorf("%s: %w", stdErr, err)
 			}
+			matches := prRegex.FindStringSubmatch(stdErr)
+			require.Len(t, matches, 2, stdErr)
+
+			assert.Contains(t, stdErr, "Visit the existing pull request")
+			assert.NotContains(t, stdErr, "git config set branch.")
 			return nil
 		}
 
