@@ -198,8 +198,15 @@ func renameUser(ctx context.Context, u *user_model.User, newUserName string, doe
 		u.Name = oldUserName
 		u.LowerName = strings.ToLower(oldUserName)
 		if clusterhook.IsOutcomeUnresolved(err) {
-			// The members may follow the rename: the directory stays.
-			log.Critical("Renaming user %s to %s: %v; the directory stays under the new name, run `forgejo cluster reconcile`", oldUserName, newUserName, err)
+			// The members may follow the rename: the directory stays, and
+			// the line gives the operator the procedure that keeps a copy
+			// under the old owner from being served (#282). Only the
+			// directories the rename moved are named: SQL names the owner
+			// by its old name until it is aligned, and a repository it
+			// creates meanwhile is its own.
+			log.Critical("Renaming user %s (ID %d) to %s: %v; the directory stays under the new name, %s, and SQL keeps the old one: %s",
+				oldUserName, u.ID, newUserName, err, user_model.UserPath(newUserName),
+				clusterhook.UnresolvedMoveProcedure("the owner name "+oldUserName, "the directories the rename moved, of its repositories and their wikis, under "+user_model.UserPath(oldUserName)))
 			return fmt.Errorf("rename user in the cluster: %w", err)
 		}
 		if err2 := util.Rename(user_model.UserPath(newUserName), user_model.UserPath(oldUserName)); err2 != nil && !os.IsNotExist(err2) {

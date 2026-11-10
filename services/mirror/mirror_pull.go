@@ -436,7 +436,8 @@ func runSync(ctx context.Context, m *repo_model.Mirror, guard *pullGuard) ([]*mi
 	stdoutBuilder := strings.Builder{}
 	stderrBuilder := strings.Builder{}
 	// In a cluster, a sync that updates more refs than one transaction
-	// takes is written by batches (#134).
+	// takes, or more than one entry holds, is written by batches (#134,
+	// #385).
 	batched, err := syncInBatches(ctx, m, remoteURL.URL.String(), repoPath, m.EnablePrune, true, timeout, envs, guard.checker(false), &stderrBuilder)
 	if err != nil {
 		if refusedSync(m, err) {
@@ -450,7 +451,7 @@ func runSync(ctx context.Context, m *repo_model.Mirror, guard *pullGuard) ([]*mi
 		return nil, false
 	}
 	if batched {
-		log.Info("SyncMirrors [repo: %-v]: the sync updated more refs than the cluster takes in one transaction; written by batches", m.Repo)
+		log.Info("SyncMirrors [repo: %-v]: the sync updated more refs than the cluster takes in one transaction or one entry; written by batches", m.Repo)
 	} else if err := guard.check(false); err != nil {
 		// The batches' dry run fetched the objects first, which takes its
 		// time: the fetch comes right after a check of its own.

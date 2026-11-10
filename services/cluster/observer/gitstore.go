@@ -267,15 +267,54 @@ func (g gitStore) createRefs(ctx context.Context, dir, checkpoint string, refs m
 	return nil
 }
 
+// dropPackedRefsLock removes the packed-refs.lock left at the root of the
+// store at dir, a regular file only: a deletion takes it whether or not
+// its refs are packed. As with dropLocks, a lock there is a git killed in
+// an earlier pass, never one at work: the observer is its store's only
+// writer (#387).
+func dropPackedRefsLock(dir string) error {
+	lock := filepath.Join(dir, "packed-refs.lock")
+	info, err := os.Lstat(lock)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", lock)
+	}
+	return os.Remove(lock)
+}
+
 // dropRefs removes a pruned checkpoint's refs; the objects stay. A store
 // whose directory does not exist holds none: an empty repository's is
 // never created, having nothing to fetch, and git cannot run there. Any
 // other failure to read the store, a damaged one included, is an error,
 // which the next pass retries (#379).
+//
+// A deletion git killed between its prepare and its commit (SIGKILL: an
+// OOM kill, a power loss, run's WaitDelay expired) left its locks, each
+// ref's under the checkpoint's namespace and packed-refs.lock: the prune
+// of that checkpoint failed on them at every pass, and with it the prune
+// of every later one, pruneData and renewBase, the observer's disk
+// growing for good (#387). They are taken up first, as createRefs takes up
+// its own (#85): nothing else ever writes in the store meanwhile. A pass
+// runs its git commands one at a time, each ended and reaped before the
+// next, under observer.lock, which a second observer process does not get
+// (lockDir); the commands that open the directory without it, `observe
+// list` and `recover --from-observer` (OpenArchive), only read the store,
+// with for-each-ref and the upload-pack of a fetch, which take no lock.
 func (g gitStore) dropRefs(ctx context.Context, dir, checkpoint string) error {
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
+		return err
+	}
+	if err := g.dropLocks(dir, checkpoint); err != nil {
+		return err
+	}
+	if err := dropPackedRefsLock(dir); err != nil {
 		return err
 	}
 	refs, err := g.refs(ctx, dir, checkpoint)

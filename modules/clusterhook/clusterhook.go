@@ -487,6 +487,24 @@ var ErrOutcomeUnresolved = errors.New("the cluster may or may not have recorded 
 // IsOutcomeUnresolved reports whether err is ErrOutcomeUnresolved.
 func IsOutcomeUnresolved(err error) bool { return errors.Is(err, ErrOutcomeUnresolved) }
 
+// UnresolvedMoveProcedure is the operator's procedure for the line Forgejo
+// logs when a repository's rename or transfer, or an owner's rename, ends
+// in ErrOutcomeUnresolved on this node. The directories stay under the new
+// name and SQL under the old one, and the hold of their keys is released
+// while the move may still apply: until this node applies it, its
+// projector may create a directory under the old name, which its table
+// still names, fetch the whole repository into it and certify it. Once SQL
+// is aligned on the move, the old name is free, and a repository created
+// there later adopted that copy and served the moved repository's objects
+// under its own rights. A restart of the node sets that copy aside, and so
+// does removing it: the operator does either, the move applied on this
+// node, before aligning SQL. The hold is not kept until the table tells,
+// which would stop this node's projection for as long as the quorum is
+// lost (#282). freed is the old name, dirs where that copy would be.
+func UnresolvedMoveProcedure(freed, dirs string) string {
+	return fmt.Sprintf("run `forgejo cluster reconcile` on this node; once it reports the move, and before aligning SQL on it, which frees %s, restart this node, or remove %s if present: until this node applied the move, its projector may have fetched a whole copy again there, for a repository created later under that name to serve (#282)", freed, dirs)
+}
+
 // RepoRenamed records a repository and its wiki moving, after Forgejo moved
 // them locally. Both moves are one replicated command, applied together or
 // not at all. An error means the other members did not follow: the caller

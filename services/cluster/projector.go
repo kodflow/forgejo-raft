@@ -584,8 +584,8 @@ func (p *projector) project(base, ctx context.Context, repo string) error {
 	withRenamedAway(p.table, repo, refs)
 
 	if _, deleted := p.table.Deleted(repo); deleted {
-		if err := os.RemoveAll(dir); err != nil {
-			return err
+		if removed, err := p.removeDeleted(repo, dir); err != nil || !removed {
+			return err // retried at the next pass
 		}
 		p.mu.Lock()
 		delete(p.deletedAt, repo)
@@ -593,8 +593,8 @@ func (p *projector) project(base, ctx context.Context, repo string) error {
 		p.certify(repo, at, nil)
 		return nil
 	}
-	if p.movesOn(repo, dir) {
-		return nil // the projection of the rename's target moves it first
+	if wait, err := p.movesOn(repo, dir); err != nil || wait {
+		return err // the projection of the rename's target moves it first
 	}
 	if err := p.setAsideStale(repo, dir); err != nil {
 		return err
@@ -631,6 +631,20 @@ func (p *projector) project(base, ctx context.Context, repo string) error {
 				if err := os.Rename(src, dir); err != nil {
 					return err
 				}
+			}
+		}
+		// The repository's directory may wait in the parking a cycle of
+		// renames sent it to (movesOn, #392), under no key: no git process
+		// and no fetch writes there.
+		if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+			if parked := p.parked(repo); parked != "" {
+				if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+					return err
+				}
+				if err := os.Rename(parked, dir); err != nil {
+					return err
+				}
+				log.Info("cluster: %s takes its repository's directory back from %s", repo, parked)
 			}
 		}
 	}
@@ -1090,21 +1104,46 @@ func (p *projector) holdsRenamed(src, from, to string, renIdx uint64) bool {
 // transaction in flight, a failure). Projecting repo now would rewrite that
 // directory as repo, certified past the rename, and Z would no longer take
 // it; repo waits, and Z is scheduled to move it.
-func (p *projector) movesOn(repo, dir string) bool {
+//
+// Waits that come back to repo never end: two repositories that swapped
+// their names through a third one (a to t, b to a, t to b), by their own
+// renames, their owners' or transfers, or more that rotated them, while
+// this node was behind, each directory still under its old key and each
+// key waiting for the next one's projection to take its directory first.
+// Every pass and every start met them again, and the keys stayed refused
+// for good (#392). Such a cycle is broken at repo: its directory is parked
+// out of the way (park), repo's projection goes on and takes the directory
+// of the key that waits for it, and Z takes the parked one once its own
+// left.
+func (p *projector) movesOn(repo, dir string) (bool, error) {
+	z, ok := p.waitsFor(repo, dir)
+	if !ok {
+		return false, nil
+	}
+	if p.waitsBack(repo, z) {
+		return false, p.park(repo, dir, z)
+	}
+	p.markDirty(z)
+	return true, nil
+}
+
+// waitsFor is movesOn's judgement alone: the key Z whose projection takes
+// dir, repo's directory, first, when repo waits for it.
+func (p *projector) waitsFor(repo, dir string) (string, bool) {
 	if _, err := os.Stat(dir); err != nil {
-		return false
+		return "", false
 	}
 	first, firstIdx, z, zIdx, ok := p.movedOn(repo, dir)
 	if !ok || z == repo {
-		return false
+		return "", false
 	}
 	if _, deleted := p.table.Deleted(z); deleted {
-		return false
+		return "", false
 	}
 	if at, deleted := p.table.DeletedBefore(z, math.MaxUint64); deleted && at > zIdx {
 		// Z was deleted since, and maybe taken again: the repository this
 		// directory holds is gone (#98).
-		return false
+		return "", false
 	}
 	if _, err := os.Stat(filepath.Join(p.root, filepath.FromSlash(z))); !errors.Is(err, os.ErrNotExist) {
 		// Z's directory may be the previous repository under that name,
@@ -1114,14 +1153,103 @@ func (p *projector) movesOn(repo, dir string) bool {
 		done := p.watermark[z] >= zIdx
 		p.mu.Unlock()
 		if done {
-			return false
+			return "", false
 		}
 	}
 	if !p.holdsRenamed(dir, repo, first, firstIdx) {
-		return false
+		return "", false
 	}
-	p.markDirty(z)
-	return true
+	return z, true
+}
+
+// waitsBack reports whether the waits that start at z, each key waiting for
+// the next one's projection (waitsFor), come back to repo. Nothing but
+// those projections lifts such a wait, and none of them gets past it. A
+// deleted key's projection removes its directory before it would wait.
+func (p *projector) waitsBack(repo, z string) bool {
+	seen := map[string]bool{}
+	for key := z; !seen[key]; {
+		if key == repo {
+			return true
+		}
+		seen[key] = true
+		if _, deleted := p.table.Deleted(key); deleted {
+			return false
+		}
+		next, ok := p.waitsFor(key, filepath.Join(p.root, filepath.FromSlash(key)))
+		if !ok {
+			return false
+		}
+		key = next
+	}
+	return false
+}
+
+// parkedPrefix starts the name, under staleDirName, of a directory parked to
+// break a cycle of renames. No owner starts with a dot, so no directory set
+// aside under its key's name does.
+const parkedPrefix = ".parked-"
+
+// park moves dir, repo's directory, which holds the repository renames moved
+// on to z, out of repo's way under staleDirName, named after its stamp: it
+// stays the repository certified under the key and at the watermark the
+// stamp names, under no key, and z's projection takes it from there once
+// z's own directory left (parked). Nothing is removed and no key serves it
+// meanwhile. A directory without a keyed stamp could not be recognised
+// there: it is set aside, and z's repository fetched from the members.
+func (p *projector) park(repo, dir, z string) error {
+	s, known := readStamp(dir)
+	if !known || reftable.ValidRepoKey(s.Repo) != nil {
+		if err := p.setAside(dir, repo, 0); err != nil {
+			return err
+		}
+		log.Warn("cluster: %s waits for %s to take its directory first, which waits back for it through renames that swapped or rotated names on this node, and that directory names no repository: it is set aside, and the repository of %s fetched from the members", repo, z, z)
+		return nil
+	}
+	aside := filepath.Join(p.root, staleDirName, fmt.Sprintf("%s%s-%d", parkedPrefix, strings.ReplaceAll(s.Repo, "/", "_"), s.Watermark))
+	if err := os.MkdirAll(filepath.Dir(aside), 0o700); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(aside); err == nil {
+		aside = fmt.Sprintf("%s-%d", aside, time.Now().UnixNano())
+	}
+	if err := os.Rename(dir, aside); err != nil {
+		return err
+	}
+	log.Warn("cluster: %s waits for %s to take its directory first, which waits back for it through renames that swapped or rotated names on this node: that directory is parked in %s until %s takes it", repo, z, aside, z)
+	return nil
+}
+
+// parked finds the directory park sent out of the way that holds the
+// repository under repo: by its stamp, the repository certified there,
+// followed along the renames that moved it on, reached repo by the newest
+// rename into it, after its certification, and stayed. "" when none does.
+// Only the directories park named are read, never one set aside: those
+// hold no repository the cluster serves.
+func (p *projector) parked(repo string) string {
+	_, renIdx, ok := p.liveRename(repo)
+	if !ok {
+		return ""
+	}
+	stale := filepath.Join(p.root, staleDirName)
+	entries, err := os.ReadDir(stale)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), parkedPrefix) {
+			continue
+		}
+		dir := filepath.Join(stale, e.Name())
+		s, known := readStamp(dir)
+		if !known || s.Watermark >= renIdx {
+			continue
+		}
+		if holder, at, ok := p.heldAfter(s.Repo, s.Watermark, math.MaxUint64); ok && holder == repo && at == renIdx {
+			return dir
+		}
+	}
+	return ""
 }
 
 // movedOn finds where the repository dir holds went from repo: the rename
@@ -1240,6 +1368,58 @@ func (p *projector) setAsideStale(repo, dir string) error {
 	}
 	log.Warn("cluster: %s was taken by a rename of %s while this node still held its previous repository: that directory is set aside in %s", repo, from, aside)
 	return nil
+}
+
+// removeDeleted removes the directory under a deleted key, and reports
+// whether nothing is left of it. Forgejo creating a repository anew under
+// the freed name, on this node, makes the directory first: git init writes
+// config, refs and HEAD.lock, then waits for the hook in "prepared", which
+// registers the transaction only once its request reached the replicator,
+// and renames HEAD.lock once the table took the key again. Until the
+// registration nothing fenced the key, and a pass of the deletion still
+// due removed the directory under git init, which failed the creation
+// (#391). A directory that is no git repository yet, carries no stamp and
+// changed lately, as setAsideInvalid judges one git may still be writing,
+// is left to the next pass: its HEAD takes the key within moments, or it
+// is an interrupted init, removed once it aged. Anything else under the
+// key, the deleted repository's directory, a file or a link, is removed at
+// once, as is a directory that cannot be judged. The key is read again
+// after the directory: a git init that completed is one whose HEAD the
+// table took first.
+func (p *projector) removeDeleted(repo, dir string) (bool, error) {
+	st, err := os.Lstat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		// Nothing to remove: a directory made from now on is a creation's.
+		return true, nil
+	}
+	if err == nil && st.IsDir() && p.mayBeInit(dir, st) {
+		return false, nil
+	}
+	if _, deleted := p.table.Deleted(repo); !deleted || p.registry.inFlight(repo) {
+		return false, nil
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// mayBeInit reports whether dir, a directory under a deleted key, may be
+// one Forgejo's git init still writes for a repository created anew: no
+// git repository yet, no stamp of a projection, and changed within the
+// registration's TTL and staleLockAge of now. A time further ahead is no
+// write of this node's git, and never holds the removal for good.
+func (p *projector) mayBeInit(dir string, st os.FileInfo) bool {
+	if _, known := readStamp(dir); known {
+		return false
+	}
+	invalid, err := invalidRepoDir(dir)
+	if err != nil || !invalid {
+		return false
+	}
+	window := max(p.registry.ttl, staleLockAge)
+	age := time.Since(st.ModTime())
+	return age > -window && age <= window
 }
 
 // setAsideInvalid moves aside a directory under repo's key that is no git
@@ -1395,16 +1575,16 @@ func (p *projector) leavesKey(repo string) bool {
 // meanwhile would keep it out (#100). It follows the projection's rule
 // (renamedIn): a key whose rename's repository left it again waits for no
 // directory, and a pack for the repository created anew there is taken
-// (#204).
+// (#204). A repository whose directory a cycle of renames parked waits for
+// it as well (#392).
 func (p *projector) awaitsRename(repo string) bool {
 	if _, err := os.Stat(filepath.Join(p.root, filepath.FromSlash(repo))); err == nil {
 		return false
 	}
-	from, to, renIdx, ok := p.renamedIn(repo)
-	if !ok {
-		return false
+	if from, to, renIdx, ok := p.renamedIn(repo); ok && p.holdsRenamed(filepath.Join(p.root, filepath.FromSlash(from)), from, to, renIdx) {
+		return true
 	}
-	return p.holdsRenamed(filepath.Join(p.root, filepath.FromSlash(from)), from, to, renIdx)
+	return p.parked(repo) != ""
 }
 
 // holdsAnotherID reports whether repo's directory holds, by its stamp,

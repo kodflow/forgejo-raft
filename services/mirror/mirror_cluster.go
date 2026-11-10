@@ -437,7 +437,8 @@ func pushCredentialURL(ctx context.Context, m *repo_model.PushMirror, remoteURL 
 }
 
 // syncRefBatch bounds the refs one git command of a mirror's sync writes in
-// a cluster, as the clone's batches do (services/repository).
+// a cluster, as the clone's batches do (services/repository); their weight
+// is bounded too (reftable.BatchBytes).
 const syncRefBatch = 512
 
 // syncInBatches runs the fetch of a mirror's sync by batches in a cluster
@@ -475,12 +476,18 @@ func syncInBatches(ctx context.Context, m *repo_model.Mirror, credURL, dir strin
 // ref git rejects or the cluster cannot hold. git 2.54 and later write a
 // whole fetch in one transaction, which the cluster refuses past
 // reftable.MaxUpdatesPerTxn: the sync failed, and every later one fetched
-// the same refs and failed the same way (#134). dry is the sync's fetch
-// with --dry-run --porcelain, which brings the objects and lists the
-// updates without writing a ref. Past the bound, the updates are written
-// by batches of syncRefBatch, each checked against the old value the fetch
-// read, and the output is the fetch's own, so the sync reports the same
-// results; batched is false when the sync's fetch can run as is.
+// the same refs and failed the same way (#134). That transaction is one
+// entry, which the engine refuses past consensus.MaxEntryBytes as well:
+// a sync of fewer refs with long names, or names encoding/json escapes,
+// was refused the same way at every sync, and a batch of syncRefBatch
+// such names too (#385). dry is the sync's fetch with --dry-run
+// --porcelain, which brings the objects and lists the updates without
+// writing a ref. Past either bound, the updates are written by batches of
+// syncRefBatch refs at most and of reftable.BatchBytes at most
+// (reftable.UpdateBytes, which bounds an update's share of its entry),
+// each checked against the old value the fetch read, and the output is
+// the fetch's own, so the sync reports the same results; batched is false
+// when the sync's fetch can run as is.
 //
 // That transaction tolerates a failure per ref (measured with git 2.51):
 // git rejects a ref that conflicts as a directory and a file with a ref
@@ -514,7 +521,11 @@ func fetchInBatches(ctx context.Context, dry *git.Command, dir string, timeout t
 		// The sync's own fetch reads the same directory and reports it.
 		return "", false, nil
 	}
-	if len(refused) == 0 && len(updates) <= reftable.MaxUpdatesPerTxn {
+	weight := 0
+	for _, u := range updates {
+		weight += reftable.UpdateBytes(u.ref, "")
+	}
+	if len(refused) == 0 && len(updates) <= reftable.MaxUpdatesPerTxn && weight <= reftable.BatchBytes {
 		return "", false, nil
 	}
 	if len(refused) > 0 {
@@ -533,7 +544,7 @@ func fetchInBatches(ctx context.Context, dry *git.Command, dir string, timeout t
 	pruned := len(updates) - len(rest)
 	var out strings.Builder
 	for len(updates) > 0 {
-		n := min(len(updates), syncRefBatch)
+		n := reftable.BatchLen(len(updates), syncRefBatch, func(i int) int { return reftable.UpdateBytes(updates[i].ref, "") })
 		if pruned > 0 {
 			n = min(n, pruned)
 			pruned -= n

@@ -10,6 +10,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"os/exec"
@@ -24,6 +26,7 @@ import (
 	auth_model "forgejo.org/models/auth"
 	cluster_model "forgejo.org/models/cluster"
 	"forgejo.org/models/db"
+	git_model "forgejo.org/models/git"
 	gitea_migrations_model "forgejo.org/models/gitea_migrations"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/modules/clusterhook"
@@ -32,6 +35,7 @@ import (
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/json"
 	"forgejo.org/modules/jwtx"
+	"forgejo.org/modules/log"
 	repo_module "forgejo.org/modules/repository"
 	"forgejo.org/modules/setting"
 	"forgejo.org/services/cluster"
@@ -58,7 +62,17 @@ func recoverFromObserverFlags() []cli.Flag {
 		&cli.StringFlag{Name: "pg-ctl", Usage: "pg_ctl, run as PostgreSQL's owner; without it, the recovery stops for the operator to start PostgreSQL"},
 		&cli.StringFlag{Name: "wal-archive-dir", Usage: "the recovered primary's fresh WAL archive (default: [cluster] WAL_ARCHIVE_DIR)"},
 		&cli.BoolFlag{Name: "accept-orphans", Usage: "step 6 restores as orphans the repositories the checkpoint holds and SQL has no row for, also when SQL holds repositories the checkpoint does not, as one half of a rename or a transfer cut in two would; the operator's decision, see observer.md"},
+		&cli.BoolFlag{Name: "accept-missing-lfs", Usage: "step 6 lists the LFS objects SQL names and the restored storage lacks, with their repositories, then deletes their rows and goes on, instead of refusing the checkpoint; a mirror's next synchronisation downloads them again, an object pushed to the forge is lost until pushed again; the operator's decision, see observer.md"},
 	}
+}
+
+// verifyDecisions are the operator's decisions step 6 takes, each a flag of
+// recover --from-observer.
+type verifyDecisions struct {
+	// acceptOrphans is --accept-orphans (verifyBranches).
+	acceptOrphans bool
+	// acceptMissingLFS is --accept-missing-lfs (verifyLFSObjects).
+	acceptMissingLFS bool
 }
 
 // recoverProgress is what a recovery did, kept in <out>/progress.json so a
@@ -339,7 +353,7 @@ func runRecoverFromObserver(ctx context.Context, c *cli.Command) error {
 		if err := git.InitSimple(ctx); err != nil {
 			return err
 		}
-		if err := verifyRecovered(ctx, m, w, c.Bool("accept-orphans")); err != nil {
+		if err := verifyRecovered(ctx, m, w, verifyDecisions{acceptOrphans: c.Bool("accept-orphans"), acceptMissingLFS: c.Bool("accept-missing-lfs")}); err != nil {
 			return err
 		}
 		if err := save(stepVerify); err != nil {
@@ -1205,9 +1219,9 @@ var revokedTables = []string{"access_token_resource_repo", "access_token", "oaut
 // forge trusts none it held. The credentials configured elsewhere, a
 // registered runner's or an OAuth2 application's secret, are kept
 // (observer.md, step 6).
-func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Write([]byte) (int, error) }, acceptOrphans bool) error {
+func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Write([]byte) (int, error) }, decisions verifyDecisions) error {
 	e := db.GetEngine(ctx)
-	if err := verifyBranches(ctx, m, w, acceptOrphans); err != nil {
+	if err := verifyBranches(ctx, m, w, decisions.acceptOrphans); err != nil {
 		return err
 	}
 	if err := verifyRestoredRepos(ctx, m, setting.RepoRootPath, w); err != nil {
@@ -1218,12 +1232,14 @@ func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Wri
 	// object, and also an attachment (but a link to an external URL, which
 	// has no file) and a package blob, whose absence
 	// would otherwise pass in silence (#90).
+	if err := verifyLFSObjects(ctx, w, decisions.acceptMissingLFS); err != nil {
+		return err
+	}
 	for _, sf := range []struct {
 		what, query, column string
 		storage             *setting.Storage
 		rel                 func(string) string
 	}{
-		{"LFS object", "SELECT DISTINCT oid FROM lfs_meta_object", "oid", setting.LFS.Storage, func(k string) string { return k[:2] + "/" + k[2:4] + "/" + k[4:] }},
 		{"attachment", "SELECT uuid FROM attachment WHERE external_url IS NULL OR external_url = ''", "uuid", setting.Attachment.Storage, func(k string) string { return k[:1] + "/" + k[1:2] + "/" + k }},
 		{"package blob", "SELECT hash_sha256 FROM package_blob", "hash_sha256", setting.Packages.Storage, func(k string) string { return k[:2] + "/" + k[2:4] + "/" + k }},
 	} {
@@ -1267,5 +1283,100 @@ func verifyRecovered(ctx context.Context, m *observer.Manifest, w interface{ Wri
 		n, _ := res.RowsAffected()
 		fmt.Fprintf(w, "revoked: %d rows of %s\n", n, table)
 	}
+	return nil
+}
+
+// lfsOidBatch bounds the LFS objects one statement of verifyLFSObjects
+// names, under every database's limit on the parameters of a statement.
+const lfsOidBatch = 500
+
+// verifyLFSObjects checks that the file of every LFS object SQL names is in
+// the restored storage, as storedPresent does for the other stored files.
+// An object whose file is missing refuses the step: a node that died
+// between the row and the file, before #301 wrote the file first, left such
+// a row for good, every checkpoint since holding it, and a mirror's
+// synchronisation outside a cluster never downloads again an object whose
+// row exists (#302). The refusal names --accept-missing-lfs, the operator's
+// decision (acceptMissing): the step then lists those objects with each
+// repository naming them, on w and in the log, deletes their rows, and goes
+// on. A mirror's next synchronisation downloads them again from its
+// upstream; an object pushed to the forge is lost until it is pushed again.
+// A file the storage cannot tell missing (a permission, an I/O error)
+// refuses the step, with the option too: its row is never deleted.
+func verifyLFSObjects(ctx context.Context, w io.Writer, acceptMissing bool) error {
+	s := setting.LFS.Storage
+	if s == nil || s.Type != setting.LocalStorageType {
+		return nil
+	}
+	e := db.GetEngine(ctx)
+	rows, err := e.Query("SELECT DISTINCT oid FROM lfs_meta_object")
+	if err != nil {
+		return err
+	}
+	present := 0
+	var missing []string
+	for _, r := range rows {
+		oid := string(r["oid"])
+		if len(oid) < 5 {
+			continue
+		}
+		_, err := os.Stat(filepath.Join(s.Path, filepath.FromSlash(oid[:2]+"/"+oid[2:4]+"/"+oid[4:])))
+		switch {
+		case err == nil:
+			present++
+		case errors.Is(err, fs.ErrNotExist):
+			missing = append(missing, oid)
+		default:
+			return fmt.Errorf("the LFS object %s is in SQL and its file in the restored storage cannot be read: %w", oid, err)
+		}
+	}
+	if len(missing) > 0 && !acceptMissing {
+		return fmt.Errorf("the LFS object %s is in SQL and not in the restored storage, one of %d such objects: a row left without its file (observer.md, step 6). Run the same command again with --accept-missing-lfs to list them with their repositories and delete their rows: a mirror's next synchronisation downloads them again, an object pushed to the forge is lost until it is pushed again", missing[0], len(missing))
+	}
+	if len(missing) > 0 {
+		var metas []*git_model.LFSMetaObject
+		for start := 0; start < len(missing); start += lfsOidBatch {
+			var batch []*git_model.LFSMetaObject
+			if err := e.In("oid", missing[start:min(start+lfsOidBatch, len(missing))]).OrderBy("oid, repository_id").Find(&batch); err != nil {
+				return err
+			}
+			metas = append(metas, batch...)
+		}
+		ids := make([]int64, 0, len(metas))
+		for _, meta := range metas {
+			ids = append(ids, meta.RepositoryID)
+		}
+		repos, err := repo_model.GetRepositoriesMapByIDs(ctx, ids)
+		if err != nil {
+			return err
+		}
+		// Listed before anything is deleted.
+		for _, meta := range metas {
+			of := fmt.Sprintf("repository ID %d, which SQL does not hold", meta.RepositoryID)
+			if repo, ok := repos[meta.RepositoryID]; ok {
+				of = fmt.Sprintf("%s/%s (ID %d)", repo.OwnerName, repo.LowerName, repo.ID)
+			}
+			line := fmt.Sprintf("the LFS object %s of %s is in SQL and not in the restored storage: its row is deleted (--accept-missing-lfs)", meta.Oid, of)
+			log.Warn("recover --from-observer, step 6: %s", line)
+			fmt.Fprintf(w, "WARNING: %s\n", line)
+		}
+		var deleted int64
+		if err := db.WithTx(ctx, func(ctx context.Context) error {
+			for start := 0; start < len(missing); start += lfsOidBatch {
+				n, err := db.GetEngine(ctx).In("oid", missing[start:min(start+lfsOidBatch, len(missing))]).Delete(new(git_model.LFSMetaObject))
+				if err != nil {
+					return err
+				}
+				deleted += n
+			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("deleting the rows of the LFS objects the restored storage lacks: %w", err)
+		}
+		line := fmt.Sprintf("deleted: %d rows of %d LFS objects the restored storage lacks (--accept-missing-lfs)", deleted, len(missing))
+		log.Warn("recover --from-observer, step 6: %s", line)
+		fmt.Fprintln(w, line)
+	}
+	fmt.Fprintf(w, "verified: %d LFS objects present\n", present)
 	return nil
 }

@@ -276,8 +276,12 @@ reach: the ingestion process cannot delete a version. In the live
 directory, a protected checkpoint older than 72 hours is let go of (never the
 newest protected one, never while the hook fails), and with it the base
 backups, WAL and stored files no remaining checkpoint needs; its snapshots
-keep it. Staging is bounded by `OBSERVER_STAGING_QUOTA`: at the quota,
-ingestion stops; nothing protected is deleted.
+keep it. A git killed while it removes a checkpoint's refs (an OOM kill,
+a power loss) leaves its locks in the observer's git store: the next pass
+removes them before it removes the refs again, as it does for the git that
+creates a checkpoint's refs. Staging is bounded by
+`OBSERVER_STAGING_QUOTA`: at the quota, ingestion stops; nothing protected
+is deleted.
 
 Once the newest base backup is older than `OBSERVER_BASE_EVERY` (default
 `168h`, one hour at least), a pass takes another after its checkpoint is
@@ -430,6 +434,20 @@ before running the command again. The steps:
    at this step. The error offers it only when the orphans are all that
    differs: the branch rows of a repository the checkpoint does not hold
    are refused, with the flag or without it.
+   An LFS object SQL names and the restored storage lacks refuses the step,
+   which names the first one and how many there are: a row left without its
+   file, by a node that died between the two before Forgejo wrote the file
+   first, is in every checkpoint taken since. In a cluster, a mirror's
+   synchronisation downloads such an object again from its upstream, and
+   the checkpoints taken afterwards restore. For a checkpoint taken before,
+   run the same command again with `--accept-missing-lfs`: it resumes at
+   this step, lists each such object with each repository naming it (a
+   `WARNING` line on the output and in the log), deletes their rows, then
+   goes on. Without its row, a mirror's next synchronisation downloads the
+   object again from its upstream; an object pushed to the forge is lost,
+   and git LFS reports it missing until it is pushed again. A file the
+   storage cannot read (a permission, an I/O error) refuses the step, with
+   the flag or without it, and its row is kept.
    Then every token the old forge handed out to sign in or to be let in is
    revoked: access tokens and the repositories some are restricted to,
    OAuth2 grants and codes, sessions, runners' registration tokens,

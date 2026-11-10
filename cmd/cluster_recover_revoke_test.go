@@ -115,7 +115,7 @@ func TestRecoverRevokesEveryToken(t *testing.T) {
 	require.NoError(t, err)
 
 	var out bytes.Buffer
-	require.NoError(t, verifyRecovered(ctx, m, &out, false), out.String())
+	require.NoError(t, verifyRecovered(ctx, m, &out, verifyDecisions{}), out.String())
 	t.Logf("step 6:\n%s", out.String())
 
 	for _, bean := range []any{new(auth_model.AccessToken), new(auth_model.AccessTokenResourceRepo), new(auth_model.AuthorizationToken), new(org_model.TeamInvite)} {

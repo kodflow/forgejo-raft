@@ -137,7 +137,7 @@ func TestRecoverAcceptsACheckpointTakenDuringAnLFSDownload(t *testing.T) {
 	// A checkpoint now: SQL at L does not name the object yet, and step 6
 	// accepts it.
 	var stepOut bytes.Buffer
-	require.NoError(t, verifyRecovered(ctx, m, &stepOut, false), "step 6 on the checkpoint taken during the download")
+	require.NoError(t, verifyRecovered(ctx, m, &stepOut, verifyDecisions{}), "step 6 on the checkpoint taken during the download")
 	require.Zero(t, rows(), "the row is committed before its file is written")
 	require.False(t, present())
 
@@ -153,7 +153,7 @@ func TestRecoverAcceptsACheckpointTakenDuringAnLFSDownload(t *testing.T) {
 
 	// Every later checkpoint holds the row and its file.
 	stepOut.Reset()
-	require.NoError(t, verifyRecovered(ctx, m, &stepOut, false), "step 6 on a later checkpoint")
+	require.NoError(t, verifyRecovered(ctx, m, &stepOut, verifyDecisions{}), "step 6 on a later checkpoint")
 	require.Contains(t, stepOut.String(), "verified: 1 LFS objects present")
 
 	// The frozen synchronisation, stopped gracefully, fails its own write

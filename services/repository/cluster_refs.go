@@ -14,13 +14,17 @@ import (
 
 	"forgejo.org/modules/git"
 	repo_module "forgejo.org/modules/repository"
+	"forgejo.org/services/cluster/reftable"
 )
 
 // clusterRefBatch bounds the refs one git command writes in a cluster. git
 // 2.54 and later make a single ref transaction of a fetch or a mirror
 // clone, and the cluster takes at most 4096 refs in one transaction: a
 // repository with more could never be forked nor migrated (#80). Batches
-// of 512, like `forgejo cluster import`, stay well under the bound.
+// of 512, like `forgejo cluster import`, stay well under the bound. Their
+// weight is bounded too (reftable.BatchBytes): a transaction is one entry,
+// which the engine refuses past consensus.MaxEntryBytes, and 512 names
+// that encoding/json escapes passed it (#385).
 const clusterRefBatch = 512
 
 // listRefs returns the refs of dir under patterns, every ref without one.
@@ -37,12 +41,12 @@ func listRefs(ctx context.Context, dir string, patterns ...string) ([]string, er
 }
 
 // fetchRefsInBatches fetches refs from the repository at from into the one
-// at to, each under its own name, at most clusterRefBatch refs per git
-// fetch. The refspecs go on stdin: thousands of them would overrun a
-// command line.
+// at to, each under its own name, at most clusterRefBatch refs and
+// reftable.BatchBytes per git fetch. The refspecs go on stdin: thousands
+// of them would overrun a command line.
 func fetchRefsInBatches(ctx context.Context, from, to string, refs []string, timeout time.Duration) error {
 	for len(refs) > 0 {
-		n := min(len(refs), clusterRefBatch)
+		n := reftable.BatchLen(len(refs), clusterRefBatch, func(i int) int { return reftable.UpdateBytes(refs[i], "") })
 		var spec bytes.Buffer
 		for _, ref := range refs[:n] {
 			fmt.Fprintf(&spec, "+%s:%s\n", ref, ref)

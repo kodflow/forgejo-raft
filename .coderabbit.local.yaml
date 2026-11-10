@@ -1,0 +1,13 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# This repository's own part of its CodeRabbit configuration. CodeRabbit
+# does not read this file: kodflow/post-commit enforce renders .coderabbit.yaml
+# from it, with the fleet's central part laid on top. Edit this file, never
+# .coderabbit.yaml. https://github.com/kodflow/post-commit#coderabbit
+# Review the PRs of this repository, whose default branch is `forgejo`, not
+# `main`: the cluster branch, its stacked PRs and the documentation.
+reviews:
+  auto_review:
+    base_branches:
+      - forgejo
+      - "feat/.*"
+      - "docs/.*"
