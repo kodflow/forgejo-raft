@@ -12,11 +12,16 @@
 # - sync/upstream is only ever pushed fast-forward. Once its last PR is
 #   merged it is an ancestor of `forgejo` and starts again from there; while a
 #   PR is still open, `forgejo` is merged into it first, then upstream.
-# - A conflict in go.mod or go.sum alone is resolved three ways by
+# - A conflict in go.mod or go.sum is resolved three ways by
 #   .github/scripts/gomodmerge (this fork's lines kept, upstream's bumps
 #   taken), then go mod tidy rebuilds go.sum and every package must still
 #   load. Git merges go.mod line by line, so an upstream bump next to a line
 #   this fork added stopped the sync from 2026-10-19.
+# - A conflict in options/locale_next/*.json is resolved by key, by
+#   gomodmerge -locale: upstream and this fork both add their strings just
+#   before meta.last_line, so nearly every new upstream string conflicts line
+#   by line although no key does, which stopped the sync from 2026-11-02. A
+#   key both sides changed differently is still a conflict.
 # - On any other conflict, a replace both sides changed differently, or when
 #   upstream changes .github/workflows (a push the GITHUB_TOKEN may not make,
 #   and where this repository's workflows live), the run fails and pushes
@@ -73,7 +78,7 @@ jobs:
           # push starts the PR's checks.
           token: ${{ secrets.SYNC_TOKEN || github.token }}
 
-      # gomodmerge and go mod tidy, for a go.mod or go.sum conflict.
+      # gomodmerge and go mod tidy, for a go.mod, go.sum or locale conflict.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -87,18 +92,32 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch --no-tags origin "+refs/heads/$SYNC_BRANCH:refs/remotes/origin/$SYNC_BRANCH" 2>/dev/null || true
 
-          # Settles a merge whose only conflicts are go.mod and go.sum; any
-          # other conflicted path, or a failing step, leaves it to a human.
-          resolve_gomod() {
+          # Settles a merge whose only conflicts are go.mod, go.sum and
+          # locale_next files; any other conflicted path, or a failing step,
+          # leaves it to a human.
+          resolve_known() {
             local f mod=false sum=false tmp
+            local -a locales=()
             while IFS= read -r f; do
               case "$f" in
                 go.mod) mod=true ;;
                 go.sum) sum=true ;;
+                options/locale_next/*.json) locales+=("$f") ;;
                 *) return 1 ;;
               esac
             done < <(git diff --name-only --diff-filter=U)
             tmp="$(mktemp -d)"
+            for f in "${locales[@]}"; do
+              git show ":1:$f" > "$tmp/base" &&
+                git show ":2:$f" > "$tmp/ours" &&
+                git show ":3:$f" > "$tmp/theirs" &&
+                (cd .github/scripts/gomodmerge &&
+                  go run . -locale "$tmp/base" "$tmp/ours" "$tmp/theirs") > "$tmp/merged" &&
+                cp "$tmp/merged" "$f" && git add "$f" || return 1
+            done
+            if [ "$mod" = false ] && [ "$sum" = false ]; then
+              return 0
+            fi
             if [ "$mod" = true ]; then
               git show :1:go.mod > "$tmp/base" &&
                 git show :2:go.mod > "$tmp/ours" &&
@@ -146,14 +165,14 @@ jobs:
               exit 1
             fi
             if ! git merge --no-edit --no-ff -m "Merge upstream forgejo/forgejo@${up:0:12}" "$up"; then
-              if ! resolve_gomod; then
+              if ! resolve_known; then
                 echo "::error::upstream does not merge cleanly into $SYNC_BRANCH; nothing was pushed. Conflicted files:"
                 git diff --name-only --diff-filter=U
                 git merge --abort
                 exit 1
               fi
               git commit --no-edit -q
-              echo "go.mod and go.sum merged three ways and tidied"
+              echo "go.mod, go.sum and locale_next conflicts merged three ways"
             fi
             echo "merged $(git rev-list --count "$mb..$up") upstream commits, up to ${up:0:12}"
           fi

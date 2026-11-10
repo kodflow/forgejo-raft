@@ -4,6 +4,7 @@
 // stops the whole sync although the two sides do not disagree.
 //
 //	gomodmerge BASE OURS THEIRS > go.mod
+//	gomodmerge -locale BASE OURS THEIRS > options/locale_next/locale_en-US.json
 //
 // It starts from OURS, so this fork's lines and their comments stay as
 // written, and applies what THEIRS changed since BASE:
@@ -19,6 +20,8 @@
 //     godebug, ignore) is not merged: the command fails.
 //
 // The result still has to go through go mod tidy, which also rebuilds go.sum.
+//
+// With -locale it merges a locale_next JSON file instead, see MergeLocale.
 package main
 
 import (
@@ -33,12 +36,16 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 4 {
-		fmt.Fprintln(os.Stderr, "usage: gomodmerge BASE OURS THEIRS")
+	args, merge := os.Args[1:], Merge
+	if len(args) > 0 && args[0] == "-locale" {
+		args, merge = args[1:], MergeLocale
+	}
+	if len(args) != 3 {
+		fmt.Fprintln(os.Stderr, "usage: gomodmerge [-locale] BASE OURS THEIRS")
 		os.Exit(2)
 	}
 	var data [3][]byte
-	for i, name := range os.Args[1:] {
+	for i, name := range args {
 		b, err := os.ReadFile(name)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -46,7 +53,7 @@ func main() {
 		}
 		data[i] = b
 	}
-	out, err := Merge(data[0], data[1], data[2])
+	out, err := merge(data[0], data[1], data[2])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gomodmerge:", err)
 		os.Exit(1)
