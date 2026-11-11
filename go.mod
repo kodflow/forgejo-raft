@@ -2,6 +2,8 @@ module forgejo.org
 
 go 1.27.3
 
+toolchain go1.27.4
+
 require (
 	code.forgejo.org/crystal/ar v0.0.0-20190502131153-809d4375e1fb
 	code.forgejo.org/forgejo-contrib/go-libravatar v0.0.0-20260301104140-add494e31dab
