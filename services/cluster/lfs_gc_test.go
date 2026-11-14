@@ -76,8 +76,9 @@ func newLFSGCBench(t *testing.T) *lfsGCBench {
 // object stores content's file and row, eight days old.
 func (b *lfsGCBench) object(content []byte) (lfs.Pointer, *git_model.LFSMetaObject) {
 	b.t.Helper()
-	pointer, err := lfs.GeneratePointer(bytes.NewReader(content))
+	generated, err := lfs.GeneratePointer(bytes.NewReader(content))
 	require.NoError(b.t, err)
+	pointer := *generated
 	require.NoError(b.t, b.store.Put(pointer, bytes.NewReader(content)))
 	meta, err := git_model.NewLFSMetaObject(b.ctx, b.repo.ID, pointer)
 	require.NoError(b.t, err)

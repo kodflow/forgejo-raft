@@ -97,8 +97,9 @@ func TestRecoverAcceptsACheckpointTakenDuringAnLFSDownload(t *testing.T) {
 
 	// A mirror whose history holds one LFS pointer.
 	content := bytes.Repeat([]byte("large lfs object "), 4096)
-	p, err := lfs.GeneratePointer(bytes.NewReader(content))
+	generated, err := lfs.GeneratePointer(bytes.NewReader(content))
 	require.NoError(t, err)
+	p := *generated
 	bare := filepath.Join(t.TempDir(), "mirror.git")
 	out, err := exec.Command("git", "init", "-q", "--bare", bare).CombinedOutput()
 	require.NoError(t, err, "%s", out)

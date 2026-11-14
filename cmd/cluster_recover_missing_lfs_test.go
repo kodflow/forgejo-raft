@@ -42,7 +42,7 @@ func newLFSObject(t *testing.T, word string) lfsObject {
 	content := bytes.Repeat([]byte(word+" "), 4096)
 	p, err := lfs.GeneratePointer(bytes.NewReader(content))
 	require.NoError(t, err)
-	return lfsObject{content: content, pointer: p}
+	return lfsObject{content: content, pointer: *p}
 }
 
 // prepareOrphanLFS sets the bench up and returns the checkpoint of its

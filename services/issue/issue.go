@@ -19,6 +19,7 @@ import (
 	repo_model "forgejo.org/models/repo"
 	system_model "forgejo.org/models/system"
 	user_model "forgejo.org/models/user"
+	"forgejo.org/modules/clusterhook"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/storage"
@@ -177,6 +178,18 @@ func DeleteIssue(ctx context.Context, doer *user_model.User, gitRepo *git.Reposi
 		return err
 	}
 
+	// The pull request's refs are listed from this node's git below, then
+	// deleted. In a cluster, a node behind would miss a force-push ref
+	// (refs/pull/N/comment/M/{old,new}) another node wrote, and leave it
+	// for good once the pull request is gone. The deletion waits for this
+	// node to serve the repository at the cluster's commit index, and is
+	// refused before any row goes while it does not.
+	if issue.IsPull && gitRepo != nil {
+		if err := clusterhook.RequireFresh(ctx, clusterhook.RepoKey(issue.Repo.OwnerName, issue.Repo.Name, false)); err != nil {
+			return err
+		}
+	}
+
 	// delete entries in database
 	if err := deleteIssue(ctx, issue); err != nil {
 		return err
@@ -184,8 +197,25 @@ func DeleteIssue(ctx context.Context, doer *user_model.User, gitRepo *git.Reposi
 
 	// delete pull request related git data
 	if issue.IsPull && gitRepo != nil {
-		if err := gitRepo.RemoveReference(fmt.Sprintf("%s%d/head", git.PullPrefix, issue.PullRequest.Index)); err != nil {
-			return err
+		// Delete refs/pull/N/* refs:
+		refs, err := gitRepo.GetRefsFiltered(fmt.Sprintf("%s%d/", git.PullPrefix, issue.PullRequest.Index))
+		if err != nil {
+			return fmt.Errorf("failed to list references: %w", err)
+		}
+		for _, ref := range refs {
+			if err := gitRepo.RemoveReference(ref.Name); err != nil {
+				return fmt.Errorf("failed to remove reference %s: %w", ref.Name, err)
+			}
+		}
+		// Delete refs/pr-force-push/N/comment/M/T references:
+		refs, err = gitRepo.GetRefsFiltered(fmt.Sprintf("%s%d/", git.PullRequestForcePush, issue.PullRequest.Index))
+		if err != nil {
+			return fmt.Errorf("failed to list references: %w", err)
+		}
+		for _, ref := range refs {
+			if err := gitRepo.RemoveReference(ref.Name); err != nil {
+				return fmt.Errorf("failed to remove reference %s: %w", ref.Name, err)
+			}
 		}
 	}
 

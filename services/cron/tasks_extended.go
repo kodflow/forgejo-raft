@@ -131,10 +131,9 @@ func registerDeleteOldActions() {
 	})
 }
 
-func registerUpdateGiteaChecker() {
+func registerUpdateChecker() {
 	type UpdateCheckerConfig struct {
 		BaseConfig
-		HTTPEndpoint   string
 		DomainEndpoint string
 		RaftEndpoint   string
 	}
@@ -144,13 +143,12 @@ func registerUpdateGiteaChecker() {
 			RunAtStart: false,
 			Schedule:   "@every 168h",
 		},
-		HTTPEndpoint:   "https://dl.gitea.com/gitea/version.json",
 		DomainEndpoint: "release.forgejo.org",
 		RaftEndpoint:   updatechecker.RaftReleasesEndpoint,
 	}, func(ctx context.Context, _ *user_model.User, config Config) error {
 		updateCheckerConfig := config.(*UpdateCheckerConfig)
 		return errors.Join(
-			updatechecker.GiteaUpdateChecker(updateCheckerConfig.HTTPEndpoint, updateCheckerConfig.DomainEndpoint),
+			updatechecker.UpdateChecker(updateCheckerConfig.DomainEndpoint),
 			updatechecker.RaftUpdateChecker(ctx, updateCheckerConfig.RaftEndpoint),
 		)
 	})
@@ -255,7 +253,7 @@ func initExtendedTasks() {
 	}
 	registerRemoveRandomAvatars()
 	registerDeleteOldActions()
-	registerUpdateGiteaChecker()
+	registerUpdateChecker()
 	registerDeleteOldSystemNotices()
 	registerGCLFS()
 	registerRebuildIssueIndexer()

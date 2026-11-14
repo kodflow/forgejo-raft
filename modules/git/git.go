@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -188,6 +187,18 @@ func InitFull(ctx context.Context) (err error) {
 			return err
 		}
 	}
+
+	// HOME is managed by Forgejo, Forgejo's git should use "HOME/.gitconfig".
+	// However git would prefer editing "XDG_CONFIG_HOME/git/config" if the XDG_CONFIG_HOME
+	// is set and the file exists.
+	_ = os.Unsetenv("XDG_CONFIG_HOME")
+
+	_ = os.Unsetenv("GIT_AUTHOR_NAME")
+	_ = os.Unsetenv("GIT_AUTHOR_EMAIL")
+	_ = os.Unsetenv("GIT_AUTHOR_DATE")
+	_ = os.Unsetenv("GIT_COMMITTER_NAME")
+	_ = os.Unsetenv("GIT_COMMITTER_EMAIL")
+	_ = os.Unsetenv("GIT_COMMITTER_DATE")
 
 	// when git works with gnupg (commit signing), there should be a stable home for gnupg commands
 	if _, ok := os.LookupEnv("GNUPGHOME"); !ok {
@@ -367,6 +378,11 @@ func syncGitConfig() (err error) {
 	if err = configUnsetAll("receive.hideRefs", ""); err != nil {
 		return err
 	}
+	// Hide PullRequestForcePush prefix so that `git push --mirror` from a remote into a Forgejo repository doesn't find
+	// and attempt to delete the force-push commit references; those references are read-only.
+	if err = configSet("receive.hideRefs", PullRequestForcePush); err != nil {
+		return err
+	}
 
 	if !setting.Git.DisablePartialClone {
 		if err = configSet("uploadpack.allowfilter", "true"); err != nil {
@@ -460,7 +476,7 @@ func configSetNonExist(key, value string) error {
 }
 
 func configAddNonExist(key, value string) error {
-	_, _, err := NewCommand(DefaultContext, "config", "--global", "--get").AddDynamicArguments(key, regexp.QuoteMeta(value)).RunStdString(nil)
+	_, _, err := NewCommand(DefaultContext, "config", "--global", "--get", "--fixed-value").AddDynamicArguments(key, value).RunStdString(nil)
 	if err == nil {
 		// already exist
 		return nil
@@ -480,7 +496,7 @@ func configUnsetAll(key, value string) error {
 	_, _, err := NewCommand(DefaultContext, "config", "--global", "--get").AddDynamicArguments(key).RunStdString(nil)
 	if err == nil {
 		// exist, need to remove
-		_, _, err = NewCommand(DefaultContext, "config", "--global", "--unset-all").AddDynamicArguments(key, regexp.QuoteMeta(value)).RunStdString(nil)
+		_, _, err = NewCommand(DefaultContext, "config", "--global", "--unset-all", "--fixed-value").AddDynamicArguments(key, value).RunStdString(nil)
 		if err != nil && !IsErrorExitCode(err, 5) {
 			// exit code 5: try to unset an option which does not exist
 			return fmt.Errorf("failed to unset git global config %s, err: %w", key, err)

@@ -1580,3 +1580,13 @@ func InsertIssueComments(ctx context.Context, comments []*Comment) error {
 	}
 	return committer.Commit()
 }
+
+func (c *Comment) ForcePushOldCommitGitRefName() string {
+	// refs/pr-force-push/N/comment/M/old
+	return fmt.Sprintf("%s%d/comment/%d/old", git.PullRequestForcePush, c.Issue.Index, c.ID)
+}
+
+func (c *Comment) ForcePushNewCommitGitRefName() string {
+	// refs/pr-force-push/N/comment/M/new
+	return fmt.Sprintf("%s%d/comment/%d/new", git.PullRequestForcePush, c.Issue.Index, c.ID)
+}

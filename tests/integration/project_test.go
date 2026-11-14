@@ -475,7 +475,7 @@ func TestProjectPermissionsAndConsistency(t *testing.T) {
 		t.Run("doer is the organization owner", func(t *testing.T) {
 			owner := forgery.CreateUser(t, nil)
 			doer := owner
-			org := forgery.CreateOrganisation(t, owner)
+			org := forgery.CreateOrganisation(t, owner, nil)
 
 			repo := forgery.CreateRepository(t, org.AsUser(), nil)
 			projectA := forgery.CreateProject(t, org, nil)
@@ -491,7 +491,7 @@ func TestProjectPermissionsAndConsistency(t *testing.T) {
 		t.Run("doer in team with write permissions", func(t *testing.T) {
 			doer := forgery.CreateUser(t, nil)
 			owner := forgery.CreateUser(t, nil)
-			org := forgery.CreateOrganisation(t, owner)
+			org := forgery.CreateOrganisation(t, owner, nil)
 			forgery.CreateTeam(t, org, &forgery.CreateTeamOptions{
 				Mode:    perm.AccessModeWrite,
 				Members: []*user_model.User{doer},
@@ -510,7 +510,7 @@ func TestProjectPermissionsAndConsistency(t *testing.T) {
 
 		t.Run("doer in a team with read permissions", func(t *testing.T) {
 			doer := forgery.CreateUser(t, nil)
-			org := forgery.CreateOrganisation(t, nil)
+			org := forgery.CreateOrganisation(t, nil, nil)
 			forgery.CreateTeam(t, org, &forgery.CreateTeamOptions{
 				Mode:    perm.AccessModeRead,
 				Members: []*user_model.User{doer},
@@ -528,7 +528,7 @@ func TestProjectPermissionsAndConsistency(t *testing.T) {
 
 		t.Run("doer not in any team", func(t *testing.T) {
 			doer := forgery.CreateUser(t, nil)
-			org := forgery.CreateOrganisation(t, nil)
+			org := forgery.CreateOrganisation(t, nil, nil)
 
 			repo := forgery.CreateRepository(t, org.AsUser(), nil)
 			project := forgery.CreateProject(t, org, nil)
@@ -709,7 +709,7 @@ func TestProjectWebProjects(t *testing.T) {
 
 		// create test projects
 		user := forgery.CreateUser(t, nil)
-		org := forgery.CreateOrganisation(t, user)
+		org := forgery.CreateOrganisation(t, user, nil)
 		project1 := forgery.CreateProject(t, org, nil)
 		project2 := forgery.CreateProject(t, org, nil)
 		project3 := forgery.CreateProject(t, org, nil)
@@ -883,7 +883,7 @@ func TestProjectWebProjectsQueryParams(t *testing.T) {
 
 	// create test user, org, repo
 	user := forgery.CreateUser(t, nil)
-	org := forgery.CreateOrganisation(t, user)
+	org := forgery.CreateOrganisation(t, user, nil)
 	repo := forgery.CreateRepository(t, user, nil)
 
 	session := loginUser(t, user.Name)
@@ -909,7 +909,7 @@ func TestProjectWebRenderNewProject(t *testing.T) {
 
 	// create test user, organization, repository
 	user := forgery.CreateUser(t, nil)
-	org := forgery.CreateOrganisation(t, user)
+	org := forgery.CreateOrganisation(t, user, nil)
 	repo := forgery.CreateRepository(t, user, nil)
 
 	for _, tt := range []struct {
@@ -976,7 +976,7 @@ func TestProjectWebCreateProject(t *testing.T) {
 
 	// create test user, organization, repository
 	user := forgery.CreateUser(t, nil)
-	org := forgery.CreateOrganisation(t, user)
+	org := forgery.CreateOrganisation(t, user, nil)
 	repo := forgery.CreateRepository(t, user, nil)
 
 	for _, tt := range []struct {
@@ -1110,7 +1110,7 @@ func TestProjectWebDeleteProject(t *testing.T) {
 
 	// create test user, organization, repository and projects
 	user := forgery.CreateUser(t, nil)
-	org := forgery.CreateOrganisation(t, user)
+	org := forgery.CreateOrganisation(t, user, nil)
 	repo := forgery.CreateRepository(t, user, nil)
 	userProject := forgery.CreateProject(t, user, nil)
 	orgProject := forgery.CreateProject(t, org, nil)
@@ -1187,7 +1187,7 @@ func TestProjectWebRenderEditProject(t *testing.T) {
 
 	// create test user, organization, repository and projects
 	user := forgery.CreateUser(t, nil)
-	org := forgery.CreateOrganisation(t, user)
+	org := forgery.CreateOrganisation(t, user, nil)
 	repo := forgery.CreateRepository(t, user, nil)
 	userProject := forgery.CreateProject(t, user, nil)
 	orgProject := forgery.CreateProject(t, org, nil)
@@ -1276,7 +1276,7 @@ func TestProjectWebEditProjectPost(t *testing.T) {
 
 	// create test user, organization, repository and projects
 	user := forgery.CreateUser(t, nil)
-	org := forgery.CreateOrganisation(t, user)
+	org := forgery.CreateOrganisation(t, user, nil)
 	repo := forgery.CreateRepository(t, user, nil)
 	userProject := forgery.CreateProject(t, user, nil)
 	orgProject := forgery.CreateProject(t, org, nil)
@@ -1345,7 +1345,7 @@ func TestProjectWebDeleteProjectColumn(t *testing.T) {
 
 	// create test user, organization, repository and projects
 	user := forgery.CreateUser(t, nil)
-	org := forgery.CreateOrganisation(t, user)
+	org := forgery.CreateOrganisation(t, user, nil)
 	repo := forgery.CreateRepository(t, user, nil)
 	userProject := forgery.CreateProject(t, user, nil)
 	orgProject := forgery.CreateProject(t, org, nil)
@@ -1479,7 +1479,7 @@ func TestProjectWebCreateColumnInProject(t *testing.T) {
 
 	// create test user, organization, repository and projects
 	user := forgery.CreateUser(t, nil)
-	org := forgery.CreateOrganisation(t, user)
+	org := forgery.CreateOrganisation(t, user, nil)
 	repo := forgery.CreateRepository(t, user, nil)
 	userProject := forgery.CreateProject(t, user, nil)
 	orgProject := forgery.CreateProject(t, org, nil)
@@ -1633,7 +1633,7 @@ func TestProjectWebEditProjectColumn(t *testing.T) {
 
 	// create test user, organization, repository and projects
 	user := forgery.CreateUser(t, nil)
-	org := forgery.CreateOrganisation(t, user)
+	org := forgery.CreateOrganisation(t, user, nil)
 	repo := forgery.CreateRepository(t, user, nil)
 	userProject := forgery.CreateProject(t, user, nil)
 	orgProject := forgery.CreateProject(t, org, nil)
@@ -1832,7 +1832,7 @@ func TestProjectWebSetDefaultProjectColumn(t *testing.T) {
 
 	// create test user, organization, repository and projects
 	user := forgery.CreateUser(t, nil)
-	org := forgery.CreateOrganisation(t, user)
+	org := forgery.CreateOrganisation(t, user, nil)
 	repo := forgery.CreateRepository(t, user, nil)
 	userProject := forgery.CreateProject(t, user, nil)
 	orgProject := forgery.CreateProject(t, org, nil)
@@ -1967,14 +1967,14 @@ func TestProjectWebMoveIssues(t *testing.T) {
 
 	// create test user, organization, repository and projects
 	user := forgery.CreateUser(t, nil)
-	org := forgery.CreateOrganisation(t, user)
+	org := forgery.CreateOrganisation(t, user, nil)
 	repo := forgery.CreateRepository(t, user, nil)
 	userProject := forgery.CreateProject(t, user, nil)
 	orgProject := forgery.CreateProject(t, org, nil)
 	repoProject := forgery.CreateProject(t, repo, nil)
 	orgRepo := forgery.CreateRepository(t, org.AsUser(), nil)
 
-	moveOpts := &project_structs.MovedIssuesOption{}
+	moveOpts := &project_structs.MoveIssuesOption{}
 
 	// invalid project
 	for _, tt := range []struct {
@@ -2080,7 +2080,7 @@ func TestProjectWebMoveIssues(t *testing.T) {
 
 			url := fmt.Sprintf("/%s/%s/projects/%d/%d/move", tt.owner, tt.repo, tt.projectID, column.ID)
 			// move not existing issue
-			moveOpts.ProjectIssues = []project_structs.ProjectIssue{
+			moveOpts.ProjectIssues = []project_structs.MoveProjectIssue{
 				{IssueID: 1234567890, Sorting: 123},
 			}
 			resp := sessionJSONPOST(t, session, url, &moveOpts, http.StatusInternalServerError)
@@ -2156,7 +2156,7 @@ func TestProjectWebMoveIssues(t *testing.T) {
 			assert.EqualValues(t, 2, count)
 
 			// set new sorting in moveOpts
-			moveOpts.ProjectIssues = []project_structs.ProjectIssue{
+			moveOpts.ProjectIssues = []project_structs.MoveProjectIssue{
 				{IssueID: preIssues[0].IssueID, Sorting: preIssues[1].Sorting},
 				{IssueID: preIssues[1].IssueID, Sorting: preIssues[0].Sorting},
 			}
@@ -2230,4 +2230,23 @@ func TestProjectWebCRUD(t *testing.T) {
 	unittest.AssertNotExistsBean(t, &project_model.Project{
 		ID: project.ID,
 	})
+}
+
+func TestPostIssuePullProjectEndpoint(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+
+	// create test user, organization, repository and projects
+	user := forgery.CreateUser(t, nil)
+	user2 := forgery.CreateUser(t, nil)
+	repo := forgery.CreateRepository(t, user, nil)
+	repo2 := forgery.CreateRepository(t, user2, nil)
+	repoProject := forgery.CreateProject(t, repo, nil)
+	repoProject2 := forgery.CreateProject(t, repo2, nil)
+
+	session := loginUser(t, user.Name)
+	path := fmt.Sprintf("/%s/%s/pulls/projects?id=%d", user.Name, repo.Name, repoProject.ID)
+	sessionPOST(t, session, path, http.StatusOK)
+
+	path2 := fmt.Sprintf("/%s/%s/pulls/projects?id=%d", user.Name, repo.Name, repoProject2.ID)
+	sessionPOST(t, session, path2, http.StatusNotFound)
 }

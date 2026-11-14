@@ -97,8 +97,7 @@ func NewPullRequest(ctx context.Context, repo *repo_model.Repository, issue *iss
 			return err
 		}
 
-		compareInfo, err := baseGitRepo.GetCompareInfo(pr.BaseRepo.RepoPath(),
-			git.BranchPrefix+pr.BaseBranch, pr.GetGitRefName(), false, false)
+		compareInfo, err := baseGitRepo.GetCompareInfo(git.BranchPrefix+pr.BaseBranch, pr.GetGitRefName(), false, false)
 		if err != nil {
 			return err
 		}
@@ -1059,7 +1058,7 @@ func GetPullCommits(ctx *app_context.Context, issue *issues_model.Issue) ([]Comm
 	if pull.HasMerged {
 		baseBranch = pull.MergeBase
 	}
-	prInfo, err := baseGitRepo.GetCompareInfo(pull.BaseRepo.RepoPath(), baseBranch, pull.GetGitRefName(), true, false)
+	prInfo, err := baseGitRepo.GetCompareInfo(baseBranch, pull.GetGitRefName(), true, false)
 	if err != nil {
 		return nil, "", err
 	}

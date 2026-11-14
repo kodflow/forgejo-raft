@@ -228,9 +228,6 @@ forgejo.org/modules/util
 forgejo.org/modules/util/filebuffer
 	CreateFromReader
 
-forgejo.org/modules/validation
-	IsErrNotValid
-
 forgejo.org/modules/web
 	RouteMock
 	RouteMockReset
@@ -290,6 +287,9 @@ forgejo.org/routers/api/v1/permissions/testhelpers
 
 forgejo.org/routers/web/org
 	MustEnableProjects
+
+forgejo.org/routers/web/repo
+	RawCommitURL
 
 forgejo.org/services/auth
 	RegisterInternalIssuerForTesting

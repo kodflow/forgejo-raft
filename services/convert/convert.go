@@ -20,12 +20,14 @@ import (
 	"forgejo.org/models/organization"
 	"forgejo.org/models/perm"
 	access_model "forgejo.org/models/perm/access"
+	project_model "forgejo.org/models/project"
 	repo_model "forgejo.org/models/repo"
 	"forgejo.org/models/unit"
 	user_model "forgejo.org/models/user"
 	"forgejo.org/modules/container"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/log"
+	project_module "forgejo.org/modules/project"
 	"forgejo.org/modules/setting"
 	api "forgejo.org/modules/structs"
 	"forgejo.org/modules/util"
@@ -497,7 +499,7 @@ func ToOAuth2Application(app *auth.OAuth2Application) *api.OAuth2Application {
 	}
 }
 
-// ToLFSLock convert a LFSLock to api.LFSLock
+// ToLFSLock converts [git_model.LFSLock] to [api.LFSLock]
 func ToLFSLock(ctx context.Context, l *git_model.LFSLock) *api.LFSLock {
 	u, err := user_model.GetUserByID(ctx, l.OwnerID)
 	if err != nil {
@@ -511,6 +513,32 @@ func ToLFSLock(ctx context.Context, l *git_model.LFSLock) *api.LFSLock {
 			Name: u.Name,
 		},
 	}
+}
+
+// ToLFSLockList converts [git_model.LFSLockList] to *[api.LFSLockList].
+//
+// Given that [api.LFSLockList] contains a "Next" field, this function supports
+// pagination. Set cursor and limit to 0 if you need all results.
+func ToLFSLockList(ctx context.Context, lockList *git_model.LFSLockList, cursor, limit int) *api.LFSLockList {
+	lockAPIArray := make([]*api.LFSLock, len(*lockList))
+	next := ""
+	for i, l := range *lockList {
+		lockAPIArray[i] = ToLFSLock(ctx, l)
+		if lockAPIArray[i] == nil {
+			return nil
+		}
+	}
+
+	if limit > 0 && len(*lockList) == limit {
+		next = strconv.Itoa(cursor + 1)
+	}
+
+	lockListAPI := api.LFSLockList{
+		Locks: lockAPIArray,
+		Next:  next,
+	}
+
+	return &lockListAPI
 }
 
 // ToChangedFile convert a gitdiff.DiffFile to api.ChangedFile
@@ -574,4 +602,38 @@ func ToActionRunner(runner *actions_model.ActionRunner) (api.ActionRunner, error
 	}
 
 	return actionRunner, nil
+}
+
+// ToAPIProject converts project_model.Project to api.Project.
+func ToAPIProject(p *project_model.Project) *api.Project {
+	status := project_module.APIStatusOpen.String()
+	if p.IsClosed {
+		status = project_module.APIStatusClosed.String()
+	}
+	proj := &api.Project{
+		ID:           p.ID,
+		Title:        p.Title,
+		Description:  p.Description,
+		Status:       status,
+		OwnerType:    p.Type.ToAPIOwnerType().String(),
+		TemplateType: p.TemplateType.ToAPITemplateType().String(),
+		CardType:     p.CardType.ToAPICardType().String(),
+	}
+	if p.Repo != nil {
+		proj.RepoName = p.Repo.Name
+	}
+	// Repo projects are created without owner
+	if p.Owner != nil {
+		proj.OwnerName = p.Owner.Name
+	}
+	return proj
+}
+
+// ToAPIProjectList converts project_model.Project list to api.Project list.
+func ToAPIProjectList(p []*project_model.Project) []*api.Project {
+	var projs []*api.Project
+	for _, project := range p {
+		projs = append(projs, ToAPIProject(project))
+	}
+	return projs
 }

@@ -1,4 +1,5 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
+// Copyright 2026 The Forgejo Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
 package repo
@@ -28,9 +29,11 @@ import (
 	csv_module "forgejo.org/modules/csv"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
+	lfs_reader "forgejo.org/modules/lfs/reader"
 	"forgejo.org/modules/log"
 	"forgejo.org/modules/markup"
 	"forgejo.org/modules/optional"
+	repo_module "forgejo.org/modules/repository"
 	"forgejo.org/modules/setting"
 	api "forgejo.org/modules/structs"
 	"forgejo.org/modules/typesniffer"
@@ -54,7 +57,7 @@ func setCompareContext(ctx *context.Context, before, head *git.Commit, headOwner
 	ctx.Data["HeadCommit"] = head
 	ctx.Data["SignInLink"] = setting.AppSubURL + "/user/login?redirect_to=" + url.QueryEscape(ctx.Data["Link"].(string))
 
-	ctx.Data["GetBlobByPathForCommit"] = func(commit *git.Commit, path string) *git.Blob {
+	ctx.Data["GetDataByPathForCommit"] = func(commit *git.Commit, path string) *git.Blob {
 		if commit == nil {
 			return nil
 		}
@@ -66,19 +69,19 @@ func setCompareContext(ctx *context.Context, before, head *git.Commit, headOwner
 		return blob
 	}
 
-	ctx.Data["GetSniffedTypeForBlob"] = func(blob *git.Blob) typesniffer.SniffedType {
-		st := typesniffer.SniffedType{}
-
+	ctx.Data["GetFileInfoForBlob"] = func(blob *git.Blob) lfs_reader.FileInfo {
 		if blob == nil {
-			return st
+			return lfs_reader.FileInfo{}
 		}
 
-		st, err := blob.GuessContentType()
+		reader, fileInfo, err := lfs_reader.OpenReaderFromMaybeLFSBlob(ctx, ctx.Repo.Repository.ID, blob)
 		if err != nil {
-			log.Error("GuessContentType failed: %v", err)
-			return st
+			log.Error("OpenReaderFromMaybeLFSBlob failed: %v", err)
+			return lfs_reader.FileInfo{}
 		}
-		return st
+		// We don't need the reader here
+		reader.Close()
+		return *fileInfo
 	}
 
 	setPathsCompareContext(ctx, before, head, headOwner, headName)
@@ -96,13 +99,19 @@ func RawCommitURL(owner, name string, commit *git.Commit) string {
 	return setting.AppSubURL + "/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/raw/commit/" + url.PathEscape(commit.ID.String())
 }
 
+// MediaCommitURL gets the relative URL for the commit in the given repository
+// (with LFS support where necessary)
+func MediaCommitURL(owner, name string, commit *git.Commit) string {
+	return setting.AppSubURL + "/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/media/commit/" + url.PathEscape(commit.ID.String())
+}
+
 // setPathsCompareContext sets context data for source and raw paths
 func setPathsCompareContext(ctx *context.Context, base, head *git.Commit, headOwner, headName string) {
 	ctx.Data["SourcePath"] = SourceCommitURL(headOwner, headName, head)
-	ctx.Data["RawPath"] = RawCommitURL(headOwner, headName, head)
+	ctx.Data["MediaPath"] = MediaCommitURL(headOwner, headName, head)
 	if base != nil {
 		ctx.Data["BeforeSourcePath"] = SourceCommitURL(headOwner, headName, base)
-		ctx.Data["BeforeRawPath"] = RawCommitURL(headOwner, headName, base)
+		ctx.Data["BeforeMediaPath"] = MediaCommitURL(headOwner, headName, base)
 	}
 }
 
@@ -192,6 +201,7 @@ func setCsvCompareContext(ctx *context.Context) {
 func ParseCompareInfo(ctx *context.Context) *common.CompareInfo {
 	baseRepo := ctx.Repo.Repository
 	ci := &common.CompareInfo{}
+	returnSuccessfully := false
 
 	fileOnly := ctx.FormBool("file-only")
 
@@ -394,16 +404,21 @@ func ParseCompareInfo(ctx *context.Context) *common.CompareInfo {
 	}
 
 	// 7. Finally open the git repo
+	var headGitRepo *git.Repository
 	if isSameRepo {
 		ci.HeadRepo = ctx.Repo.Repository
-		ci.HeadGitRepo = ctx.Repo.GitRepo
+		headGitRepo = ctx.Repo.GitRepo
 	} else if has {
-		ci.HeadGitRepo, err = gitrepo.OpenRepository(ctx, ci.HeadRepo)
+		headGitRepo, err = gitrepo.OpenRepository(ctx, ci.HeadRepo)
 		if err != nil {
 			ctx.ServerError("OpenRepository", err)
 			return nil
 		}
-		defer ci.HeadGitRepo.Close()
+		defer func() {
+			if !returnSuccessfully {
+				headGitRepo.Close()
+			}
+		}()
 	} else {
 		ctx.NotFound("ParseCompareInfo", nil)
 		return nil
@@ -500,9 +515,9 @@ func ParseCompareInfo(ctx *context.Context) *common.CompareInfo {
 	}
 
 	// Check if head branch is valid.
-	headIsCommit := ci.HeadGitRepo.IsCommitExist(ci.HeadBranch)
-	headIsBranch := ci.HeadGitRepo.IsBranchExist(ci.HeadBranch)
-	headIsTag := ci.HeadGitRepo.IsTagExist(ci.HeadBranch)
+	headIsCommit := headGitRepo.IsCommitExist(ci.HeadBranch)
+	headIsBranch := headGitRepo.IsBranchExist(ci.HeadBranch)
+	headIsTag := headGitRepo.IsTagExist(ci.HeadBranch)
 	if !headIsCommit && !headIsBranch && !headIsTag {
 		ctx.NotFound("IsRefExist", nil)
 		return nil
@@ -529,17 +544,31 @@ func ParseCompareInfo(ctx *context.Context) *common.CompareInfo {
 		headBranchRef = git.TagPrefix + ci.HeadBranch
 	}
 
-	ci.CompareInfo, err = ci.HeadGitRepo.GetCompareInfo(baseRepo.RepoPath(), baseBranchRef, headBranchRef, ci.DirectComparison, fileOnly)
+	baseGitRepo, err := gitrepo.OpenRepository(ctx, baseRepo)
+	if err != nil {
+		ctx.ServerError("OpenRepository", err)
+		return nil
+	}
+	defer func() {
+		if !returnSuccessfully {
+			baseGitRepo.Close()
+		}
+	}()
+
+	xrepoCompare, err := repo_module.NewCrossRepositoryCompare(ctx, baseGitRepo, headGitRepo, baseBranchRef, headBranchRef, ci.DirectComparison, fileOnly)
 	if err != nil {
 		ctx.ServerError("GetCompareInfo", err)
 		return nil
 	}
+	ci.CompareInfo = xrepoCompare
+
 	if ci.DirectComparison {
 		ctx.Data["BeforeCommitID"] = ci.CompareInfo.BaseCommitID
 	} else {
 		ctx.Data["BeforeCommitID"] = ci.CompareInfo.MergeBase
 	}
 
+	returnSuccessfully = true
 	return ci
 }
 
@@ -588,7 +617,7 @@ func PrepareCompareDiff(
 	fileOnly := ctx.FormBool("file-only")
 	files := ctx.FormStrings("files")
 	ctx.Data["FileSelection"] = files
-	diffFileMetadata, err := gitdiff.GetDiffNameStatus(ctx, ci.HeadGitRepo, beforeCommitID, headCommitID, setting.UI.DiffPagingNum, files...)
+	diffFileMetadata, err := gitdiff.GetDiffNameStatus(ctx, ci.CompareInfo.CompareRepo(), beforeCommitID, headCommitID, setting.UI.DiffPagingNum, files...)
 	if err != nil {
 		ctx.ServerError("GetDiffNameStatus", err)
 		return false
@@ -609,7 +638,7 @@ func PrepareCompareDiff(
 		maxLines = -1
 	}
 
-	diff, err := gitdiff.GetDiffFull(ctx, ci.HeadGitRepo,
+	diff, err := gitdiff.GetDiffFull(ctx, ci.CompareInfo.CompareRepo(),
 		&gitdiff.DiffOptions{
 			BeforeCommitID:     beforeCommitID,
 			AfterCommitID:      headCommitID,
@@ -626,15 +655,13 @@ func PrepareCompareDiff(
 	ctx.Data["Diff"] = diff
 	ctx.Data["DiffNotAvailable"] = len(diff.Files) == 0
 
-	headCommit, err := ci.HeadGitRepo.GetCommit(headCommitID)
+	headCommit, err := ci.CompareInfo.CompareRepo().GetCommit(headCommitID)
 	if err != nil {
 		ctx.ServerError("GetCommit", err)
 		return false
 	}
 
-	baseGitRepo := ctx.Repo.GitRepo
-
-	beforeCommit, err := baseGitRepo.GetCommit(beforeCommitID)
+	beforeCommit, err := ci.CompareInfo.CompareRepo().GetCommit(beforeCommitID)
 	if err != nil {
 		ctx.ServerError("GetCommit", err)
 		return false
@@ -701,29 +728,27 @@ func getBranchesAndTagsForRepo(ctx gocontext.Context, repo *repo_model.Repositor
 // CompareDiff show different from one commit to another commit
 func CompareDiff(ctx *context.Context) {
 	ci := ParseCompareInfo(ctx)
-	defer func() {
-		if ci != nil && ci.HeadGitRepo != nil {
-			ci.HeadGitRepo.Close()
-		}
-	}()
+	if ci != nil {
+		defer ci.Close()
+	}
 	if ctx.Written() {
 		return
 	}
 
 	if ctx.Data["ComparingDiff"] != nil && ctx.Data["ComparingDiff"].(bool) {
-		err := git.GetRepoRawDiffForFile(ci.HeadGitRepo, ci.BaseBranch, ci.HeadBranch, git.RawDiffNormal, "", ctx.Resp)
+		err := git.GetRepoRawDiffForFile(ci.CompareInfo.CompareRepo(), ci.CompareInfo.BaseCommitID, ci.CompareInfo.HeadCommitID, git.RawDiffNormal, "", ctx.Resp)
 		if err != nil {
 			ctx.ServerError("ComparingDiff", err)
-			return
 		}
+		return
 	}
 
 	if ctx.Data["ComparingPatch"] != nil && ctx.Data["ComparingPatch"].(bool) {
-		err := git.GetRepoRawDiffForFile(ci.HeadGitRepo, ci.BaseBranch, ci.HeadBranch, git.RawDiffPatch, "", ctx.Resp)
+		err := git.GetRepoRawDiffForFile(ci.CompareInfo.CompareRepo(), ci.CompareInfo.BaseCommitID, ci.CompareInfo.HeadCommitID, git.RawDiffPatch, "", ctx.Resp)
 		if err != nil {
 			ctx.ServerError("ComparingPatch", err)
-			return
 		}
+		return
 	}
 
 	ctx.Data["PullRequestWorkInProgressPrefixes"] = setting.Repository.PullRequest.WorkInProgressPrefixes
@@ -804,14 +829,21 @@ func CompareDiff(ctx *context.Context) {
 			}
 		}
 	}
-	beforeCommitID := ctx.Data["BeforeCommitID"].(string)
-	afterCommitID := ctx.Data["AfterCommitID"].(string)
 
 	separator := "..."
 	if ci.DirectComparison {
 		separator = ".."
 	}
-	ctx.Data["Comparing"] = base.ShortSha(beforeCommitID) + separator + base.ShortSha(afterCommitID)
+	// Reconstruct the full {:baseBranch}...{:headOwner}/{:headRepoName}:{:headBranch} for this compare, but with the
+	// specific commit IDs that the user is currently viewing as the branch names. This is used in the page title, but
+	// also in the download .diff & .patch links, where they must include the head owner/repo if different from the base
+	// to ensure that the cross-repository comparison works correctly (not all shas are available in the base repo).
+	ctx.Data["Comparing"] = fmt.Sprintf("%s%s%s/%s:%s",
+		base.ShortSha(ci.CompareInfo.BaseCommitID),
+		separator,
+		ci.HeadUser.Name,
+		ci.HeadRepo.Name,
+		base.ShortSha(ci.CompareInfo.HeadCommitID))
 	ctx.Data["Title"] = "Comparing " + ctx.Data["Comparing"].(string)
 
 	ctx.Data["IsDiffCompare"] = true
